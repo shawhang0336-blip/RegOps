@@ -1,5 +1,4 @@
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -7,24 +6,25 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..asset_models import FieldMetadataModel, MetadataRevisionModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from ..code_service import extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
-from ..metadata_domain import MetadataFieldDraft, validate_metadata_draft
-from ..segment_service import analyze_block_segments, merge_metadata_tables
+from ..metadata_domain import MetadataFieldDraft
 from ..metadata_service import (
-    extract_metadata_for_block,
     metadata_to_spec,
     publish_table,
     table_detail,
     table_summary,
     update_field,
 )
+from ..structure_service import analyze_document_structure
 
 router = APIRouter(prefix="/metadata", tags=["metadata"])
 
 
 class ExtractRequest(BaseModel):
     block_ids: List[str]
+    targets: Optional[List[str]] = None
 
 
 class EditRequest(BaseModel):
@@ -50,22 +50,26 @@ class PublishRequest(BaseModel):
 def extract_metadata(request: ExtractRequest) -> Dict[str, Any]:
     if not request.block_ids:
         raise HTTPException(status_code=422, detail="Select at least one raw block")
+    settings = get_settings()
     with SessionLocal() as session:
         blocks = session.query(RawBlockModel).filter(RawBlockModel.id.in_(request.block_ids)).all()
         if any(block.content_json.get("superseded") for block in blocks):
             raise HTTPException(status_code=409, detail="Superseded raw blocks cannot be extracted")
+        doc_ids_to_analyze = set()
         for block in blocks:
             document = session.get(SourceDocumentModel, block.document_id)
-            if document.status == "UPLOADED":
-                raise HTTPException(status_code=409, detail="Run AI document-structure analysis before metadata extraction")
-    settings = get_settings()
-    with ThreadPoolExecutor(max_workers=min(4, len(request.block_ids))) as executor:
-        segment_groups = list(executor.map(lambda block_id: analyze_block_segments(block_id, settings), request.block_ids))
-    table_ids = []
-    for block_id, segment_ids in zip(request.block_ids, segment_groups):
-        segment_table_ids = [extract_metadata_for_block(segment_id, settings) for segment_id in segment_ids]
-        table_ids.append(merge_metadata_tables(SessionLocal(), block_id, segment_table_ids) if len(segment_table_ids) > 1 else segment_table_ids[0])
-    return {"table_ids": table_ids, "status": "AI_SELF_VALIDATION_COMPLETE"}
+            if document and document.status == "UPLOADED":
+                doc_ids_to_analyze.add(document.id)
+    for doc_id in doc_ids_to_analyze:
+        analyze_document_structure(doc_id, settings)
+
+    result = extract_parallel_for_blocks(request.block_ids, settings, request.targets or ["metadata", "code_sets"])
+    return {
+        "table_ids": result["table_ids"],
+        "code_set_ids": result["code_set_ids"],
+        "resolved_reference_count": result["resolved_reference_count"],
+        "status": "AI_SELF_VALIDATION_COMPLETE",
+    }
 
 
 @router.get("/tables")

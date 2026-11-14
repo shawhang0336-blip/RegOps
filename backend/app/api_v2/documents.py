@@ -1,12 +1,14 @@
 import hashlib
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
+from ..code_service import extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
 from ..extractors import extract_document
@@ -15,6 +17,11 @@ from ..structure_service import analyze_document_structure, reextract_document_b
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 FILE_TYPES = {"pdf": "pdf", "docx": "docx", "xlsx": "xlsx"}
+
+
+class ParallelExtractRequest(BaseModel):
+    block_ids: List[str]
+    targets: Optional[List[str]] = None
 
 
 def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
@@ -30,12 +37,10 @@ def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
     }
 
 
-@router.post("", status_code=201)
-async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
-    suffix = Path(file.filename).suffix.lower().lstrip(".")
+def ingest_uploaded_file(filename: str, content: bytes) -> SourceDocumentModel:
+    suffix = Path(filename).suffix.lower().lstrip(".")
     if suffix not in FILE_TYPES:
         raise HTTPException(status_code=422, detail="Only PDF, DOCX and XLSX are supported")
-    content = await file.read()
     if len(content) > 30 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds the 30 MB limit")
     if suffix == "pdf" and not content.startswith(b"%PDF"):
@@ -56,10 +61,10 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     with SessionLocal() as session:
         existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one_or_none()
         if existing:
-            return document_summary(existing)
+            return existing
         document = SourceDocumentModel(
             id=str(uuid.uuid4()),
-            file_name=Path(file.filename).name,
+            file_name=Path(filename).name,
             file_type=suffix,
             sha256=digest,
             blob_uri=f"blob://uploads/{digest}.{suffix}",
@@ -72,7 +77,14 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         for block in blocks:
             session.add(RawBlockModel(id=str(uuid.uuid4()), document_id=document.id, **block))
         session.commit()
-        return document_summary(document)
+        return document
+
+
+@router.post("", status_code=201)
+async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
+    content = await file.read()
+    document = ingest_uploaded_file(file.filename, content)
+    return document_summary(document)
 
 
 @router.get("")
@@ -101,11 +113,17 @@ def document_detail(document_id: str) -> Dict[str, Any]:
                     "id": block.id,
                     "ordinal": block.ordinal,
                     "block_type": block.block_type,
+                    "candidate_role": block.content_json.get(
+                        "candidate_role",
+                        "CODE_SET" if block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} else "TABLE_METADATA",
+                    ),
+                    "table_name": block.content_json.get("table_name", ""),
                     "source_locator": block.source_locator,
                     "raw_hash": block.raw_hash,
                     "eligible": block.content_json.get("eligible", True),
                     "reason": block.content_json.get("reason", ""),
                     "field_count": block.content_json.get("field_count"),
+                    "inline_code_count": len(block.content_json.get("inline_code_sets", [])),
                     "superseded": block.content_json.get("superseded", False),
                     "column_mapping": block.content_json.get("column_mapping", {}),
                     "human_required": block.content_json.get("human_required", False),
@@ -140,6 +158,23 @@ def analyze_structure(document_id: str) -> Dict[str, Any]:
             "warnings": architecture.warnings_json,
             "trace": architecture.trace_json,
         }
+
+
+@router.post("/{document_id}/extract-parallel", status_code=202)
+def extract_document_parallel(document_id: str, request: ParallelExtractRequest) -> Dict[str, Any]:
+    if not request.block_ids:
+        raise HTTPException(status_code=422, detail="Select at least one raw block")
+    settings = get_settings()
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if document.status == "UPLOADED":
+            analyze_document_structure(document_id, settings)
+    try:
+        return extract_parallel_for_blocks(request.block_ids, settings, request.targets)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/{document_id}/architecture")

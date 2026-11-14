@@ -22,7 +22,7 @@ def _candidate(block: RawBlockModel) -> Dict[str, Any]:
         "structure": {
             key: value
             for key, value in block.content_json.items()
-            if key in {"table_code", "table_name", "field_count", "headers", "rows", "spec", "reason", "eligible"}
+            if key in {"table_code", "table_name", "field_count", "headers", "rows", "spec", "code_set_spec", "candidate_role", "reason", "eligible"}
         },
     }
 
@@ -45,6 +45,27 @@ def _validate_plan(args: Dict[str, Any], blocks: List[RawBlockModel]) -> Dict[st
 
 
 def _default_plan(block: RawBlockModel) -> Dict[str, Any]:
+    is_code_set = (
+        block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"}
+        or block.content_json.get("candidate_role") == "CODE_SET"
+        or bool(block.content_json.get("code_set_spec"))
+    )
+    if is_code_set:
+        return {
+            "source_block_ids": [block.id],
+            "role": "CODE_SET",
+            "title": block.content_json.get("table_name") or block.source_locator.get("section", "结构化码值表"),
+            "column_mapping": block.content_json.get("column_mapping")
+            or {
+                "value": "value",
+                "label_cn": "label_cn",
+                "label_en": "label_en",
+                "definition": "definition",
+            },
+            "human_required": False,
+            "warnings": [],
+            "split_markers": [],
+        }
     return {
         "source_block_ids": [block.id],
         "role": "TABLE_METADATA",
@@ -173,7 +194,12 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
         ]
         if not blocks:
             raise ValueError("Document has no raw blocks")
-        structured = [block for block in blocks if block.content_json.get("eligible") and block.content_json.get("spec")]
+        structured = [
+            block
+            for block in blocks
+            if (block.content_json.get("eligible") and (block.content_json.get("spec") or block.content_json.get("code_set_spec")))
+            or (block.content_json.get("candidate_role") == "CODE_SET" and block.content_json.get("code_set_spec"))
+        ]
         ambiguous = [block for block in blocks if block not in structured]
         architecture_id = ""
         if structured:
@@ -185,7 +211,7 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                 status="DETERMINISTIC_STRUCTURE",
                 plan_json=args,
                 warnings_json=[],
-                trace_json={"strategy": "structured blocks require no LLM architecture call"},
+                trace_json={"strategy": "structured table and code_set blocks require no LLM architecture call"},
             )
             session.add(architecture)
             session.commit()
@@ -195,15 +221,24 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
             for block in ambiguous:
                 section = str(block.source_locator.get("section", "UNKNOWN"))
                 groups.setdefault(section, []).append(block)
-            llm = RealDesignLlm(settings)
+            try:
+                llm = RealDesignLlm(settings)
+            except Exception as llm_init_exc:
+                llm = None
+                init_error = llm_init_exc
 
             def analyze_group(item):
                 section, group = item
+                if llm is None:
+                    return {
+                        "blocks": [_fallback_plan(block, init_error) for block in group],
+                        "global_warnings": [f"{section}: {type(init_error).__name__}: {init_error}"],
+                    }, {"error": f"{type(init_error).__name__}: {init_error}"}, None
                 candidates = [_candidate(block) for block in group]
                 try:
                     args, trace = llm.assign(
                         "assign_document_structure",
-                        "先看这一章节原始块的整体结构，再决定保留、忽略、合并、拆分及列映射。每个章节最多一次调用，不得虚构字段。",
+                        "先看这一章节原始块的整体结构，再决定保留为 TABLE_METADATA 或 CODE_SET、忽略、合并、拆分及列映射。每个章节最多一次调用，不得虚构字段。",
                         {"file_name": document.file_name, "file_type": document.file_type, "candidate_blocks": candidates},
                         timeout=25,
                     )

@@ -55,6 +55,27 @@ METADATA_TABLE_PROPERTIES = {
     },
 }
 
+CODE_VALUE_PROPERTIES = {
+    "value": {"type": "string"},
+    "label_cn": {"type": "string"},
+    "label_en": {"type": "string"},
+    "definition": {"type": "string"},
+}
+
+CODE_SET_PROPERTIES = {
+    "code": {"type": "string"},
+    "name": {"type": "string"},
+    "definition": {"type": "string"},
+    "values": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": CODE_VALUE_PROPERTIES,
+            "required": ["value", "label_cn"],
+        },
+    },
+}
+
 TOOL_SCHEMAS = {
     "assign_document_structure": {
         "type": "object",
@@ -130,6 +151,30 @@ TOOL_SCHEMAS = {
                         "message": {"type": "string"},
                     },
                     "required": ["severity", "code", "field_en", "message"],
+                },
+            }
+        },
+        "required": ["issues"],
+    },
+    "assign_code_set": {
+        "type": "object",
+        "properties": CODE_SET_PROPERTIES,
+        "required": list(CODE_SET_PROPERTIES),
+    },
+    "review_code_set": {
+        "type": "object",
+        "properties": {
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["ERROR", "WARNING", "INFO"]},
+                        "code": {"type": "string"},
+                        "value": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["severity", "code", "value", "message"],
                 },
             }
         },

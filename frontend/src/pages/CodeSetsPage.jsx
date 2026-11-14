@@ -16,6 +16,9 @@ export default function CodeSetsPage() {
   const [newSet, setNewSet] = useState({ code: '', name: '', definition: '' })
   const [newValue, setNewValue] = useState({ value: '', label_cn: '', label_en: '' })
   const [filterText, setFilterText] = useState('')
+  const [setSearch, setSetSearch] = useState('')
+  const [includeInline, setIncludeInline] = useState(true)
+  const [dragging, setDragging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -47,6 +50,41 @@ export default function CodeSetsPage() {
   async function select(id) {
     const data = await v2(`/code-sets/${id}`)
     setDetail(data)
+  }
+
+  async function handleDocumentCodeUpload(file) {
+    if (!file) return
+    const form = new FormData()
+    form.append('file', file)
+    form.append('include_inline', includeInline ? 'true' : 'false')
+    setBusy(true)
+    setError('')
+    try {
+      const result = await v2('/code-sets/upload-file', { method: 'POST', body: form })
+      const firstId = result.code_set_ids?.[0]
+      await load(firstId)
+      setNotice(
+        `已按文档解析流水线从「${result.file_name}」并行提取 ${result.code_set_count} 张码值字典（共 ${result.total_value_count} 项码值），自动绑定消解 ${result.resolved_reference_count} 处字段码值引用。`
+      )
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function onDocInputChange(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (file) handleDocumentCodeUpload(file)
+  }
+
+  function onDrop(event) {
+    event.preventDefault()
+    setDragging(false)
+    if (busy) return
+    const file = event.dataTransfer.files?.[0]
+    if (file) handleDocumentCodeUpload(file)
   }
 
   async function createSet() {
@@ -171,6 +209,16 @@ export default function CodeSetsPage() {
     }
   }
 
+  const filteredSets = sets.filter((s) => {
+    if (!setSearch.trim()) return true
+    const q = setSearch.toLowerCase()
+    return (
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.code || '').toLowerCase().includes(q) ||
+      (s.source_type || '').toLowerCase().includes(q)
+    )
+  })
+
   const filteredValues = (detail?.values || []).filter((item) => {
     if (!filterText.trim()) return true
     const q = filterText.toLowerCase()
@@ -184,17 +232,59 @@ export default function CodeSetsPage() {
   return (
     <>
       <PageHeader
-        eyebrow="STAGE 03 · 公共字典与未决码值消解"
+        eyebrow="STAGE 03 · 码值文档解析、公共字典与未决引用消解"
         title="公共码值中心"
-        description="统一管理文档引用自动建表、人工维护与 Excel 导入的公共字典；只有当码值表包含有效启用项并发布后，下游必填字段才允许生成。"
+        description="采用与规范文件中心同构的「文件切块 → 结构预检 → 并行提取」流水线，支持直接上传 PDF/DOCX/XLSX 批量解析公共代码表、制度附录及字段内联枚举。"
+        actions={
+          <div className="actions">
+            <label className="check-label" style={{ paddingTop: 0 }}>
+              <input
+                type="checkbox"
+                checked={includeInline}
+                onChange={(e) => setIncludeInline(e.target.checked)}
+              />
+              同步提取表内字段枚举
+            </label>
+            <label className="button primary">
+              {busy ? '正在解析码值文档...' : '+ 上传文件解析码值 (.pdf/.docx/.xlsx)'}
+              <input
+                className="file-input"
+                type="file"
+                accept=".pdf,.docx,.xlsx"
+                disabled={busy}
+                onChange={onDocInputChange}
+              />
+            </label>
+          </div>
+        }
       />
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
+      <label
+        className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
+        onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+      >
+        <div className="upload-dropzone-text">
+          <strong>拖拽码值文件或监管规范文档到此处，按文档流水线批量解析码值字典</strong>
+          <span>支持：监管规范 PDF（第九章代码表/内联枚举）、统计制度 PDF（附录一～九代码表）、Word/Excel 多表码值文件，提取后自动与表元数据字段引用对齐消解</span>
+        </div>
+        <span className="button secondary">选择码值文件</span>
+        <input
+          className="file-input"
+          type="file"
+          accept=".pdf,.docx,.xlsx"
+          disabled={busy}
+          onChange={onDocInputChange}
+        />
+      </label>
+
       {unresolved.length > 0 && (
         <div className="unresolved-banner">
           <div className="unresolved-banner-header">
-            <strong>发现 {unresolved.length} 处未解决的字段码值引用（将阻断下游生成，请点击下方标签补充码值并发布）</strong>
+            <strong>发现 {unresolved.length} 处未解决的字段码值引用（可上传对应码值文档自动消解，或点击下方标签手动补充）</strong>
             <StatusBadge status="UNRESOLVED">{unresolved.length} 项待消解</StatusBadge>
           </div>
           <div className="unresolved-chips">
@@ -223,9 +313,18 @@ export default function CodeSetsPage() {
             <StatusBadge tone="neutral">{sets.length}</StatusBadge>
           </div>
 
-          {sets.length > 0 ? (
+          <div style={{ marginBottom: 10 }}>
+            <input
+              type="search"
+              placeholder="检索码值表名称或代码..."
+              value={setSearch}
+              onChange={(e) => setSetSearch(e.target.value)}
+            />
+          </div>
+
+          {filteredSets.length > 0 ? (
             <div className="list-stack">
-              {sets.map((set) => (
+              {filteredSets.map((set) => (
                 <button
                   type="button"
                   className={`list-row ${detail?.id === set.id ? 'selected' : ''}`}
@@ -244,13 +343,13 @@ export default function CodeSetsPage() {
                       关联 {set.unresolved_reference_count} 个未决字段引用
                     </em>
                   ) : (
-                    <em>版本 v{set.current_version} · 引用已就绪</em>
+                    <em>版本 v{set.current_version} · {set.source_type}</em>
                   )}
                 </button>
               ))}
             </div>
           ) : (
-            <div className="empty">暂无码值表，可在下方新建或从元数据工作台发布自动生成。</div>
+            <div className="empty">暂无匹配码值表，可在上方上传文件解析或下方手动新建。</div>
           )}
 
           <details className="inline-form" open={!sets.length}>
@@ -300,7 +399,7 @@ export default function CodeSetsPage() {
                     onChange={(e) => setFilterText(e.target.value)}
                   />
                   <label className="button secondary">
-                    导入 Excel (.xlsx)
+                    单表追加 Excel (.xlsx)
                     <input
                       className="file-input"
                       type="file"
@@ -344,7 +443,7 @@ export default function CodeSetsPage() {
                         <th>#</th>
                         <th>码值编码</th>
                         <th>中文含义</th>
-                        <th>英文含义</th>
+                        <th>英文含义 / 映射</th>
                         <th>当前状态</th>
                         <th>来源溯源</th>
                         <th>操作</th>
@@ -359,6 +458,7 @@ export default function CodeSetsPage() {
                           </td>
                           <td>
                             <strong>{value.label_cn}</strong>
+                            {value.definition ? <small style={{ display: 'block' }}>{value.definition}</small> : null}
                           </td>
                           <td>{value.label_en || '—'}</td>
                           <td>
@@ -386,12 +486,12 @@ export default function CodeSetsPage() {
                 </div>
               ) : (
                 <div className="empty" style={{ marginTop: 14 }}>
-                  当前码值表尚无码值项，请在上方手动添加或通过 Excel 批量导入（表头需包含「码值/value」与「中文含义/label_cn」）。
+                  当前码值表尚无码值项，请在上方上传码值文档解析、手动添加或通过 Excel 批量导入。
                 </div>
               )}
             </>
           ) : (
-            <div className="empty">请从左侧选择或新建一张码值字典表。</div>
+            <div className="empty">请从左侧选择一张码值字典表，或直接在上方拖拽上传文件自动解析码值。</div>
           )}
         </div>
       </section>

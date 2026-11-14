@@ -12,7 +12,7 @@ export default function DocumentsPage() {
   const [selected, setSelected] = useState([])
   const [raw, setRaw] = useState(null)
   const [architecture, setArchitecture] = useState(null)
-  const [onlyEligible, setOnlyEligible] = useState(false)
+  const [blockFilter, setBlockFilter] = useState('all')
   const [dragging, setDragging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -34,7 +34,7 @@ export default function DocumentsPage() {
   async function selectDocument(id) {
     const doc = await v2(`/documents/${id}`)
     setDetail(doc)
-    const eligibleIds = (doc.blocks || []).filter((b) => b.eligible !== false).map((b) => b.id)
+    const eligibleIds = (doc.blocks || []).filter((b) => b.eligible !== false && !b.superseded).map((b) => b.id)
     setSelected(eligibleIds)
     setRaw(null)
     if (doc.status !== 'UPLOADED') {
@@ -53,7 +53,7 @@ export default function DocumentsPage() {
     try {
       const document = await v2('/documents', { method: 'POST', body: form })
       await load(document.id)
-      setNotice(`已上传「${document.file_name}」。请先运行 AI 架构预检，再由程序切块并进行元数据解析。`)
+      setNotice(`已上传「${document.file_name}」。支持直接点击「并行解析（元数据 + 码值）」自动完成预检与双通道提取。`)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -81,7 +81,7 @@ export default function DocumentsPage() {
     try {
       await v2(`/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
       await selectDocument(detail.id)
-      setNotice('原始块已按最新解析器重建，请重新运行 AI 架构预检。')
+      setNotice('原始块已按最新多模式解析器重建（同时识别字段表与码值表）。')
     } catch (err) {
       setError(err.message)
     } finally {
@@ -97,7 +97,7 @@ export default function DocumentsPage() {
       const result = await v2(`/documents/${detail.id}/analyze-structure`, { method: 'POST', body: JSON.stringify({}) })
       setArchitecture(result)
       await selectDocument(detail.id)
-      setNotice(`AI 架构预检完成，程序已按预检计划切块。请留意标记为「人工介入」的块。`)
+      setNotice('架构预检完成：已自动完成字段表（TABLE_METADATA）与码值表（CODE_SET）双轨路由。')
     } catch (err) {
       setError(err.message)
     } finally {
@@ -116,7 +116,7 @@ export default function DocumentsPage() {
         body: JSON.stringify({ column_mapping: parsed, human_required: true, editor: '结构调整人工确认' }),
       })
       await selectDocument(detail.id)
-      setNotice('结构映射已人工调整，后续 AI 会使用新映射。')
+      setNotice('结构映射已人工调整，后续解析会使用新映射。')
     } catch (err) {
       setError(err.message)
     }
@@ -135,18 +135,28 @@ export default function DocumentsPage() {
     setRaw(await v2(`/documents/${detail.id}/blocks/${blockId}`))
   }
 
-  async function extract() {
-    if (!selected.length) return
+  async function extractParallel(targets = ['metadata', 'code_sets']) {
+    if (!selected.length || !detail) return
     setBusy(true)
     setError('')
     try {
-      const result = await v2('/metadata/extract', {
+      const result = await v2(`/documents/${detail.id}/extract-parallel`, {
         method: 'POST',
-        body: JSON.stringify({ block_ids: selected }),
+        body: JSON.stringify({ block_ids: selected, targets }),
       })
-      const firstTableId = result.table_ids?.[0] || ''
-      setNotice(`GLM 已完成 ${result.table_ids.length} 张表的结构化元数据提取与独立自审，正在进入元数据工作台。`)
-      navigate(firstTableId ? `/metadata?table=${firstTableId}` : '/metadata')
+      const tableCount = result.table_ids?.length || 0
+      const codeSetCount = result.code_set_ids?.length || 0
+      const resolvedCount = result.resolved_reference_count || 0
+      setNotice(
+        `双通道并行解析完成：生成 ${tableCount} 张表元数据、${codeSetCount} 张码值字典，自动绑定消解 ${resolvedCount} 处字段码值引用。`
+      )
+      if (targets.length === 1 && targets[0] === 'code_sets') {
+        const firstSetId = result.code_set_ids?.[0] || ''
+        navigate(firstSetId ? `/code-sets?set=${firstSetId}` : '/code-sets')
+      } else {
+        const firstTableId = result.table_ids?.[0] || ''
+        navigate(firstTableId ? `/metadata?table=${firstTableId}` : '/metadata')
+      }
     } catch (err) {
       setError(err.message)
     } finally {
@@ -154,27 +164,38 @@ export default function DocumentsPage() {
     }
   }
 
-  const allBlocks = detail?.blocks || []
-  const eligibleBlocks = allBlocks.filter((b) => b.eligible !== false && !b.superseded)
-  const visibleBlocks = onlyEligible ? eligibleBlocks : allBlocks
+  const allBlocks = (detail?.blocks || []).filter((b) => !b.superseded)
+  const tableBlocks = allBlocks.filter((b) => b.candidate_role !== 'CODE_SET' && b.block_type !== 'CODE_SET' && b.block_type !== 'CODE_SET_CANDIDATE')
+  const codeSetBlocks = allBlocks.filter((b) => b.candidate_role === 'CODE_SET' || b.block_type === 'CODE_SET' || b.block_type === 'CODE_SET_CANDIDATE')
+  const eligibleBlocks = allBlocks.filter((b) => b.eligible !== false)
+  const totalInlineCodeSets = tableBlocks.reduce((acc, b) => acc + (b.inline_code_count || 0), 0)
 
-  function toggleSelectAllEligible() {
-    if (selected.length === eligibleBlocks.length) {
-      setSelected([])
+  const visibleBlocks = allBlocks.filter((b) => {
+    if (blockFilter === 'eligible') return b.eligible !== false
+    if (blockFilter === 'tables') return b.candidate_role !== 'CODE_SET' && b.block_type !== 'CODE_SET' && b.block_type !== 'CODE_SET_CANDIDATE'
+    if (blockFilter === 'codes') return b.candidate_role === 'CODE_SET' || b.block_type === 'CODE_SET' || b.block_type === 'CODE_SET_CANDIDATE'
+    return true
+  })
+
+  function toggleSelectAllVisible() {
+    const visibleEligibleIds = visibleBlocks.filter((b) => b.eligible !== false).map((b) => b.id)
+    const allSelected = visibleEligibleIds.length > 0 && visibleEligibleIds.every((id) => selected.includes(id))
+    if (allSelected) {
+      setSelected(selected.filter((id) => !visibleEligibleIds.includes(id)))
     } else {
-      setSelected(eligibleBlocks.map((b) => b.id))
+      setSelected(Array.from(new Set([...selected, ...visibleEligibleIds])))
     }
   }
 
   return (
     <>
       <PageHeader
-        eyebrow="STAGE 01 · 规范导入与原始块提取"
+        eyebrow="STAGE 01 · 规范导入、多模式切块与双通道并行解析"
         title="规范文件中心"
-        description="支持上传 PDF、DOCX、XLSX 监管规范文件，自动切分带原文页码与章节位置的 RawBlock，再交由 AI 提取表级元数据。"
+        description="支持上传 PDF、DOCX、XLSX 监管规范或制度文件，自动识别「采集字段表」与「公共/附录/内联码值表」，一键并行提取表元数据与码值字典并自动消解引用。"
         actions={
           <label className="button primary">
-            {busy ? '正在处理...' : '+ 上传规范文件'}
+            {busy ? '正在处理...' : '+ 上传规范/制度文件'}
             <input
               className="file-input"
               type="file"
@@ -195,8 +216,8 @@ export default function DocumentsPage() {
         onDrop={onDrop}
       >
         <div className="upload-dropzone-text">
-          <strong>拖拽监管规范文件到此处，或点击直接上传</strong>
-          <span>支持格式：.pdf / .docx / .xlsx（单文件上限 30 MB，自动计算 SHA-256 防重并保留原文证据锚点）</span>
+          <strong>拖拽监管规范、统计制度、核查规则或码值文件到此处，或点击直接上传</strong>
+          <span>支持格式：.pdf / .docx / .xlsx（自动识别接口表、调查表式、主要指标解释、第九章代码表、统计制度附录及表格码值）</span>
         </div>
         <span className="button secondary">选择本地文件</span>
         <input
@@ -248,64 +269,113 @@ export default function DocumentsPage() {
                 <div>
                   <h2>{detail.file_name}</h2>
                   <p>
-                    共切分 {allBlocks.length} 个原始块（其中 {eligibleBlocks.length} 个符合字段表特征） · SHA-256:{' '}
+                    共切分 {allBlocks.length} 个原始块（{tableBlocks.length} 个字段表候选 · {codeSetBlocks.length} 个独立码值表候选 · 内嵌 {totalInlineCodeSets} 组字段枚举码值） · SHA-256:{' '}
                     <code>{detail.sha256?.slice(0, 12)}…</code>
                   </p>
                 </div>
                 <div className="actions">
                   <button
                     type="button"
-                    className="button primary"
-                    disabled={busy || !selected.length || detail.status === 'UPLOADED'}
-                    onClick={extract}
+                    className="button secondary sm"
+                    disabled={busy || !selected.length}
+                    onClick={() => extractParallel(['code_sets'])}
                   >
-                    {busy ? 'AI 正在提取并自审...' : `AI 解析选中块 (${selected.length}) →`}
+                    仅解析码值
+                  </button>
+                  <button
+                    type="button"
+                    className="button primary"
+                    disabled={busy || !selected.length}
+                    onClick={() => extractParallel(['metadata', 'code_sets'])}
+                  >
+                    {busy ? '双通道并行提取中...' : `并行解析表元数据 + 码值 (${selected.length}) →`}
                   </button>
                 </div>
               </div>
 
               <div className="architecture-bar">
                 <div>
-                  <strong>{detail.status === 'UPLOADED' ? '先运行 AI 架构预检' : 'AI 架构预检已完成'}</strong>
-                  <span>{detail.status === 'UPLOADED' ? '先判断字段表、码值表、说明文字与切块方式，再解析元数据。' : '程序已按预检计划切块，可逐块解析。'}</span>
+                  <strong>{detail.status === 'UPLOADED' ? '支持一键自动预检或手动运行架构预检' : '双轨架构预检已完成'}</strong>
+                  <span>
+                    {detail.status === 'UPLOADED'
+                      ? '点击右侧「并行解析表元数据 + 码值」将自动执行双轨架构预检、整表批量提取与码值引用绑定。'
+                      : '已按「表元数据通道」与「码值字典通道」完成分类，可勾选任意块并行提取。'}
+                  </span>
                 </div>
                 <div className="actions">
                   <button type="button" className="button secondary sm" disabled={busy} onClick={reextractBlocks}>重新提取原始块</button>
-                  {detail.status === 'UPLOADED' ? <button type="button" className="button primary" disabled={busy} onClick={analyzeStructure}>{busy ? 'AI 正在预检架构...' : '运行 AI 架构预检'}</button> : <button type="button" className="button secondary sm" onClick={viewArchitecture}>{architecture ? '收起预检结果' : '查看预检结果'}</button>}
+                  {detail.status === 'UPLOADED' ? (
+                    <button type="button" className="button secondary sm" disabled={busy} onClick={analyzeStructure}>
+                      {busy ? '正在预检...' : '运行架构预检'}
+                    </button>
+                  ) : (
+                    <button type="button" className="button secondary sm" onClick={viewArchitecture}>
+                      {architecture ? '收起预检结果' : '查看预检结果'}
+                    </button>
+                  )}
                 </div>
               </div>
-              {architecture && <div className="architecture-result">
-                <div className="architecture-summary"><StatusBadge tone={architecture.warnings?.length ? 'amber' : 'green'}>{architecture.warnings?.length || 0} 个架构提示</StatusBadge><span>状态：{architecture.status}</span></div>
-                {architecture.warnings?.map((warning, index) => <p className="architecture-warning" key={index}>{warning}</p>)}
-                <details><summary>查看完整架构计划</summary><pre>{JSON.stringify(architecture.plan, null, 2)}</pre></details>
-              </div>}
+              {architecture && (
+                <div className="architecture-result">
+                  <div className="architecture-summary">
+                    <StatusBadge tone={architecture.warnings?.length ? 'amber' : 'green'}>
+                      {architecture.warnings?.length || 0} 个架构提示
+                    </StatusBadge>
+                    <span>状态：{architecture.status}</span>
+                  </div>
+                  {architecture.warnings?.map((warning, index) => (
+                    <p className="architecture-warning" key={index}>{warning}</p>
+                  ))}
+                  <details>
+                    <summary>查看完整架构计划</summary>
+                    <pre>{JSON.stringify(architecture.plan, null, 2)}</pre>
+                  </details>
+                </div>
+              )}
 
               <div className="block-toolbar">
                 <div className="actions">
-                  <button type="button" className="button secondary sm" onClick={toggleSelectAllEligible}>
-                    {selected.length === eligibleBlocks.length && eligibleBlocks.length > 0
-                      ? '取消全选'
-                      : `全选合规候选块 (${eligibleBlocks.length})`}
+                  <button type="button" className="button secondary sm" onClick={toggleSelectAllVisible}>
+                    全选/取消当前视图 ({visibleBlocks.filter((b) => b.eligible !== false).length})
                   </button>
                   <button
                     type="button"
-                    className="button secondary sm"
-                    onClick={() => setOnlyEligible(!onlyEligible)}
+                    className={`button sm ${blockFilter === 'all' ? 'primary' : 'secondary'}`}
+                    onClick={() => setBlockFilter('all')}
                   >
-                    {onlyEligible ? '显示全部原始块' : '仅看合规候选块'}
+                    全部块 ({allBlocks.length})
+                  </button>
+                  <button
+                    type="button"
+                    className={`button sm ${blockFilter === 'tables' ? 'primary' : 'secondary'}`}
+                    onClick={() => setBlockFilter('tables')}
+                  >
+                    字段表候选 ({tableBlocks.length})
+                  </button>
+                  <button
+                    type="button"
+                    className={`button sm ${blockFilter === 'codes' ? 'primary' : 'secondary'}`}
+                    onClick={() => setBlockFilter('codes')}
+                  >
+                    码值表候选 ({codeSetBlocks.length})
                   </button>
                 </div>
-                <span className="muted-text">点击任意块可预览右侧/下方原文内容与结构化表格数据</span>
+                <span className="muted-text">点击任意块可预览下方原文内容与结构化数据</span>
               </div>
 
               <div className="block-list">
                 {visibleBlocks.map((block) => {
                   const isSelected = selected.includes(block.id)
                   const isCurrentRaw = raw?.id === block.id
+                  const isCodeBlock =
+                    block.candidate_role === 'CODE_SET' ||
+                    block.block_type === 'CODE_SET' ||
+                    block.block_type === 'CODE_SET_CANDIDATE'
                   const title =
+                    block.table_name ||
                     block.source_locator?.section ||
                     block.source_locator?.sheet ||
-                    `原始表格 #${block.ordinal + 1}`
+                    `原始块 #${block.ordinal + 1}`
                   return (
                     <div
                       className={`block-row ${block.eligible === false ? 'ineligible' : ''} ${isCurrentRaw ? 'active-block' : ''}`}
@@ -330,14 +400,28 @@ export default function DocumentsPage() {
                         </div>
                         <div className="actions">
                           <SourceLocatorTag locator={block.source_locator} />
-                          {block.field_count ? (
-                            <StatusBadge tone="green">{block.field_count} 字段</StatusBadge>
-                          ) : null}
-                          {block.human_required && <StatusBadge tone="amber">人工介入</StatusBadge>}
-                          <StatusBadge tone={block.eligible === false ? 'neutral' : 'blue'}>
-                            {block.superseded ? '已被重组' : block.eligible === false ? '跳过（非采集表）' : '可提取'}
+                          <StatusBadge tone={isCodeBlock ? 'amber' : 'blue'}>
+                            {isCodeBlock ? '码值通道' : '元数据通道'}
                           </StatusBadge>
-                          <button type="button" className="button secondary sm" onClick={(event) => { event.stopPropagation(); adjustStructure(block) }}>调整映射</button>
+                          {block.field_count ? (
+                            <StatusBadge tone="green">
+                              {isCodeBlock ? `${block.field_count} 项码值` : `${block.field_count} 字段`}
+                            </StatusBadge>
+                          ) : null}
+                          {!isCodeBlock && block.inline_code_count > 0 && (
+                            <StatusBadge tone="amber">+{block.inline_code_count} 内联枚举</StatusBadge>
+                          )}
+                          {block.human_required && <StatusBadge tone="amber">人工介入</StatusBadge>}
+                          <button
+                            type="button"
+                            className="button secondary sm"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              adjustStructure(block)
+                            }}
+                          >
+                            调整映射
+                          </button>
                         </div>
                       </button>
                     </div>

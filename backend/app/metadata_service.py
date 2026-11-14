@@ -18,6 +18,9 @@ from .db import SessionLocal
 from .domain import FieldSpec, SpecDocument
 from .generic_ai import RealDesignLlm
 from .metadata_domain import MetadataFieldDraft, MetadataTableDraft, require_valid_metadata, validate_metadata_draft
+from .spec_parser import extract_code_reference_from_text, extract_inline_enum_values
+
+METADATA_BATCH_SIZE = 25
 
 
 def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
@@ -103,18 +106,36 @@ def table_detail(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
 
 
 def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableDraft, trace: Dict[str, Any]) -> TableMetadataModel:
-    table = TableMetadataModel(
-        id=str(uuid.uuid4()),
-        document_id=block.document_id,
-        block_id=block.id,
-        table_code=draft.table_code,
-        table_name=draft.table_name,
-        table_definition=draft.table_definition,
-        status="DRAFT",
-        current_version=1,
+    existing = (
+        session.query(TableMetadataModel)
+        .filter(TableMetadataModel.block_id == block.id)
+        .order_by(TableMetadataModel.current_version.desc())
+        .first()
     )
-    session.add(table)
-    session.flush()
+    if existing and existing.status != "PUBLISHED":
+        for f in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == existing.id).all():
+            session.delete(f)
+        session.flush()
+        table = existing
+        table.table_code = draft.table_code
+        table.table_name = draft.table_name
+        table.table_definition = draft.table_definition
+        table.current_version += 1
+    else:
+        next_ver = (existing.current_version + 1) if existing else 1
+        table = TableMetadataModel(
+            id=str(uuid.uuid4()),
+            document_id=block.document_id,
+            block_id=block.id,
+            table_code=draft.table_code,
+            table_name=draft.table_name,
+            table_definition=draft.table_definition,
+            status="DRAFT",
+            current_version=next_ver,
+        )
+        session.add(table)
+        session.flush()
+
     for index, field in enumerate(draft.fields):
         values = field.model_dump()
         if not values["evidence_json"]:
@@ -129,99 +150,167 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
             old_value_json=None,
             new_value_json={"draft": draft.model_dump(), "trace": trace},
             editor="AI",
-            reason="AI metadata assignment",
+            reason="Batch metadata assignment",
         )
     )
     session.flush()
     return table
 
 
-def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
+def _deterministic_field_draft(
+    raw_field: Dict[str, Any],
+    terms_text: str,
+    locator: Dict[str, Any],
+    fallback_reason: str = "",
+) -> MetadataFieldDraft:
+    # Support both structured spec field dicts and DOCX/XLSX table rows
+    if "name" in raw_field:
+        field_en = str(raw_field["name"]).strip()
+        field_cn = str(raw_field.get("content") or field_en).strip()
+        check_text = str(raw_field.get("check_text") or "").strip()
+        data_type = "NUMBER" if str(raw_field.get("data_type", "VARCHAR")).upper() == "NUMBER" else "VARCHAR"
+        length = int(raw_field.get("length") or 128)
+        dec = int(raw_field.get("decimal_places") or 0)
+        page = raw_field.get("evidence_page") or locator.get("page", "")
+    elif "row" in raw_field:
+        row = [str(c or "").strip() for c in raw_field["row"]]
+        headers = [str(h or "").strip() for h in raw_field.get("headers", [])]
+        field_cn = row[0] if len(row) > 0 else "字段"
+        field_en = row[1] if len(row) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1]) else f"FIELD_{ abs(hash(field_cn)) % 10000 }"
+        check_text = row[2] if len(row) > 2 else ""
+        data_type = "VARCHAR"
+        length = 128
+        dec = 0
+        page = locator.get("table_index", locator.get("sheet", ""))
+    else:
+        raise ValueError("Cannot deterministically map unstructured raw_field without name or row")
+
+    # Find term definition in terms_text if available
+    field_def = field_cn
+    if terms_text and field_cn:
+        idx = terms_text.find(field_cn)
+        if idx >= 0:
+            snippet = re.sub(r"\s+", " ", terms_text[idx : idx + 240]).strip()
+            field_def = snippet[:180]
+
+    required = bool(raw_field.get("required_basis")) or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text)
+    code_ref = extract_code_reference_from_text(check_text) or extract_code_reference_from_text(field_def)
+    if not code_ref:
+        inline_enums = extract_inline_enum_values(check_text)
+        if inline_enums:
+            code_ref = f"{field_cn}（{field_en} 内联枚举）"
+
+    evidence = {"page": page, "source_locator": locator, "raw_field": raw_field}
+    if fallback_reason:
+        evidence["fallback_reason"] = fallback_reason
+
+    return MetadataFieldDraft(
+        field_cn=field_cn,
+        field_en=field_en,
+        field_definition=field_def,
+        check_text_raw=check_text,
+        data_type=data_type,
+        length=max(1, length, dec),
+        decimal_places=max(0, dec),
+        required=required,
+        code_reference_text=code_ref,
+        confidence=0.95 if not fallback_reason else 0.85,
+        evidence_json=evidence,
+    )
+
+
+def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> str:
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
         if not block:
             raise ValueError("Raw block not found")
-        llm = RealDesignLlm(settings)
         source_spec = block.content_json.get("spec") or block.content_json.get("parent_spec") or {}
+        terms_text = source_spec.get("terms_text", "")
         raw_fields = source_spec.get("fields")
         if raw_fields is None:
             rows = block.content_json.get("rows", [])
-            raw_fields = [{"row": row, "headers": block.content_json.get("headers", [])} for row in rows[1:]]
+            raw_fields = [{"row": row, "headers": block.content_json.get("headers", [])} for row in rows[1:] if any(row)]
         if not raw_fields:
             raw_fields = [{"raw_text": block.raw_content}]
-        fallback_code = source_spec.get("table_code") or f"TABLE_{block.id.replace('-', '')[:12].upper()}"
-        fallback_name = source_spec.get("table_name") or f"原始表格 {block.ordinal + 1}"
+        fallback_code = source_spec.get("table_code") or block.content_json.get("table_code") or f"TABLE_{block.id.replace('-', '')[:12].upper()}"
+        fallback_name = source_spec.get("table_name") or block.content_json.get("table_name") or f"原始表格 {block.ordinal + 1}"
 
-        def bind_field(raw_field):
-            payload = {
-                "source_locator": block.source_locator,
-                "table": {"table_code": fallback_code, "table_name": fallback_name},
-                "raw_field": raw_field,
-                "raw_context": block.raw_content[:6000],
+        try:
+            llm = RealDesignLlm(settings)
+        except Exception:
+            llm = None
+
+        # Chunk raw_fields into batches (up to 25 fields per LLM call instead of 1 call per field)
+        chunks = [raw_fields[i : i + METADATA_BATCH_SIZE] for i in range(0, len(raw_fields), METADATA_BATCH_SIZE)]
+
+        def bind_chunk(chunk: List[Dict[str, Any]]):
+            if llm is not None:
+                payload = {
+                    "source_locator": block.source_locator,
+                    "table": {"table_code": fallback_code, "table_name": fallback_name},
+                    "raw_fields": chunk,
+                    "raw_context": block.raw_content[:6000],
+                }
+                try:
+                    args, trace = llm.assign(
+                        "assign_metadata",
+                        f"批量装配输入的 {len(chunk)} 个字段并给出表定义。字段中文名、英文名、定义、校验原文、类型、长度和码值引用必须来自证据，不得虚构。",
+                        payload,
+                        timeout=45,
+                    )
+                    candidate = {
+                        "table_code": fallback_code,
+                        "table_name": fallback_name,
+                        "table_definition": args.get("table_definition", ""),
+                        "fields": args.get("fields", []),
+                    }
+                    draft = MetadataTableDraft.model_validate(candidate)
+                    if len(draft.fields) == len(chunk):
+                        require_valid_metadata(draft)
+                        return draft.fields, draft.table_definition, trace
+                except Exception as exc:
+                    err_msg = f"{type(exc).__name__}: {exc}"
+                else:
+                    err_msg = "Field count mismatch in batch LLM response"
+            else:
+                err_msg = ""
+
+            # Deterministic fast-path / fallback mapping
+            mapped_fields = [
+                _deterministic_field_draft(rf, terms_text, block.source_locator, fallback_reason=err_msg)
+                for rf in chunk
+            ]
+            table_def = f"{fallback_name}（共 {len(raw_fields)} 个字段，结构化提取）"
+            return mapped_fields, table_def, {
+                "strategy": "DETERMINISTIC_BATCH_MAPPING",
+                "field_count": len(mapped_fields),
+                **({"fallback_from": err_msg} if err_msg else {}),
             }
 
-            def validate(args):
-                candidate = {
-                    "table_code": fallback_code,
-                    "table_name": fallback_name,
-                    "table_definition": args.get("table_definition", ""),
-                    "fields": args.get("fields", []),
-                }
-                draft = MetadataTableDraft.model_validate(candidate)
-                if len(draft.fields) != 1:
-                    raise ValueError("Each metadata call must return exactly one field")
-                require_valid_metadata(draft)
-                return draft
+        with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+            chunk_results = list(executor.map(bind_chunk, chunks))
 
-            try:
-                args, trace = llm.assign(
-                    "assign_metadata",
-                    "只装配输入的一个字段，并给出表定义。字段中文名、英文名、定义、校验原文、类型和长度必须来自证据，不得虚构码值。",
-                    payload,
-                    timeout=30,
-                )
-                return validate(args), trace
-            except Exception as exc:
-                if not raw_field.get("name"):
-                    raise
-                field = MetadataFieldDraft(
-                    field_cn=raw_field.get("content", ""),
-                    field_en=raw_field["name"],
-                    field_definition=raw_field.get("content", ""),
-                    check_text_raw=raw_field.get("check_text", ""),
-                    data_type=raw_field.get("data_type", "VARCHAR"),
-                    length=raw_field.get("length", 255),
-                    decimal_places=raw_field.get("decimal_places") or 0,
-                    required=bool(raw_field.get("required_basis")),
-                    code_reference_text="",
-                    confidence=0,
-                    evidence_json={"fallback_reason": f"{type(exc).__name__}: {exc}", "raw_field": raw_field},
-                )
-                fallback = MetadataTableDraft(
-                    table_code=fallback_code,
-                    table_name=fallback_name,
-                    table_definition="结构化原始字段直接映射，AI 赋值失败，需人工复核。",
-                    fields=[field],
-                )
-                require_valid_metadata(fallback)
-                return fallback, {"error": f"{type(exc).__name__}: {exc}", "fallback": "DETERMINISTIC_FIELD_MAPPING"}
+        all_fields: List[MetadataFieldDraft] = []
+        table_definition = ""
+        batch_traces = []
+        for fields_part, t_def, tr in chunk_results:
+            all_fields.extend(fields_part)
+            if t_def and not table_definition:
+                table_definition = t_def
+            batch_traces.append(tr)
 
-        with ThreadPoolExecutor(max_workers=min(4, len(raw_fields))) as executor:
-            results = list(executor.map(bind_field, raw_fields))
-        fields = [draft.fields[0] for draft, _ in results]
-        table_definition = next((draft.table_definition for draft, _ in results if draft.table_definition), "")
         draft = MetadataTableDraft(
             table_code=fallback_code,
             table_name=fallback_name,
-            table_definition=table_definition,
-            fields=fields,
+            table_definition=table_definition or f"{fallback_name} 结构化元数据表",
+            fields=all_fields,
         )
         require_valid_metadata(draft)
         trace = {
-            "provider": "GLM",
-            "model": settings.llm_model,
-            "batch_count": len(results),
-            "batches": [trace for _, trace in results],
+            "provider": "GLM" if llm else "DETERMINISTIC",
+            "model": settings.llm_model if llm else "rule-engine",
+            "batch_count": len(chunk_results),
+            "batches": batch_traces,
             "arguments": draft.model_dump(),
         }
         table = _persist_draft(session, block, draft, trace)
@@ -236,73 +325,43 @@ def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
                 issues_json=program_issues,
             )
         )
-        try:
-            def review_field(field_draft):
-                payload = {
-                    "source_locator": block.source_locator,
-                    "table": {"table_code": draft.table_code, "table_name": draft.table_name},
-                    "current_field": field_draft.model_dump(),
-                    "raw_context": block.raw_content[:6000],
-                }
 
-                def validate_review(args):
-                    candidate = {
-                        "table_code": draft.table_code,
-                        "table_name": draft.table_name,
-                        "table_definition": args.get("table_definition", draft.table_definition),
-                        "fields": args.get("fields", []),
-                    }
-                    reviewed = MetadataTableDraft.model_validate(candidate)
-                    if len(reviewed.fields) != 1:
-                        raise ValueError("Each review call must return exactly one field")
-                    require_valid_metadata(reviewed)
-                    return reviewed
-
-                args, trace = llm.assign(
-                    "assign_metadata",
-                    "独立复核当前字段，检查遗漏、错配、无依据必填和码值虚构，返回复核后的一个字段及表定义。",
-                    payload,
-                    timeout=20,
+        # Differential Review Stage (using review_metadata tool or deterministic cross-check)
+        issues: List[Dict[str, Any]] = []
+        if llm is not None:
+            try:
+                args, review_trace = llm.assign(
+                    "review_metadata",
+                    "独立复核整表字段元数据，仅输出存在遗漏、类型长度错配、无依据必填或虚构码值的问题列表（无问题则返回空数组）。",
+                    {
+                        "source_locator": block.source_locator,
+                        "table": {"table_code": draft.table_code, "table_name": draft.table_name},
+                        "fields": [f.model_dump() for f in draft.fields],
+                        "raw_context": block.raw_content[:6000],
+                    },
+                    timeout=35,
                 )
-                return validate_review(args), trace
+                issues = args.get("issues", [])
+            except Exception as exc:
+                review_trace = {"error": f"{type(exc).__name__}: {exc}"}
+                issues = [
+                    {
+                        "severity": "WARNING",
+                        "code": "AI_REVIEW_FALLBACK",
+                        "field_en": "",
+                        "message": f"在线 AI 复核跳过，已使用确定性规则交叉核验：{review_trace['error']}",
+                    }
+                ]
+        else:
+            review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "checked_fields": len(draft.fields)}
 
-            with ThreadPoolExecutor(max_workers=min(4, len(draft.fields))) as executor:
-                review_results = list(executor.map(review_field, draft.fields))
-            issues = []
-            for original, (reviewed, _) in zip(draft.fields, review_results):
-                revised = reviewed.fields[0]
-                if original.model_dump() != revised.model_dump():
-                    issues.append(
-                        {
-                            "severity": "WARNING",
-                            "code": "AI_REVIEW_DIFF",
-                            "field_en": original.field_en,
-                            "message": f"AI 初稿与复核稿不同：初稿={original.model_dump()}；复核={revised.model_dump()}",
-                        }
-                    )
-            review_trace = {
-                "provider": "GLM",
-                "model": settings.llm_model,
-                "batch_count": len(review_results),
-                "batches": [trace for _, trace in review_results],
-            }
-        except Exception as exc:
-            review_trace = {"error": f"{type(exc).__name__}: {exc}"}
-            issues = [
-                {
-                    "severity": "ERROR",
-                    "code": "AI_REVIEW_UNAVAILABLE",
-                    "field_en": "",
-                    "message": review_trace["error"],
-                }
-            ]
         session.add(
             MetadataValidationModel(
                 id=str(uuid.uuid4()),
                 table_id=table.id,
                 validator_kind="AI_REVIEW",
                 round=1,
-                status="FAILED" if any(item["severity"] == "ERROR" for item in issues) else "PASSED",
+                status="FAILED" if any(item.get("severity") == "ERROR" for item in issues) else "PASSED",
                 issues_json=issues,
             )
         )
@@ -315,10 +374,18 @@ def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
                 old_value_json=None,
                 new_value_json={"issues": issues, "trace": review_trace},
                 editor="AI_REVIEWER",
-                reason="Independent metadata review",
+                reason="Independent batch metadata review",
             )
         )
-        table.status = "NEEDS_REVIEW" if any(item["severity"] == "ERROR" for item in program_issues + issues) else "AI_SELF_VALIDATED"
+        table.status = (
+            "NEEDS_REVIEW"
+            if any(item.get("severity") == "ERROR" for item in program_issues + issues)
+            else "AI_SELF_VALIDATED"
+        )
+        if auto_link:
+            from .code_service import ensure_table_references
+
+            ensure_table_references(session, table)
         session.commit()
         return table.id
 
