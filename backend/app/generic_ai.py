@@ -56,6 +56,50 @@ METADATA_TABLE_PROPERTIES = {
 }
 
 TOOL_SCHEMAS = {
+    "assign_document_structure": {
+        "type": "object",
+        "properties": {
+            "blocks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_block_ids": {"type": "array", "items": {"type": "string"}},
+                        "role": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "NARRATIVE", "IGNORE"]},
+                        "title": {"type": "string"},
+                        "column_mapping": {"type": "object"},
+                        "human_required": {"type": "boolean"},
+                        "warnings": {"type": "array", "items": {"type": "string"}},
+                        "split_markers": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["source_block_ids", "role", "title", "column_mapping", "human_required", "warnings", "split_markers"],
+                },
+            },
+            "global_warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["blocks", "global_warnings"],
+    },
+    "assign_block_segments": {
+        "type": "object",
+        "properties": {
+            "segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "segment_type": {"type": "string", "enum": ["TERMINOLOGY", "XML_FORMAT", "DATA_DICTIONARY", "CODE_VALUES", "PRIMARY_KEY", "NARRATIVE", "IGNORE"]},
+                        "title": {"type": "string"},
+                        "start_marker": {"type": "string"},
+                        "end_marker": {"type": "string"},
+                        "requires_human": {"type": "boolean"},
+                        "warnings": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["segment_type", "title", "start_marker", "end_marker", "requires_human", "warnings"],
+                },
+            }
+        },
+        "required": ["segments"],
+    },
     "assign_generation_plan": {
         "type": "object",
         "properties": {
@@ -176,6 +220,7 @@ class RealDesignLlm:
         instruction: str,
         payload: Dict[str, Any],
         feedback: Optional[str] = None,
+        timeout: int = 90,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         schema = TOOL_SCHEMAS[tool_name]
         prompt = (
@@ -203,7 +248,7 @@ class RealDesignLlm:
                 "temperature": 0,
                 "max_tokens": 8192,
             },
-            timeout=180,
+            timeout=timeout,
         )
         response.raise_for_status()
         body = response.json()

@@ -7,6 +7,18 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
 
+class DocumentArchitectureModel(Base):
+    __tablename__ = "document_architectures"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32))
+    plan_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
+    warnings_json: Mapped[list] = mapped_column(JSON)
+    trace_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class SystemSettingModel(Base):
     __tablename__ = "system_settings"
 

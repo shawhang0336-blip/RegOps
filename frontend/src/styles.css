@@ -252,3 +252,5 @@
 :root[data-theme="dark"] .production-download-info span {
   color: #7cc4a3;
 }
+
+.architecture-bar{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:13px 14px;border:1px solid #cfe1d4;background:#f1f8f3;border-radius:9px;margin-bottom:12px}.architecture-bar strong,.architecture-bar span{display:block}.architecture-bar strong{font-size:12px}.architecture-bar span{font-size:10px;color:var(--muted);margin-top:4px}.architecture-result{border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}.architecture-summary{display:flex;align-items:center;gap:10px;font-size:10px}.architecture-warning{font-size:10px;color:#8b641c;line-height:1.6}.architecture-result pre{max-height:340px;overflow:auto;font-size:9px;background:#f4f6f3;padding:12px;border-radius:7px;white-space:pre-wrap}:root[data-theme="dark"] .architecture-bar{background:#152b23;border-color:#284c3d}:root[data-theme="dark"] .architecture-result pre{background:#10231c}

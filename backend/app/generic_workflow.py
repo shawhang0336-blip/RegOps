@@ -36,12 +36,15 @@ def _specs(session: Session, spec_id: str) -> List[SpecDocument]:
     return [SpecDocument.model_validate(item) for item in row.content_json["tables"]]
 
 
-def _call_validated(llm, tool_name, instruction, payload, validator):
+def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None):
     feedback = None
     rejection = None
     for _ in range(2):
         try:
-            arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
+            if timeout is None:
+                arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
+            else:
+                arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=timeout)
             result = validator(arguments)
             if rejection:
                 trace["previous_rejection"] = rejection

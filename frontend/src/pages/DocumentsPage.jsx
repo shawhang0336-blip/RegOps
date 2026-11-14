@@ -11,6 +11,7 @@ export default function DocumentsPage() {
   const [detail, setDetail] = useState(null)
   const [selected, setSelected] = useState([])
   const [raw, setRaw] = useState(null)
+  const [architecture, setArchitecture] = useState(null)
   const [onlyEligible, setOnlyEligible] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -36,6 +37,11 @@ export default function DocumentsPage() {
     const eligibleIds = (doc.blocks || []).filter((b) => b.eligible !== false).map((b) => b.id)
     setSelected(eligibleIds)
     setRaw(null)
+    if (doc.status !== 'UPLOADED') {
+      setArchitecture(await v2(`/documents/${id}/architecture`).catch(() => null))
+    } else {
+      setArchitecture(null)
+    }
   }
 
   async function handleFileUpload(file) {
@@ -47,7 +53,7 @@ export default function DocumentsPage() {
     try {
       const document = await v2('/documents', { method: 'POST', body: form })
       await load(document.id)
-      setNotice(`已从「${document.file_name}」提取 ${document.block_count} 个原始块，并为您默认勾选全部合规候选块。`)
+      setNotice(`已上传「${document.file_name}」。请先运行 AI 架构预检，再由程序切块并进行元数据解析。`)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -67,6 +73,61 @@ export default function DocumentsPage() {
     if (busy) return
     const file = event.dataTransfer.files?.[0]
     if (file) handleFileUpload(file)
+  }
+
+  async function reextractBlocks() {
+    if (!detail || !window.confirm('重新提取会保留历史元数据，但将当前原始块标记为已重组，是否继续？')) return
+    setBusy(true)
+    try {
+      await v2(`/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
+      await selectDocument(detail.id)
+      setNotice('原始块已按最新解析器重建，请重新运行 AI 架构预检。')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function analyzeStructure() {
+    if (!detail) return
+    setBusy(true)
+    setError('')
+    try {
+      const result = await v2(`/documents/${detail.id}/analyze-structure`, { method: 'POST', body: JSON.stringify({}) })
+      setArchitecture(result)
+      await selectDocument(detail.id)
+      setNotice(`AI 架构预检完成，程序已按预检计划切块。请留意标记为「人工介入」的块。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function adjustStructure(block) {
+    const current = JSON.stringify(block.column_mapping || {})
+    const next = window.prompt('修改列映射（JSON），例如 {"field_en":"字段名","check_text_raw":"字段校验"}', current)
+    if (!next) return
+    try {
+      const parsed = JSON.parse(next)
+      await v2(`/documents/${detail.id}/blocks/${block.id}/structure`, {
+        method: 'PATCH',
+        body: JSON.stringify({ column_mapping: parsed, human_required: true, editor: '结构调整人工确认' }),
+      })
+      await selectDocument(detail.id)
+      setNotice('结构映射已人工调整，后续 AI 会使用新映射。')
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  async function viewArchitecture() {
+    if (architecture) {
+      setArchitecture(null)
+    } else {
+      setArchitecture(await v2(`/documents/${detail.id}/architecture`))
+    }
   }
 
   async function showRaw(blockId) {
@@ -94,7 +155,7 @@ export default function DocumentsPage() {
   }
 
   const allBlocks = detail?.blocks || []
-  const eligibleBlocks = allBlocks.filter((b) => b.eligible !== false)
+  const eligibleBlocks = allBlocks.filter((b) => b.eligible !== false && !b.superseded)
   const visibleBlocks = onlyEligible ? eligibleBlocks : allBlocks
 
   function toggleSelectAllEligible() {
@@ -195,13 +256,29 @@ export default function DocumentsPage() {
                   <button
                     type="button"
                     className="button primary"
-                    disabled={busy || !selected.length}
+                    disabled={busy || !selected.length || detail.status === 'UPLOADED'}
                     onClick={extract}
                   >
                     {busy ? 'AI 正在提取并自审...' : `AI 解析选中块 (${selected.length}) →`}
                   </button>
                 </div>
               </div>
+
+              <div className="architecture-bar">
+                <div>
+                  <strong>{detail.status === 'UPLOADED' ? '先运行 AI 架构预检' : 'AI 架构预检已完成'}</strong>
+                  <span>{detail.status === 'UPLOADED' ? '先判断字段表、码值表、说明文字与切块方式，再解析元数据。' : '程序已按预检计划切块，可逐块解析。'}</span>
+                </div>
+                <div className="actions">
+                  <button type="button" className="button secondary sm" disabled={busy} onClick={reextractBlocks}>重新提取原始块</button>
+                  {detail.status === 'UPLOADED' ? <button type="button" className="button primary" disabled={busy} onClick={analyzeStructure}>{busy ? 'AI 正在预检架构...' : '运行 AI 架构预检'}</button> : <button type="button" className="button secondary sm" onClick={viewArchitecture}>{architecture ? '收起预检结果' : '查看预检结果'}</button>}
+                </div>
+              </div>
+              {architecture && <div className="architecture-result">
+                <div className="architecture-summary"><StatusBadge tone={architecture.warnings?.length ? 'amber' : 'green'}>{architecture.warnings?.length || 0} 个架构提示</StatusBadge><span>状态：{architecture.status}</span></div>
+                {architecture.warnings?.map((warning, index) => <p className="architecture-warning" key={index}>{warning}</p>)}
+                <details><summary>查看完整架构计划</summary><pre>{JSON.stringify(architecture.plan, null, 2)}</pre></details>
+              </div>}
 
               <div className="block-toolbar">
                 <div className="actions">
@@ -236,7 +313,7 @@ export default function DocumentsPage() {
                     >
                       <input
                         type="checkbox"
-                        disabled={block.eligible === false}
+                        disabled={block.eligible === false || block.superseded}
                         checked={isSelected}
                         onChange={(event) =>
                           setSelected(
@@ -256,9 +333,11 @@ export default function DocumentsPage() {
                           {block.field_count ? (
                             <StatusBadge tone="green">{block.field_count} 字段</StatusBadge>
                           ) : null}
+                          {block.human_required && <StatusBadge tone="amber">人工介入</StatusBadge>}
                           <StatusBadge tone={block.eligible === false ? 'neutral' : 'blue'}>
-                            {block.eligible === false ? '跳过（非采集表）' : '可提取'}
+                            {block.superseded ? '已被重组' : block.eligible === false ? '跳过（非采集表）' : '可提取'}
                           </StatusBadge>
+                          <button type="button" className="button secondary sm" onClick={(event) => { event.stopPropagation(); adjustStructure(block) }}>调整映射</button>
                         </div>
                       </button>
                     </div>

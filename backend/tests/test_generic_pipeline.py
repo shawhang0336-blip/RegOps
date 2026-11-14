@@ -11,7 +11,7 @@ from .test_workflow import make_session
 
 
 class FixtureDesignLlm:
-    def assign(self, tool_name, instruction, payload, feedback=None):
+    def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
         if tool_name == "assign_generation_plan":
             args = {"mandatory_rule_target": 1, "expanded_rule_target": 0, "golden_count": 2, "mutations_per_rule": 1, "rationale": "fixture plan"}
         elif tool_name == "assign_schema":
@@ -71,6 +71,18 @@ def test_catalog_discovers_eligibility_without_preselected_tables():
     assert len(eligible) >= 20
     assert any(entry["table_code"] == "SAFE_6_1" for entry in eligible)
     assert all(entry["reason"] for entry in entries)
+
+
+def test_mixed_case_xml_and_dictionary_fields_are_supported():
+    entries = parse_document_catalog(get_settings().safe_13_spec_path)
+    account_balance = next(entry for entry in entries if entry["table_code"] == "SAFE_6_4_2")
+    assert account_balance["eligible"] is True
+    assert [field["name"] for field in account_balance["spec"]["fields"]] == [
+        "ACTIONTYPE", "ACTIONDESC", "BRANCH_CODE", "accountNO", "DEAL_DATE", "CURRENCY_code", "CREDIT", "DEBIT", "BALANCE", "REMARK"
+    ]
+    account_open = next(entry for entry in entries if entry["table_code"] == "SAFE_6_4_1")
+    assert account_open["eligible"] is True
+    assert len(account_open["spec"]["fields"]) == 17
 
 
 def test_generic_binding_enforces_full_coverage_and_source(organization_spec):

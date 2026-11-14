@@ -108,7 +108,7 @@ def _parse_fields(
     expected_fields: int = 0,
     repair_layout: bool = True,
 ) -> List[FieldSpec]:
-    xml_names = re.findall(r"<([A-Z][A-Z0-9]*)>", format_text)
+    xml_names = re.findall(r"<([A-Za-z][A-Za-z0-9_]*)>", format_text)
     field_names = [name for name in xml_names if name not in {"REC", "BANKINFOS", "BANKINFO"}]
     if not field_names or len(set(field_names)) != len(field_names):
         raise SpecParseError("XML format does not contain a unique field whitelist")
@@ -126,7 +126,7 @@ def _parse_fields(
     cursor = 0
     for name in field_names:
         search_name = "INCORPORATORIDCO" if name == "INCORPORATORIDCODE" else name
-        index = compact.find(search_name, cursor)
+        index = compact.lower().find(search_name.lower(), cursor)
         if index < 0:
             raise SpecParseError(f"Field {name} is absent from the data dictionary")
         positions.append((name, index, index + len(search_name)))
@@ -138,7 +138,7 @@ def _parse_fields(
         entry = compact[entry_start:entry_end]
         if name == "INCORPORATORIDCODE":
             entry = entry.replace("DE份证件号码", "")
-        type_match = re.search(r"(字符型|数值型|日期型)[，,](\d+)(?:\.(\d+))?", entry)
+        type_match = re.search(r"(定长字符型|变长字符型|定长|变长|字符型|数值型|日期型)[，,](\d+)(?:\.(\d+))?", entry)
         if name == "REGDATE" and not type_match:
             fields.append(
                 FieldSpec(
@@ -152,6 +152,22 @@ def _parse_fields(
             )
             continue
         if not type_match:
+            loose_match = re.search(r"(?:变长数值型|数值型)[，,]", entry)
+            length_match = loose_match and re.search(r"(\d+)\.(\d+)", entry[loose_match.end() :])
+            if loose_match and length_match:
+                check_tail = entry[loose_match.end() :]
+                fields.append(
+                    FieldSpec(
+                        name=name,
+                        content=entry[: loose_match.start()].strip("，,。 "),
+                        data_type="NUMBER",
+                        length=int(length_match.group(1)),
+                        decimal_places=int(length_match.group(2)),
+                        check_text=check_tail[: length_match.start()] + check_tail[length_match.end() :],
+                        evidence_page=evidence_page,
+                    )
+                )
+                continue
             raise SpecParseError(f"Cannot determine the type of field {name}")
         data_type = "NUMBER" if type_match.group(1) == "数值型" else "VARCHAR"
         content = entry[: type_match.start()].strip("，,。 ")

@@ -17,8 +17,7 @@ from .config import Settings
 from .db import SessionLocal
 from .domain import FieldSpec, SpecDocument
 from .generic_ai import RealDesignLlm
-from .generic_workflow import _call_validated
-from .metadata_domain import MetadataTableDraft, require_valid_metadata, validate_metadata_draft
+from .metadata_domain import MetadataFieldDraft, MetadataTableDraft, require_valid_metadata, validate_metadata_draft
 
 
 def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
@@ -143,13 +142,13 @@ def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
         if not block:
             raise ValueError("Raw block not found")
         llm = RealDesignLlm(settings)
-        source_spec = block.content_json.get("spec") or {}
+        source_spec = block.content_json.get("spec") or block.content_json.get("parent_spec") or {}
         raw_fields = source_spec.get("fields")
         if raw_fields is None:
             rows = block.content_json.get("rows", [])
             raw_fields = [{"row": row, "headers": block.content_json.get("headers", [])} for row in rows[1:]]
         if not raw_fields:
-            raise ValueError("No metadata field candidates were found")
+            raw_fields = [{"raw_text": block.raw_content}]
         fallback_code = source_spec.get("table_code") or f"TABLE_{block.id.replace('-', '')[:12].upper()}"
         fallback_name = source_spec.get("table_name") or f"原始表格 {block.ordinal + 1}"
 
@@ -174,13 +173,38 @@ def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
                 require_valid_metadata(draft)
                 return draft
 
-            return _call_validated(
-                llm,
-                "assign_metadata",
-                "只装配输入的一个字段，并给出表定义。字段中文名、英文名、定义、校验原文、类型和长度必须来自证据，不得虚构码值。",
-                payload,
-                validate,
-            )
+            try:
+                args, trace = llm.assign(
+                    "assign_metadata",
+                    "只装配输入的一个字段，并给出表定义。字段中文名、英文名、定义、校验原文、类型和长度必须来自证据，不得虚构码值。",
+                    payload,
+                    timeout=30,
+                )
+                return validate(args), trace
+            except Exception as exc:
+                if not raw_field.get("name"):
+                    raise
+                field = MetadataFieldDraft(
+                    field_cn=raw_field.get("content", ""),
+                    field_en=raw_field["name"],
+                    field_definition=raw_field.get("content", ""),
+                    check_text_raw=raw_field.get("check_text", ""),
+                    data_type=raw_field.get("data_type", "VARCHAR"),
+                    length=raw_field.get("length", 255),
+                    decimal_places=raw_field.get("decimal_places") or 0,
+                    required=bool(raw_field.get("required_basis")),
+                    code_reference_text="",
+                    confidence=0,
+                    evidence_json={"fallback_reason": f"{type(exc).__name__}: {exc}", "raw_field": raw_field},
+                )
+                fallback = MetadataTableDraft(
+                    table_code=fallback_code,
+                    table_name=fallback_name,
+                    table_definition="结构化原始字段直接映射，AI 赋值失败，需人工复核。",
+                    fields=[field],
+                )
+                require_valid_metadata(fallback)
+                return fallback, {"error": f"{type(exc).__name__}: {exc}", "fallback": "DETERMINISTIC_FIELD_MAPPING"}
 
         with ThreadPoolExecutor(max_workers=min(4, len(raw_fields))) as executor:
             results = list(executor.map(bind_field, raw_fields))
@@ -234,13 +258,13 @@ def extract_metadata_for_block(block_id: str, settings: Settings) -> str:
                     require_valid_metadata(reviewed)
                     return reviewed
 
-                return _call_validated(
-                    llm,
+                args, trace = llm.assign(
                     "assign_metadata",
                     "独立复核当前字段，检查遗漏、错配、无依据必填和码值虚构，返回复核后的一个字段及表定义。",
                     payload,
-                    validate_review,
+                    timeout=20,
                 )
+                return validate_review(args), trace
 
             with ThreadPoolExecutor(max_workers=min(4, len(draft.fields))) as executor:
                 review_results = list(executor.map(review_field, draft.fields))
