@@ -1,91 +1,804 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
+import {
+  EvidenceCard,
+  RevisionDiffView,
+  StatusBadge,
+  formatTime,
+} from './SharedUI.jsx'
 
-const emptyField = { field_cn: '', field_en: '', field_definition: '', check_text_raw: '', data_type: 'VARCHAR', length: 128, decimal_places: 0, required: false, code_reference_text: '', confidence: 1, evidence_json: { source: 'HUMAN' } }
+const emptyField = {
+  field_cn: '',
+  field_en: '',
+  field_definition: '',
+  check_text_raw: '',
+  data_type: 'VARCHAR',
+  length: 128,
+  decimal_places: 0,
+  required: false,
+  code_reference_text: '',
+  confidence: 1,
+  evidence_json: { source: 'HUMAN' },
+}
 
 export default function MetadataPage() {
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const { requireOperator } = useOperator()
+
   const [tables, setTables] = useState([])
   const [detail, setDetail] = useState(null)
-  const [editor, setEditor] = useState('')
+  const [unresolvedRefs, setUnresolvedRefs] = useState([])
+  const [codeSets, setCodeSets] = useState([])
+  const [editingFieldId, setEditingFieldId] = useState(null)
+  const [editReason, setEditReason] = useState('人工复核修正元数据')
   const [newField, setNewField] = useState(emptyField)
   const [showAdd, setShowAdd] = useState(false)
-  const [tab, setTab] = useState('fields')
+  const [tab, setTab] = useState(params.get('tab') || 'fields')
+  const [fieldSearch, setFieldSearch] = useState('')
+  const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
-  async function load() { setTables(await v2('/metadata/tables')) }
-  useEffect(() => { load().catch((err) => setError(err.message)) }, [])
-  async function select(id) { setDetail(await v2(`/metadata/tables/${id}`)); setTab('fields') }
-  function change(id, key, value) { setDetail({ ...detail, fields: detail.fields.map((field) => field.id === id ? { ...field, [key]: value } : field) }) }
-  function requireEditor() { if (!editor.trim()) { setError('请先填写编辑/审批人。'); return false } return true }
+  async function load(preferredId) {
+    const [tableList, unresolvedList, codeSetList] = await Promise.all([
+      v2('/metadata/tables'),
+      v2('/code-sets/references/unresolved').catch(() => []),
+      v2('/code-sets').catch(() => []),
+    ])
+    setTables(tableList)
+    setUnresolvedRefs(unresolvedList)
+    setCodeSets(codeSetList)
 
-  async function save(field) {
-    if (!requireEditor()) return
-    try {
-      const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, { method: 'PATCH', body: JSON.stringify({ expected_version: detail.current_version, editor, reason: '人工复核元数据', changes: {
-        field_cn: field.field_cn, field_en: field.field_en, field_definition: field.field_definition, check_text_raw: field.check_text_raw,
-        data_type: field.data_type, length: Number(field.length), decimal_places: Number(field.decimal_places), required: field.required, code_reference_text: field.code_reference_text,
-      } }) })
-      setDetail(body); setNotice(`${field.field_en} 已保存为新草稿版本。`)
-    } catch (err) { setError(err.message) }
+    const targetId = preferredId || params.get('table') || detail?.id || tableList[0]?.id
+    if (targetId) {
+      await select(targetId, false)
+    }
   }
 
-  async function remove(field) {
-    if (!requireEditor() || !window.confirm(`确认删除字段 ${field.field_en}？`) ) return
+  useEffect(() => {
+    load().catch((err) => setError(err.message))
+  }, [])
+
+  async function select(id, resetTab = false) {
+    const data = await v2(`/metadata/tables/${id}`)
+    setDetail(data)
+    setEditingFieldId(null)
+    if (resetTab) setTab('fields')
+  }
+
+  function changeFieldProp(id, key, value) {
+    setDetail({
+      ...detail,
+      fields: detail.fields.map((field) => (field.id === id ? { ...field, [key]: value } : field)),
+    })
+  }
+
+  const saveField = useCallback(
+    async (field) => {
+      if (!field || !detail) return
+      const editor = requireOperator(setError)
+      if (!editor) return
+      setBusy(true)
+      setError('')
+      try {
+        const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            expected_version: detail.current_version,
+            editor,
+            reason: editReason || '人工复核元数据',
+            changes: {
+              field_cn: field.field_cn,
+              field_en: field.field_en,
+              field_definition: field.field_definition,
+              check_text_raw: field.check_text_raw,
+              data_type: field.data_type,
+              length: Number(field.length),
+              decimal_places: Number(field.decimal_places),
+              required: Boolean(field.required),
+              code_reference_text: field.code_reference_text,
+            },
+          }),
+        })
+        setDetail(body)
+        await load(body.id)
+        setNotice(`字段「${field.field_cn} (${field.field_en})」已保存，当前表升级为草稿 v${body.current_version}。`)
+      } catch (err) {
+        setError(err.message)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [detail, editReason, requireOperator]
+  )
+
+  const isPublished = detail?.status === 'PUBLISHED'
+  const activeField = detail?.fields?.find((f) => f.id === editingFieldId) || null
+  const filteredFields = (detail?.fields || []).filter((f) => {
+    if (!fieldSearch.trim()) return true
+    const q = fieldSearch.toLowerCase()
+    return (
+      (f.field_cn || '').toLowerCase().includes(q) ||
+      (f.field_en || '').toLowerCase().includes(q) ||
+      (f.field_definition || '').toLowerCase().includes(q) ||
+      (f.code_reference_text || '').toLowerCase().includes(q)
+    )
+  })
+
+  // Keyboard shortcuts for field inspector drawer: Ctrl+S save, Esc close, Alt+Up/Down switch field
+  useEffect(() => {
+    if (!activeField || tab !== 'fields') return undefined
+
+    function onKeyDown(e) {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        if (!isPublished && !busy) {
+          saveField(activeField)
+        }
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setEditingFieldId(null)
+        return
+      }
+      if (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+        e.preventDefault()
+        const idx = filteredFields.findIndex((f) => f.id === activeField.id)
+        if (idx === -1) return
+        const nextIdx =
+          e.key === 'ArrowDown'
+            ? Math.min(filteredFields.length - 1, idx + 1)
+            : Math.max(0, idx - 1)
+        setEditingFieldId(filteredFields[nextIdx]?.id || activeField.id)
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [activeField, tab, isPublished, busy, filteredFields, saveField])
+
+  async function removeField(field) {
+    const editor = requireOperator(setError)
+    if (!editor || !window.confirm(`确认删除字段「${field.field_cn} (${field.field_en})」吗？`)) return
+    setBusy(true)
+    setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, { method: 'DELETE', body: JSON.stringify({ expected_version: detail.current_version, editor, reason: '人工删除', changes: {} }) })
+      const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, {
+        method: 'DELETE',
+        body: JSON.stringify({
+          expected_version: detail.current_version,
+          editor,
+          reason: '人工删除字段',
+          changes: {},
+        }),
+      })
       setDetail(body)
-    } catch (err) { setError(err.message) }
+      setEditingFieldId(null)
+      await load(body.id)
+      setNotice(`已删除字段 ${field.field_en}。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
-  async function add() {
-    if (!requireEditor()) return
+  async function addField() {
+    const editor = requireOperator(setError)
+    if (!editor) return
+    if (!newField.field_cn.trim() || !newField.field_en.trim()) {
+      setError('请填写新字段的中文名称和英文列名。')
+      return
+    }
+    setBusy(true)
+    setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/fields`, { method: 'POST', body: JSON.stringify({ expected_version: detail.current_version, editor, reason: '人工补充字段', field: { ...newField, length: Number(newField.length), decimal_places: Number(newField.decimal_places) } }) })
-      setDetail(body); setShowAdd(false); setNewField(emptyField)
-    } catch (err) { setError(err.message) }
+      const body = await v2(`/metadata/tables/${detail.id}/fields`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_version: detail.current_version,
+          editor,
+          reason: '人工补充字段',
+          field: {
+            ...newField,
+            length: Number(newField.length),
+            decimal_places: Number(newField.decimal_places),
+          },
+        }),
+      })
+      setDetail(body)
+      setShowAdd(false)
+      setNewField(emptyField)
+      await load(body.id)
+      setNotice(`已新增字段「${newField.field_cn} (${newField.field_en})」。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function publish() {
-    if (!requireEditor()) return
+    const editor = requireOperator(setError)
+    if (!editor) return
+    setBusy(true)
+    setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/publish`, { method: 'POST', body: JSON.stringify({ expected_version: detail.current_version, approver: editor }) })
-      setDetail(body); await load(); setNotice(`已发布 ${body.table_code} v${body.published_version}，可用于第二阶段。`)
-    } catch (err) { setError(err.message) }
+      const body = await v2(`/metadata/tables/${detail.id}/publish`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_version: detail.current_version,
+          approver: editor,
+        }),
+      })
+      setDetail(body)
+      await load(body.id)
+      setNotice(`已正式发布 ${body.table_name} (${body.table_code}) v${body.published_version}，现可前往「生成与预检」启动规则装配。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function createDraft() {
-    if (!requireEditor()) return
+    const editor = requireOperator(setError)
+    if (!editor) return
+    setBusy(true)
+    setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/draft`, { method: 'POST', body: JSON.stringify({ expected_version: detail.current_version, approver: editor }) })
-      await load(); await select(body.id); setNotice('已从发布版本创建可编辑草稿。')
-    } catch (err) { setError(err.message) }
+      const body = await v2(`/metadata/tables/${detail.id}/draft`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_version: detail.current_version,
+          approver: editor,
+        }),
+      })
+      await load(body.id)
+      setNotice(`已从发布基线派生可编辑草稿版本 v${body.current_version}。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
-  return <>
-    <PageHeader title="元数据工作台" description="AI 初值、程序验证、独立自审与人工修改分栏保留；发布后才可用于生成。" actions={<div className="approval-submit"><input value={editor} onChange={(event) => setEditor(event.target.value)} placeholder="编辑 / 审批人" /></div>} />
-    <StatusMessage error={error} notice={notice} onClose={() => setNotice('')} />
-    <section className="workspace-grid metadata-layout">
-      <div className="panel list-panel"><div className="panel-heading"><h2>元数据表</h2><span>{tables.length}</span></div>{tables.map((table) => <button className="list-row" key={table.id} onClick={() => select(table.id)}><strong>{table.table_name}</strong><span>{table.table_code} · {table.field_count} 字段</span><em>{table.status} · v{table.current_version}</em></button>)}</div>
-      <div className="panel metadata-detail">
-        {detail ? <>
-          <div className="panel-heading"><div><h2>{detail.table_name}</h2><p>{detail.table_code} · {detail.status} · v{detail.current_version}</p></div><div className="actions"><button className="button secondary" onClick={() => setShowAdd(!showAdd)}>增加字段</button>{detail.status === 'PUBLISHED' ? <button className="button secondary" onClick={createDraft}>新建草稿</button> : <button className="button primary" onClick={publish}>发布版本</button>}</div></div>
-          <div className="tab-bar"><button className={tab === 'fields' ? 'active' : ''} onClick={() => setTab('fields')}>字段</button><button className={tab === 'validation' ? 'active' : ''} onClick={() => setTab('validation')}>验证报告</button><button className={tab === 'revisions' ? 'active' : ''} onClick={() => setTab('revisions')}>变更记录</button></div>
-          {tab === 'fields' && <div className="table-wrap"><table><thead><tr><th>中文名 / 英文名</th><th>字段定义</th><th>原始校验</th><th>类型 / 长度</th><th>必填 / 码值引用</th><th>操作</th></tr></thead><tbody>{detail.fields.map((field) => <tr key={field.id}>
-            <td><input value={field.field_cn} onChange={(e) => change(field.id, 'field_cn', e.target.value)} /><input value={field.field_en} onChange={(e) => change(field.id, 'field_en', e.target.value)} /><details><summary>AI 初值与证据</summary><pre>{JSON.stringify(field.ai_value_json, null, 2)}</pre><code>{JSON.stringify(field.evidence_json)}</code></details></td>
-            <td><textarea value={field.field_definition} onChange={(e) => change(field.id, 'field_definition', e.target.value)} /></td>
-            <td><textarea value={field.check_text_raw} onChange={(e) => change(field.id, 'check_text_raw', e.target.value)} /></td>
-            <td><select value={field.data_type} onChange={(e) => change(field.id, 'data_type', e.target.value)}><option>VARCHAR</option><option>NUMBER</option></select><input type="number" value={field.length} onChange={(e) => change(field.id, 'length', e.target.value)} /></td>
-            <td><label className="check-label"><input type="checkbox" checked={field.required} onChange={(e) => change(field.id, 'required', e.target.checked)} />必填</label><input placeholder="码值表引用" value={field.code_reference_text} onChange={(e) => change(field.id, 'code_reference_text', e.target.value)} /></td>
-            <td><div className="row-actions"><button onClick={() => save(field)}>保存</button><button className="danger" onClick={() => remove(field)}>删除</button></div></td>
-          </tr>)}</tbody></table></div>}
-          {showAdd && <div className="add-field-form">{Object.entries(newField).filter(([key]) => !['evidence_json', 'decimal_places', 'confidence'].includes(key)).map(([key, value]) => <label key={key}><span>{key}</span>{key === 'required' ? <input type="checkbox" checked={value} onChange={(e) => setNewField({ ...newField, [key]: e.target.checked })} /> : <input value={value} type={key === 'length' ? 'number' : 'text'} onChange={(e) => setNewField({ ...newField, [key]: e.target.value })} />}</label>)}<button className="button primary" onClick={add}>添加</button></div>}
-          {tab === 'validation' && <div className="validation-list">{detail.validations.map((item, index) => <div key={index}><strong>{item.validator_kind} · {item.status}</strong><pre>{JSON.stringify(item.issues, null, 2)}</pre></div>)}</div>}
-          {tab === 'revisions' && <div className="validation-list">{detail.revisions.map((item, index) => <div key={index}><strong>{item.revision_kind} · {item.editor}</strong><p>{item.reason} · {item.created_at}</p><details><summary>查看差异</summary><pre>{JSON.stringify({ old: item.old_value, new: item.new_value }, null, 2)}</pre></details></div>)}</div>}
-        </> : <p className="empty">请选择一张元数据表。</p>}
-      </div>
-    </section>
-  </>
+  function getCodeRefMeta(field) {
+    const text = (field.code_reference_text || '').trim()
+    if (!text || ['无', 'N/A', 'NONE', '无引用'].includes(text.toUpperCase())) {
+      return null
+    }
+    const unresolved = unresolvedRefs.find((r) => r.field_id === field.id)
+    const matchedSet = codeSets.find((s) => s.name === text || s.code === text.toUpperCase())
+    if (unresolved) {
+      return {
+        text,
+        status: 'UNRESOLVED',
+        codeSetId: unresolved.code_set_id || matchedSet?.id,
+      }
+    }
+    if (matchedSet) {
+      return {
+        text,
+        status: matchedSet.enabled_value_count > 0 ? 'RESOLVED' : 'UNRESOLVED',
+        codeSetId: matchedSet.id,
+      }
+    }
+    return { text, status: 'DRAFT', codeSetId: null }
+  }
+
+  const totalIssues = (detail?.validations || []).reduce(
+    (acc, v) => acc + (Array.isArray(v.issues) ? v.issues.length : 0),
+    0
+  )
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="STAGE 02 · 元数据精修、交叉自审与版本审计"
+        title="元数据与版本工作台"
+        description="集中审阅 AI 初值、确定性程序校验与独立复核报告；支持抽屉式字段精修、码值联动跳转与字段级版本差异对比。"
+        actions={
+          detail && (
+            <>
+              {isPublished ? (
+                <>
+                  <button type="button" className="button secondary" disabled={busy} onClick={createDraft}>
+                    派生可编辑草稿
+                  </button>
+                  <button
+                    type="button"
+                    className="button primary"
+                    onClick={() => navigate(`/generation?table=${detail.id}`)}
+                  >
+                    前往生成规则 →
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>
+                    {showAdd ? '收起新增面板' : '+ 新增字段'}
+                  </button>
+                  <button type="button" className="button primary" disabled={busy} onClick={publish}>
+                    发布定版 (v{detail.current_version})
+                  </button>
+                </>
+              )}
+            </>
+          )
+        }
+      />
+
+      <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
+
+      <section className="workspace-grid metadata-layout">
+        <div className="panel list-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>元数据表清单</h2>
+              <p>共 {tables.length} 张表</p>
+            </div>
+            <StatusBadge tone="neutral">{tables.length}</StatusBadge>
+          </div>
+
+          {tables.length > 0 ? (
+            <div className="list-stack">
+              {tables.map((table) => (
+                <button
+                  type="button"
+                  className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
+                  key={table.id}
+                  onClick={() => select(table.id, false)}
+                >
+                  <div className="list-row-top">
+                    <strong>{table.table_name}</strong>
+                    <StatusBadge status={table.status} />
+                  </div>
+                  <span>
+                    <code>{table.table_code}</code> · {table.field_count} 个字段
+                  </span>
+                  <em>
+                    当前 v{table.current_version}
+                    {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
+                  </em>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty">
+              暂无元数据表，请先前往「规范导入与切块」解析文档。
+            </div>
+          )}
+        </div>
+
+        <div className="panel metadata-detail">
+          {detail ? (
+            <>
+              <div className="panel-heading">
+                <div>
+                  <div className="actions">
+                    <h2>{detail.table_name}</h2>
+                    <code>{detail.table_code}</code>
+                    <StatusBadge status={detail.status} />
+                  </div>
+                  <p>
+                    {detail.table_definition || '暂无表级业务说明'} · 当前版本 v{detail.current_version}
+                    {detail.published_version ? `（已发布版本 v${detail.published_version}）` : ''}
+                  </p>
+                </div>
+                <div className="actions">
+                  <input
+                    type="search"
+                    placeholder="检索字段中英文名/定义..."
+                    value={fieldSearch}
+                    onChange={(e) => setFieldSearch(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {showAdd && !isPublished && (
+                <div className="add-field-form">
+                  <label>
+                    <span>中文名称 *</span>
+                    <input
+                      placeholder="例：申报号码"
+                      value={newField.field_cn}
+                      onChange={(e) => setNewField({ ...newField, field_cn: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>英文列名 *</span>
+                    <input
+                      placeholder="例：RPTNO"
+                      value={newField.field_en}
+                      onChange={(e) => setNewField({ ...newField, field_en: e.target.value.toUpperCase() })}
+                    />
+                  </label>
+                  <label>
+                    <span>数据类型</span>
+                    <select
+                      value={newField.data_type}
+                      onChange={(e) => setNewField({ ...newField, data_type: e.target.value })}
+                    >
+                      <option value="VARCHAR">VARCHAR</option>
+                      <option value="NUMBER">NUMBER</option>
+                      <option value="DATE">DATE</option>
+                      <option value="CHAR">CHAR</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>字段长度</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={newField.length}
+                      onChange={(e) => setNewField({ ...newField, length: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>字段定义</span>
+                    <input
+                      placeholder="业务含义说明"
+                      value={newField.field_definition}
+                      onChange={(e) => setNewField({ ...newField, field_definition: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>原始校验规则</span>
+                    <input
+                      placeholder="例：必填，22位定长字符"
+                      value={newField.check_text_raw}
+                      onChange={(e) => setNewField({ ...newField, check_text_raw: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>码值表引用</span>
+                    <input
+                      placeholder="无引用可留空"
+                      value={newField.code_reference_text}
+                      onChange={(e) => setNewField({ ...newField, code_reference_text: e.target.value })}
+                    />
+                  </label>
+                  <div className="actions" style={{ alignSelf: 'end' }}>
+                    <label className="check-label" style={{ paddingTop: 0 }}>
+                      <input
+                        type="checkbox"
+                        checked={newField.required}
+                        onChange={(e) => setNewField({ ...newField, required: e.target.checked })}
+                      />
+                      必填
+                    </label>
+                    <button type="button" className="button primary" disabled={busy} onClick={addField}>
+                      确认添加
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="tab-bar">
+                <button
+                  type="button"
+                  className={tab === 'fields' ? 'active' : ''}
+                  onClick={() => setTab('fields')}
+                >
+                  字段清单与精修 ({detail.fields.length})
+                </button>
+                <button
+                  type="button"
+                  className={tab === 'validation' ? 'active' : ''}
+                  onClick={() => setTab('validation')}
+                >
+                  交叉验证报告
+                  <StatusBadge tone={totalIssues > 0 ? 'amber' : 'green'}>
+                    {totalIssues > 0 ? `${totalIssues} 项提示` : '通过'}
+                  </StatusBadge>
+                </button>
+                <button
+                  type="button"
+                  className={tab === 'revisions' ? 'active' : ''}
+                  onClick={() => setTab('revisions')}
+                >
+                  版本审计与字段 Diff ({detail.revisions.length})
+                </button>
+              </div>
+
+              {tab === 'fields' && (
+                <>
+                  {activeField && (
+                    <div className="field-editor-drawer">
+                      <div className="panel-heading">
+                        <div>
+                          <h2>
+                            字段精修与溯源：{activeField.field_cn} (<code>{activeField.field_en}</code>)
+                          </h2>
+                          <p>
+                            {isPublished
+                              ? '当前表处于「已发布」锁定状态，如需修改字段请点击右上角「派生可编辑草稿」。'
+                              : '支持快捷键 Ctrl+S 保存修改、Alt+↑/↓ 切换上下字段、Esc 收起面板。'}
+                          </p>
+                        </div>
+                        <div className="actions">
+                          {!isPublished && (
+                            <>
+                              <input
+                                placeholder="修改原因说明..."
+                                value={editReason}
+                                onChange={(e) => setEditReason(e.target.value)}
+                              />
+                              <button
+                                type="button"
+                                className="button danger sm"
+                                disabled={busy}
+                                onClick={() => removeField(activeField)}
+                              >
+                                删除字段
+                              </button>
+                              <button
+                                type="button"
+                                className="button primary sm"
+                                disabled={busy}
+                                onClick={() => saveField(activeField)}
+                              >
+                                保存修改 <kbd className="kbd-hint">Ctrl+S</kbd>
+                              </button>
+                            </>
+                          )}
+                          <button
+                            type="button"
+                            className="button secondary sm"
+                            onClick={() => setEditingFieldId(null)}
+                          >
+                            收起 <kbd className="kbd-hint">Esc</kbd>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="field-editor-grid">
+                        <label>
+                          <span>中文名称 (field_cn)</span>
+                          <input
+                            disabled={isPublished}
+                            value={activeField.field_cn}
+                            onChange={(e) => changeFieldProp(activeField.id, 'field_cn', e.target.value)}
+                          />
+                        </label>
+                        <label>
+                          <span>英文列名 (field_en)</span>
+                          <input
+                            disabled={isPublished}
+                            value={activeField.field_en}
+                            onChange={(e) => changeFieldProp(activeField.id, 'field_en', e.target.value)}
+                          />
+                        </label>
+                        <label>
+                          <span>数据类型与长度</span>
+                          <div className="actions">
+                            <select
+                              disabled={isPublished}
+                              value={activeField.data_type}
+                              onChange={(e) => changeFieldProp(activeField.id, 'data_type', e.target.value)}
+                            >
+                              <option value="VARCHAR">VARCHAR</option>
+                              <option value="NUMBER">NUMBER</option>
+                              <option value="DATE">DATE</option>
+                              <option value="CHAR">CHAR</option>
+                            </select>
+                            <input
+                              type="number"
+                              disabled={isPublished}
+                              style={{ width: 92 }}
+                              value={activeField.length}
+                              onChange={(e) => changeFieldProp(activeField.id, 'length', e.target.value)}
+                              title="字段长度"
+                            />
+                            <input
+                              type="number"
+                              disabled={isPublished}
+                              style={{ width: 76 }}
+                              value={activeField.decimal_places}
+                              onChange={(e) => changeFieldProp(activeField.id, 'decimal_places', e.target.value)}
+                              title="小数位数"
+                            />
+                          </div>
+                        </label>
+
+                        <label className="span-2">
+                          <span>码值表引用 (code_reference_text)</span>
+                          <input
+                            disabled={isPublished}
+                            placeholder="如引用公共码值表请填写码值表名称，无引用请留空"
+                            value={activeField.code_reference_text}
+                            onChange={(e) =>
+                              changeFieldProp(activeField.id, 'code_reference_text', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label className="check-label">
+                          <input
+                            type="checkbox"
+                            disabled={isPublished}
+                            checked={Boolean(activeField.required)}
+                            onChange={(e) => changeFieldProp(activeField.id, 'required', e.target.checked)}
+                          />
+                          设为必填字段 (Required)
+                        </label>
+
+                        <label className="span-3">
+                          <span>字段业务定义 (field_definition)</span>
+                          <textarea
+                            disabled={isPublished}
+                            value={activeField.field_definition}
+                            onChange={(e) =>
+                              changeFieldProp(activeField.id, 'field_definition', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label className="span-3">
+                          <span>原始校验规则描述 (check_text_raw)</span>
+                          <textarea
+                            disabled={isPublished}
+                            value={activeField.check_text_raw}
+                            onChange={(e) =>
+                              changeFieldProp(activeField.id, 'check_text_raw', e.target.value)
+                            }
+                          />
+                        </label>
+                      </div>
+
+                      <EvidenceCard field={activeField} />
+                    </div>
+                  )}
+
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>中文名称 / 英文列名</th>
+                          <th>类型与长度</th>
+                          <th>必填</th>
+                          <th>码值表引用与状态</th>
+                          <th>业务定义与校验规则</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredFields.map((field, index) => {
+                          const codeMeta = getCodeRefMeta(field)
+                          const isEditing = editingFieldId === field.id
+                          return (
+                            <tr
+                              key={field.id}
+                              className={isEditing ? 'field-row-active' : ''}
+                            >
+                              <td className="row-index">{index + 1}</td>
+                              <td>
+                                <strong>{field.field_cn}</strong>
+                                <code>{field.field_en}</code>
+                              </td>
+                              <td>
+                                <code>
+                                  {field.data_type}({field.length}
+                                  {field.decimal_places ? `,${field.decimal_places}` : ''})
+                                </code>
+                              </td>
+                              <td>
+                                <StatusBadge tone={field.required ? 'amber' : 'neutral'}>
+                                  {field.required ? '必填' : '选填'}
+                                </StatusBadge>
+                              </td>
+                              <td>
+                                {codeMeta ? (
+                                  <div className="row-actions">
+                                    <span>{codeMeta.text}</span>
+                                    <StatusBadge status={codeMeta.status} />
+                                    <button
+                                      type="button"
+                                      className="button-link"
+                                      onClick={() =>
+                                        navigate(
+                                          codeMeta.codeSetId
+                                            ? `/code-sets?set=${codeMeta.codeSetId}`
+                                            : `/code-sets?name=${encodeURIComponent(codeMeta.text)}`
+                                        )
+                                      }
+                                    >
+                                      维护码值 →
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <span className="muted-text">无码值引用</span>
+                                )}
+                              </td>
+                              <td style={{ maxWidth: 420 }}>
+                                <strong>{field.field_definition || '—'}</strong>
+                                <small>{field.check_text_raw || '无附加校验描述'}</small>
+                              </td>
+                              <td>
+                                <button
+                                  type="button"
+                                  className={`button sm ${isEditing ? 'primary' : 'secondary'}`}
+                                  onClick={() =>
+                                    setEditingFieldId(isEditing ? null : field.id)
+                                  }
+                                >
+                                  {isEditing ? '正在精修' : '精修 / 溯源'}
+                                </button>
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {tab === 'validation' && (
+                <div className="validation-list">
+                  {detail.validations.length > 0 ? (
+                    detail.validations.map((item, index) => {
+                      const issues = Array.isArray(item.issues) ? item.issues : []
+                      return (
+                        <div className="validation-group-card" key={index}>
+                          <div className="validation-group-header">
+                            <div className="actions">
+                              <StatusBadge status={item.validator_kind} />
+                              <strong>第 {item.round || 1} 轮验证</strong>
+                              <span className="muted-text">{formatTime(item.created_at)}</span>
+                            </div>
+                            <StatusBadge status={item.status} />
+                          </div>
+                          {issues.length === 0 ? (
+                            <div className="validation-pass-banner">
+                              未发现任何异常或分歧，全部字段均通过该轮校验。
+                            </div>
+                          ) : (
+                            <div className="issue-card-list">
+                              {issues.map((issue, idx) => (
+                                <div
+                                  key={idx}
+                                  className={`issue-card severity-${(issue.severity || 'WARNING').toLowerCase()}`}
+                                >
+                                  <StatusBadge status={issue.severity || 'WARNING'} />
+                                  <div>
+                                    <strong>
+                                      {issue.field_en ? `字段 ${issue.field_en}` : '整表级'} · {issue.code}
+                                    </strong>
+                                    <p>{issue.message}</p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })
+                  ) : (
+                    <div className="empty">当前表暂无验证记录。</div>
+                  )}
+                </div>
+              )}
+
+              {tab === 'revisions' && (
+                <div className="revision-list">
+                  {detail.revisions.map((item, index) => (
+                    <RevisionDiffView key={index} revision={item} />
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="empty">请从左侧选择一张元数据表进行复核或精修。</div>
+          )}
+        </div>
+      </section>
+    </>
+  )
 }

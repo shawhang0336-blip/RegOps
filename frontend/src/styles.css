@@ -1,3 +1,254 @@
+/* Dark Mode Variable Overrides & Theme Toggle / Shortcut Styles */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  color: #e6f0eb;
+  background: #0b1512;
 
-@media(max-width:1050px){.brand>div:last-child{display:none}}
-.production-download{display:flex;align-items:center;gap:12px;background:#edf7f0;border:1px solid #cde5d5;border-radius:9px;padding:13px;margin:14px 0}.production-download span{font-size:10px;color:#427158}
+  --ink: #e6f0eb;
+  --ink-secondary: #bdd0c6;
+  --muted: #8aa196;
+  --muted-light: #657c71;
+  --surface: #12211c;
+  --surface-subtle: #172a23;
+  --surface-hover: #1d352c;
+  --line: #253d34;
+  --line-subtle: #1c3028;
+
+  --green: #26a678;
+  --green-hover: #1f8b64;
+  --green-light: #16382b;
+  --green-border: #2a634d;
+
+  --amber: #f0b456;
+  --amber-light: #332713;
+  --amber-border: #664c22;
+
+  --red: #f27463;
+  --red-light: #381b18;
+  --red-border: #6e312a;
+
+  --blue: #6cb2f7;
+  --blue-light: #152b40;
+
+  --violet: #b197fc;
+  --violet-light: #261e40;
+
+  --navy: #08110e;
+  --navy-elevated: #13261f;
+  --navy-border: #1e382f;
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.32);
+  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.55);
+}
+
+:root[data-theme="dark"] body {
+  background: #0b1512;
+  color: var(--ink);
+}
+
+:root[data-theme="dark"] input,
+:root[data-theme="dark"] select,
+:root[data-theme="dark"] textarea {
+  background: #0f1c18;
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+:root[data-theme="dark"] code,
+:root[data-theme="dark"] .code-pill {
+  background: #1a3028;
+  color: #9be5c4;
+}
+
+:root[data-theme="dark"] tbody tr:hover {
+  background: #162922;
+}
+
+:root[data-theme="dark"] .list-row.selected {
+  background: #17362a;
+  border-color: var(--green-border);
+  border-left-color: var(--green);
+}
+
+:root[data-theme="dark"] .upload-dropzone {
+  background: linear-gradient(135deg, #13261f 0%, #101f19 100%);
+  border-color: #2d634d;
+}
+
+:root[data-theme="dark"] .upload-dropzone:hover,
+:root[data-theme="dark"] .upload-dropzone.dragging {
+  background: #183329;
+  border-color: var(--green);
+}
+
+:root[data-theme="dark"] .block-row,
+:root[data-theme="dark"] .evidence-card,
+:root[data-theme="dark"] .revision-card,
+:root[data-theme="dark"] .validation-group-card,
+:root[data-theme="dark"] .generation-table-card,
+:root[data-theme="dark"] .event,
+:root[data-theme="dark"] .unresolved-chip,
+:root[data-theme="dark"] .segmented button {
+  background: var(--surface);
+  border-color: var(--line);
+}
+
+:root[data-theme="dark"] .block-row.active-block,
+:root[data-theme="dark"] .generation-table-card.selected,
+:root[data-theme="dark"] .field-row-active {
+  background: #173328 !important;
+  border-color: var(--green);
+}
+
+:root[data-theme="dark"] .generation-table-card.has-blocker,
+:root[data-theme="dark"] .blocker-alert-item {
+  background: #2b1816;
+  border-color: var(--red-border);
+}
+
+:root[data-theme="dark"] .field-editor-drawer {
+  background: #152720;
+  border-color: var(--green-border);
+}
+
+:root[data-theme="dark"] .locator-pill {
+  background: #192e26;
+  color: #a7d8c2;
+  border-color: #294a3d;
+}
+
+:root[data-theme="dark"] .approval-panel {
+  background: #1c1912;
+  border-color: var(--amber-border);
+}
+
+:root[data-theme="dark"] .approval-rule,
+:root[data-theme="dark"] .approval-submit {
+  border-top-color: #383020;
+}
+
+:root[data-theme="dark"] .pipeline-step.done {
+  background: #153025;
+  border-color: #295c46;
+}
+
+:root[data-theme="dark"] .data-preview-table th {
+  background: #182c24;
+}
+
+/* Theme Toggle Button & KBD Badges */
+.theme-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--surface);
+  color: var(--ink-secondary);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.theme-toggle-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--green-border);
+}
+
+.theme-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.kbd-hint {
+  display: inline-block;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: rgba(128, 128, 128, 0.14);
+  border: 1px solid rgba(128, 128, 128, 0.26);
+  color: inherit;
+  margin-left: 3px;
+}
+
+.shortcut-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 9px 13px;
+  margin-bottom: 10px;
+  background: var(--surface-subtle);
+  border: 1px dashed var(--amber-border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--ink-secondary);
+}
+
+.approval-rule {
+  padding: 14px 12px !important;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.approval-rule.focused-rule {
+  background: rgba(20, 108, 78, 0.08);
+  outline: 1.5px solid var(--green-border);
+}
+
+:root[data-theme="dark"] .approval-rule.focused-rule {
+  background: rgba(38, 166, 120, 0.14);
+}
+
+.rule-index-pill {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+
+.production-download {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: linear-gradient(135deg, #e6f6ed 0%, #f4fbf7 100%);
+  border: 1.5px solid #9ad4b6;
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+:root[data-theme="dark"] .production-download {
+  background: linear-gradient(135deg, #143326 0%, #10261d 100%);
+  border-color: #2b694f;
+}
+
+.production-download-info strong {
+  display: block;
+  font-size: 14.5px;
+  color: #114a35;
+}
+
+:root[data-theme="dark"] .production-download-info strong {
+  color: #a5f2ce;
+}
+
+.production-download-info span {
+  font-size: 12.5px;
+  color: #366953;
+  margin-top: 2px;
+  display: block;
+}
+
+:root[data-theme="dark"] .production-download-info span {
+  color: #7cc4a3;
+}
