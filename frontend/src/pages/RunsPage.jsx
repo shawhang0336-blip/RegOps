@@ -4,23 +4,21 @@ import { api, v2 } from '../api.js'
 import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
-import { DataTableModal, StatusBadge } from './SharedUI.jsx'
+import { DataTableModal, StatusBadge, formatTime } from './SharedUI.jsx'
 
 const PIPELINE_STEPS = [
-  { num: '01', label: 'AI 生成计划', match: ['PLAN', 'INIT'] },
-  { num: '02', label: 'Schema 扇出', match: ['SCHEMA', 'DDL'] },
-  { num: '03', label: '规则扇出与汇合', match: ['RULE', 'BARRIER'] },
-  { num: '04', label: '拓展规则确权', match: ['APPROVAL', 'WAIT', 'HUMAN'] },
-  { num: '05', label: '生成器扇出', match: ['DATA', 'GEN', 'MUTATION'] },
-  { num: '06', label: '审计用例扇出', match: ['CASE', 'SQL'] },
-  { num: '07', label: 'Oracle 双表执行', match: ['ORACLE', 'SANDBOX', 'AUDIT'] },
-  { num: '08', label: '审计收敛与部署包', match: ['COMPLETE', 'DONE', 'RETRY'] },
+  { num: '01', label: '生成表结构、码表和规则', match: ['PLAN', 'INIT', 'SCHEMA', 'DDL', 'RULE', 'BINDER', 'ORACLE_ASSET'] },
+  { num: '02', label: '确认校验规则', match: ['APPROVAL', 'HUMAN', 'BARRIER'] },
+  { num: '03', label: '生成测试数据', match: ['DATA', 'GEN', 'MUTATION'] },
+  { num: '04', label: '执行数据库测试', match: ['CASE', 'SQL', 'ORACLE', 'SANDBOX', 'AUDIT'] },
+  { num: '05', label: '确认结果并下载', match: ['COMPLETE', 'DONE', 'RETRY', 'EXPORT', 'TEST_CONFIRMATION'] },
 ]
 
 function resolveStepIndex(run) {
   if (!run) return -1
-  if (run.status === 'COMPLETED') return 7
-  if (run.status === 'WAITING_APPROVAL') return 3
+  if (run.status === 'COMPLETED') return 4
+  if (run.status === 'WAITING_APPROVAL') return 1
+  if (run.status === 'WAITING_TEST_APPROVAL') return 4
   const node = (run.current_node || '').toUpperCase()
   for (let i = PIPELINE_STEPS.length - 1; i >= 0; i -= 1) {
     if (PIPELINE_STEPS[i].match.some((m) => node.includes(m))) return i
@@ -113,7 +111,7 @@ export default function RunsPage() {
     const approver = requireOperator(setError)
     if (!approver) return
     if (pending.some((rule) => !decisions[rule.rule_hash])) {
-      setError('请对全部待确权规则选择「批准」或「拒绝」（可使用快捷键 Shift+A 全批 / Shift+R 全拒）。')
+      setError('请对每条新增规则选择“批准”或“拒绝”，再提交确认。')
       return
     }
     setBusy(true)
@@ -135,7 +133,7 @@ export default function RunsPage() {
       }
       setActive(body)
       setDecisions({})
-      setNotice('人工确权决定已写入不可变事件账本，流水线已自动推进后续造数与沙箱审计。')
+      setNotice('确认结果已保存，系统将继续生成测试数据并进行数据库验证。')
       await load(body.id)
     } catch (err) {
       setError(err.message)
@@ -225,6 +223,26 @@ export default function RunsPage() {
     }
   }
 
+  async function confirmTests() {
+    const approver = requireOperator(setError)
+    if (!approver) return
+    setBusy(true)
+    setError('')
+    try {
+      const body = await api(`/api/runs/${active.id}/test-confirmation`, {
+        method: 'POST',
+        body: JSON.stringify({ approver }),
+      })
+      setActive(body)
+      await load(body.id)
+      setNotice('测试结果已确认，现在可以下载生产部署包。')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const summary = active?.result?.audit_summary
   const stepIdx = resolveStepIndex(active)
   const tableCodes = useMemo(
@@ -243,13 +261,22 @@ export default function RunsPage() {
   const explicitCount = (active?.rules || []).filter((r) => r.source === 'DOC_EXPLICIT').length
   const expandedCount = (active?.rules || []).filter((r) => r.source === 'AI_EXPANDED').length
   const decidedCount = pending.filter((r) => Boolean(decisions[r.rule_hash])).length
+  const outcome = !active ? null : active.status === 'COMPLETED' && summary?.all_passed
+    ? { tone: 'success', title: '验证已通过，可以下载部署包', description: '部署包包含 Oracle 建表语句、码值数据和校验规则 SQL。' }
+    : active.status === 'WAITING_APPROVAL'
+      ? { tone: 'attention', title: `有 ${pending.length} 条新增规则需要您确认`, description: active?.result?.oracle_precheck?.all_passed ? 'Oracle 建表和规则空跑已通过，确认规则后再生成测试数据。' : '表结构、码表和规则 SQL 已生成，确认规则后再生成测试数据。' }
+      : active.status === 'WAITING_TEST_APPROVAL'
+        ? { tone: 'success', title: '数据库测试已通过，请确认测试结果', description: '确认后才开放生产部署包下载；您也可以先查看验证报告和测试数据。' }
+        : active.status === 'FAILED'
+        ? { tone: 'danger', title: '本次验证发现问题', description: '请查看验证报告；可以从失败位置重新处理，不需要重新上传文件。' }
+        : { tone: 'working', title: '系统正在生成和验证', description: '您可以留在本页查看进度，需要人工确认时系统会提示。' }
 
   return (
     <>
       <PageHeader
-        eyebrow="STAGE 05 · 8 阶段实时进度、人工确权与沙箱双表审计"
-        title="执行与审计中心"
-        description="实时跟踪 AI 生成计划、规则扇出、拓展规则人工确权、Oracle 沙箱双表验证与生产部署包导出。"
+        eyebrow="第 3 步 · 共 3 步"
+        title="测试与下载"
+        description="生成测试数据并执行 Oracle 测试；确认结果后下载码表、表结构和校验 SQL。"
         actions={
           active && (
             <>
@@ -261,9 +288,12 @@ export default function RunsPage() {
               >
                 刷新状态
               </button>
+              {active.status === 'WAITING_TEST_APPROVAL' && (
+                <button type="button" className="button primary" disabled={busy} onClick={confirmTests}>确认测试结果并开放下载</button>
+              )}
               {active.status === 'FAILED' && (
                 <button type="button" className="button primary" disabled={busy} onClick={retry}>
-                  从失败点自愈重试
+                  重新处理失败项
                 </button>
               )}
             </>
@@ -276,34 +306,24 @@ export default function RunsPage() {
       {active && (
         <section className="metrics">
           <div>
-            <span>当前运行状态</span>
-            <strong>
-              <StatusBadge status={active.status} />
-            </strong>
-            <small>当前节点：{active.current_node || '—'}</small>
+            <span>当前状态</span>
+            <strong><StatusBadge status={active.status} /></strong>
+            <small>{outcome?.title}</small>
           </div>
           <div>
-            <span>装配规则总数</span>
+            <span>校验规则</span>
             <strong>{active.rules?.length || 0} 条</strong>
-            <small>
-              文档显性 {explicitCount} · AI 拓展 {expandedCount}
-            </small>
+            <small>文档明确 {explicitCount} · 建议新增 {expandedCount}</small>
           </div>
           <div>
-            <span>待人工确权</span>
+            <span>等待确认</span>
             <strong>{pending.length} 条</strong>
-            <small>
-              {pending.length > 0 ? `已决 ${decidedCount} / ${pending.length} 条` : '全部规则已确权'}
-            </small>
+            <small>{pending.length > 0 ? `已选择 ${decidedCount} / ${pending.length} 条` : '当前无需人工确认'}</small>
           </div>
           <div>
-            <span>Oracle 沙箱审计</span>
-            <strong>{summary ? `${summary.case_count} 用例` : '待执行'}</strong>
-            <small>
-              {summary
-                ? `${summary.false_positive_count} 误报 · ${summary.false_negative_count} 漏报`
-                : '确权后自动执行双表比对'}
-            </small>
+            <span>数据库验证</span>
+            <strong>{summary ? `${summary.case_count} 项测试` : '尚未开始'}</strong>
+            <small>{summary ? `${summary.false_positive_count} 项误拦截 · ${summary.false_negative_count} 项漏拦截` : '确认规则后自动执行'}</small>
           </div>
         </section>
       )}
@@ -312,8 +332,8 @@ export default function RunsPage() {
         <div className="panel list-panel">
           <div className="panel-heading">
             <div>
-              <h2>运行批次列表</h2>
-              <p>共 {runs.length} 次运行记录</p>
+              <h2>生成记录</h2>
+              <p>共 {runs.length} 个批次</p>
             </div>
             <StatusBadge tone="neutral">{runs.length}</StatusBadge>
           </div>
@@ -332,11 +352,11 @@ export default function RunsPage() {
                   }}
                 >
                   <div className="list-row-top">
-                    <strong>运行 #{run.id.slice(0, 8)}</strong>
+                    <strong>生成批次 {run.id.slice(0, 8)}</strong>
                     <StatusBadge status={run.status} />
                   </div>
-                  <span>当前阶段：{run.current_node}</span>
-                  <em>事件数：{run.event_count ?? '—'}</em>
+                  <span>{run.status === 'COMPLETED' ? '可以下载部署包' : PIPELINE_STEPS[resolveStepIndex(run)]?.label}</span>
+                  {(run.created_at || run.updated_at) && <em>{formatTime(run.created_at || run.updated_at)}</em>}
                 </button>
               ))}
             </div>
@@ -351,19 +371,17 @@ export default function RunsPage() {
               <div className="panel-heading">
                 <div>
                   <div className="actions">
-                    <h2>运行批次 #{active.id.slice(0, 8)}</h2>
+                    <h2>本次生成结果</h2>
                     <StatusBadge status={active.status} />
-                    {summary && (
-                      <StatusBadge tone={summary.all_passed ? 'green' : 'amber'}>
-                        {summary.all_passed ? '沙箱零差异通过' : '存在审计差异'}
-                      </StatusBadge>
-                    )}
                   </div>
-                  <p>
-                    完整批次 ID：<code>{active.id}</code> · 当前节点：<code>{active.current_node}</code>
-                  </p>
+                  <p>批次 {active.id.slice(0, 8)}{(active.created_at || active.updated_at) ? ` · ${formatTime(active.created_at || active.updated_at)}` : ''}</p>
                 </div>
               </div>
+
+              <section className={`run-outcome ${outcome.tone}`}>
+                <strong>{outcome.title}</strong>
+                <span>{outcome.description}</span>
+              </section>
 
               <div className="pipeline-stepper">
                 {PIPELINE_STEPS.map((step, idx) => {
@@ -372,7 +390,7 @@ export default function RunsPage() {
                   else if (idx === stepIdx) stateClass = active.status === 'FAILED' ? 'failed' : 'current'
                   return (
                     <div key={step.num} className={`pipeline-step ${stateClass}`}>
-                      <span className="pipeline-step-num">STAGE {step.num}</span>
+                      <span className="pipeline-step-num">步骤 {step.num}</span>
                       <strong>{step.label}</strong>
                     </div>
                   )
@@ -382,8 +400,8 @@ export default function RunsPage() {
               {active.status === 'COMPLETED' && summary?.all_passed && (
                 <div className="production-download">
                   <div className="production-download-info">
-                    <strong>沙箱审计全部通过，生产部署包已就绪</strong>
-                    <span>包含正式表名 DDL 与确定性校验 SQL（已剥离测试数据与沙箱辅助字段）</span>
+                    <strong>生产部署包已就绪</strong>
+                    <span>包含 Oracle 建表语句、码值数据和校验规则 SQL，不包含测试数据。</span>
                   </div>
                   <a
                     className="button primary"
@@ -398,10 +416,8 @@ export default function RunsPage() {
                 <section className="approval-panel">
                   <div className="panel-heading">
                     <div>
-                      <h2>
-                        AI 拓展规则人工确权 ({decidedCount} / {pending.length} 已选择)
-                      </h2>
-                      <p>批准决定与当前规则内容哈希强绑定；支持键盘快捷键极速逐条审批或批量审批。</p>
+                      <h2>请确认 AI 建议新增的规则</h2>
+                      <p>请根据业务口径选择批准或拒绝；文档明确要求的规则无需在此确认。</p>
                     </div>
                     <div className="actions">
                       <button
@@ -409,18 +425,20 @@ export default function RunsPage() {
                         className="button secondary sm"
                         onClick={() => setAllDecisions('REJECTED')}
                       >
-                        全部拒绝 <kbd className="kbd-hint">Shift+R</kbd>
+                        全部拒绝
                       </button>
                       <button
                         type="button"
                         className="button primary sm"
                         onClick={() => setAllDecisions('APPROVED')}
                       >
-                        全部批准 <kbd className="kbd-hint">Shift+A</kbd>
+                        全部批准
                       </button>
                     </div>
                   </div>
 
+                  <details className="technical-details">
+                    <summary>查看批量操作快捷键</summary>
                   <div className="shortcut-bar">
                     <span>
                       <kbd className="kbd-hint">↑</kbd> <kbd className="kbd-hint">↓</kbd> 或{' '}
@@ -436,6 +454,7 @@ export default function RunsPage() {
                       <kbd className="kbd-hint">Ctrl+Enter</kbd> 提交审批入账
                     </span>
                   </div>
+                  </details>
 
                   {pending.map((rule, idx) => {
                     const isFocused = idx === focusedRuleIndex
@@ -447,17 +466,15 @@ export default function RunsPage() {
                       >
                         <div>
                           <div className="actions">
-                            <span className="rule-index-pill">#{idx + 1}</span>
-                            <strong>{rule.rule_key}</strong>
-                            <code>{rule.table_code}</code>
-                            <StatusBadge tone="violet">{rule.definition.operator}</StatusBadge>
-                            {rule.definition.field && <code>字段: {rule.definition.field}</code>}
+                            <span className="rule-index-pill">{idx + 1}</span>
+                            <strong>{rule.definition.field ? `字段 ${rule.definition.field}` : '报表级校验'}</strong>
+                            <StatusBadge tone="violet">AI 建议新增</StatusBadge>
                           </div>
                           <p>{rule.definition.rationale}</p>
-                          <small className="muted-text">
-                            参数：<code>{JSON.stringify(rule.definition.params)}</code> · 规则哈希：
-                            <code>{rule.rule_hash.slice(0, 16)}…</code>
-                          </small>
+                          <details className="technical-details">
+                            <summary>查看规则技术详情</summary>
+                            <pre>{JSON.stringify({ rule_key: rule.rule_key, table_code: rule.table_code, operator: rule.definition.operator, params: rule.definition.params, rule_hash: rule.rule_hash }, null, 2)}</pre>
+                          </details>
                         </div>
                         <div className="segmented">
                           <button
@@ -469,7 +486,7 @@ export default function RunsPage() {
                               setFocusedRuleIndex(Math.min(pending.length - 1, idx + 1))
                             }}
                           >
-                            批准 <kbd className="kbd-hint">A</kbd>
+                            批准
                           </button>
                           <button
                             type="button"
@@ -480,7 +497,7 @@ export default function RunsPage() {
                               setFocusedRuleIndex(Math.min(pending.length - 1, idx + 1))
                             }}
                           >
-                            拒绝 <kbd className="kbd-hint">R</kbd>
+                            拒绝
                           </button>
                         </div>
                       </div>
@@ -488,15 +505,14 @@ export default function RunsPage() {
                   })}
 
                   <div className="approval-submit">
-                    <span className="muted-text">将使用右上角「当前操作/审批人」身份签名入账</span>
+                    <span className="muted-text">确认结果会记录在变更历史中</span>
                     <button
                       type="button"
                       className="button primary"
                       disabled={busy}
                       onClick={submitApprovals}
                     >
-                      {busy ? '正在写入事件账本并继续...' : '确认提交审批并推进流水线 →'}
-                      <kbd className="kbd-hint">Ctrl+Enter</kbd>
+                      {busy ? '正在提交并继续...' : '提交确认并继续'}
                     </button>
                   </div>
                 </section>
@@ -506,16 +522,16 @@ export default function RunsPage() {
                 <section className="run-section">
                   <div className="panel-heading" style={{ marginBottom: 8 }}>
                     <div>
-                      <h2>编译产物与 Oracle 沙箱实体表预览</h2>
-                      <p>点击任意产物或沙箱表可在弹窗中以结构化表格或代码视图查看详情</p>
+                      <h2>生成结果</h2>
+                      <p>查看本次生成的建表语句、校验规则、验证报告和测试数据。</p>
                     </div>
                   </div>
                   <div className="artifact-actions">
                     {[
-                      ['ddl_blob', '查看 MySQL 建表 DDL'],
-                      ['oracle_ddl_blob', '查看 Oracle 建表 DDL'],
-                      ['validation_sql_blob', '查看确定性校验 SQL'],
-                      ['audit_report_blob', '查看独立审计报告'],
+                      ['ddl_blob', 'MySQL 建表语句'],
+                      ['oracle_ddl_blob', 'Oracle 建表语句'],
+                      ['validation_sql_blob', '校验规则 SQL'],
+                      ['audit_report_blob', '验证报告'],
                     ]
                       .filter(([key]) => active.result[key])
                       .map(([key, title]) => (
@@ -540,8 +556,8 @@ export default function RunsPage() {
                           onClick={() => previewOracleTable(code, table)}
                         >
                           <div>
-                            <strong>预览沙箱表 · {code}</strong>
-                            <small className="muted-text">点击打开二维数据表格视图</small>
+                            <strong>查看测试数据 · {code}</strong>
+                            <small className="muted-text">点击查看数据表</small>
                           </div>
                           <code>{table}</code>
                         </button>
@@ -552,8 +568,8 @@ export default function RunsPage() {
               )}
 
               {plans.length > 0 && (
-                <details className="run-section" open>
-                  <summary>AI 生成计划与预算配额 ({plans.length} 张表)</summary>
+                <details className="run-section">
+                  <summary>查看生成计划 ({plans.length} 张报表)</summary>
                   <div className="plan-grid">
                     {plans.map((item) => (
                       <div className="plan-card" key={item.table_code}>
@@ -574,8 +590,8 @@ export default function RunsPage() {
                 </details>
               )}
 
-              <details className="run-section" open>
-                <summary>RuleIR 规则与算子清单 ({filteredRules.length} / {active.rules.length})</summary>
+              <details className="run-section">
+                <summary>查看全部校验规则 ({filteredRules.length} / {active.rules.length})</summary>
                 <div className="block-toolbar">
                   <div className="actions">
                     <select
@@ -658,7 +674,7 @@ export default function RunsPage() {
               </details>
 
               <details className="run-section">
-                <summary>不可变事件因果账本 ({active.events.length} 条记录)</summary>
+                <summary>查看技术日志 ({active.events.length} 条)</summary>
                 <div className="timeline">
                   {active.events.map((event) => (
                     <div className="event" key={event.seq}>

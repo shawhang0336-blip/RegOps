@@ -8,6 +8,10 @@ import {
   EvidenceCard,
   RevisionDiffView,
   StatusBadge,
+  ISSUE_LABELS,
+  issueSeverity,
+  groupValidationIssues,
+  friendlyError,
   formatTime,
 } from './SharedUI.jsx'
 
@@ -25,7 +29,7 @@ const emptyField = {
   evidence_json: { source: 'HUMAN' },
 }
 
-export default function MetadataPage() {
+export default function MetadataPage({ embedded = false }) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
   const { requireOperator } = useOperator()
@@ -45,24 +49,34 @@ export default function MetadataPage() {
   const [notice, setNotice] = useState('')
 
   async function load(preferredId) {
+    const documentId = params.get('document_id')
+    const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
+    if (embedded && !documentId) {
+      setTables([])
+      setDetail(null)
+      return
+    }
     const [tableList, unresolvedList, codeSetList] = await Promise.all([
-      v2('/metadata/tables'),
-      v2('/code-sets/references/unresolved').catch(() => []),
-      v2('/code-sets').catch(() => []),
+      v2(`/metadata/tables${scopeQuery}`),
+      v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
+      v2(`/code-sets${scopeQuery}`).catch(() => []),
     ])
     setTables(tableList)
     setUnresolvedRefs(unresolvedList)
     setCodeSets(codeSetList)
 
-    const targetId = preferredId || params.get('table') || detail?.id || tableList[0]?.id
+    const requestedId = params.get('table')
+    const currentId = detail?.id
+    const targetId = preferredId || (tableList.some((table) => table.id === requestedId) ? requestedId : null) || (tableList.some((table) => table.id === currentId) ? currentId : null) || tableList[0]?.id
     if (targetId) {
       await select(targetId, false)
     }
   }
 
   useEffect(() => {
+    setDetail(null)
     load().catch((err) => setError(err.message))
-  }, [])
+  }, [params.get('document_id')])
 
   async function select(id, resetTab = false) {
     const data = await v2(`/metadata/tables/${id}`)
@@ -294,46 +308,35 @@ export default function MetadataPage() {
   }
 
   const totalIssues = (detail?.validations || []).reduce(
-    (acc, v) => acc + (Array.isArray(v.issues) ? v.issues.length : 0),
+    (acc, v) => acc + (Array.isArray(v.issues) ? groupValidationIssues(v.issues).length : 0),
     0
+  )
+
+  const pageActions = detail && (
+    <>
+      {isPublished ? (
+        <>
+          <button type="button" className="button secondary" disabled={busy} onClick={createDraft}>新建修改版本</button>
+          <button type="button" className="button primary" onClick={() => navigate(`/generation?table=${detail.id}`)}>前往生成 →</button>
+        </>
+      ) : (
+        <>
+          <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
+          <button type="button" className="button primary" disabled={busy} onClick={publish}>发布此表</button>
+        </>
+      )}
+    </>
   )
 
   return (
     <>
-      <PageHeader
-        eyebrow="STAGE 02 · 元数据精修、交叉自审与版本审计"
-        title="元数据与版本工作台"
-        description="集中审阅 AI 初值、确定性程序校验与独立复核报告；支持抽屉式字段精修、码值联动跳转与字段级版本差异对比。"
-        actions={
-          detail && (
-            <>
-              {isPublished ? (
-                <>
-                  <button type="button" className="button secondary" disabled={busy} onClick={createDraft}>
-                    派生可编辑草稿
-                  </button>
-                  <button
-                    type="button"
-                    className="button primary"
-                    onClick={() => navigate(`/generation?table=${detail.id}`)}
-                  >
-                    前往生成规则 →
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>
-                    {showAdd ? '收起新增面板' : '+ 新增字段'}
-                  </button>
-                  <button type="button" className="button primary" disabled={busy} onClick={publish}>
-                    发布定版 (v{detail.current_version})
-                  </button>
-                </>
-              )}
-            </>
-          )
-        }
-      />
+      {!embedded && <PageHeader
+        eyebrow="第 1 步 · 共 3 步"
+        title="核对报表字段"
+        description="检查系统识别的字段、类型和校验要求；确认无误后发布，即可生成校验规则。"
+        actions={pageActions}
+      />}
+      {embedded && <div className="embedded-page-actions">{pageActions}</div>}
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
@@ -341,7 +344,7 @@ export default function MetadataPage() {
         <div className="panel list-panel">
           <div className="panel-heading">
             <div>
-              <h2>元数据表清单</h2>
+              <h2>报表清单</h2>
               <p>共 {tables.length} 张表</p>
             </div>
             <StatusBadge tone="neutral">{tables.length}</StatusBadge>
@@ -372,7 +375,7 @@ export default function MetadataPage() {
             </div>
           ) : (
             <div className="empty">
-              暂无元数据表，请先前往「规范导入与切块」解析文档。
+              当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。
             </div>
           )}
         </div>
@@ -481,20 +484,27 @@ export default function MetadataPage() {
                 </div>
               )}
 
+              {totalIssues > 0 && tab === 'fields' && (
+                <div className="review-guide">
+                  <span>这张表有 {totalIssues} 项需要核对，请先查看具体问题。</span>
+                  <button type="button" className="button secondary sm" onClick={() => setTab('validation')}>查看待核对问题</button>
+                </div>
+              )}
+
               <div className="tab-bar">
                 <button
                   type="button"
                   className={tab === 'fields' ? 'active' : ''}
                   onClick={() => setTab('fields')}
                 >
-                  字段清单与精修 ({detail.fields.length})
+                  字段清单 ({detail.fields.length})
                 </button>
                 <button
                   type="button"
                   className={tab === 'validation' ? 'active' : ''}
                   onClick={() => setTab('validation')}
                 >
-                  交叉验证报告
+                  待处理问题
                   <StatusBadge tone={totalIssues > 0 ? 'amber' : 'green'}>
                     {totalIssues > 0 ? `${totalIssues} 项提示` : '通过'}
                   </StatusBadge>
@@ -504,7 +514,7 @@ export default function MetadataPage() {
                   className={tab === 'revisions' ? 'active' : ''}
                   onClick={() => setTab('revisions')}
                 >
-                  版本审计与字段 Diff ({detail.revisions.length})
+                  变更记录 ({detail.revisions.length})
                 </button>
               </div>
 
@@ -515,12 +525,12 @@ export default function MetadataPage() {
                       <div className="panel-heading">
                         <div>
                           <h2>
-                            字段精修与溯源：{activeField.field_cn} (<code>{activeField.field_en}</code>)
+                            查看或修改字段：{activeField.field_cn} (<code>{activeField.field_en}</code>)
                           </h2>
                           <p>
                             {isPublished
-                              ? '当前表处于「已发布」锁定状态，如需修改字段请点击右上角「派生可编辑草稿」。'
-                              : '支持快捷键 Ctrl+S 保存修改、Alt+↑/↓ 切换上下字段、Esc 收起面板。'}
+                              ? '已发布内容不可直接修改；如需调整，请先点击“新建修改版本”。'
+                              : '修改后请点击保存；字段原文和自动识别依据可在下方查看。'}
                           </p>
                         </div>
                         <div className="actions">
@@ -545,7 +555,7 @@ export default function MetadataPage() {
                                 disabled={busy}
                                 onClick={() => saveField(activeField)}
                               >
-                                保存修改 <kbd className="kbd-hint">Ctrl+S</kbd>
+                                保存修改
                               </button>
                             </>
                           )}
@@ -554,104 +564,55 @@ export default function MetadataPage() {
                             className="button secondary sm"
                             onClick={() => setEditingFieldId(null)}
                           >
-                            收起 <kbd className="kbd-hint">Esc</kbd>
+                            收起
                           </button>
                         </div>
                       </div>
 
                       <div className="field-editor-grid">
                         <label>
-                          <span>中文名称 (field_cn)</span>
-                          <input
-                            disabled={isPublished}
-                            value={activeField.field_cn}
-                            onChange={(e) => changeFieldProp(activeField.id, 'field_cn', e.target.value)}
-                          />
+                          <span>中文名称</span>
+                          <input disabled={isPublished} value={activeField.field_cn} onChange={(e) => changeFieldProp(activeField.id, 'field_cn', e.target.value)} />
                         </label>
                         <label>
-                          <span>英文列名 (field_en)</span>
-                          <input
-                            disabled={isPublished}
-                            value={activeField.field_en}
-                            onChange={(e) => changeFieldProp(activeField.id, 'field_en', e.target.value)}
-                          />
+                          <span>英文列名</span>
+                          <input disabled={isPublished} value={activeField.field_en} onChange={(e) => changeFieldProp(activeField.id, 'field_en', e.target.value)} />
                         </label>
                         <label>
                           <span>数据类型与长度</span>
-                          <div className="actions">
-                            <select
-                              disabled={isPublished}
-                              value={activeField.data_type}
-                              onChange={(e) => changeFieldProp(activeField.id, 'data_type', e.target.value)}
-                            >
-                              <option value="VARCHAR">VARCHAR</option>
-                              <option value="NUMBER">NUMBER</option>
-                              <option value="DATE">DATE</option>
-                              <option value="CHAR">CHAR</option>
+                          <div className="actions field-type-inputs">
+                            <select disabled={isPublished} value={activeField.data_type} onChange={(e) => changeFieldProp(activeField.id, 'data_type', e.target.value)}>
+                              <option value="VARCHAR">文本</option>
+                              <option value="NUMBER">数值</option>
+                              <option value="DATE">日期</option>
+                              <option value="CHAR">定长文本</option>
                             </select>
-                            <input
-                              type="number"
-                              disabled={isPublished}
-                              style={{ width: 92 }}
-                              value={activeField.length}
-                              onChange={(e) => changeFieldProp(activeField.id, 'length', e.target.value)}
-                              title="字段长度"
-                            />
-                            <input
-                              type="number"
-                              disabled={isPublished}
-                              style={{ width: 76 }}
-                              value={activeField.decimal_places}
-                              onChange={(e) => changeFieldProp(activeField.id, 'decimal_places', e.target.value)}
-                              title="小数位数"
-                            />
+                            <input type="number" disabled={isPublished} style={{ width: 92 }} value={activeField.length} onChange={(e) => changeFieldProp(activeField.id, 'length', e.target.value)} title="字段长度" />
+                            <input type="number" disabled={isPublished} style={{ width: 76 }} value={activeField.decimal_places} onChange={(e) => changeFieldProp(activeField.id, 'decimal_places', e.target.value)} title="小数位数" />
                           </div>
                         </label>
-
                         <label className="span-2">
-                          <span>码值表引用 (code_reference_text)</span>
-                          <input
-                            disabled={isPublished}
-                            placeholder="如引用公共码值表请填写码值表名称，无引用请留空"
-                            value={activeField.code_reference_text}
-                            onChange={(e) =>
-                              changeFieldProp(activeField.id, 'code_reference_text', e.target.value)
-                            }
-                          />
+                          <span>关联码值表</span>
+                          <input disabled={isPublished} placeholder="无关联码值表可留空" value={activeField.code_reference_text} onChange={(e) => changeFieldProp(activeField.id, 'code_reference_text', e.target.value)} />
                         </label>
                         <label className="check-label">
-                          <input
-                            type="checkbox"
-                            disabled={isPublished}
-                            checked={Boolean(activeField.required)}
-                            onChange={(e) => changeFieldProp(activeField.id, 'required', e.target.checked)}
-                          />
-                          设为必填字段 (Required)
-                        </label>
-
-                        <label className="span-3">
-                          <span>字段业务定义 (field_definition)</span>
-                          <textarea
-                            disabled={isPublished}
-                            value={activeField.field_definition}
-                            onChange={(e) =>
-                              changeFieldProp(activeField.id, 'field_definition', e.target.value)
-                            }
-                          />
+                          <input type="checkbox" disabled={isPublished} checked={Boolean(activeField.required)} onChange={(e) => changeFieldProp(activeField.id, 'required', e.target.checked)} />
+                          必填字段
                         </label>
                         <label className="span-3">
-                          <span>原始校验规则描述 (check_text_raw)</span>
-                          <textarea
-                            disabled={isPublished}
-                            value={activeField.check_text_raw}
-                            onChange={(e) =>
-                              changeFieldProp(activeField.id, 'check_text_raw', e.target.value)
-                            }
-                          />
+                          <span>业务定义</span>
+                          <textarea disabled={isPublished} value={activeField.field_definition} onChange={(e) => changeFieldProp(activeField.id, 'field_definition', e.target.value)} />
+                        </label>
+                        <label className="span-3">
+                          <span>规范中的校验要求</span>
+                          <textarea disabled={isPublished} value={activeField.check_text_raw} onChange={(e) => changeFieldProp(activeField.id, 'check_text_raw', e.target.value)} />
                         </label>
                       </div>
 
-                      <EvidenceCard field={activeField} />
+                      <details className="technical-details">
+                        <summary>查看自动识别初值与原文依据</summary>
+                        <EvidenceCard field={activeField} />
+                      </details>
                     </div>
                   )}
 
@@ -659,17 +620,15 @@ export default function MetadataPage() {
                     <table>
                       <thead>
                         <tr>
-                          <th>#</th>
-                          <th>中文名称 / 英文列名</th>
-                          <th>类型与长度</th>
-                          <th>必填</th>
-                          <th>码值表引用与状态</th>
-                          <th>业务定义与校验规则</th>
+                          <th>字段名称</th>
+                          <th>类型 / 必填</th>
+                          <th>关联码值表</th>
+                          <th>业务定义与校验要求</th>
                           <th>操作</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredFields.map((field, index) => {
+                        {filteredFields.map((field) => {
                           const codeMeta = getCodeRefMeta(field)
                           const isEditing = editingFieldId === field.id
                           return (
@@ -677,7 +636,6 @@ export default function MetadataPage() {
                               key={field.id}
                               className={isEditing ? 'field-row-active' : ''}
                             >
-                              <td className="row-index">{index + 1}</td>
                               <td>
                                 <strong>{field.field_cn}</strong>
                                 <code>{field.field_en}</code>
@@ -687,8 +645,6 @@ export default function MetadataPage() {
                                   {field.data_type}({field.length}
                                   {field.decimal_places ? `,${field.decimal_places}` : ''})
                                 </code>
-                              </td>
-                              <td>
                                 <StatusBadge tone={field.required ? 'amber' : 'neutral'}>
                                   {field.required ? '必填' : '选填'}
                                 </StatusBadge>
@@ -728,7 +684,7 @@ export default function MetadataPage() {
                                     setEditingFieldId(isEditing ? null : field.id)
                                   }
                                 >
-                                  {isEditing ? '正在精修' : '精修 / 溯源'}
+                                  {isEditing ? '收起' : '查看 / 修改'}
                                 </button>
                               </td>
                             </tr>
@@ -744,7 +700,7 @@ export default function MetadataPage() {
                 <div className="validation-list">
                   {detail.validations.length > 0 ? (
                     detail.validations.map((item, index) => {
-                      const issues = Array.isArray(item.issues) ? item.issues : []
+                      const issues = Array.isArray(item.issues) ? groupValidationIssues(item.issues) : []
                       return (
                         <div className="validation-group-card" key={index}>
                           <div className="validation-group-header">
@@ -764,14 +720,27 @@ export default function MetadataPage() {
                               {issues.map((issue, idx) => (
                                 <div
                                   key={idx}
-                                  className={`issue-card severity-${(issue.severity || 'WARNING').toLowerCase()}`}
+                                  className={`issue-card severity-${issueSeverity(issue).toLowerCase()}`}
                                 >
-                                  <StatusBadge status={issue.severity || 'WARNING'} />
+                                  <StatusBadge status={issueSeverity(issue)} />
                                   <div>
                                     <strong>
-                                      {issue.field_en ? `字段 ${issue.field_en}` : '整表级'} · {issue.code}
+                                      {issue.field_en ? `字段 ${issue.field_en}` : '整表提示'} · {ISSUE_LABELS[issue.code] || issue.code}
                                     </strong>
-                                    <p>{issue.message}</p>
+                                    <p>{friendlyError(issue.message || '请对照原文确认该字段的识别结果。')}</p>
+                                    {issue.field_en && detail.fields.some((field) => field.field_en === issue.field_en) && (
+                                      <button
+                                        type="button"
+                                        className="button-link"
+                                        onClick={() => {
+                                          setFieldSearch(issue.field_en)
+                                          setEditingFieldId(detail.fields.find((field) => field.field_en === issue.field_en)?.id || null)
+                                          setTab('fields')
+                                        }}
+                                      >
+                                        定位并处理这个字段 →
+                                      </button>
+                                    )}
                                   </div>
                                 </div>
                               ))}
@@ -795,7 +764,7 @@ export default function MetadataPage() {
               )}
             </>
           ) : (
-            <div className="empty">请从左侧选择一张元数据表进行复核或精修。</div>
+            <div className="empty">当前文件还没有可核对的字段。</div>
           )}
         </div>
       </section>

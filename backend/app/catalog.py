@@ -65,17 +65,15 @@ def _parse_chapter6_catalog(full_text: str, path: Path, digest: str) -> List[Dic
     document_version = f"SAFE_{version_match.group(1)}" if version_match else "UNKNOWN"
     marker_pattern = re.compile(r"(?m)^\s*(6(?:\.\d+){1,4})\s+(数据术语解释|数据格式|数据字典)\s*$")
     markers = list(marker_pattern.finditer(text))
-    term_markers = [match for match in markers if match.group(2) == "数据术语解释"]
+    dictionary_markers = [match for match in markers if match.group(2) == "数据字典"]
     entries: List[Dict[str, Any]] = []
-    for index, marker in enumerate(term_markers):
-        numbered_section = marker.group(1)
-        section = numbered_section.rsplit(".", 1)[0]
-        title_start, table_name = _heading_before(text, section, marker.start())
-        next_start = term_markers[index + 1].start() if index + 1 < len(term_markers) else len(text)
-        next_title_start = next_start
-        if index + 1 < len(term_markers):
-            next_section = term_markers[index + 1].group(1).rsplit(".", 1)[0]
-            next_title_start, _ = _heading_before(text, next_section, next_start)
+    for index, dictionary_marker in enumerate(dictionary_markers):
+        section = dictionary_marker.group(1).rsplit(".", 1)[0]
+        title_start, table_name = _heading_before(text, section, dictionary_marker.start())
+        next_title_start = len(text)
+        if index + 1 < len(dictionary_markers):
+            next_section = dictionary_markers[index + 1].group(1).rsplit(".", 1)[0]
+            next_title_start, _ = _heading_before(text, next_section, dictionary_markers[index + 1].start())
         section_text = text[title_start:next_title_start]
         code = _table_code(section)
         page = max(1, full_text[: chapter_start + title_start].count("\f") + 1 - 12)
@@ -87,17 +85,22 @@ def _parse_chapter6_catalog(full_text: str, path: Path, digest: str) -> List[Dic
             "reason": "",
             "spec": None,
         }
+        parse_warnings: List[str] = []
         try:
-            format_marker = f"{section}.2 数据格式"
-            dictionary_marker = f"{section}.3 数据字典"
-            terms_text = _between(section_text, marker.group(0), format_marker)
-            format_text = _between(section_text, format_marker, dictionary_marker)
-            dictionary_text = section_text.split(dictionary_marker, 1)[1]
+            local_markers = list(marker_pattern.finditer(section_text))
+            terms_marker = next((item for item in local_markers if item.group(2) == "数据术语解释"), None)
+            format_marker = next((item for item in local_markers if item.group(2) == "数据格式"), None)
+            if not format_marker:
+                raise SpecParseError(f"Cannot find data format for {section}")
+            terms_text = section_text[terms_marker.end():format_marker.start()] if terms_marker else ""
+            format_text = section_text[format_marker.end():local_markers[-1].start()]
+            dictionary_text = section_text[local_markers[-1].end():]
             fields = _parse_fields(
                 format_text,
                 dictionary_text,
                 str(page),
                 repair_layout=section == "6.1",
+                parse_warnings=parse_warnings,
             )
             spec = SpecDocument(
                 version=document_version,
@@ -114,8 +117,10 @@ def _parse_chapter6_catalog(full_text: str, path: Path, digest: str) -> List[Dic
             base.update(
                 {
                     "eligible": True,
-                    "reason": "术语、XML 格式、数据字典及字段类型均可结构化提取",
+                    "reason": "已从数据格式和数据字典提取字段；术语解释为可选内容" + (f"；存在 {len(parse_warnings)} 项解析兜底，需人工确认" if parse_warnings else ""),
                     "field_count": len(fields),
+                    "parse_warnings": parse_warnings,
+                    "human_required": bool(parse_warnings),
                     "spec": spec.model_dump(),
                     "inline_code_sets": inline_sets,
                 }
@@ -221,9 +226,11 @@ def _parse_statistical_system_catalog(full_text: str, path: Path, digest: str) -
                 "table_name": f"{raw_tcode} 表：{t_title}",
                 "section": raw_tcode,
                 "eligible": True,
-                "reason": "从调查表式与主要指标解释联合提取字段定义及内联码值",
+                "reason": "从调查表式与主要指标解释联合提取字段定义及内联码值；类型长度需人工确认",
                 "field_count": len(fields),
                 "spec": spec.model_dump(),
+                "human_required": True,
+                "parse_warnings": ["字段类型与长度由指标名称及解释关键词推断，发布前必须逐项确认"],
                 "inline_code_sets": _collect_inline_code_sets(spec),
             }
         )
@@ -298,7 +305,8 @@ def _parse_rules_or_revision_catalog(full_text: str, path: Path, digest: str) ->
                 "table_name": f"{tcode} 表（核查与修订规则提取）",
                 "section": tcode,
                 "eligible": True,
-                "reason": f"按表聚合提取 {len(fields)} 个涉及字段的核查规则与修订说明",
+                "candidate_role": "REVISION_DIFF" if "修订" in path.name else "RULE_EVIDENCE",
+                "reason": f"按表聚合提取 {len(fields)} 个涉及字段的核查规则与修订说明，仅作为规则证据，不作为完整建表结构",
                 "field_count": len(fields),
                 "spec": spec.model_dump(),
                 "inline_code_sets": _collect_inline_code_sets(spec),

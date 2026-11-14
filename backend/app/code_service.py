@@ -1,13 +1,14 @@
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .asset_models import (
     CodeSetModel,
+    CodeSetValidationModel,
     CodeValueModel,
     FieldCodeReferenceModel,
     FieldMetadataModel,
@@ -103,6 +104,26 @@ def code_set_summary(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     }
 
 
+def document_code_set_ids(session: Session, document_id: str) -> set:
+    block_ids = {
+        row.id for row in session.query(RawBlockModel.id).filter(RawBlockModel.document_id == document_id).all()
+    }
+    referenced_ids = {
+        row.code_set_id
+        for row in session.query(FieldCodeReferenceModel)
+        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+        .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+        .filter(TableMetadataModel.document_id == document_id)
+        .all()
+    }
+    sourced_ids = {
+        value.code_set_id
+        for value in session.query(CodeValueModel).all()
+        if value.source_locator.get("block_id") in block_ids
+    }
+    return referenced_ids | sourced_ids
+
+
 def refresh_reference_status(session: Session, code_set_id: str) -> None:
     session.flush()
     has_values = session.query(CodeValueModel).filter(
@@ -120,7 +141,7 @@ def _find_matching_code_set(
     reference_text: str,
     by_name: Optional[Dict[str, CodeSetModel]] = None,
     by_code: Optional[Dict[str, CodeSetModel]] = None,
-    by_norm: Optional[Dict[str, CodeSetModel]] = None,
+    by_norm: Optional[Dict[str, Optional[CodeSetModel]]] = None,
 ) -> Optional[CodeSetModel]:
     if by_name is not None and reference_text in by_name:
         return by_name[reference_text]
@@ -128,12 +149,7 @@ def _find_matching_code_set(
         return by_code[reference_text.upper()]
     norm_target = normalize_code_set_name(reference_text)
     if by_norm is not None and norm_target:
-        if norm_target in by_norm:
-            return by_norm[norm_target]
-        for k, cs in by_norm.items():
-            if len(norm_target) >= 3 and len(k) >= 3 and (norm_target in k or k in norm_target):
-                return cs
-        return None
+        return by_norm.get(norm_target)
 
     exact = session.query(CodeSetModel).filter(CodeSetModel.name == reference_text).first()
     if exact:
@@ -144,8 +160,7 @@ def _find_matching_code_set(
     if not norm_target:
         return None
     for cs in session.query(CodeSetModel).all():
-        nk = normalize_code_set_name(cs.name)
-        if nk == norm_target or (len(norm_target) >= 3 and len(nk) >= 3 and (norm_target in nk or nk in norm_target)):
+        if normalize_code_set_name(cs.name) == norm_target:
             return cs
     return None
 
@@ -155,7 +170,7 @@ def ensure_field_reference(
     field: FieldMetadataModel,
     by_name: Optional[Dict[str, CodeSetModel]] = None,
     by_code: Optional[Dict[str, CodeSetModel]] = None,
-    by_norm: Optional[Dict[str, CodeSetModel]] = None,
+    by_norm: Optional[Dict[str, Optional[CodeSetModel]]] = None,
     sets_with_values: Optional[set] = None,
     existing_ref_by_field: Optional[Dict[str, FieldCodeReferenceModel]] = None,
 ) -> None:
@@ -234,15 +249,17 @@ def auto_link_all_references(session: Session) -> int:
     }
     by_name: Dict[str, CodeSetModel] = {}
     by_code: Dict[str, CodeSetModel] = {}
-    by_norm: Dict[str, CodeSetModel] = {}
+    by_norm: Dict[str, Optional[CodeSetModel]] = {}
 
-    # Sort so sets with values take priority in lookup maps
     for cs in sorted(all_sets, key=lambda x: x.id in sets_with_values):
         by_name[cs.name] = cs
         by_code[cs.code.upper()] = cs
         nk = normalize_code_set_name(cs.name)
         if nk:
-            by_norm[nk] = cs
+            if nk in by_norm and by_norm[nk] is not None and by_norm[nk].id != cs.id:
+                by_norm[nk] = None
+            else:
+                by_norm[nk] = cs
 
     existing_ref_by_field = {
         r.field_id: r for r in session.query(FieldCodeReferenceModel).all()
@@ -290,25 +307,33 @@ def _upsert_code_set_draft(
     session: Session,
     draft: CodeSetDraft,
     locator: Dict[str, Any],
-) -> CodeSetModel:
-    existing = session.query(CodeSetModel).filter(CodeSetModel.code == draft.code.upper()[:96]).first()
+) -> Tuple[CodeSetModel, bool]:
+    existing = (
+        session.query(CodeSetModel)
+        .filter(CodeSetModel.code == draft.code.upper()[:96])
+        .order_by(CodeSetModel.current_version.desc())
+        .first()
+    )
     if not existing:
         existing = session.query(CodeSetModel).filter(CodeSetModel.name == draft.name[:255]).first()
+    changed = False
     if existing:
         row = existing
-        if draft.definition and (not row.definition or row.source_type == "DOCUMENT_REFERENCE"):
+        if draft.definition and (not row.definition or row.source_type == "DOCUMENT_REFERENCE") and row.definition != draft.definition:
             row.definition = draft.definition
-        if row.source_type == "DOCUMENT_REFERENCE":
+            changed = True
+        if row.source_type == "DOCUMENT_REFERENCE" and row.source_type != draft.source_type:
             row.source_type = draft.source_type
-        row.current_version += 1
+            changed = True
     else:
+        has_errors = any(issue["severity"] == "ERROR" for issue in validate_code_set_draft(draft))
         row = CodeSetModel(
             id=str(uuid.uuid4()),
             code=draft.code.upper()[:96],
             name=draft.name[:255],
             definition=draft.definition,
             source_type=draft.source_type,
-            status="AI_SELF_VALIDATED" if draft.values else "DRAFT",
+            status="NEEDS_REVIEW" if has_errors else ("AI_SELF_VALIDATED" if draft.values else "DRAFT"),
             current_version=1,
         )
         session.add(row)
@@ -327,10 +352,13 @@ def _upsert_code_set_draft(
             cur = existing_vals[code_val]
             if item.label_cn and not cur.label_cn:
                 cur.label_cn = item.label_cn[:255]
+                changed = True
             if item.label_en and not cur.label_en:
                 cur.label_en = item.label_en[:255]
+                changed = True
             if item.definition and not cur.definition:
                 cur.definition = item.definition
+                changed = True
         else:
             new_val = CodeValueModel(
                 id=str(uuid.uuid4()),
@@ -346,10 +374,89 @@ def _upsert_code_set_draft(
             session.add(new_val)
             existing_vals[code_val] = new_val
             sort_order += 1
+            changed = True
 
-    if len(existing_vals) > 0 and row.status == "DRAFT":
-        row.status = "AI_SELF_VALIDATED"
-    return row
+    if not existing:
+        return row, True
+    has_errors = any(issue["severity"] == "ERROR" for issue in validate_code_set_draft(draft))
+    target_status = "NEEDS_REVIEW" if has_errors else ("AI_SELF_VALIDATED" if existing_vals else "DRAFT")
+    if row.status != "PUBLISHED" and row.status != target_status:
+        row.status = target_status
+        changed = True
+    if changed:
+        row.current_version += 1
+    return row, changed
+
+
+def _record_code_set_validation(
+    session: Session,
+    row: CodeSetModel,
+    draft: CodeSetDraft,
+    block: RawBlockModel,
+    settings: Settings,
+    content_changed: bool,
+) -> None:
+    program_issues = validate_code_set_draft(draft)
+    session.add(
+        CodeSetValidationModel(
+            id=str(uuid.uuid4()),
+            code_set_id=row.id,
+            validator_kind="PROGRAM",
+            status="NEEDS_REVIEW" if program_issues else "PASSED",
+            issues_json=program_issues,
+            trace_json={"value_count": len(draft.values)},
+        )
+    )
+    if row.status == "PUBLISHED":
+        return
+
+    llm = None
+    try:
+        llm = RealDesignLlm(settings)
+    except Exception:
+        pass
+
+    existing_review = session.query(CodeSetValidationModel).filter(
+        CodeSetValidationModel.code_set_id == row.id,
+        CodeSetValidationModel.validator_kind == "AI_REVIEW",
+    ).first()
+    if llm is None:
+        row.status = "NEEDS_REVIEW" if program_issues else "PROGRAM_VALIDATED"
+        return
+    if not content_changed and existing_review:
+        return
+
+    try:
+        args, trace = llm.assign(
+            "review_code_set",
+            "独立复核码值表。仅输出码值遗漏、重复、含义错配、无证据码值或定义不一致的问题；无问题返回空数组。",
+            {
+                "source_locator": block.source_locator,
+                "code_set": draft.model_dump(),
+                "raw_context": block.raw_content[:6000],
+            },
+            timeout=35,
+        )
+        issues = args.get("issues", [])
+    except Exception as exc:
+        trace = {"error": f"{type(exc).__name__}: {exc}"}
+        issues = [{
+            "severity": "WARNING",
+            "code": "AI_REVIEW_UNAVAILABLE",
+            "value": "",
+            "message": f"AI 复核不可用：{trace['error']}",
+        }]
+    session.add(
+        CodeSetValidationModel(
+            id=str(uuid.uuid4()),
+            code_set_id=row.id,
+            validator_kind="AI_REVIEW",
+            status="NEEDS_REVIEW" if issues else "PASSED",
+            issues_json=issues,
+            trace_json=trace,
+        )
+    )
+    row.status = "NEEDS_REVIEW" if program_issues or issues else "AI_SELF_VALIDATED"
 
 
 def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> List[str]:
@@ -374,7 +481,8 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                     source_type=cs_spec.get("source_type", "DOCUMENT_TABLE"),
                     values=valid_vals,
                 )
-                row = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
+                row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
+                _record_code_set_validation(session, row, draft, block, settings, changed)
                 created_ids.append(row.id)
 
         # Case 2: Block has inline_code_sets (from table fields in Chapter 6 or Statistical System Section 四)
@@ -390,7 +498,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                 source_type="INLINE_ENUM",
                 values=valid_vals,
             )
-            row = _upsert_code_set_draft(
+            row, changed = _upsert_code_set_draft(
                 session,
                 draft,
                 {
@@ -400,6 +508,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                     "page": inline_cs.get("page", ""),
                 },
             )
+            _record_code_set_validation(session, row, draft, block, settings, changed)
             created_ids.append(row.id)
 
         # Case 3: Unstructured block routed as CODE_SET without pre-extracted values -> regex + AI fallback
@@ -436,7 +545,8 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                     values=valid_vals,
                 )
             if draft.values:
-                row = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
+                row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
+                _record_code_set_validation(session, row, draft, block, settings, changed)
                 created_ids.append(row.id)
 
         if auto_link:
@@ -465,7 +575,11 @@ def extract_parallel_for_blocks(
                 b.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"}
                 or b.content_json.get("candidate_role") == "CODE_SET"
             )
-            if "metadata" in active_targets and not is_cs_only and b.block_type != "IGNORE":
+            is_rule_evidence = (
+                b.block_type in {"RULE_EVIDENCE", "REVISION_DIFF"}
+                or b.content_json.get("candidate_role") in {"RULE_EVIDENCE", "REVISION_DIFF"}
+            )
+            if "metadata" in active_targets and not is_cs_only and not is_rule_evidence and b.block_type != "IGNORE":
                 metadata_block_ids.append(bid)
             if "code_sets" in active_targets:
                 if is_cs_only or b.content_json.get("inline_code_sets") or b.content_json.get("code_set_spec"):
@@ -486,37 +600,53 @@ def extract_parallel_for_blocks(
             return extract_metadata_for_block(bid, settings, auto_link=False)
         seg_ids = analyze_block_segments(bid, settings)
         seg_tables = [extract_metadata_for_block(sid, settings, auto_link=False) for sid in seg_ids]
-        return merge_metadata_tables(SessionLocal(), bid, seg_tables) if len(seg_tables) > 1 else seg_tables[0]
+        if len(seg_tables) > 1:
+            with SessionLocal() as merge_session:
+                return merge_metadata_tables(merge_session, bid, seg_tables)
+        if seg_tables:
+            return seg_tables[0]
+        raise ValueError(f"No table metadata produced for block {bid}")
 
     def _run_code_set_one(bid: str) -> List[str]:
         return extract_code_sets_for_block(bid, settings, auto_link=False)
 
     table_ids: List[str] = []
     code_set_ids: List[str] = []
+    errors: List[Dict[str, str]] = []
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        meta_futures = [executor.submit(_run_metadata_one, bid) for bid in metadata_block_ids]
-        cs_futures = [executor.submit(_run_code_set_one, bid) for bid in code_set_block_ids]
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(metadata_block_ids)))) as executor:
+        meta_futures = {bid: executor.submit(_run_metadata_one, bid) for bid in metadata_block_ids}
 
-        for fut in meta_futures:
-            tid = fut.result()
-            if tid:
-                table_ids.append(tid)
-        for fut in cs_futures:
-            cids = fut.result()
-            for cid in cids:
-                if cid not in code_set_ids:
-                    code_set_ids.append(cid)
+        for bid in code_set_block_ids:
+            try:
+                for cid in _run_code_set_one(bid):
+                    if cid not in code_set_ids:
+                        code_set_ids.append(cid)
+            except Exception as exc:
+                errors.append({"block_id": bid, "track": "code_sets", "error": f"{type(exc).__name__}: {exc}"})
+
+        for bid, future in meta_futures.items():
+            try:
+                table_id = future.result()
+                if table_id:
+                    table_ids.append(table_id)
+            except Exception as exc:
+                errors.append({"block_id": bid, "track": "metadata", "error": f"{type(exc).__name__}: {exc}"})
 
     with SessionLocal() as session:
         resolved_count = auto_link_all_references(session)
         session.commit()
 
+    produced_count = len(table_ids) + len(code_set_ids)
+    status = "PARALLEL_EXTRACTION_COMPLETE"
+    if errors:
+        status = "PARALLEL_EXTRACTION_PARTIAL" if produced_count else "PARALLEL_EXTRACTION_FAILED"
     return {
         "table_ids": table_ids,
         "code_set_ids": code_set_ids,
         "resolved_reference_count": resolved_count,
-        "status": "PARALLEL_EXTRACTION_COMPLETE",
+        "errors": errors,
+        "status": status,
     }
 
 

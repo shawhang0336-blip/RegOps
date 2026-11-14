@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from .config import Settings
 from .db import SessionLocal
-from .extractors import extract_document
+from .extractors import extract_document, survey_document
 from .generic_ai import RealDesignLlm
 
 
@@ -66,6 +66,16 @@ def _default_plan(block: RawBlockModel) -> Dict[str, Any]:
             "warnings": [],
             "split_markers": [],
         }
+    if block.block_type in {"RULE_EVIDENCE", "REVISION_DIFF"}:
+        return {
+            "source_block_ids": [block.id],
+            "role": block.block_type,
+            "title": block.content_json.get("table_name") or block.source_locator.get("section", "规则证据"),
+            "column_mapping": {},
+            "human_required": False,
+            "warnings": ["该块仅作为规则或版本差异证据，不得单独生成完整建表 DDL"],
+            "split_markers": [],
+        }
     return {
         "source_block_ids": [block.id],
         "role": "TABLE_METADATA",
@@ -78,8 +88,8 @@ def _default_plan(block: RawBlockModel) -> Dict[str, Any]:
             "data_type": "data_type",
             "length": "length",
         },
-        "human_required": False,
-        "warnings": [],
+        "human_required": bool(block.content_json.get("human_required")),
+        "warnings": list(block.content_json.get("parse_warnings") or []),
         "split_markers": [],
     }
 
@@ -159,11 +169,82 @@ def _apply_plan(session: Session, document: SourceDocumentModel, blocks: List[Ra
     )
 
 
-def reextract_document_blocks(document_id: str, settings: Settings) -> int:
+def latest_document_architecture(session, document_id: str, statuses=None):
+    query = session.query(DocumentArchitectureModel.id, DocumentArchitectureModel.created_at).filter(
+        DocumentArchitectureModel.document_id == document_id
+    )
+    if statuses:
+        query = query.filter(DocumentArchitectureModel.status.in_(statuses))
+    rows = query.all()
+    if not rows:
+        return None
+    latest_id = max(rows, key=lambda row: (row.created_at, row.id)).id
+    return session.get(DocumentArchitectureModel, latest_id)
+
+
+def inspect_document_overview(document_id: str, settings: Settings, force: bool = False) -> str:
     with SessionLocal() as session:
         document = session.get(SourceDocumentModel, document_id)
         if not document:
             raise ValueError("Document not found")
+        latest = latest_document_architecture(
+            session,
+            document_id,
+            statuses={"OVERVIEW_REVIEWED", "OVERVIEW_NEEDS_REVIEW", "OVERVIEW_FAILED"},
+        )
+        if latest and not force:
+            return latest.id
+
+        survey = {}
+        try:
+            source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
+            survey = survey_document(source_path, document.file_type)
+            llm = RealDesignLlm(settings)
+            result, trace = llm.assign(
+                "inspect_document_structure",
+                "在初步切块前检查整份文件的目录、章节、表格或工作表结构。判断文档类型、包含内容和适合的切块方式；只输出结构结论，不提取字段，不得虚构。",
+                {"file_name": document.file_name, "survey": survey},
+                timeout=60,
+            )
+            warnings = list(result.get("warnings") or [])
+            expected_strategy = survey["available_chunk_strategy"]
+            if result.get("chunking_strategy") not in {expected_strategy, "MANUAL_REVIEW"}:
+                warnings.append("AI 建议的切块方式与文件类型不一致，程序将使用文件类型对应的安全切块方式")
+                result["requires_human"] = True
+            result["chunking_strategy"] = expected_strategy
+            result["warnings"] = warnings
+            status = "OVERVIEW_NEEDS_REVIEW" if result.get("requires_human") else "OVERVIEW_REVIEWED"
+        except Exception as exc:
+            result = {}
+            trace = {"error": f"{type(exc).__name__}: {exc}"}
+            status = "OVERVIEW_FAILED"
+            warnings = [f"整份文件结构检查未完成：{type(exc).__name__}: {exc}"]
+
+        architecture = DocumentArchitectureModel(
+            id=str(uuid.uuid4()),
+            document_id=document.id,
+            status=status,
+            plan_json={"stage": "DOCUMENT_OVERVIEW", "survey": survey, "result": result},
+            warnings_json=warnings,
+            trace_json=trace,
+        )
+        session.add(architecture)
+        document.status = status
+        session.commit()
+        return architecture.id
+
+
+def reextract_document_blocks(document_id: str, settings: Settings) -> int:
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        retry_failed_overview = bool(document and document.status == "OVERVIEW_FAILED")
+    inspect_document_overview(document_id, settings, force=retry_failed_overview)
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if not document:
+            raise ValueError("Document not found")
+        if document.status == "OVERVIEW_FAILED":
+            raise ValueError("Document structure inspection failed; initial chunking is blocked")
         source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
         if not source_path.is_file():
             raise ValueError("Original document blob not found")

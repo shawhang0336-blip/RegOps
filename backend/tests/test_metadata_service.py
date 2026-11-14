@@ -2,9 +2,10 @@ import uuid
 
 import pytest
 
-from app.asset_models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
-from app.metadata_domain import MetadataTableDraft, validate_metadata_draft
-from app.metadata_service import metadata_to_spec, publish_table, update_field
+from app.asset_models import FieldMetadataModel, MetadataValidationModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from app.config import Settings
+from app.metadata_domain import MetadataFieldDraft, MetadataTableDraft, validate_metadata_draft
+from app.metadata_service import _deterministic_field_draft, _persist_draft, extract_metadata_for_block, metadata_to_spec, publish_table, update_field
 from .test_workflow import make_session
 
 
@@ -92,3 +93,99 @@ def test_duplicate_field_is_validation_error():
     )
     issues = validate_metadata_draft(draft)
     assert any(issue["code"] == "DUPLICATE_FIELD" for issue in issues)
+
+
+def test_identical_metadata_reextract_does_not_create_version():
+    session = make_session()
+    table, field = make_metadata(session)
+    block = session.get(RawBlockModel, table.block_id)
+    draft = MetadataTableDraft(
+        table_code=table.table_code,
+        table_name=table.table_name,
+        table_definition=table.table_definition,
+        fields=[
+            {
+                "field_cn": field.field_cn,
+                "field_en": field.field_en,
+                "field_definition": field.field_definition,
+                "check_text_raw": field.check_text_raw,
+                "data_type": field.data_type,
+                "length": field.length,
+                "decimal_places": field.decimal_places,
+                "required": field.required,
+                "code_reference_text": "",
+                "confidence": field.confidence,
+                "evidence_json": field.evidence_json,
+            }
+        ],
+    )
+    result = _persist_draft(session, block, draft, {})
+    assert result.id == table.id
+    assert result.current_version == 1
+    assert session.query(FieldMetadataModel).count() == 1
+
+
+def test_reextract_preserves_human_edited_version():
+    session = make_session()
+    table, field = make_metadata(session)
+    update_field(session, table, field, {"field_cn": "人工确认名称"}, 1, "编辑员", "确认")
+    block = session.get(RawBlockModel, table.block_id)
+    draft = MetadataTableDraft(
+        table_code=table.table_code,
+        table_name=table.table_name,
+        table_definition=table.table_definition,
+        fields=[{"field_cn": "AI 名称", "field_en": "CUSTNAME", "length": 128}],
+    )
+    result = _persist_draft(session, block, draft, {})
+    assert result.id != table.id
+    assert result.current_version == table.current_version + 1
+    assert session.get(FieldMetadataModel, field.id).field_cn == "人工确认名称"
+
+
+def test_tabular_fallback_reads_numeric_type_and_precision():
+    field = _deterministic_field_draft(
+        {"row": ["交易金额", "AMOUNT", "必填项，数值型，22.2"], "headers": ["字段中文名", "字段名", "字段校验"]},
+        "",
+        {"sheet": "字段字典"},
+        fallback_reason="ReadTimeout",
+    )
+    assert field.data_type == "NUMBER"
+    assert field.length == 22
+    assert field.decimal_places == 2
+    assert field.confidence == 0.5
+
+
+def test_metadata_requires_only_four_core_field_values():
+    number = MetadataFieldDraft(field_cn="金额", field_en="AMT", data_type="NUMBER", check_text_raw="必填")
+    text = MetadataFieldDraft(field_cn="名称", field_en="NAME", data_type="VARCHAR", check_text_raw="")
+
+    assert number.length == 22
+    assert number.field_definition == ""
+    assert number.code_reference_text == ""
+    assert text.length == 128
+
+
+def test_failed_assignment_skips_second_llm_review(monkeypatch):
+    session = make_session()
+    table, _ = make_metadata(session)
+    block = session.get(RawBlockModel, table.block_id)
+    block.content_json = {"headers": ["字段中文名", "字段名", "字段校验"], "rows": [["字段中文名", "字段名", "字段校验"], ["机构名称", "CUSTNAME", "必填"]]}
+    session.commit()
+    monkeypatch.setattr("app.metadata_service.SessionLocal", lambda: session)
+    calls = []
+
+    class UnavailableLlm:
+        def assign(self, tool_name, *args, **kwargs):
+            calls.append(tool_name)
+            raise RuntimeError("offline unavailable")
+
+    monkeypatch.setattr("app.metadata_service.RealDesignLlm", lambda settings: UnavailableLlm())
+    extract_metadata_for_block(block.id, Settings(), auto_link=False)
+
+    assert calls == ["assign_metadata"]
+    validations = session.query(MetadataValidationModel).filter(MetadataValidationModel.table_id == table.id).all()
+    program = next(item for item in validations if item.validator_kind == "PROGRAM")
+    review = next(item for item in validations if item.validator_kind == "AI_REVIEW")
+    assert len([issue for issue in program.issues_json if issue["code"] == "LOW_CONFIDENCE"]) == 1
+    assert review.issues_json[0]["code"] == "AI_REVIEW_UNAVAILABLE"
+    assert review.issues_json[0]["severity"] == "WARNING"

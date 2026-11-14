@@ -1,3 +1,4 @@
+import hashlib
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -6,6 +7,7 @@ from typing import Any, Dict, List
 from sqlalchemy.orm import Session
 
 from .asset_models import (
+    FieldCodeReferenceModel,
     FieldMetadataModel,
     MetadataRevisionModel,
     MetadataValidationModel,
@@ -18,9 +20,9 @@ from .db import SessionLocal
 from .domain import FieldSpec, SpecDocument
 from .generic_ai import RealDesignLlm
 from .metadata_domain import MetadataFieldDraft, MetadataTableDraft, require_valid_metadata, validate_metadata_draft
-from .spec_parser import extract_code_reference_from_text, extract_inline_enum_values
+from .spec_parser import _parse_type_from_entry, extract_code_reference_from_text, extract_inline_enum_values
 
-METADATA_BATCH_SIZE = 25
+METADATA_BATCH_SIZE = 10
 
 
 def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
@@ -112,9 +114,46 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
         .order_by(TableMetadataModel.current_version.desc())
         .first()
     )
-    if existing and existing.status != "PUBLISHED":
-        for f in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == existing.id).all():
-            session.delete(f)
+    if existing:
+        current_fields = (
+            session.query(FieldMetadataModel)
+            .filter(FieldMetadataModel.table_id == existing.id)
+            .order_by(FieldMetadataModel.sort_order)
+            .all()
+        )
+        field_keys = (
+            "field_cn", "field_en", "field_definition", "check_text_raw", "data_type",
+            "length", "decimal_places", "required", "code_reference_text", "confidence", "evidence_json",
+        )
+        current_values = [{key: getattr(field, key) for key in field_keys} for field in current_fields]
+        incoming_values = [field.model_dump() for field in draft.fields]
+        if (
+            existing.table_code == draft.table_code
+            and existing.table_name == draft.table_name
+            and existing.table_definition == draft.table_definition
+            and current_values == incoming_values
+        ):
+            return existing
+
+    preserve_existing = False
+    if existing:
+        preserve_existing = existing.status == "PUBLISHED" or bool(
+            session.query(MetadataRevisionModel)
+            .filter(
+                MetadataRevisionModel.table_id == existing.id,
+                MetadataRevisionModel.revision_kind.in_(["HUMAN_EDIT", "HUMAN_ADD", "HUMAN_DELETE"]),
+            )
+            .first()
+        ) or bool(
+            session.query(FieldCodeReferenceModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+            .filter(FieldMetadataModel.table_id == existing.id)
+            .first()
+        )
+
+    if existing and not preserve_existing:
+        for field in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == existing.id).all():
+            session.delete(field)
         session.flush()
         table = existing
         table.table_code = draft.table_code
@@ -176,11 +215,10 @@ def _deterministic_field_draft(
         row = [str(c or "").strip() for c in raw_field["row"]]
         headers = [str(h or "").strip() for h in raw_field.get("headers", [])]
         field_cn = row[0] if len(row) > 0 else "字段"
-        field_en = row[1] if len(row) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1]) else f"FIELD_{ abs(hash(field_cn)) % 10000 }"
+        field_en = row[1] if len(row) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1]) else f"FIELD_{hashlib.sha1(field_cn.encode('utf-8')).hexdigest()[:8].upper()}"
         check_text = row[2] if len(row) > 2 else ""
-        data_type = "VARCHAR"
-        length = 128
-        dec = 0
+        _, data_type, length, parsed_dec, _, type_warnings = _parse_type_from_entry(check_text, field_cn)
+        dec = parsed_dec or 0
         page = locator.get("table_index", locator.get("sheet", ""))
     else:
         raise ValueError("Cannot deterministically map unstructured raw_field without name or row")
@@ -203,6 +241,8 @@ def _deterministic_field_draft(
     evidence = {"page": page, "source_locator": locator, "raw_field": raw_field}
     if fallback_reason:
         evidence["fallback_reason"] = fallback_reason
+    if "row" in raw_field and type_warnings:
+        evidence["parse_warnings"] = type_warnings
 
     return MetadataFieldDraft(
         field_cn=field_cn,
@@ -214,7 +254,7 @@ def _deterministic_field_draft(
         decimal_places=max(0, dec),
         required=required,
         code_reference_text=code_ref,
-        confidence=0.95 if not fallback_reason else 0.85,
+        confidence=0.5 if fallback_reason else (0.65 if "row" in raw_field and type_warnings else 0.95),
         evidence_json=evidence,
     )
 
@@ -240,7 +280,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         except Exception:
             llm = None
 
-        # Chunk raw_fields into batches (up to 25 fields per LLM call instead of 1 call per field)
+        # Chunk raw_fields into batches (up to 10 fields per LLM call instead of 1 call per field)
         chunks = [raw_fields[i : i + METADATA_BATCH_SIZE] for i in range(0, len(raw_fields), METADATA_BATCH_SIZE)]
 
         def bind_chunk(chunk: List[Dict[str, Any]]):
@@ -254,9 +294,9 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                 try:
                     args, trace = llm.assign(
                         "assign_metadata",
-                        f"批量装配输入的 {len(chunk)} 个字段并给出表定义。字段中文名、英文名、定义、校验原文、类型、长度和码值引用必须来自证据，不得虚构。",
+                        f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。",
                         payload,
-                        timeout=45,
+                        timeout=60,
                     )
                     candidate = {
                         "table_code": fallback_code,
@@ -287,7 +327,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                 **({"fallback_from": err_msg} if err_msg else {}),
             }
 
-        with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+        with ThreadPoolExecutor(max_workers=min(2, len(chunks))) as executor:
             chunk_results = list(executor.map(bind_chunk, chunks))
 
         all_fields: List[MetadataFieldDraft] = []
@@ -299,6 +339,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                 table_definition = t_def
             batch_traces.append(tr)
 
+        assignment_fallback = bool(batch_traces) and all(trace.get("fallback_from") for trace in batch_traces)
         draft = MetadataTableDraft(
             table_code=fallback_code,
             table_name=fallback_name,
@@ -315,6 +356,15 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         }
         table = _persist_draft(session, block, draft, trace)
         program_issues = validate_metadata_draft(draft)
+        if block.content_json.get("human_required"):
+            program_issues.append(
+                {
+                    "severity": "WARNING",
+                    "code": "SOURCE_PARSE_REVIEW_REQUIRED",
+                    "field_en": "",
+                    "message": "；".join(block.content_json.get("parse_warnings") or ["来源块需要人工确认"]),
+                }
+            )
         session.add(
             MetadataValidationModel(
                 id=str(uuid.uuid4()),
@@ -328,7 +378,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
 
         # Differential Review Stage (using review_metadata tool or deterministic cross-check)
         issues: List[Dict[str, Any]] = []
-        if llm is not None:
+        if llm is not None and not assignment_fallback:
             try:
                 args, review_trace = llm.assign(
                     "review_metadata",
@@ -352,6 +402,14 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "message": f"在线 AI 复核跳过，已使用确定性规则交叉核验：{review_trace['error']}",
                     }
                 ]
+        elif assignment_fallback:
+            review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "skipped_reason": "AI_ASSIGNMENT_UNAVAILABLE"}
+            issues = [{
+                "severity": "WARNING",
+                "code": "AI_REVIEW_UNAVAILABLE",
+                "field_en": "",
+                "message": "AI 字段赋值不可用，已使用程序提取并交叉检查；无需再等待一次 AI 复核。",
+            }]
         else:
             review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "checked_fields": len(draft.fields)}
 
@@ -379,7 +437,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         )
         table.status = (
             "NEEDS_REVIEW"
-            if any(item.get("severity") == "ERROR" for item in program_issues + issues)
+            if any(item.get("severity") in {"ERROR", "WARNING"} for item in program_issues + issues)
             else "AI_SELF_VALIDATED"
         )
         if auto_link:

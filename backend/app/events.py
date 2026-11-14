@@ -23,6 +23,14 @@ def apply(run: RunModel, kind: str, payload: Dict[str, Any]) -> None:
     elif kind == "HUMAN_DECISIONS_RECORDED":
         run.status = "READY_TO_AUDIT" if payload.get("all_decided") else "WAITING_APPROVAL"
         run.current_node = "build_audit" if payload.get("all_decided") else "human_gate"
+    elif kind == "ORACLE_ASSETS_PREPARED":
+        run.result_json = payload.get("result")
+    elif kind == "TEST_CONFIRMATION_REQUIRED":
+        run.status = "WAITING_TEST_APPROVAL"
+        run.current_node = "test_confirmation"
+    elif kind == "TEST_RESULTS_CONFIRMED":
+        run.status = "COMPLETED"
+        run.current_node = "export"
     elif kind == "AUDIT_STARTED":
         run.status = "AUDITING"
         run.current_node = "sandbox_audit"

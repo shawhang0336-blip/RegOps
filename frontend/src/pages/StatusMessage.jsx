@@ -18,7 +18,7 @@ export default function StatusMessage({ error, notice, onClose }) {
       {notice && (
         <div className="message notice">
           <div className="message-content">
-            <span className="message-tag">执行反馈</span>
+            <span className="message-tag">已完成</span>
             <span>{notice}</span>
           </div>
           {onClose && (

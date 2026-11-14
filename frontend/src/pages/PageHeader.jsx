@@ -1,7 +1,7 @@
 import { useOperator } from '../context/OperatorContext.jsx'
 
 export default function PageHeader({
-  eyebrow = 'REGOPS · 监管数据与规则工程工作台',
+  eyebrow = '',
   title,
   description,
   actions,
@@ -12,7 +12,7 @@ export default function PageHeader({
   return (
     <header className="topbar">
       <div className="topbar-title-group">
-        <p className="eyebrow">{eyebrow}</p>
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
         <h1>{title}</h1>
         {description && <p className="subtitle">{description}</p>}
       </div>
@@ -21,19 +21,15 @@ export default function PageHeader({
           type="button"
           className="theme-toggle-btn"
           onClick={toggleTheme}
-          title="切换深色/浅色外观模式（快捷键 Alt + D）"
+          title="切换深色/浅色外观模式"
         >
-          <span className="theme-icon" aria-hidden="true">
-            {theme === 'dark' ? '☀️' : '🌙'}
-          </span>
-          <span>{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
-          <kbd className="kbd-hint">Alt+D</kbd>
+          <span>{theme === 'dark' ? '切换浅色' : '切换深色'}</span>
         </button>
 
         {!hideOperator && (
-          <label className="operator-pill" title="操作人/审批人身份会在全站各步骤自动复用并保存在浏览器本地">
+          <label className="operator-pill" title="用于保存修改和确认规则，会在本机自动记住">
             <span className="operator-dot" />
-            <span className="operator-label">当前操作/审批人</span>
+            <span className="operator-label">操作人</span>
             <input
               value={operator}
               onChange={(e) => setOperator(e.target.value)}

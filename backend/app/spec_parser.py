@@ -281,8 +281,9 @@ def _parse_fields_strict(
     return fields
 
 
-def _parse_type_from_entry(entry: str, xml_label: str) -> Tuple[str, str, int, Optional[int], str]:
-    """Extract (content, data_type, length, decimal_places, check_text) from a compact dictionary entry."""
+def _parse_type_from_entry(entry: str, xml_label: str) -> Tuple[str, str, int, Optional[int], str, List[str]]:
+    """Extract field properties and non-fatal parsing warnings from a dictionary entry."""
+    warnings: List[str] = []
     # Remove any residual wrapped suffix of field_en at start of entry (e.g. "T签约金额..." or "PE操作类型...")
     cleaned = re.sub(r"^[A-Za-z0-9_]{1,8}(?=[\u4e00-\u9fa5])", "", entry)
 
@@ -309,30 +310,38 @@ def _parse_type_from_entry(entry: str, xml_label: str) -> Tuple[str, str, int, O
             elif kind == "整数型":
                 length = 10
                 decimal_places = 0
+                warnings.append("整数型未提供长度，暂按 NUMBER(10,0) 处理")
             else:
                 len_m = re.search(r"([1-9]\d*)\.(\d+)", check_text)
                 length = int(len_m.group(1)) if len_m else 22
                 decimal_places = int(len_m.group(2)) if len_m else 2
+                warnings.append("数值型未提供明确精度，需人工确认长度与小数位")
             if decimal_places is not None and decimal_places > length:
                 length, decimal_places = 22, min(decimal_places, 8)
         elif kind in {"日期型"}:
             data_type = "VARCHAR"
             length = int(raw_len) if raw_len else 8
             decimal_places = None
+            if not raw_len:
+                warnings.append("日期型未提供长度，暂按 VARCHAR(8) 处理")
         elif kind in {"时间型", "日期时间型"}:
             data_type = "VARCHAR"
             length = int(raw_len) if raw_len else 19
             decimal_places = None
+            if not raw_len:
+                warnings.append("时间类型未提供长度，暂按 VARCHAR(19) 处理")
         else:
             data_type = "VARCHAR"
             length = int(raw_len) if raw_len else 128
             decimal_places = None
-        return content or xml_label or "字段", data_type, max(1, length), decimal_places, check_text
+            if not raw_len:
+                warnings.append("字符类型未提供长度，暂按 VARCHAR(128) 处理")
+        return content or xml_label or "字段", data_type, max(1, length), decimal_places, check_text, warnings
 
-    return xml_label or "字段", "VARCHAR", 128, None, cleaned.strip("，,。 ")
+    return xml_label or "字段", "VARCHAR", 128, None, cleaned.strip("，,。 "), ["未识别字段类型，暂按 VARCHAR(128) 处理"]
 
 
-def _parse_non_xml_dictionary(dictionary_text: str, evidence_page: str) -> List[FieldSpec]:
+def _parse_non_xml_dictionary(dictionary_text: str, evidence_page: str, parse_warnings: Optional[List[str]] = None) -> List[FieldSpec]:
     cleaned = re.sub(
         r"国家外汇管理局金融机构外汇业务数据采集规范（V1\.[0-9]）",
         "",
@@ -356,7 +365,16 @@ def _parse_non_xml_dictionary(dictionary_text: str, evidence_page: str) -> List[
         tail_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(cleaned)
         check_raw = re.sub(r"\s+", "", cleaned[tail_start:tail_end])
         check_raw = re.sub(r"\d{1,3}内容类型（长度）校验", "", check_raw)
-        en_name = NON_XML_FIELD_CODE_MAP.get(cn_name, f"FIELD_{idx + 1:02d}")
+        en_name = NON_XML_FIELD_CODE_MAP.get(cn_name, "")
+        if not en_name and len(cn_name) >= 6:
+            prefix_matches = [(full_name, code) for full_name, code in NON_XML_FIELD_CODE_MAP.items() if full_name.startswith(cn_name)]
+            unused_matches = [item for item in prefix_matches if item[1] not in seen_names]
+            if unused_matches:
+                cn_name, en_name = unused_matches[0]
+                if len(prefix_matches) > 1 and parse_warnings is not None:
+                    parse_warnings.append(f"{cn_name}：多个字段共享截断前缀，已按文档顺序暂映射为 {en_name}")
+        if not en_name:
+            en_name = f"FIELD_{idx + 1:02d}"
         if en_name in seen_names:
             en_name = f"{en_name}_{idx + 1}"
         seen_names.add(en_name)
@@ -378,6 +396,7 @@ def _parse_fields_flexible(
     format_text: str,
     dictionary_text: str,
     evidence_page: str,
+    parse_warnings: Optional[List[str]] = None,
 ) -> List[FieldSpec]:
     # Extract leaf XML tags: <TAG>中文描述</TAG> (ignoring container tags like <PROJECTS>, <INVESTS>, <BeneficiaryS>)
     leaf_matches = re.findall(
@@ -385,7 +404,14 @@ def _parse_fields_flexible(
         format_text,
     )
     if not leaf_matches:
-        return _parse_non_xml_dictionary(dictionary_text, evidence_page)
+        fields = _parse_non_xml_dictionary(dictionary_text, evidence_page, parse_warnings)
+        if parse_warnings is not None:
+            parse_warnings.extend(
+                f"{field.content}：未提供字段英文名，暂使用 {field.name}"
+                for field in fields
+                if re.fullmatch(r"FIELD_\d+(?:_\d+)?", field.name)
+            )
+        return fields
 
     xml_items: List[Tuple[str, str]] = []
     seen = set()
@@ -453,6 +479,8 @@ def _parse_fields_flexible(
     fields: List[FieldSpec] = []
     for name, xml_label, start_pos, _ in matched_positions:
         if start_pos < 0:
+            if parse_warnings is not None:
+                parse_warnings.append(f"{name}：XML 中存在，但未在数据字典中定位到字段定义")
             fields.append(
                 FieldSpec(
                     name=name,
@@ -466,7 +494,9 @@ def _parse_fields_flexible(
             )
             continue
         raw_entry = entry_by_name.get(name, "")
-        content, data_type, length, dec, check_text = _parse_type_from_entry(raw_entry, xml_label)
+        content, data_type, length, dec, check_text, field_warnings = _parse_type_from_entry(raw_entry, xml_label)
+        if parse_warnings is not None:
+            parse_warnings.extend(f"{name}：{warning}" for warning in field_warnings)
         fields.append(
             FieldSpec(
                 name=name,
@@ -487,13 +517,14 @@ def _parse_fields(
     evidence_page: str,
     expected_fields: int = 0,
     repair_layout: bool = True,
+    parse_warnings: Optional[List[str]] = None,
 ) -> List[FieldSpec]:
     try:
         return _parse_fields_strict(format_text, dictionary_text, evidence_page, expected_fields, repair_layout)
     except SpecParseError:
         if expected_fields or repair_layout:
             raise
-        return _parse_fields_flexible(format_text, dictionary_text, evidence_page)
+        return _parse_fields_flexible(format_text, dictionary_text, evidence_page, parse_warnings)
 
 
 def _parse_location(

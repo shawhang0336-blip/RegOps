@@ -7,8 +7,8 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..asset_models import CodeSetModel, CodeValueModel, FieldCodeReferenceModel, RawBlockModel
-from ..code_service import auto_link_all_references, code_set_summary, extract_parallel_for_blocks, refresh_reference_status
+from ..asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel, RawBlockModel, TableMetadataModel
+from ..code_service import auto_link_all_references, code_set_summary, document_code_set_ids, extract_parallel_for_blocks, refresh_reference_status
 from ..config import get_settings
 from ..db import SessionLocal
 from ..structure_service import analyze_document_structure
@@ -42,8 +42,25 @@ class CodeValueRequest(BaseModel):
 
 def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     values = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).order_by(CodeValueModel.sort_order, CodeValueModel.value).all()
+    validations = (
+        session.query(CodeSetValidationModel)
+        .filter(CodeSetValidationModel.code_set_id == row.id)
+        .order_by(CodeSetValidationModel.created_at.desc())
+        .limit(20)
+        .all()
+    )
     return {
         **code_set_summary(session, row),
+        "validations": [
+            {
+                "validator_kind": validation.validator_kind,
+                "status": validation.status,
+                "issues": validation.issues_json,
+                "trace": validation.trace_json,
+                "created_at": validation.created_at.isoformat(),
+            }
+            for validation in validations
+        ],
         "values": [
             {
                 "id": value.id,
@@ -61,9 +78,13 @@ def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
 
 
 @router.get("")
-def list_code_sets() -> List[Dict[str, Any]]:
+def list_code_sets(document_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
-        rows = session.query(CodeSetModel).order_by(CodeSetModel.updated_at.desc()).all()
+        query = session.query(CodeSetModel)
+        if document_id:
+            ids = document_code_set_ids(session, document_id)
+            query = query.filter(CodeSetModel.id.in_(ids))
+        rows = query.order_by(CodeSetModel.updated_at.desc()).all()
         return [code_set_summary(session, row) for row in rows]
 
 
@@ -135,13 +156,22 @@ async def upload_code_set_document(
         "code_set_count": len(extracted_sets),
         "total_value_count": total_values,
         "resolved_reference_count": result["resolved_reference_count"],
+        "errors": result["errors"],
+        "status": result["status"],
     }
 
 
 @router.get("/references/unresolved")
-def unresolved_references() -> List[Dict[str, Any]]:
+def unresolved_references(document_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
-        rows = session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.status == "UNRESOLVED").all()
+        query = session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.status == "UNRESOLVED")
+        if document_id:
+            query = (
+                query.join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+                .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+                .filter(TableMetadataModel.document_id == document_id)
+            )
+        rows = query.all()
         return [
             {
                 "id": row.id,

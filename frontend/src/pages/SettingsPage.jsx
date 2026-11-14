@@ -6,16 +6,16 @@ import { StatusBadge } from './SharedUI.jsx'
 
 const SERVICE_META = {
   mysql: {
-    title: 'MySQL 元数据与事件库',
-    desc: '存储规范原始块、表级元数据、码值字典与不可变事件因果账本',
+    title: 'MySQL 管理数据库',
+    desc: '保存规范内容、报表字段、码值和操作记录',
   },
   oracle: {
-    title: 'Oracle 独立审计沙箱',
-    desc: '执行双表物理建表、合成数据装载与确定性校验 SQL 审计',
+    title: 'Oracle 验证数据库',
+    desc: '实际建表、写入测试数据并执行校验规则',
   },
   llm: {
-    title: 'GLM 结构化赋值服务',
-    desc: '驱动元数据提取、交叉复核、RuleIR 算子赋值与变异样本规划',
+    title: 'AI 服务',
+    desc: '帮助识别字段、复核内容并生成规则参数',
   },
 }
 
@@ -26,19 +26,19 @@ const BUDGET_META = {
     unit: '条 / 表',
   },
   max_cases_per_table: {
-    label: '单表沙箱用例上限',
-    desc: '黄金正向样本与变异负样本的合成总行数上限',
+    label: '每张报表的测试数据上限',
+    desc: '正常与异常测试数据的总行数上限',
     unit: '行 / 表',
   },
   max_retries: {
-    label: '最大自愈回边次数',
-    desc: '沙箱审计发现误报/漏报时允许 AI 自动修正的最大轮数',
+    label: '失败后的自动修正次数',
+    desc: '验证发现误拦截或漏拦截时，允许自动修正的最大轮数',
     unit: '轮',
   },
   max_llm_concurrency: {
-    label: '模型最大并发度',
-    desc: '单阶段扇出调用 GLM 接口的最大并发工作线程数',
-    unit: '并发',
+    label: 'AI 同时处理任务数',
+    desc: '同一阶段允许并行处理的 AI 任务数量',
+    unit: '个',
   },
 }
 
@@ -123,9 +123,9 @@ export default function SettingsPage() {
   return (
     <>
       <PageHeader
-        eyebrow="SYSTEM · 基础设施连通性与确定性预算围栏"
-        title="系统与执行预算设置"
-        description="管理元数据库、Oracle 沙箱与大模型连接状态（敏感密钥仅驻留服务端环境变量），配置防失控的确定性执行预算。"
+        eyebrow="运行环境"
+        title="系统设置"
+        description="检查数据库和 AI 服务连接，并设置单次生成的数量上限。"
       />
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
@@ -192,8 +192,8 @@ export default function SettingsPage() {
       <section className="panel budget-panel">
         <div className="panel-heading">
           <div>
-            <h2>确定性执行预算围栏 (Execution Budget)</h2>
-            <p>AI 可以根据表复杂度自主规划规则与样本数量，但程序内核会强制拦截任何超出以下硬上限的赋值请求。</p>
+            <h2>生成数量上限</h2>
+            <p>AI 可以按报表复杂度决定具体数量，但不会超过这里设置的上限。</p>
           </div>
           <button type="button" className="button primary" onClick={saveBudget}>
             保存预算配置

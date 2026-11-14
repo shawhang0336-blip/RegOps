@@ -22,7 +22,7 @@ from .catalog import parse_document_catalog
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .events import fold_events
-from .generic_workflow import approve_generic_rules, retry_generic_run, start_generic_run
+from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
 from .llm import LlmConfigurationError
 from .models import EventModel, RuleModel, RunModel, SpecificationModel
 from .oracle_sandbox import OracleSandbox
@@ -71,6 +71,10 @@ class RunRequest(BaseModel):
 
 class ConfirmationRequest(BaseModel):
     table_codes: List[str]
+    approver: str = Field(min_length=1, max_length=80)
+
+
+class TestConfirmationRequest(BaseModel):
     approver: str = Field(min_length=1, max_length=80)
 
 
@@ -337,6 +341,19 @@ def approve_run(run_id: str, request: ApprovalRequest, session: Session = Depend
             {decision.rule_hash: decision.decision for decision in request.decisions},
             settings,
         )
+    except WorkflowError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return run_view(session, run)
+
+
+@app.post("/api/runs/{run_id}/test-confirmation")
+def confirm_test_results(run_id: str, request: TestConfirmationRequest, session: Session = Depends(db_session)) -> Dict:
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        run = confirm_generic_test_results(session, run, request.approver.strip())
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc

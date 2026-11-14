@@ -4,9 +4,9 @@ import { v2 } from '../api.js'
 import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
-import { SourceLocatorTag, StatusBadge } from './SharedUI.jsx'
+import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeverity } from './SharedUI.jsx'
 
-export default function CodeSetsPage() {
+export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   const [params] = useSearchParams()
   const { requireOperator } = useOperator()
 
@@ -24,9 +24,16 @@ export default function CodeSetsPage() {
   const [notice, setNotice] = useState('')
 
   async function load(preferredId) {
+    const documentId = params.get('document_id')
+    const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
+    if (embedded && !documentId) {
+      setSets([])
+      setDetail(null)
+      return
+    }
     const [setList, unresolvedList] = await Promise.all([
-      v2('/code-sets'),
-      v2('/code-sets/references/unresolved').catch(() => []),
+      v2(`/code-sets${scopeQuery}`),
+      v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
     ])
     setSets(setList)
     setUnresolved(unresolvedList)
@@ -37,15 +44,17 @@ export default function CodeSetsPage() {
       ? setList.find((s) => s.name === paramName || s.code === paramName.toUpperCase())?.id
       : null
 
-    const targetId = preferredId || paramSetId || matchedByName || detail?.id || setList[0]?.id
+    const currentId = detail?.id
+    const targetId = preferredId || (setList.some((set) => set.id === paramSetId) ? paramSetId : null) || matchedByName || (setList.some((set) => set.id === currentId) ? currentId : null) || setList[0]?.id
     if (targetId) {
       await select(targetId)
     }
   }
 
   useEffect(() => {
+    setDetail(null)
     load().catch((err) => setError(err.message))
-  }, [])
+  }, [params.get('document_id')])
 
   async function select(id) {
     const data = await v2(`/code-sets/${id}`)
@@ -63,9 +72,13 @@ export default function CodeSetsPage() {
       const result = await v2('/code-sets/upload-file', { method: 'POST', body: form })
       const firstId = result.code_set_ids?.[0]
       await load(firstId)
+      if (onDocumentChange && result.document_id) onDocumentChange(result.document_id)
       setNotice(
-        `已按文档解析流水线从「${result.file_name}」并行提取 ${result.code_set_count} 张码值字典（共 ${result.total_value_count} 项码值），自动绑定消解 ${result.resolved_reference_count} 处字段码值引用。`
+        `已从「${result.file_name}」提取 ${result.code_set_count} 张码值字典（共 ${result.total_value_count} 项码值）；全库已绑定 ${result.resolved_reference_count} 处字段码值引用。`
       )
+      if (result.errors?.length) {
+        setError(`${result.errors.length} 个码值块未完成：${result.errors[0].error}`)
+      }
     } catch (err) {
       setError(err.message)
     } finally {
@@ -231,61 +244,39 @@ export default function CodeSetsPage() {
 
   return (
     <>
-      <PageHeader
-        eyebrow="STAGE 03 · 码值文档解析、公共字典与未决引用消解"
-        title="公共码值中心"
-        description="采用与规范文件中心同构的「文件切块 → 结构预检 → 并行提取」流水线，支持直接上传 PDF/DOCX/XLSX 批量解析公共代码表、制度附录及字段内联枚举。"
-        actions={
-          <div className="actions">
-            <label className="check-label" style={{ paddingTop: 0 }}>
-              <input
-                type="checkbox"
-                checked={includeInline}
-                onChange={(e) => setIncludeInline(e.target.checked)}
-              />
-              同步提取表内字段枚举
-            </label>
-            <label className="button primary">
-              {busy ? '正在解析码值文档...' : '+ 上传文件解析码值 (.pdf/.docx/.xlsx)'}
-              <input
-                className="file-input"
-                type="file"
-                accept=".pdf,.docx,.xlsx"
-                disabled={busy}
-                onChange={onDocInputChange}
-              />
-            </label>
-          </div>
-        }
-      />
+      {!embedded && <PageHeader
+        eyebrow="第 1 步 · 共 3 步"
+        title="维护码值"
+        description="检查字段可使用的取值，补充缺失内容并发布；已就绪的码值才能用于生成和验证。"
+      />}
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
-      <label
+      <div
         className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
         onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
       >
         <div className="upload-dropzone-text">
-          <strong>拖拽码值文件或监管规范文档到此处，按文档流水线批量解析码值字典</strong>
-          <span>支持：监管规范 PDF（第九章代码表/内联枚举）、统计制度 PDF（附录一～九代码表）、Word/Excel 多表码值文件，提取后自动与表元数据字段引用对齐消解</span>
+          <strong>上传码值文件，系统会自动识别并关联字段</strong>
+          <span>支持 PDF、Word、Excel；也可以上传完整规范，只提取其中的码值表</span>
         </div>
-        <span className="button secondary">选择码值文件</span>
-        <input
-          className="file-input"
-          type="file"
-          accept=".pdf,.docx,.xlsx"
-          disabled={busy}
-          onChange={onDocInputChange}
-        />
+        <label className="button primary">
+          {busy ? '正在识别...' : '选择码值文件'}
+          <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onDocInputChange} />
+        </label>
+      </div>
+      <label className="inline-option code-upload-option">
+        <input type="checkbox" checked={includeInline} onChange={(e) => setIncludeInline(e.target.checked)} />
+        同时提取字段说明中列出的取值
       </label>
 
       {unresolved.length > 0 && (
         <div className="unresolved-banner">
           <div className="unresolved-banner-header">
-            <strong>发现 {unresolved.length} 处未解决的字段码值引用（可上传对应码值文档自动消解，或点击下方标签手动补充）</strong>
-            <StatusBadge status="UNRESOLVED">{unresolved.length} 项待消解</StatusBadge>
+            <strong>还有 {unresolved.length} 项码值需要补充</strong>
+            <StatusBadge status="UNRESOLVED">{unresolved.length} 项待处理</StatusBadge>
           </div>
           <div className="unresolved-chips">
             {unresolved.map((item) => (
@@ -296,7 +287,7 @@ export default function CodeSetsPage() {
                 onClick={() => select(item.code_set_id)}
               >
                 <strong>{item.reference_text}</strong>
-                <span className="muted-text">点击维护此码值表 →</span>
+                <span className="muted-text">去补充 →</span>
               </button>
             ))}
           </div>
@@ -339,17 +330,15 @@ export default function CodeSetsPage() {
                     <code>{set.code}</code> · 启用 {set.enabled_value_count ?? set.value_count}/{set.value_count} 项
                   </span>
                   {set.unresolved_reference_count > 0 ? (
-                    <em className="danger-text">
-                      关联 {set.unresolved_reference_count} 个未决字段引用
-                    </em>
+                    <em className="danger-text">还有 {set.unresolved_reference_count} 个字段待关联</em>
                   ) : (
-                    <em>版本 v{set.current_version} · {set.source_type}</em>
+                    <em>{set.published_version ? `已发布 v${set.published_version}` : '尚未发布'} · {set.value_count} 项取值</em>
                   )}
                 </button>
               ))}
             </div>
           ) : (
-            <div className="empty">暂无匹配码值表，可在上方上传文件解析或下方手动新建。</div>
+            <div className="empty">当前文件没有已识别的码表，可点击上方“解析当前文件”，或上传码值文件。</div>
           )}
 
           <details className="inline-form" open={!sets.length}>
@@ -384,7 +373,7 @@ export default function CodeSetsPage() {
                     <h2>{detail.name}</h2>
                     <code>{detail.code}</code>
                     <StatusBadge status={detail.status} />
-                    <StatusBadge status={detail.source_type} />
+                    <StatusBadge status={detail.source_type}>{detail.source_type === 'MANUAL' ? '人工维护' : '文档识别'}</StatusBadge>
                   </div>
                   <p>
                     {detail.definition || '暂无字典定义'} · 当前版本 v{detail.current_version}
@@ -399,7 +388,7 @@ export default function CodeSetsPage() {
                     onChange={(e) => setFilterText(e.target.value)}
                   />
                   <label className="button secondary">
-                    单表追加 Excel (.xlsx)
+                    追加 Excel 取值
                     <input
                       className="file-input"
                       type="file"
@@ -409,10 +398,31 @@ export default function CodeSetsPage() {
                     />
                   </label>
                   <button type="button" className="button primary" disabled={busy} onClick={publish}>
-                    发布码值版本 (v{detail.current_version})
+                    发布此码值表
                   </button>
                 </div>
               </div>
+
+              {detail.validations?.length > 0 && (
+                <details className="technical-details">
+                  <summary>查看自动检查结果</summary>
+                <div className="architecture-result">
+                  <div className="architecture-summary">
+                    <strong>程序检查与 AI 独立复核</strong>
+                    {detail.validations.slice(0, 4).map((validation, index) => (
+                      <StatusBadge key={`${validation.validator_kind}-${validation.created_at}-${index}`} tone={validation.status === 'PASSED' ? 'green' : 'amber'}>
+                        {validation.validator_kind === 'AI_REVIEW' ? 'AI 复核' : '程序检查'} · {validation.status === 'PASSED' ? '通过' : '需核对'} · {validation.issues?.length || 0} 项
+                      </StatusBadge>
+                    ))}
+                  </div>
+                  {detail.validations.slice(0, 4).flatMap((validation) => validation.issues || []).slice(0, 8).map((issue, index) => (
+                    <p className="architecture-warning" key={`${issue.code}-${index}`}>
+                      {issueSeverity(issue) === 'ERROR' ? '错误' : '提示'} / {ISSUE_LABELS[issue.code] || issue.code}{issue.value ? ` / ${issue.value}` : ''}：{friendlyError(issue.message || '请对照原文确认该码值。')}
+                    </p>
+                  ))}
+                </div>
+                </details>
+              )}
 
               <div className="add-value-form">
                 <input
@@ -491,7 +501,7 @@ export default function CodeSetsPage() {
               )}
             </>
           ) : (
-            <div className="empty">请从左侧选择一张码值字典表，或直接在上方拖拽上传文件自动解析码值。</div>
+            <div className="empty">当前文件还没有可查看的码值。</div>
           )}
         </div>
       </section>

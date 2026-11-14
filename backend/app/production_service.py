@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from .asset_models import ArtifactModel
 from .blobs import LocalBlobStore
+from .code_set_oracle import compile_code_set_oracle_ddl, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
 from .domain import RuleDefinition, canonical_json
 from .generic_domain import SchemaBinding
 from .generic_workflow import _latest_payload, _specs
@@ -31,6 +32,19 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
     }
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
+    expected_versions = run.result_json["audit_summary"].get("code_set_versions", {})
+    code_sets, _ = load_published_code_sets(session, specs, expected_versions=expected_versions)
+    if code_sets and "code_set_versions" not in run.result_json["audit_summary"]:
+        raise WorkflowError("This run predates code set auditing; rerun the Oracle audit before production export")
+    code_set_tables = {item["code"]: stable_code_set_table(item["code"]) for item in code_sets}
+    oracle_code_sets = []
+    for code_set in code_sets:
+        table = code_set_tables[code_set["code"]]
+        data_sql = compile_code_set_oracle_merge(code_set, table)
+        oracle_code_sets.append(
+            f"-- {code_set['code']} | {code_set['name']} | audited version {code_set['version']}\n"
+            f"{compile_code_set_oracle_ddl(table)};\n{data_sql}" + (";" if data_sql else "")
+        )
     oracle_ddl = "\n\n".join(compile_production_oracle_ddl(spec.table_code, schemas[spec.table_code]) + ";" for spec in specs)
     mysql_ddl = "\n\n".join(compile_production_mysql_ddl(spec.table_code, schemas[spec.table_code]) + ";" for spec in specs)
     oracle_rules = []
@@ -56,6 +70,16 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
             for spec in specs
         ],
         "rule_count": len(rules),
+        "code_sets": [
+            {
+                "code": item["code"],
+                "name": item["name"],
+                "version": item["version"],
+                "table": code_set_tables[item["code"]],
+                "value_count": len(item["values"]),
+            }
+            for item in code_sets
+        ],
         "contains_test_data": False,
         "uses_run_specific_tables": False,
         "contains_synthetic_record_id": False,
@@ -63,13 +87,15 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
             "Backup target schemas",
             "Review manifest.json and rules.json",
             "Run oracle/01_create_tables.sql or mysql/01_create_tables.sql as appropriate",
-            "Run oracle/02_validation_rules.sql in report mode",
+            "Run oracle/02_code_sets.sql to create and merge the audited code set versions",
+            "Run oracle/03_validation_rules.sql in report mode",
         ],
     }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("oracle/01_create_tables.sql", oracle_ddl + "\n")
-        archive.writestr("oracle/02_validation_rules.sql", "\n\n".join(oracle_rules) + "\n")
+        archive.writestr("oracle/02_code_sets.sql", "\n\n".join(oracle_code_sets) + "\n")
+        archive.writestr("oracle/03_validation_rules.sql", "\n\n".join(oracle_rules) + "\n")
         archive.writestr("mysql/01_create_tables.sql", mysql_ddl + "\n")
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         archive.writestr("rules.json", canonical_json([rule.model_dump() for rule in rules]))

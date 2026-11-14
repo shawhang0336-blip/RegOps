@@ -50,7 +50,7 @@ METADATA_TABLE_PROPERTIES = {
         "items": {
             "type": "object",
             "properties": METADATA_FIELD_PROPERTIES,
-            "required": list(METADATA_FIELD_PROPERTIES),
+            "required": ["field_cn", "field_en", "data_type", "check_text_raw"],
         },
     },
 }
@@ -77,6 +77,21 @@ CODE_SET_PROPERTIES = {
 }
 
 TOOL_SCHEMAS = {
+    "inspect_document_structure": {
+        "type": "object",
+        "properties": {
+            "document_kind": {
+                "type": "string",
+                "enum": ["COLLECTION_SPEC", "STATISTICAL_SYSTEM", "RULE_DOCUMENT", "REVISION_DOCUMENT", "CODE_VALUES", "MIXED", "UNKNOWN"],
+            },
+            "summary": {"type": "string"},
+            "chunking_strategy": {"type": "string", "enum": ["DOCUMENT_CATALOG", "WORD_TABLE_AND_PARAGRAPH", "SHEET_PER_TABLE", "MANUAL_REVIEW"]},
+            "expected_contents": {"type": "array", "items": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "REVISION_DIFF", "NARRATIVE"]}},
+            "requires_human": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["document_kind", "summary", "chunking_strategy", "expected_contents", "requires_human", "warnings"],
+    },
     "assign_document_structure": {
         "type": "object",
         "properties": {
@@ -135,7 +150,7 @@ TOOL_SCHEMAS = {
     "assign_metadata": {
         "type": "object",
         "properties": METADATA_TABLE_PROPERTIES,
-        "required": list(METADATA_TABLE_PROPERTIES),
+        "required": ["table_code", "table_name", "fields"],
     },
     "review_metadata": {
         "type": "object",
@@ -291,6 +306,7 @@ class RealDesignLlm:
                 "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
                 "tool_choice": {"type": "function", "function": {"name": tool_name}},
                 "temperature": 0,
+                "thinking": {"type": "disabled"},
                 "max_tokens": 8192,
             },
             timeout=timeout,

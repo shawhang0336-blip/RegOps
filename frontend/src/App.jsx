@@ -1,26 +1,29 @@
-import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { OperatorProvider } from './context/OperatorContext.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
-import DocumentsPage from './pages/DocumentsPage.jsx'
-import MetadataPage from './pages/MetadataPage.jsx'
-import CodeSetsPage from './pages/CodeSetsPage.jsx'
+import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
 import GenerationPage from './pages/GenerationPage.jsx'
 import RunsPage from './pages/RunsPage.jsx'
 import VersionsPage from './pages/VersionsPage.jsx'
 import LegacyApp from './LegacyApp.jsx'
 
 const pipelineNavigation = [
-  ['/documents', '规范导入与切块', '01', '上传 PDF/Word/Excel 提取原始块'],
-  ['/metadata', '元数据与版本台', '02', 'AI 初值复核 · 字段精修 · 版本发布'],
-  ['/code-sets', '公共码值中心', '03', '消解未决码值 · Excel 批量导入'],
-  ['/generation', '生成范围与预检', '04', '码值阻断预检 · 启动 AI 规则装配'],
-  ['/runs', '执行与审计中心', '05', '8 阶进度看板 · 人工确权 · 部署包'],
+  ['/documents', '规范解析与核对', '01', '上传文件，自动解析并核对字段和码表'],
+  ['/generation', '生成表结构、码表和规则', '02', 'Oracle 建表，生成并确认校验规则'],
+  ['/runs', '测试与下载', '03', '生成测试数据，确认结果并下载 SQL'],
 ]
 
 const governanceNavigation = [
-  ['/versions', '全局版本审计', 'AU'],
-  ['/settings', '系统与执行预算', 'SY'],
+  ['/versions', '变更记录', '历'],
+  ['/settings', '系统设置', '设'],
 ]
+
+function PreparationRedirect({ view }) {
+  const location = useLocation()
+  const params = new URLSearchParams(location.search)
+  params.set('view', view)
+  return <Navigate to={`/documents?${params.toString()}`} replace />
+}
 
 function WorkbenchLayout() {
   return (
@@ -30,12 +33,12 @@ function WorkbenchLayout() {
           <div className="brand-mark">R</div>
           <div>
             <strong>RegOps</strong>
-            <span>监管元数据与规则工程台</span>
+            <span>监管报送规则生成工具</span>
           </div>
         </div>
 
         <div className="nav-group">
-          <p className="nav-group-title">主干工程流水线</p>
+          <p className="nav-group-title">使用流程</p>
           <nav className="nav-list">
             {pipelineNavigation.map(([path, label, number, hint]) => (
               <NavLink
@@ -55,7 +58,7 @@ function WorkbenchLayout() {
         </div>
 
         <div className="nav-group nav-group-secondary">
-          <p className="nav-group-title">审计与系统底座</p>
+          <p className="nav-group-title">其他功能</p>
           <nav className="nav-list compact">
             {governanceNavigation.map(([path, label, code]) => (
               <NavLink
@@ -73,18 +76,18 @@ function WorkbenchLayout() {
         <div className="sidebar-bottom">
           <div className="environment-dot" />
           <div>
-            <strong>GLM 结构化赋值引擎</strong>
-            <span>确定性算子 · 沙箱双表审计</span>
+            <strong>服务已连接</strong>
+            <span>数据与验证环境可用</span>
           </div>
         </div>
       </aside>
 
       <main className="main-content">
         <Routes>
-          <Route path="/" element={<DocumentsPage />} />
-          <Route path="/documents" element={<DocumentsPage />} />
-          <Route path="/metadata" element={<MetadataPage />} />
-          <Route path="/code-sets" element={<CodeSetsPage />} />
+          <Route path="/" element={<PreparationWorkspace />} />
+          <Route path="/documents" element={<PreparationWorkspace />} />
+          <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
+          <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
           <Route path="/generation" element={<GenerationPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/versions" element={<VersionsPage />} />

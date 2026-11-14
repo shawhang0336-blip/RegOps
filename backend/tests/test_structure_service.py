@@ -1,9 +1,10 @@
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
-from app.asset_models import RawBlockModel, SourceDocumentModel
-from app.structure_service import _apply_plan, _validate_plan
+from app.asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
+from app.structure_service import _apply_plan, _validate_plan, latest_document_architecture
 from .test_workflow import make_session
 
 
@@ -146,3 +147,29 @@ def test_structured_block_skips_llm_architecture_call(monkeypatch):
     monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: NoCallLlm())
     architecture_id = analyze_document_structure(document.id, __import__('app.config', fromlist=['Settings']).Settings())
     assert architecture_id
+
+
+def test_latest_architecture_reads_only_latest_record():
+    session = make_session()
+    document, _, _ = make_document_with_blocks(session)
+    now = datetime.utcnow()
+    older = DocumentArchitectureModel(
+        id=str(uuid.uuid4()), document_id=document.id, status="OVERVIEW_FAILED",
+        plan_json={"stage": "DOCUMENT_OVERVIEW"}, warnings_json=[], trace_json={}, created_at=now - timedelta(minutes=1),
+    )
+    latest = DocumentArchitectureModel(
+        id=str(uuid.uuid4()), document_id=document.id, status="OVERVIEW_REVIEWED",
+        plan_json={"stage": "DOCUMENT_OVERVIEW"}, warnings_json=[], trace_json={}, created_at=now,
+    )
+    other = DocumentArchitectureModel(
+        id=str(uuid.uuid4()), document_id=document.id, status="AI_STRUCTURE_REVIEWED",
+        plan_json={}, warnings_json=[], trace_json={}, created_at=now + timedelta(minutes=1),
+    )
+    session.add_all([older, latest, other])
+    session.commit()
+
+    selected = latest_document_architecture(
+        session, document.id, statuses={"OVERVIEW_FAILED", "OVERVIEW_REVIEWED"}
+    )
+
+    assert selected.id == latest.id

@@ -73,8 +73,8 @@ def _sniff_tabular_code_set(title: str, headers: List[str], rows: List[List[str]
         )
     if not values:
         return None
-    clean_code = re.sub(r"[^A-Z0-9_]", "_", title.upper()).strip("_") or "IMPORTED_CODESET"
-    if not re.match(r"^[A-Z]", clean_code):
+    clean_code = re.sub(r"[^A-Z0-9_]", "_", title.upper()).strip("_")
+    if not clean_code or not re.match(r"^[A-Z]", clean_code):
         clean_code = f"CS_{hashlib.sha1(title.encode('utf-8')).hexdigest()[:8].upper()}"
     return {
         "code": clean_code[:90],
@@ -98,7 +98,7 @@ def extract_pdf(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
         blocks.append(
             _block(
                 index,
-                "TABLE_CANDIDATE",
+                entry.get("candidate_role", "TABLE_CANDIDATE"),
                 raw,
                 {"section": entry["section"], "table_code": entry["table_code"]},
                 entry,
@@ -203,6 +203,63 @@ def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
         )
     workbook.close()
     return "UNKNOWN", blocks
+
+
+def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
+    if file_type == "pdf":
+        from .spec_parser import _extract_pdf_text
+
+        text = _extract_pdf_text(path)
+        headings = []
+        for line in text.splitlines():
+            title = re.sub(r"\s+", " ", line).strip()
+            if not title or len(title) > 100:
+                continue
+            if re.match(r"^(?:第[一二三四五六七八九十百]+章|[一二三四五六七八九十]+、|\d+(?:\.\d+){0,4}\s+\S+)", title):
+                headings.append(title)
+        return {
+            "file_type": file_type,
+            "page_count": max(1, text.count("\f")),
+            "headings": headings[:300],
+            "heading_count": len(headings),
+            "content_preview": text[:5000],
+            "available_chunk_strategy": "DOCUMENT_CATALOG",
+        }
+    if file_type == "docx":
+        document = Document(str(path))
+        paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+        tables = []
+        for index, table in enumerate(document.tables[:80]):
+            rows = [[cell.text.strip() for cell in row.cells] for row in table.rows[:4]]
+            tables.append({"table_index": index, "row_count": len(table.rows), "sample_rows": rows})
+        return {
+            "file_type": file_type,
+            "paragraph_count": len(paragraphs),
+            "headings": paragraphs[:160],
+            "table_count": len(document.tables),
+            "tables": tables,
+            "available_chunk_strategy": "WORD_TABLE_AND_PARAGRAPH",
+        }
+    if file_type == "xlsx":
+        workbook = load_workbook(path, read_only=False, data_only=False)
+        sheets = []
+        for sheet in workbook.worksheets:
+            sample_rows = []
+            for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 6), values_only=True):
+                values = ["" if value is None else str(value) for value in row]
+                while values and values[-1] == "":
+                    values.pop()
+                if values:
+                    sample_rows.append(values)
+            sheets.append({"sheet": sheet.title, "row_count": sheet.max_row, "column_count": sheet.max_column, "sample_rows": sample_rows})
+        workbook.close()
+        return {
+            "file_type": file_type,
+            "sheet_count": len(sheets),
+            "sheets": sheets,
+            "available_chunk_strategy": "SHEET_PER_TABLE",
+        }
+    raise ValueError(f"Unsupported file type: {file_type}")
 
 
 def extract_document(path: Path, file_type: str) -> Tuple[str, List[Dict[str, Any]]]:

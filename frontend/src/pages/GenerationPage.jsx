@@ -7,14 +7,11 @@ import StatusMessage from './StatusMessage.jsx'
 import { BLOCKER_REASONS, StatusBadge, formatTime } from './SharedUI.jsx'
 
 const PIPELINE_STAGES = [
-  ['01', 'AI 生成计划', '在预算上限内计算必做/拓展规则与造数配额'],
-  ['02', 'Schema 扇出', '并发生成 MySQL 与 Oracle 沙箱建表 DDL'],
-  ['03', '规则扇出与汇合', '单表显性/拓展规则装配与跨表屏障归约'],
-  ['04', '拓展规则确权', '人工按规则内容哈希审批 AI 拓展规则'],
-  ['05', '生成器扇出', '生成黄金正向样本与针对性变异负样本'],
-  ['06', '审计用例扇出', '编译确定性校验 SQL 与预期命中矩阵'],
-  ['07', 'Oracle 双表执行', '在真实 Oracle 沙箱建表、装数并执行校验'],
-  ['08', '差异回边与收敛', '零误报零漏报则产出生产包，否则自愈回边'],
+  ['01', '生成表结构、码表和规则', '生成 DDL、码表和校验 SQL，并在 Oracle 空表上空跑验证'],
+  ['02', '确认校验规则', '确认 AI 建议新增的规则'],
+  ['03', '生成测试数据', '按已确认规则生成正常与异常测试数据'],
+  ['04', '执行数据库测试', '在 Oracle 中检查误拦截和漏拦截'],
+  ['05', '确认结果并下载', '确认测试结果后下载码表、表结构和校验 SQL'],
 ]
 
 export default function GenerationPage() {
@@ -111,9 +108,9 @@ export default function GenerationPage() {
   return (
     <>
       <PageHeader
-        eyebrow="STAGE 04 · 生产范围锁定与码值阻断预检"
-        title="生成范围与预检中心"
-        description="仅使用已发布定版的元数据表与已消解的公共码值；进入页面即自动完成全表预检，杜绝运行中途因码值缺失而失败。"
+        eyebrow="第 2 步 · 共 3 步"
+        title="生成表结构、码表和规则"
+        description="根据已发布字段生成 DDL、码表和校验 SQL，在 Oracle 验证库建表后，由您确认规则。"
         actions={
           <button
             type="button"
@@ -121,45 +118,40 @@ export default function GenerationPage() {
             disabled={busy || checking || !selected.length}
             onClick={create}
           >
-            {busy ? '正在启动 AI 规则装配...' : `启动 AI 规则与数据生成 (${selected.length} 张表) →`}
+            {busy ? '正在启动 AI 规则装配...' : `开始生成 (${selected.length} 张报表)`}
           </button>
         }
       />
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
-      <section className="metrics">
+      <section className="metrics metrics-three">
         <div>
-          <span>已发布元数据表</span>
-          <strong>{tables.length}</strong>
-          <small>已锁定 SHA-256 快照</small>
+          <span>可以生成</span>
+          <strong>{readyCount} 张</strong>
+          <small>字段和码值均已就绪</small>
         </div>
         <div>
-          <span>预检就绪可生成</span>
-          <strong>{readyCount}</strong>
-          <small>所有必填码值均已绑定</small>
+          <span>需要先处理</span>
+          <strong>{blockedCount} 张</strong>
+          <small>{blockedCount > 0 ? '请补充缺失的码值' : '当前没有待处理项'}</small>
         </div>
         <div>
-          <span>存在码值阻断</span>
-          <strong>{blockedCount}</strong>
-          <small>{blockedCount > 0 ? '需前往码值中心补充' : '全部表均无阻断'}</small>
-        </div>
-        <div>
-          <span>当前已勾选范围</span>
-          <strong>{selected.length} 张表</strong>
-          <small>支持单表或多表联合扇出</small>
+          <span>本次已选择</span>
+          <strong>{selected.length} 张</strong>
+          <small>可以选择一张或多张报表</small>
         </div>
       </section>
 
       <section className="panel generation-panel">
         <div className="panel-heading">
           <div>
-            <h2>选择本次生成范围</h2>
-            <p>勾选需要装配校验规则与合成沙箱数据的已发布表（系统已为您自动预检码值依赖）</p>
+            <h2>选择本次要生成的报表</h2>
+            <p>只能选择已发布的报表；如果提示缺少码值，请先完成补充。</p>
           </div>
           <div className="actions">
             <button type="button" className="button secondary sm" onClick={selectAllReady}>
-              全选无阻断表 ({readyCount})
+              选择所有可生成报表 ({readyCount})
             </button>
             <button
               type="button"
@@ -196,7 +188,7 @@ export default function GenerationPage() {
                     <div className="generation-card-top">
                       <strong>{table.table_name}</strong>
                       <StatusBadge tone={hasBlocker ? 'red' : 'green'}>
-                        {hasBlocker ? `${tableBlockers.length} 项码值阻断` : '预检通过'}
+                        {hasBlocker ? `缺少 ${tableBlockers.length} 项码值` : '可以生成'}
                       </StatusBadge>
                     </div>
                     <div className="generation-card-meta">
@@ -223,7 +215,7 @@ export default function GenerationPage() {
                                 )
                               }
                             >
-                              前往消解码值 →
+                              去补充 →
                             </button>
                           </div>
                         ))}
@@ -236,22 +228,22 @@ export default function GenerationPage() {
           </div>
         ) : (
           <div className="empty">
-            当前尚无已发布的元数据表。请先在「元数据与版本台」完成字段复核并点击「发布定版」。
+            当前没有可生成的报表。请先在“核对字段”中检查并发布报表。
           </div>
         )}
       </section>
 
-      <section className="panel">
+      <section className="panel simple-flow">
         <div className="panel-heading">
           <div>
-            <h2>下游 8 阶段确定性扇出与沙箱自愈架构</h2>
-            <p>启动生成后，执行中心将按以下 8 个阶段实时推进并记录不可篡改的事件账本</p>
+            <h2>接下来会发生什么</h2>
+            <p>大部分步骤自动完成，只在有新增规则时需要您确认。</p>
           </div>
         </div>
         <div className="pipeline-stepper">
           {PIPELINE_STAGES.map(([num, label, desc]) => (
             <div key={num} className="pipeline-step" title={desc}>
-              <span className="pipeline-step-num">STAGE {num}</span>
+              <span className="pipeline-step-num">步骤 {num}</span>
               <strong>{label}</strong>
             </div>
           ))}

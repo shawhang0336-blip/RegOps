@@ -68,16 +68,19 @@ def extract_metadata(request: ExtractRequest) -> Dict[str, Any]:
         "table_ids": result["table_ids"],
         "code_set_ids": result["code_set_ids"],
         "resolved_reference_count": result["resolved_reference_count"],
-        "status": "AI_SELF_VALIDATION_COMPLETE",
+        "errors": result["errors"],
+        "status": result["status"],
     }
 
 
 @router.get("/tables")
-def list_tables(status: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_tables(status: Optional[str] = None, document_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
         query = session.query(TableMetadataModel)
         if status:
             query = query.filter(TableMetadataModel.status == status)
+        if document_id:
+            query = query.filter(TableMetadataModel.document_id == document_id)
         rows = query.order_by(TableMetadataModel.updated_at.desc()).all()
         result = []
         for row in rows:

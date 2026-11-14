@@ -154,6 +154,18 @@ class CodeValueModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class CodeSetValidationModel(Base):
+    __tablename__ = "code_set_validations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    code_set_id: Mapped[str] = mapped_column(ForeignKey("code_sets.id"), index=True)
+    validator_kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32))
+    issues_json: Mapped[list] = mapped_column(JSON)
+    trace_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class FieldCodeReferenceModel(Base):
     __tablename__ = "field_code_references"
 

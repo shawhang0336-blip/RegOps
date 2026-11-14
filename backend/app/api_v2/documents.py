@@ -12,7 +12,12 @@ from ..code_service import extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
 from ..extractors import extract_document
-from ..structure_service import analyze_document_structure, reextract_document_blocks
+from ..structure_service import (
+    analyze_document_structure,
+    inspect_document_overview,
+    latest_document_architecture,
+    reextract_document_blocks,
+)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -37,6 +42,33 @@ def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
     }
 
 
+def store_initial_blocks(document_id: str) -> SourceDocumentModel:
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        existing_blocks = session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).count()
+        if existing_blocks:
+            return document
+        settings = get_settings()
+        source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
+        try:
+            version, blocks = extract_document(source_path, document.file_type)
+            if not blocks:
+                raise ValueError("No raw blocks were discovered")
+        except Exception as exc:
+            document.status = "BLOCK_EXTRACTION_FAILED"
+            session.commit()
+            raise HTTPException(status_code=422, detail=f"Cannot extract document: {type(exc).__name__}: {exc}") from exc
+        document.spec_version = version
+        document.status = "UPLOADED"
+        document.block_count = len(blocks)
+        for block in blocks:
+            session.add(RawBlockModel(id=str(uuid.uuid4()), document_id=document.id, **block))
+        session.commit()
+        return document
+
+
 def ingest_uploaded_file(filename: str, content: bytes) -> SourceDocumentModel:
     suffix = Path(filename).suffix.lower().lstrip(".")
     if suffix not in FILE_TYPES:
@@ -52,32 +84,41 @@ def ingest_uploaded_file(filename: str, content: bytes) -> SourceDocumentModel:
     target = Path(settings.blob_dir) / "uploads" / f"{digest}.{suffix}"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
-    try:
-        version, blocks = extract_document(target, suffix)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Cannot extract document: {type(exc).__name__}: {exc}") from exc
-    if not blocks:
-        raise HTTPException(status_code=422, detail="No raw blocks were discovered")
+    reimport_deleted = False
     with SessionLocal() as session:
         existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one_or_none()
         if existing:
-            return existing
-        document = SourceDocumentModel(
-            id=str(uuid.uuid4()),
-            file_name=Path(filename).name,
-            file_type=suffix,
-            sha256=digest,
-            blob_uri=f"blob://uploads/{digest}.{suffix}",
-            spec_version=version,
-            status="UPLOADED",
-            block_count=len(blocks),
-        )
-        session.add(document)
-        session.flush()
-        for block in blocks:
-            session.add(RawBlockModel(id=str(uuid.uuid4()), document_id=document.id, **block))
-        session.commit()
-        return document
+            if existing.status != "DELETED":
+                return existing
+            reimport_deleted = True
+            existing.status = "OVERVIEW_REQUIRED"
+            existing.spec_version = "UNKNOWN"
+            session.commit()
+            document_id = existing.id
+        else:
+            document = SourceDocumentModel(
+                id=str(uuid.uuid4()),
+                file_name=Path(filename).name,
+                file_type=suffix,
+                sha256=digest,
+                blob_uri=f"blob://uploads/{digest}.{suffix}",
+                spec_version="UNKNOWN",
+                status="OVERVIEW_REQUIRED",
+                block_count=0,
+            )
+            session.add(document)
+            session.commit()
+            document_id = document.id
+    inspect_document_overview(document_id, settings, force=reimport_deleted)
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if document.status == "OVERVIEW_FAILED":
+            return document
+    if reimport_deleted:
+        reextract_document_blocks(document_id, settings)
+        with SessionLocal() as session:
+            return session.get(SourceDocumentModel, document_id)
+    return store_initial_blocks(document_id)
 
 
 @router.post("", status_code=201)
@@ -90,8 +131,24 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
 @router.get("")
 def list_documents() -> list:
     with SessionLocal() as session:
-        rows = session.query(SourceDocumentModel).order_by(SourceDocumentModel.created_at.desc()).all()
+        rows = (
+            session.query(SourceDocumentModel)
+            .filter(SourceDocumentModel.status != "DELETED")
+            .order_by(SourceDocumentModel.created_at.desc())
+            .all()
+        )
         return [document_summary(row) for row in rows]
+
+
+@router.delete("/{document_id}")
+def delete_document(document_id: str) -> Dict[str, Any]:
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        document.status = "DELETED"
+        session.commit()
+        return {"id": document.id, "status": document.status, "assets_preserved": True}
 
 
 @router.get("/{document_id}")
@@ -127,11 +184,23 @@ def document_detail(document_id: str) -> Dict[str, Any]:
                     "superseded": block.content_json.get("superseded", False),
                     "column_mapping": block.content_json.get("column_mapping", {}),
                     "human_required": block.content_json.get("human_required", False),
-                    "structure_warnings": block.content_json.get("structure_warnings", []),
+                    "structure_warnings": block.content_json.get("structure_warnings", block.content_json.get("parse_warnings", [])),
                 }
                 for block in blocks
             ],
         }
+
+
+@router.post("/{document_id}/prepare")
+def prepare_document(document_id: str) -> Dict[str, Any]:
+    inspect_document_overview(document_id, get_settings(), force=True)
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if document.status == "OVERVIEW_FAILED":
+            return document_summary(document)
+    return document_summary(store_initial_blocks(document_id))
 
 
 @router.post("/{document_id}/reextract")
@@ -169,23 +238,43 @@ def extract_document_parallel(document_id: str, request: ParallelExtractRequest)
         document = session.get(SourceDocumentModel, document_id)
         if not document:
             raise HTTPException(status_code=404, detail="Document not found")
-        if document.status == "UPLOADED":
-            analyze_document_structure(document_id, settings)
+        needs_analysis = document.status == "UPLOADED"
+        document.status = "EXTRACTING"
+        session.commit()
     try:
-        return extract_parallel_for_blocks(request.block_ids, settings, request.targets)
+        with SessionLocal() as session:
+            if needs_analysis:
+                analyze_document_structure(document_id, settings)
+        result = extract_parallel_for_blocks(request.block_ids, settings, request.targets)
+        final_status = "EXTRACTION_PARTIAL" if result.get("errors") else "EXTRACTED"
+        if result.get("errors") and not result.get("table_ids") and not result.get("code_set_ids"):
+            final_status = "EXTRACTION_FAILED"
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result = {"table_ids": [], "code_set_ids": [], "errors": [{"error": f"{type(exc).__name__}: {exc}"}]}
+        final_status = "EXTRACTION_FAILED"
+    with SessionLocal() as session:
+        document = session.get(SourceDocumentModel, document_id)
+        document.status = final_status
+        session.add(
+            DocumentArchitectureModel(
+                id=str(uuid.uuid4()),
+                document_id=document_id,
+                status=final_status,
+                plan_json={"stage": "EXTRACTION", "result": result},
+                warnings_json=[item.get("error", "解析未完成") for item in result.get("errors", [])],
+                trace_json={"table_count": len(result.get("table_ids", [])), "code_set_count": len(result.get("code_set_ids", []))},
+            )
+        )
+        session.commit()
+    if final_status == "EXTRACTION_FAILED":
+        raise HTTPException(status_code=422, detail=result["errors"][0]["error"])
+    return result
 
 
 @router.get("/{document_id}/architecture")
 def get_architecture(document_id: str) -> Dict[str, Any]:
     with SessionLocal() as session:
-        architecture = (
-            session.query(DocumentArchitectureModel)
-            .filter(DocumentArchitectureModel.document_id == document_id)
-            .order_by(DocumentArchitectureModel.created_at.desc())
-            .first()
-        )
+        architecture = latest_document_architecture(session, document_id)
         if not architecture:
             raise HTTPException(status_code=404, detail="No architecture analysis found")
         return {
@@ -216,7 +305,7 @@ def adjust_structure(document_id: str, block_id: str, changes: Dict[str, Any]) -
             document_id=document.id,
             status="HUMAN_ADJUSTED",
             plan_json={"block_id": block_id, "changes": changes},
-            warnings_json=block.content_json.get("structure_warnings", []),
+            warnings_json=[] if changes.get("human_required") is False else block.content_json.get("structure_warnings", []),
             trace_json={"editor": changes.get("editor", "HUMAN")},
         )
         session.add(architecture)

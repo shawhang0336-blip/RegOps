@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MetadataFieldDraft(BaseModel):
@@ -10,12 +10,19 @@ class MetadataFieldDraft(BaseModel):
     field_definition: str = ""
     check_text_raw: str = ""
     data_type: Literal["VARCHAR", "NUMBER"] = "VARCHAR"
-    length: int = Field(gt=0)
+    length: int = Field(default=128, gt=0)
     decimal_places: int = Field(default=0, ge=0)
     required: bool = False
     code_reference_text: str = ""
     confidence: float = Field(default=0, ge=0, le=1)
     evidence_json: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_length_from_type(cls, value):
+        if isinstance(value, dict) and not value.get("length"):
+            return {**value, "length": 22 if str(value.get("data_type", "VARCHAR")).upper() == "NUMBER" else 128}
+        return value
 
 
 class MetadataTableDraft(BaseModel):
@@ -32,6 +39,7 @@ class MetadataValidationError(ValueError):
 def validate_metadata_draft(draft: MetadataTableDraft) -> List[Dict[str, Any]]:
     issues = []
     seen = set()
+    low_confidence = []
     for field in draft.fields:
         if field.field_en in seen:
             issues.append({"severity": "ERROR", "code": "DUPLICATE_FIELD", "field_en": field.field_en})
@@ -43,7 +51,14 @@ def validate_metadata_draft(draft: MetadataTableDraft) -> List[Dict[str, Any]]:
         if not field.evidence_json:
             issues.append({"severity": "WARNING", "code": "MISSING_EVIDENCE", "field_en": field.field_en})
         if field.confidence < 0.7:
-            issues.append({"severity": "WARNING", "code": "LOW_CONFIDENCE", "field_en": field.field_en})
+            low_confidence.append(field.field_en)
+    if low_confidence:
+        issues.append({
+            "severity": "WARNING",
+            "code": "LOW_CONFIDENCE",
+            "field_en": low_confidence[0] if len(low_confidence) == 1 else "",
+            "message": f"{len(low_confidence)} 个字段的识别置信度较低，请对照原文核对字段名、类型和长度。",
+        })
     if not draft.fields:
         issues.append({"severity": "ERROR", "code": "EMPTY_TABLE"})
     return issues

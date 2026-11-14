@@ -1,3 +1,4 @@
+import hashlib
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .blobs import LocalBlobStore
+from .code_set_oracle import compile_code_set_oracle_ddl, load_published_code_sets, validate_code_set_usage
 from .compiler import compile_rule_query
 from .asset_models import ApprovalModel, ArtifactModel, AuditCaseDefinitionModel, GenerationPlanModel, GeneratorDefinitionModel, SchemaDefinitionModel
 from .config import Settings
@@ -36,6 +38,20 @@ def _specs(session: Session, spec_id: str) -> List[SpecDocument]:
     return [SpecDocument.model_validate(item) for item in row.content_json["tables"]]
 
 
+def _code_set_context(field_code_sets, table_code: str, field: str) -> Dict[str, Any]:
+    code_set = field_code_sets.get((table_code, field))
+    if not code_set:
+        return {}
+    return {
+        "published_code_set": {
+            "code": code_set["code"],
+            "name": code_set["name"],
+            "version": code_set["version"],
+            "values": [item["value"] for item in code_set["values"]],
+        }
+    }
+
+
 def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None):
     feedback = None
     rejection = None
@@ -49,7 +65,9 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
             if rejection:
                 trace["previous_rejection"] = rejection
             return result, trace
-        except (httpx.HTTPError, RuntimeError, RuleValidationError, ValueError, KeyError, TypeError) as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:
+            raise WorkflowError(f"{tool_name} model call failed without retry: {type(exc).__name__}: {exc}") from exc
+        except (RuleValidationError, ValueError, KeyError, TypeError) as exc:
             rejection = str(exc)
             feedback = rejection
     raise WorkflowError(f"{tool_name} failed deterministic validation twice: {rejection}")
@@ -105,6 +123,7 @@ def _plan_stage(session, run, specs, llm, budget):
             "根据表复杂度自行决定必做规则数、拓展规则数、黄金数据量和每规则变异数，并说明理由；不得超出输入预算。",
             {**spec_payload(spec), "budget": budget},
             lambda args: _validate_plan(args, budget),
+            timeout=45,
         )
 
     results = _fanout(session, run, "generation_planner", specs, worker)
@@ -139,6 +158,7 @@ def _schema_stage(session, run, specs, llm):
             "为每个白名单字段赋予物理存储类型和长度。必须逐字段全覆盖，不得改变数值字段语义。",
             spec_payload(spec),
             lambda args: bind_schema(spec, args.get("fields", [])),
+            timeout=30,
         )
 
     results = _fanout(session, run, "schema_mapper", specs, worker)
@@ -172,6 +192,8 @@ def _schema_stage(session, run, specs, llm):
 
 
 def _rules_stage(session, run, specs, llm, plans=None) -> int:
+    _, field_code_sets = load_published_code_sets(session, specs)
+
     def worker(spec):
         bound_rules = []
         batch_traces = []
@@ -186,13 +208,15 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                     "fields": [field.model_dump()],
                     "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
                     "existing_rule_keys": [rule.rule_key for rule in field_rules],
+                    **_code_set_context(field_code_sets, spec.table_code, field.name),
                 }
                 rules, trace = _call_validated(
                     llm,
                     "assign_rules",
-                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。",
+                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。",
                     payload,
                     lambda args: bind_rules(spec, args.get("rules", [])),
+                    timeout=40,
                 )
                 traces.append(trace)
                 if not rules:
@@ -270,6 +294,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
             "装配跨表 FOREIGN_KEY 规则。rule 必须额外带 table_code；references_table 必须来自已确认表。可返回 golden_overrides 对齐引用值。",
             payload,
             cross_validator,
+            timeout=45,
         )
         append_event(session, run, "AI_TOOL_ASSIGNED", "cross_rule_binder", trace)
         for rule in cross_rules:
@@ -281,6 +306,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
         "cross_rule_binder",
         {"rule_keys": [rule.rule_key for rule in cross_rules], "golden_overrides": golden_overrides},
     )
+    _dedupe_approved_rules(session, run)
     bound = session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
     pending_count = len(_pending_rules(session, run.id))
     append_event(
@@ -299,12 +325,73 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
     return pending_count
 
 
+def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
+    attempt = run.attempt + 1
+    existing = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == "ORACLE_ASSETS_PREPARED")
+        .order_by(EventModel.seq.desc())
+        .first()
+    )
+    if existing and existing.payload_json.get("attempt") == attempt:
+        return existing.payload_json["assets"]
+
+    from .generic_domain import SchemaBinding
+
+    typed_schemas = {
+        code: [SchemaBinding.model_validate(item) for item in items]
+        for code, items in schema_payload.items()
+    }
+    code_sets, _ = load_published_code_sets(session, specs)
+    assets = GenericOracleExecutor(settings.oracle_sandbox_url).prepare_assets(
+        run.id, attempt, specs, typed_schemas, code_sets=code_sets, rules=rules
+    )
+    blobs = LocalBlobStore(settings.blob_dir)
+    ddl_uri = blobs.put(
+        "\n\n".join(compile_ai_schema_mysql_ddl(spec.table_code, typed_schemas[spec.table_code]) for spec in specs).encode()
+    )
+    oracle_ddl_parts = [
+        compile_code_set_oracle_ddl(assets["code_set_tables"][code_set["code"]]) for code_set in code_sets
+    ] + [
+        compile_ai_schema_oracle_ddl(assets["target_tables"][spec.table_code], typed_schemas[spec.table_code])
+        for spec in specs
+    ]
+    oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
+    queries = []
+    for rule in rules:
+        sql, params = compile_rule_query(rule, "oracle", assets["physical_tables"])
+        queries.append({"rule_key": rule.rule_key, "table_code": rule.table_code, "sql": sql, "params": params})
+    sql_uri = blobs.put(canonical_json({"dialect": "oracle", "queries": queries}).encode())
+    result = {
+        "ddl_blob": ddl_uri,
+        "oracle_ddl_blob": oracle_ddl_uri,
+        "validation_sql_blob": sql_uri,
+        "oracle_tables": assets["physical_tables"],
+        "oracle_target_tables": assets["target_tables"],
+        "oracle_code_set_tables": assets["code_set_tables"],
+        "oracle_precheck": assets["empty_run"],
+    }
+    for artifact_type, uri in [("MYSQL_DDL", ddl_uri), ("ORACLE_DDL", oracle_ddl_uri), ("VALIDATION_SQL", sql_uri)]:
+        session.add(ArtifactModel(
+            id=str(uuid.uuid4()), run_id=run.id, artifact_type=artifact_type, blob_uri=uri,
+            sha256=uri.removeprefix("blob://"), version=attempt,
+        ))
+    append_event(
+        session, run, "ORACLE_ASSETS_PREPARED", "oracle_asset_builder",
+        {"attempt": attempt, "assets": assets, "result": result},
+    )
+    session.flush()
+    return assets
+
+
 def _next_asset_version(session, model, run_id, table_code) -> int:
     current = session.query(func.max(model.version)).filter(model.run_id == run_id, model.table_code == table_code).scalar()
     return int(current or 0) + 1
 
 
 def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None):
+    _, field_code_sets = load_published_code_sets(session, specs)
+
     def worker(spec):
         rule_views = [rule.model_dump() for rule in active_rules if rule.table_code == spec.table_code]
 
@@ -315,6 +402,7 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 "approved_rules": rule_views,
                 "required_reference_values": golden_overrides.get(spec.table_code, {}),
                 "generation_plan": plans.get(spec.table_code),
+                **_code_set_context(field_code_sets, spec.table_code, field.name),
             }
 
             def validate_one(args):
@@ -326,9 +414,10 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
             return _call_validated(
                 llm,
                 "assign_generators",
-                "只为输入的一个字段赋予黄金合规生成器。FIXED 使用 params.value；ENUM 使用 params.values。必须满足相关规则和引用值。",
+                "只为输入的一个字段赋予黄金合规生成器。FIXED 使用 params.value；ENUM 使用 params.values。必须满足相关规则和引用值。若提供 published_code_set，ENUM 的 values 只能是其子集。",
                 payload,
                 validate_one,
+                timeout=35,
             )
 
         with ThreadPoolExecutor(max_workers=min(4, len(spec.fields))) as field_executor:
@@ -392,6 +481,8 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
 
 
 def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None):
+    _, field_code_sets = load_published_code_sets(session, specs)
+
     def worker(spec):
         table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
         active_keys = {rule.rule_key for rule in table_rules}
@@ -403,9 +494,14 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 "active_rules": [rule.model_dump() for rule in table_rules],
                 "target_rule": target_rule.model_dump() if target_rule else None,
                 "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
+                "published_code_sets": {
+                    field.name: _code_set_context(field_code_sets, spec.table_code, field.name)["published_code_set"]
+                    for field in spec.fields
+                    if (spec.table_code, field.name) in field_code_sets
+                },
             }
             instruction = (
-                "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例，expected_rule_keys 精确列出全部预期命中。"
+                "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例，expected_rule_keys 精确列出全部预期命中；ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
                 if target_rule
                 else "设计一个无覆盖的黄金合规审计用例，expected_rule_keys 应为空。"
             )
@@ -415,6 +511,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 instruction,
                 payload,
                 lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys),
+                timeout=35,
             )
 
         targets = [None] + table_rules
@@ -469,7 +566,36 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
     return cases
 
 
+def _dedupe_approved_rules(session: Session, run: RunModel) -> int:
+    rows = (
+        session.query(RuleModel)
+        .filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED")
+        .order_by(RuleModel.source.desc(), RuleModel.created_at, RuleModel.rule_key)
+        .all()
+    )
+    seen = set()
+    superseded = []
+    for row in rows:
+        definition = row.definition_json
+        signature = (
+            row.table_code,
+            definition.get("field"),
+            definition.get("operator"),
+            canonical_json(definition.get("params", {})),
+        )
+        if signature in seen:
+            row.status = "SUPERSEDED"
+            superseded.append({"rule_key": row.rule_key, "rule_hash": row.rule_hash})
+        else:
+            seen.add(signature)
+    if superseded:
+        append_event(session, run, "RULE_DUPLICATES_SUPERSEDED", "rule_barrier", {"rules": superseded})
+        session.flush()
+    return len(superseded)
+
+
 def _rebind_failed_rules(session, run, specs, llm, report) -> int:
+    changed_count = _dedupe_approved_rules(session, run)
     failed_keys = sorted(
         {
             rule_key
@@ -516,6 +642,7 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
             "根据失败记录修正当前规则赋值。最大长度用 LENGTH_MAX，精确长度用 LENGTH；只返回修正后的一条规则。",
             payload,
             validate_revision,
+            timeout=40,
         )
         append_event(
             session,
@@ -527,15 +654,23 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
         row.status = "SUPERSEDED"
         _upsert_rule(session, run, revised, "APPROVED" if revised.source == "DOC_EXPLICIT" else "PENDING")
         revised_count += 1
-    return revised_count
+    return changed_count + revised_count
 
 
 def retry_generic_run(session: Session, run: RunModel, settings: Settings) -> RunModel:
-    if not run.result_json or not run.result_json.get("audit_report_blob"):
+    report_uri = (run.result_json or {}).get("audit_report_blob")
+    if not report_uri:
+        redirect = (
+            session.query(EventModel)
+            .filter(EventModel.run_id == run.id, EventModel.kind == "GO_REDIRECT")
+            .order_by(EventModel.seq.desc())
+            .first()
+        )
+        report_uri = ((redirect.payload_json.get("failed_result") or {}).get("audit_report_blob") if redirect else None)
+    if not report_uri:
         raise WorkflowError("This failure has no persisted audit report to repair")
     specs = _specs(session, run.spec_id)
     llm = RealDesignLlm(settings)
-    report_uri = run.result_json["audit_report_blob"]
     report = json.loads(LocalBlobStore(settings.blob_dir).get(report_uri).decode("utf-8"))
     append_event(
         session,
@@ -584,8 +719,18 @@ def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=No
     )
     try:
         plans = _plan_stage(session, run, specs, llm, generation_budget) if generation_budget else None
+        session.commit()
         _schema_stage(session, run, specs, llm)
+        session.commit()
         pending_count = _rules_stage(session, run, specs, llm, plans)
+        session.commit()
+        schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
+        generated_rules = [
+            RuleDefinition.model_validate(row.definition_json)
+            for row in session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status != "SUPERSEDED").all()
+        ]
+        _ensure_oracle_assets(session, run, specs, schema_payload, generated_rules, settings)
+        session.commit()
     except Exception as exc:
         append_event(
             session,
@@ -652,6 +797,35 @@ def approve_generic_rules(
     return continue_generic_run(session, run, settings, llm) if all_decided else run
 
 
+def confirm_generic_test_results(session: Session, run: RunModel, approver: str) -> RunModel:
+    if run.status != "WAITING_TEST_APPROVAL":
+        raise WorkflowError("Run is not waiting for test result confirmation")
+    summary = (run.result_json or {}).get("audit_summary", {})
+    if not summary.get("all_passed"):
+        raise WorkflowError("Test results can only be confirmed after all Oracle checks pass")
+    report_uri = run.result_json.get("audit_report_blob", "")
+    object_hash = hashlib.sha256(f"{run.id}:{report_uri}".encode()).hexdigest()
+    session.add(
+        ApprovalModel(
+            id=str(uuid.uuid4()),
+            object_type="TEST_RESULTS",
+            object_hash=object_hash,
+            decision="APPROVED",
+            approver=approver,
+            comment="",
+        )
+    )
+    append_event(
+        session,
+        run,
+        "TEST_RESULTS_CONFIRMED",
+        "test_confirmation",
+        {"approver": approver, "object_hash": object_hash},
+    )
+    session.commit()
+    return run
+
+
 def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None) -> RunModel:
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
@@ -667,8 +841,11 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     plans = plan_event.payload_json["tables"] if plan_event else {}
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
+    prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
     golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans)
+    session.commit()
     audit_cases = _audit_stage(session, run, specs, llm, rules, golden_records, plans)
+    session.commit()
     attempt = run.attempt + 1
     append_event(session, run, "AUDIT_STARTED", "oracle_executor", {"attempt": attempt})
     schema_models = {code: [item for item in items] for code, items in schema_payload.items()}
@@ -683,6 +860,8 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     typed_schemas = {
         code: [SchemaBinding.model_validate(item) for item in items] for code, items in schema_models.items()
     }
+    code_sets, field_code_sets = load_published_code_sets(session, specs)
+    validate_code_set_usage(rules, golden_generators, field_code_sets)
     report = GenericOracleExecutor(settings.oracle_sandbox_url).execute(
         run.id,
         attempt,
@@ -693,18 +872,21 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
         rules,
         golden_counts,
         golden_generators,
+        code_sets=code_sets,
+        prepared_assets=prepared_assets,
     )
     blobs = LocalBlobStore(settings.blob_dir)
     ddl_uri = blobs.put(
         "\n\n".join(compile_ai_schema_mysql_ddl(spec.table_code, typed_schemas[spec.table_code]) for spec in specs).encode()
     )
     physical_tables = report["physical_tables"]
-    oracle_ddl_uri = blobs.put(
-        "\n\n".join(
-            compile_ai_schema_oracle_ddl(report["target_tables"][spec.table_code], typed_schemas[spec.table_code])
-            for spec in specs
-        ).encode()
-    )
+    oracle_ddl_parts = [
+        compile_code_set_oracle_ddl(report["code_set_tables"][code_set["code"]]) for code_set in code_sets
+    ] + [
+        compile_ai_schema_oracle_ddl(report["target_tables"][spec.table_code], typed_schemas[spec.table_code])
+        for spec in specs
+    ]
+    oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
     queries = []
     for rule in rules:
         sql, params = compile_rule_query(rule, "oracle", physical_tables)
@@ -718,6 +900,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
         "audit_report_blob": report_uri,
         "oracle_tables": physical_tables,
         "oracle_target_tables": report["target_tables"],
+        "oracle_code_set_tables": report["code_set_tables"],
         "active_rule_hashes": sorted(rule.rule_hash for rule in rules),
         "audit_summary": {key: value for key, value in report.items() if key not in {"cases", "physical_tables", "target_tables"}},
     }
@@ -761,6 +944,14 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
         "oracle_executor",
         {"result": result, "node": "oracle_executor"},
     )
+    if report["all_passed"]:
+        append_event(
+            session,
+            run,
+            "TEST_CONFIRMATION_REQUIRED",
+            "test_confirmation",
+            {"audit_report_blob": report_uri, "active_rule_hashes": result["active_rule_hashes"]},
+        )
     session.commit()
     return run
 
