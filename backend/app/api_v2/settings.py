@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..asset_models import SystemSettingModel
 from ..config import Settings, get_settings
 from ..db import SessionLocal
+from ..generic_ai import RealDesignLlm
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -86,21 +87,19 @@ def test_connection(kind: str) -> Dict[str, Any]:
         if kind == "llm":
             if not settings.llm_api_key:
                 raise HTTPException(status_code=422, detail="LLM credential is not configured")
-            response = httpx.post(
-                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json={
-                    "model": settings.llm_model,
-                    "messages": [{"role": "user", "content": "只回复 OK"}],
-                    "max_tokens": 8,
-                    "temperature": 0,
-                    "thinking": {"type": "enabled"},
-                },
-                timeout=30,
+            _, trace = RealDesignLlm(settings).assign(
+                "assign_generation_plan",
+                "执行连接健康检查，返回最小的合法生成计划。",
+                {"budget": DEFAULT_BUDGET},
+                timeout=60,
             )
-            response.raise_for_status()
-            body = response.json()
-            return {"kind": kind, "ok": True, "request_id": body.get("id"), "model": body.get("model")}
+            return {
+                "kind": kind,
+                "ok": True,
+                "request_id": trace.get("request_id"),
+                "model": trace.get("model"),
+                "elapsed_seconds": trace.get("elapsed_seconds"),
+            }
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM connection failed: {type(exc).__name__}") from exc
     except Exception as exc:

@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -6,6 +8,8 @@ from json_repair import repair_json
 
 from .config import Settings
 from .domain import SpecDocument
+
+LLM_CALL_SEMAPHORE = threading.BoundedSemaphore(4)
 
 FIELD_PROPERTIES = {
     "field": {"type": "string"},
@@ -294,29 +298,50 @@ class RealDesignLlm:
         )
         if feedback:
             prompt += f"\n上次参数被确定性门禁拒绝，请修正：{feedback}"
-        response = httpx.post(
-            f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},
-            json={
-                "model": self.settings.llm_model,
-                "messages": [
-                    {"role": "system", "content": "只进行工具参数赋值，不输出自由文本。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
-                "tool_choice": {"type": "function", "function": {"name": tool_name}},
-                "temperature": 0,
-                "thinking": {"type": "disabled"},
-                "max_tokens": 8192,
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
+        started_at = time.monotonic()
+        try:
+            with LLM_CALL_SEMAPHORE:
+                response = httpx.post(
+                    f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},
+                    json={
+                        "model": self.settings.llm_model,
+                        "messages": [
+                            {"role": "system", "content": "只进行工具参数赋值，不输出自由文本。"},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
+                        "tool_choice": {"type": "function", "function": {"name": tool_name}},
+                        "temperature": 0,
+                        "thinking": {"type": "low"},
+                        "max_tokens": 8192,
+                    },
+                    timeout=timeout,
+                )
+        except httpx.HTTPError as exc:
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
+        if response.is_error:
+            error = response.json().get("error", {})
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(
+                f"LLM HTTP {response.status_code} {error.get('code', '')}: {error.get('message', '')}; elapsed={elapsed}s"
+            )
         body = response.json()
-        message = body["choices"][0]["message"]
+        choice = body["choices"][0]
+        message = choice["message"]
         calls = message.get("tool_calls") or []
         if not calls:
-            raise RuntimeError(f"Model returned no tool call: {message.get('content', '')[:500]}")
+            diagnostic = {
+                "request_id": body.get("id"),
+                "finish_reason": choice.get("finish_reason"),
+                "content_chars": len(message.get("content") or ""),
+                "reasoning_chars": len(message.get("reasoning_content") or ""),
+                "request_chars": len(prompt),
+                "usage": body.get("usage"),
+                "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            }
+            raise RuntimeError(f"Model returned no tool call: {json.dumps(diagnostic, ensure_ascii=False)}")
         arguments: Dict[str, Any] = {}
         json_repaired = False
         for call in calls:
@@ -340,6 +365,9 @@ class RealDesignLlm:
             "tool_name": tool_name,
             "tool_call_count": len(calls),
             "json_repaired": json_repaired,
+            "http_status": response.status_code,
+            "request_chars": len(prompt),
+            "elapsed_seconds": round(time.monotonic() - started_at, 2),
             "arguments": arguments,
         }
         return arguments, trace

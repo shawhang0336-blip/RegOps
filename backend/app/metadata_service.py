@@ -296,7 +296,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "assign_metadata",
                         f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。",
                         payload,
-                        timeout=60,
+                        timeout=120,
                     )
                     candidate = {
                         "table_code": fallback_code,
@@ -389,7 +389,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "fields": [f.model_dump() for f in draft.fields],
                         "raw_context": block.raw_content[:6000],
                     },
-                    timeout=35,
+                    timeout=60,
                 )
                 issues = args.get("issues", [])
             except Exception as exc:
