@@ -45,8 +45,8 @@ IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 ARTIFACTS = ("ddl", "rule_materials", "code_sets")
 
 
-def _issue(severity: str, code: str, message: str, field_en: str = "") -> Dict[str, Any]:
-    return {"severity": severity, "code": code, "message": message, "field_en": field_en}
+def _issue(severity: str, code: str, message: str, field_en: str = "", **extra: Any) -> Dict[str, Any]:
+    return {"severity": severity, "code": code, "message": message, "field_en": field_en, **extra}
 
 
 def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
@@ -159,12 +159,17 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
             continue
         affected = "、".join(sorted(code_set_fields.get(code_set_id, []))[:3])
         for blocker in verdict["blockers"]:
+            extra = {key: value for key, value in blocker.items() if key not in {"severity", "code", "message"}}
             codes.append(
                 _issue(
                     "ERROR",
                     blocker["code"],
                     f"码表「{code_set.code}」{blocker['message']}" + (f"（字段 {affected}）" if affected else ""),
                     affected,
+                    # 让前端能定位到具体码表（跳过去补）和具体码值（在详情里标出来）
+                    code_set_id=code_set_id,
+                    code_set_code=code_set.code,
+                    **extra,
                 )
             )
         if not verdict["value_count"]:

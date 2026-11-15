@@ -236,6 +236,16 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   )
   const verdictOf = (id) => readinessById[id]
 
+  // 码值超长要在列表里指出来——只说「需补 1 项」，用户对着 257 个码值找不到哪个有问题
+  const problemValueSet = new Set()
+  const problemValueHint = new Map()
+  for (const blocker of verdictOf(detail?.id)?.blockers || []) {
+    for (const item of blocker.problem_values || []) {
+      problemValueSet.add(String(item.value))
+      problemValueHint.set(String(item.value), `${item.field_en}（限 ${item.limit} 位，实际 ${item.length} 位）`)
+    }
+  }
+
   const filteredSets = sets.filter((s) => {
     if (!setSearch.trim()) return true
     const q = setSearch.toLowerCase()
@@ -539,10 +549,15 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                     </thead>
                     <tbody>
                       {filteredValues.map((value, idx) => (
-                        <tr key={value.id}>
+                        <tr key={value.id} className={problemValueSet.has(String(value.value)) ? 'field-row-highlight' : ''}>
                           <td className="row-index">{idx + 1}</td>
                           <td>
                             <code>{value.value}</code>
+                            {problemValueSet.has(String(value.value)) && (
+                              <small className="danger-text" style={{ display: 'block' }}>
+                                超出引用字段 {problemValueHint.get(String(value.value))}
+                              </small>
+                            )}
                           </td>
                           <td>
                             <strong>{value.label_cn}</strong>

@@ -118,8 +118,18 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     if (resetTab) setTab('fields')
   }
 
-  async function removeTable(table) {
-    const published = Boolean(table.published_version)
+  // 从码值缺陷直接跳到那张码表（第一步的码值表 tab），并选中它
+  function openCodeSet(codeSetId) {
+    if (!codeSetId) return
+    const next = new URLSearchParams()
+    next.set('view', 'codes')
+    const documentId = params.get('document_id')
+    if (documentId) next.set('document_id', documentId)
+    next.set('set', codeSetId)
+    navigate(`/documents?${next.toString()}`)
+  }
+
+  async function removeTable(table) {    const published = Boolean(table.published_version)
     const warning = published
       ? `\n\n注意：这张表已定稿（v${table.published_version}），删掉后之前生成过的运行仍能靠快照复现，但表本身会从列表里消失。`
       : ''
@@ -592,15 +602,39 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                         const problems = key === 'code_sets' ? defects : section.blockers || []
                         // 这张表根本没有这一项（例如没有码值引用的报表）
                         const na = section.applicable === false
+                        // 码值有问题时能直接跳到那张码表，不然用户看着 ✕ 不知道去哪补
+                        const jumpTo = key === 'code_sets' && problems.length && problems[0].code_set_id
                         return (
                           <span
                             key={key}
-                            className={`ready-chip ${na ? 'na' : problems.length ? 'bad' : 'ok'}`}
+                            role={jumpTo ? 'button' : undefined}
+                            tabIndex={jumpTo ? 0 : undefined}
+                            className={`ready-chip ${na ? 'na' : problems.length ? 'bad' : 'ok'} ${jumpTo ? 'jumpable' : ''}`}
+                            onClick={
+                              jumpTo
+                                ? (event) => {
+                                    event.stopPropagation()
+                                    openCodeSet(problems[0].code_set_id)
+                                  }
+                                : undefined
+                            }
+                            onKeyDown={
+                              jumpTo
+                                ? (event) => {
+                                    if (event.key === 'Enter' || event.key === ' ') {
+                                      event.preventDefault()
+                                      event.stopPropagation()
+                                      openCodeSet(problems[0].code_set_id)
+                                    }
+                                  }
+                                : undefined
+                            }
                             title={
                               na
                                 ? `${label} 不适用：这张表没有引用任何码表`
                                 : problems.length
-                                  ? problems.map((item) => item.message).join('；')
+                                  ? problems.map((item) => item.message).join('；') +
+                                    (jumpTo ? '\n（点击打开这张码表）' : '')
                                   : key === 'code_sets'
                                     ? '码值齐备，不需要补充；码表会在发布时自动发出'
                                     : `${label} 可以生成`

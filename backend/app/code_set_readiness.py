@@ -21,8 +21,8 @@ from sqlalchemy.orm import Session
 from .asset_models import CodeSetModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel
 
 
-def _issue(severity: str, code: str, message: str) -> Dict[str, Any]:
-    return {"severity": severity, "code": code, "message": message}
+def _issue(severity: str, code: str, message: str, **extra: Any) -> Dict[str, Any]:
+    return {"severity": severity, "code": code, "message": message, **extra}
 
 
 def evaluate_code_set(
@@ -70,6 +70,7 @@ def evaluate_code_set(
         )
 
     too_long = []
+    problem_values: List[Dict[str, Any]] = []
     for ref, field in refs:
         limit = int(field.length or 0)
         if not limit:
@@ -77,10 +78,24 @@ def evaluate_code_set(
         for value in values:
             if len(str(value.value)) > limit:
                 too_long.append(f"{value.value}（字段 {field.field_en} 限 {limit} 位）")
+                problem_values.append(
+                    {
+                        "value": str(value.value),
+                        "label_cn": value.label_cn or "",
+                        "field_en": field.field_en,
+                        "limit": limit,
+                        "length": len(str(value.value)),
+                    }
+                )
                 break
     if too_long:
         blockers.append(
-            _issue("ERROR", "VALUE_TOO_LONG", f"码值长度超过引用字段长度：{'；'.join(too_long[:3])}")
+            _issue(
+                "ERROR",
+                "VALUE_TOO_LONG",
+                f"码值长度超过引用字段长度：{'；'.join(too_long[:3])}",
+                problem_values=problem_values[:20],
+            )
         )
 
     if not refs:

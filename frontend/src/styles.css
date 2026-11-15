@@ -1606,3 +1606,13 @@
   background: var(--amber-light);
   box-shadow: inset 3px 0 0 var(--amber);
 }
+
+/* 可点击的 chip：提示用户点进去能到具体位置 */
+.ready-chip.jumpable {
+  cursor: pointer;
+}
+
+.ready-chip.jumpable:hover {
+  filter: brightness(0.96);
+  text-decoration: underline;
+}
