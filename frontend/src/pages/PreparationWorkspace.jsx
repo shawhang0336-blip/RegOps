@@ -52,9 +52,9 @@ export default function PreparationWorkspace() {
       />
       <DocumentsPage embedded importOnly autoParse onShowAssets={changeView} onSelectDocument={changeDocument} />
       <nav className="asset-workspace-tabs" aria-label="导入与核对视图">
-        {VIEWS.map(([key, label], index) => (
+        {VIEWS.map(([key, label]) => (
           <button type="button" key={key} className={view === key ? 'active' : ''} onClick={() => changeView(key)}>
-            <span>{index + 1}</span>{label}
+            {label}
           </button>
         ))}
       </nav>

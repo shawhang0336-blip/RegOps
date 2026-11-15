@@ -54,6 +54,22 @@ def _source_declares_type(raw_context: str) -> bool:
     return any(hint in text for hint in TYPE_DECLARATION_HINTS)
 
 
+# "校验规则有没有装配好"是后续阶段的职责，阶段 1 的字段复核不该用它阻断整张表
+RULE_ASSEMBLY_KEYWORDS = (
+    "OPERATOR",
+    "COND_REQUIRED",
+    "MISSING_CONDITIONAL_REQUIRED",
+    "MISSING_CONDITIONAL",
+    "FOREIGN_KEY",
+    "RULE_NOT_ASSEMBLED",
+)
+
+
+def _is_rule_assembly_issue(code: str) -> bool:
+    upper = (code or "").upper()
+    return any(keyword in upper for keyword in RULE_ASSEMBLY_KEYWORDS)
+
+
 def _field_declares_length(raw_context: str, field_en: str) -> Optional[bool]:
     """判断原文对该字段是否给出了明确的长度。
 
@@ -119,6 +135,8 @@ def enforce_issue_evidence(
                 reason = "来源原文未声明数据类型或长度，该判断属推断"
             elif _is_length_related(code) and _field_declares_length(raw_context, str(item.get("field_en") or "")) is False:
                 reason = "来源原文只写了类型、未给出长度，长度判断属推断"
+            elif _is_rule_assembly_issue(code):
+                reason = "校验规则装配属后续阶段，不作为字段元数据的阻断项"
             elif evidence and evidence.upper() not in {"NO_SOURCE", "无", "N/A"}:
                 compact_evidence = re.sub(r"\s+", "", evidence)
                 if compact_evidence and compact_evidence not in compact_source:
@@ -509,7 +527,9 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "②raw_context 没有声明数据类型/长度时，不得判定类型或长度错配为 ERROR，"
                         "只能报 WARNING 并把 evidence 填 NO_SOURCE；"
                         "③不要用业务常识（如\"金额项应为数值型\"）替代原文声明，此类推断不得报 ERROR；"
-                        "④没有问题就返回空数组。"
+                        "④原文用①②③列举取值时，按序号 1..N 编码是允许的，不要判为编造码值；"
+                        "⑤本条只审字段元数据本身，不要评价校验规则/条件算子是否已装配（那是后续阶段）；"
+                        "⑥没有问题就返回空数组。"
                     ),
                     {
                         "source_locator": block.source_locator,

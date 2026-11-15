@@ -264,3 +264,19 @@ def test_enforce_issue_evidence_downgrades_length_claim_without_declared_length(
     result = enforce_issue_evidence(issues, raw)
     assert result[0]["severity"] == "WARNING"
     assert "未给出长度" in result[0]["message"]
+
+
+def test_rule_assembly_issues_do_not_block_metadata_stage():
+    from app.metadata_service import enforce_issue_evidence, table_needs_review
+
+    raw = "A0101  境外被投资机构代码  字符型，256  必填项。"
+    issues = [
+        {"severity": "ERROR", "code": "MISSING_OPERATOR", "field_en": "A0101", "message": "算术校验未装配算子"},
+        {"severity": "ERROR", "code": "COND_REQUIRED_MISSING", "field_en": "A0101", "message": "条件必填未装配"},
+        {"severity": "ERROR", "code": "MISSING_ENUM", "field_en": "A0101", "message": "码值未登记"},
+    ]
+    result = enforce_issue_evidence(issues, raw)
+    assert result[0]["severity"] == "WARNING"   # 规则装配属后续阶段
+    assert result[1]["severity"] == "WARNING"
+    assert result[2]["severity"] == "ERROR"     # 码值登记属阶段 1
+    assert table_needs_review(result) is True
