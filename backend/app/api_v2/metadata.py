@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..asset_models import (
+    FieldCodeReferenceModel,
     FieldMetadataModel,
     MetadataRevisionModel,
     MetadataValidationModel,
@@ -27,6 +28,7 @@ from ..metadata_service import (
     apply_field_type_import,
     metadata_to_spec,
     publish_table,
+    remove_table,
     table_detail,
     table_summary,
     update_field,
@@ -58,6 +60,12 @@ class FieldCreateRequest(BaseModel):
 class PublishRequest(BaseModel):
     expected_version: int
     approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
+
+
+class DeleteRequest(BaseModel):
+    expected_version: Optional[int] = None
+    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
+    reason: str = ""
 
 
 @router.post("/extract", status_code=202)
@@ -344,6 +352,24 @@ def delete_field(table_id: str, field_id: str, request: EditRequest) -> Dict[str
         )
         session.commit()
         return table_detail(session, table)
+
+
+@router.delete("/tables/{table_id}")
+def delete_table(table_id: str, request: DeleteRequest) -> Dict[str, Any]:
+    """删掉一张不想要的报表（抽取错了、不是目标表等）。
+
+    硬删除，连带字段和字段上的码值引用。历史 run 不受影响——run 里存的是
+    spec 快照（content_json），不依赖这一行还在不在。
+    """
+    with SessionLocal() as session:
+        table = session.get(TableMetadataModel, table_id)
+        if not table:
+            raise HTTPException(status_code=404, detail="Metadata table not found")
+        if request.expected_version is not None and table.current_version != request.expected_version:
+            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+        result = remove_table(session, table)
+        session.commit()
+        return {**result, "editor": request.editor, "reason": request.reason}
 
 
 @router.post("/tables/{table_id}/draft")

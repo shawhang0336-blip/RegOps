@@ -1079,3 +1079,30 @@ def generation_blockers(session: Session, table: TableMetadataModel) -> List[Dic
             if reference.status == "UNRESOLVED" and field.required:
                 blockers.append({"field_en": field.field_en, "reason": "REQUIRED_CODE_SET_UNRESOLVED", "code_set_id": reference.code_set_id})
     return blockers
+
+
+def remove_code_set(session: Session, row) -> Dict[str, Any]:
+    """删掉一张码表及其码值。
+
+    被字段引用着的不能直接删——那会让字段的码值引用悬空，
+    后面 readiness 报 UNRESOLVED 时已经晚了。要先解除引用。
+    """
+    from .asset_models import CodeValueModel, FieldCodeReferenceModel
+
+    reference_count = (
+        session.query(FieldCodeReferenceModel)
+        .filter(FieldCodeReferenceModel.code_set_id == row.id)
+        .count()
+    )
+    if reference_count:
+        raise ValueError(
+            f"码表「{row.code}」被 {reference_count} 个字段引用着，"
+            "删掉会让这些字段的码值引用悬空。先处理引用再删。"
+        )
+    value_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).count()
+    session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).delete(synchronize_session=False)
+    code = row.code
+    code_set_id = row.id
+    session.delete(row)
+    session.flush()
+    return {"deleted": code_set_id, "code": code, "value_count": value_count}

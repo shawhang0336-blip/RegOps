@@ -774,6 +774,33 @@ def update_field(
     session.flush()
 
 
+def remove_table(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
+    """删掉一张报表：字段、字段上的码值引用、历史修订一并清掉。
+
+    历史 run 不受影响——run 存的是 spec 快照（content_json），不依赖这一行。
+    码表不跟着删，它可能还被别的表引用着。
+    """
+    field_ids = [
+        row[0]
+        for row in session.query(FieldMetadataModel.id).filter(FieldMetadataModel.table_id == table.id).all()
+    ]
+    if field_ids:
+        session.query(FieldCodeReferenceModel).filter(
+            FieldCodeReferenceModel.field_id.in_(field_ids)
+        ).delete(synchronize_session=False)
+    session.query(MetadataRevisionModel).filter(
+        MetadataRevisionModel.table_id == table.id
+    ).delete(synchronize_session=False)
+    session.query(FieldMetadataModel).filter(
+        FieldMetadataModel.table_id == table.id
+    ).delete(synchronize_session=False)
+    code = table.table_code
+    table_id = table.id
+    session.delete(table)
+    session.flush()
+    return {"deleted": table_id, "table_code": code, "field_count": len(field_ids)}
+
+
 def publish_table(session: Session, table: TableMetadataModel, approver: str, expected_version: int) -> Dict[str, Any]:
     """定稿一张表；顺带把它引用、且检查通过的码表一起发布。
 

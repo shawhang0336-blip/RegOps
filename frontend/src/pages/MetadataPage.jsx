@@ -40,7 +40,7 @@ function typeBasisMeta(basis) {
   return TYPE_BASIS_META[String(basis || 'UNKNOWN').toUpperCase()] || TYPE_BASIS_META.UNKNOWN
 }
 
-export default function MetadataPage({ embedded = false }) {
+export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
 
@@ -103,6 +103,35 @@ export default function MetadataPage({ embedded = false }) {
     setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
     setEditingFieldId(null)
     if (resetTab) setTab('fields')
+  }
+
+  async function removeTable(table) {
+    const published = Boolean(table.published_version)
+    const warning = published
+      ? `\n\n注意：这张表已定稿（v${table.published_version}），删掉后之前生成过的运行仍能靠快照复现，但表本身会从列表里消失。`
+      : ''
+    if (
+      !window.confirm(
+        `删除报表「${table.table_name}」（${table.table_code}）？\n\n会连带删掉 ${table.field_count} 个字段和字段上的码值引用，不可恢复。${warning}`
+      )
+    ) {
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      await v2(`/metadata/tables/${table.id}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ expected_version: table.current_version }),
+      })
+      setNotice(`已删除「${table.table_code}」。`)
+      if (detail?.id === table.id) setDetail(null)
+      await load()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
   function changeFieldProp(id, key, value) {
@@ -408,6 +437,10 @@ export default function MetadataPage({ embedded = false }) {
   const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
 
   const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
+  // 有码值缺陷（空码表、引用解析不到）的表——补数据要去码表页
+  const codeDefectCount = (readiness?.tables || []).filter(
+    (item) => item.code_sets?.applicable && (item.code_sets.defects || []).length > 0
+  ).length
 
   const pageActions = detail && (
     <>
@@ -482,6 +515,14 @@ export default function MetadataPage({ embedded = false }) {
               <p className="readiness-hint">
                 不用在这里点发布：去第 2 步选表，能用的会直接定稿并生成，不能用会告诉你缺什么。
               </p>
+              {onOpenCodeSets && codeDefectCount > 0 && (
+                <p className="readiness-hint">
+                  有 {codeDefectCount} 张表的码值需要补（空码表或码值引用解析不到），发布解决不了。
+                  <button type="button" className="link-button" onClick={onOpenCodeSets}>
+                    去补码值 →
+                  </button>
+                </p>
+              )}
               {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
                 readiness.summary.ready.ddl && (
                 <p className="readiness-hint">
@@ -494,12 +535,30 @@ export default function MetadataPage({ embedded = false }) {
           {visibleTables.length > 0 ? (
             <div className="list-stack">
               {visibleTables.map((table) => (
-                <button
-                  type="button"
-                  className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
+                <div
                   key={table.id}
+                  role="button"
+                  tabIndex={0}
+                  className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
                   onClick={() => select(table.id, false)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      select(table.id, false)
+                    }
+                  }}
                 >
+                  <button
+                    type="button"
+                    className="row-delete"
+                    title={table.published_version ? '已定稿的表需要先确认' : '删除这张报表'}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      removeTable(table)
+                    }}
+                  >
+                    ×
+                  </button>
                   <div className="list-row-top">
                     <strong>{table.table_name}</strong>
                     <StatusBadge status={table.status} />
@@ -561,7 +620,7 @@ export default function MetadataPage({ embedded = false }) {
                   ) : (table.review_advisory_count || 0) > 0 ? (
                     <em className="muted-text">{table.review_advisory_count} 条提示，不影响使用</em>
                   ) : null}
-                </button>
+                </div>
               ))}
             </div>
           ) : (

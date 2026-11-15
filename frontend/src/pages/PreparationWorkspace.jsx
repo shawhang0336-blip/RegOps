@@ -6,14 +6,14 @@ import DocumentsPage from './DocumentsPage.jsx'
 import MetadataPage from './MetadataPage.jsx'
 import CodeSetsPage from './CodeSetsPage.jsx'
 
-const VIEWS = [
-  ['fields', '报表字段'],
-  ['codes', '码表'],
-]
+const DEFAULT_VIEW = 'fields'
 
 export default function PreparationWorkspace() {
   const [params, setParams] = useSearchParams()
-  const view = VIEWS.some(([key]) => key === params.get('view')) ? params.get('view') : 'fields'
+  // 只留报表字段一个主视图。码表不再作为一个并列的入口——它由阶段 2 自动生成、
+  // 发布时自动发出，不需要人在这里逐张核对。保留 view=codes 是为了：
+  // ① 解析结果里只有码表没有报表时自动跳过去；② 元数据页遇到码值缺陷时能过去补。
+  const view = params.get('view') === 'codes' ? 'codes' : DEFAULT_VIEW
   const documentId = params.get('document_id') || ''
 
   useEffect(() => {
@@ -48,18 +48,24 @@ export default function PreparationWorkspace() {
       <PageHeader
         eyebrow="第 1 步 · 共 3 步"
         title="规范解析与核对"
-        description="上传文件后自动解析，在同一页面核对报表字段和码表。"
+        description="上传文件后自动解析，在这里核对报表字段。码表由下一步自动生成并发布。"
       />
       <DocumentsPage embedded importOnly autoParse onShowAssets={changeView} onSelectDocument={changeDocument} />
-      <nav className="asset-workspace-tabs" aria-label="导入与核对视图">
-        {VIEWS.map(([key, label]) => (
-          <button type="button" key={key} className={view === key ? 'active' : ''} onClick={() => changeView(key)}>
-            {label}
-          </button>
-        ))}
-      </nav>
-      {view === 'fields' && <MetadataPage embedded />}
-      {view === 'codes' && <CodeSetsPage embedded onDocumentChange={changeDocument} />}
+      {view === 'codes' ? (
+        <>
+          <div className="asset-scope-bar">
+            <span>
+              正在查看码表（由阶段 2 自动生成，发布表时自动发出）
+            </span>
+            <button type="button" className="button secondary sm" onClick={() => changeView('fields')}>
+              ← 返回报表字段
+            </button>
+          </div>
+          <CodeSetsPage embedded onDocumentChange={changeDocument} />
+        </>
+      ) : (
+        <MetadataPage embedded onOpenCodeSets={() => changeView('codes')} />
+      )}
     </>
   )
 }

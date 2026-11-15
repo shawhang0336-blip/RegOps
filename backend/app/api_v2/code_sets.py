@@ -16,6 +16,7 @@ from ..code_service import (
     document_code_set_ordinals,
     extract_parallel_for_blocks,
     refresh_reference_status,
+    remove_code_set,
 )
 from ..config import get_settings
 from ..db import SessionLocal
@@ -318,6 +319,28 @@ def edit_code_set(code_set_id: str, request: VersionRequest) -> Dict[str, Any]:
         row.status = "DRAFT"
         session.commit()
         return detail(session, row)
+
+
+@router.delete("/{code_set_id}")
+def delete_code_set(code_set_id: str) -> Dict[str, Any]:
+    """删掉一张不想要的码表（抽取错了、重复的、不是码表等）。
+
+    被字段引用着的不能直接删——那会让字段的码值引用悬空。先让它变成
+    UNRESOLVED，或者去把引用解除。
+    """
+    with SessionLocal() as session:
+        row = session.get(CodeSetModel, code_set_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Code set not found")
+        try:
+            result = remove_code_set(session, row)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CODE_SET_IN_USE", "message": str(exc)},
+            ) from exc
+        session.commit()
+        return result
 
 
 @router.post("/{code_set_id}/values")

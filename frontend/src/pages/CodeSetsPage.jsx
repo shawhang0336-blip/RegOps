@@ -65,6 +65,28 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     setDetail(data)
   }
 
+  async function removeCodeSet(set) {
+    if (
+      !window.confirm(
+        `删除码表「${set.name}」（${set.code}）？\n\n会连带删掉 ${set.value_count} 项码值，不可恢复。`
+      )
+    ) {
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      await v2(`/code-sets/${set.id}`, { method: 'DELETE' })
+      setNotice(`已删除「${set.code}」。`)
+      if (detail?.id === set.id) setDetail(null)
+      await load()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function handleDocumentCodeUpload(file) {
     if (!file) return
     const form = new FormData()
@@ -359,12 +381,30 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
           {filteredSets.length > 0 ? (
             <div className="list-stack">
               {filteredSets.map((set) => (
-                <button
-                  type="button"
-                  className={`list-row ${detail?.id === set.id ? 'selected' : ''}`}
+                <div
                   key={set.id}
+                  role="button"
+                  tabIndex={0}
+                  className={`list-row ${detail?.id === set.id ? 'selected' : ''}`}
                   onClick={() => select(set.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      select(set.id)
+                    }
+                  }}
                 >
+                  <button
+                    type="button"
+                    className="row-delete"
+                    title="删除这张码表"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      removeCodeSet(set)
+                    }}
+                  >
+                    ×
+                  </button>
                   <div className="list-row-top">
                     <strong>{set.name}</strong>
                     <StatusBadge status={set.status} />
@@ -377,7 +417,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   ) : (
                     <em>{set.published_version ? `已发布 v${set.published_version}` : '尚未发布'} · {set.value_count} 项取值</em>
                   )}
-                </button>
+                </div>
               ))}
             </div>
           ) : (
