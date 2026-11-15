@@ -57,13 +57,43 @@ CODE_NAME_SYNONYMS = {
 }
 
 
+CIRCLED_NUM = "①②③④⑤⑥⑦⑧⑨⑩"
+
+
+def parse_inline_enum(text: str) -> List[Dict[str, str]]:
+    """把 "Y-是；N-否" / "①政府；②央行" / "是-Y，否-N" 这类内联枚举解析成码值对；解析失败返回空。"""
+    parts = [p.strip() for p in re.split(r"[；;，,]", text or "") if p.strip()]
+    if len(parts) < 2:
+        return []
+    values = []
+    for part in parts:
+        match = re.match(r"^([A-Za-z0-9①②③④⑤⑥⑦⑧⑨⑩]+)\s*[\-—:：、]?\s*(.+)$", part)
+        if match:
+            code, label = match.group(1).strip(), match.group(2).strip()
+        else:
+            reverse = re.match(r"^(.+?)\s*[\-—:：、]\s*([A-Za-z0-9①②③④⑤⑥⑦⑧⑨⑩]+)$", part)
+            if not reverse:
+                return []
+            label, code = reverse.group(1).strip(), reverse.group(2).strip()
+        if code in CIRCLED_NUM:
+            code = str(CIRCLED_NUM.index(code) + 1)
+        values.append({"value": code[:20], "label_cn": label[:80]})
+    codes = [item["value"] for item in values]
+    if len(set(codes)) != len(codes):
+        return []
+    return values
+
+
 def normalize_code_set_name(raw_name: str) -> str:
     if not raw_name:
         return ""
     text = raw_name.strip()
-    text = re.sub(r"^(?:参?见|参照|本制度|数据采集规范最新版本中的相关代码表或本制度)", "", text)
-    text = re.sub(r"附录[（(][一二三四五六七八九十0-9]+[)）]", "", text)
-    text = re.sub(r"(?:代码表|分类标准表|分类标准|代码|名录|表)$", "", text)
+    # 先去掉括号及内容（如"（3位字母代码）"），避免其污染核心名
+    text = re.sub(r"[（(][^）)]*[）)]", "", text)
+    text = re.sub(r"^(?:参?见|参照|本制度|数据采集规范最新版本中的相关代码表或本制度)+", "", text)
+    # 去掉"附录"残留（括号在上一步已移除）
+    text = re.sub(r"(?:五、附录|附[录表])", "", text)
+    text = re.sub(r"(?:代码表|分类标准表|分类标准|代码|名录|表|填写|填)+$", "", text)
     text = re.sub(r"[\s/（）()—\-·:：，,。]", "", text)
     return CODE_NAME_SYNONYMS.get(text, text)
 
@@ -159,9 +189,25 @@ def _find_matching_code_set(
         return code_match
     if not norm_target:
         return None
-    for cs in session.query(CodeSetModel).all():
+    candidates = session.query(CodeSetModel).all()
+    for cs in candidates:
         if normalize_code_set_name(cs.name) == norm_target:
             return cs
+    # 核心名包含匹配：一方包含另一方且长度接近，容忍"附录/参照/（3位字母代码）"等残留修饰
+    contains = []
+    for cs in candidates:
+        norm_cs = normalize_code_set_name(cs.name)
+        if len(norm_cs) < 2:
+            continue
+        shorter, longer = (norm_target, norm_cs) if len(norm_target) <= len(norm_cs) else (norm_cs, norm_target)
+        if len(shorter) >= 2 and shorter in longer and len(longer) - len(shorter) <= 6:
+            contains.append(cs)
+    if contains:
+        with_values = [
+            cs for cs in contains
+            if session.query(CodeValueModel).filter(CodeValueModel.code_set_id == cs.id).count() > 0
+        ]
+        return (with_values or contains)[0]
     return None
 
 
@@ -179,28 +225,63 @@ def ensure_field_reference(
         return
     code_set = _find_matching_code_set(session, text, by_name=by_name, by_code=by_code, by_norm=by_norm)
     if not code_set:
-        code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())
-        code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
-        if not code_set:
-            code_set = CodeSetModel(
-                id=str(uuid.uuid4()),
-                code=code[:96],
-                name=text[:255],
-                definition=f"由字段 {field.field_en} 的校验引用自动建立",
-                source_type="DOCUMENT_REFERENCE",
-                status="DRAFT",
-                current_version=1,
-            )
-            session.add(code_set)
-            session.flush()
-            if by_name is not None:
-                by_name[text] = code_set
-            if by_code is not None:
-                by_code[code] = code_set
-            if by_norm is not None:
-                nk = normalize_code_set_name(text)
-                if nk and nk not in by_norm:
-                    by_norm[nk] = code_set
+        enum_values = parse_inline_enum(text)
+        if enum_values:
+            code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_INLINE_ENUM".upper())[:96]
+            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+            if not code_set:
+                code_set = CodeSetModel(
+                    id=str(uuid.uuid4()),
+                    code=code,
+                    name=text[:255],
+                    definition=f"字段 {field.field_en} 的内联枚举",
+                    source_type="INLINE_ENUM",
+                    status="AI_SELF_VALIDATED",
+                    current_version=1,
+                )
+                session.add(code_set)
+                session.flush()
+                for index, item in enumerate(enum_values):
+                    session.add(
+                        CodeValueModel(
+                            id=str(uuid.uuid4()),
+                            code_set_id=code_set.id,
+                            value=item["value"],
+                            label_cn=item["label_cn"],
+                            label_en="",
+                            definition="",
+                            sort_order=index,
+                            enabled=True,
+                            source_locator={},
+                        )
+                    )
+                if by_code is not None:
+                    by_code[code] = code_set
+                if sets_with_values is not None:
+                    sets_with_values.add(code_set.id)
+        else:
+            code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())
+            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+            if not code_set:
+                code_set = CodeSetModel(
+                    id=str(uuid.uuid4()),
+                    code=code[:96],
+                    name=text[:255],
+                    definition=f"由字段 {field.field_en} 的校验引用自动建立",
+                    source_type="DOCUMENT_REFERENCE",
+                    status="DRAFT",
+                    current_version=1,
+                )
+                session.add(code_set)
+                session.flush()
+                if by_name is not None:
+                    by_name[text] = code_set
+                if by_code is not None:
+                    by_code[code] = code_set
+                if by_norm is not None:
+                    nk = normalize_code_set_name(text)
+                    if nk and nk not in by_norm:
+                        by_norm[nk] = code_set
 
     has_val = (
         (code_set.id in sets_with_values)
@@ -251,15 +332,17 @@ def auto_link_all_references(session: Session) -> int:
     by_code: Dict[str, CodeSetModel] = {}
     by_norm: Dict[str, Optional[CodeSetModel]] = {}
 
-    for cs in sorted(all_sets, key=lambda x: x.id in sets_with_values):
+    for cs in all_sets:
         by_name[cs.name] = cs
         by_code[cs.code.upper()] = cs
         nk = normalize_code_set_name(cs.name)
-        if nk:
-            if nk in by_norm and by_norm[nk] is not None and by_norm[nk].id != cs.id:
-                by_norm[nk] = None
-            else:
-                by_norm[nk] = cs
+        if not nk:
+            continue
+        existing = by_norm.get(nk)
+        if existing is None or existing.id == cs.id:
+            by_norm[nk] = cs
+        elif (cs.id in sets_with_values) and (existing.id not in sets_with_values):
+            by_norm[nk] = cs  # 归一化名冲突时优先保留有值码表，避免占位表遮蔽
 
     existing_ref_by_field = {
         r.field_id: r for r in session.query(FieldCodeReferenceModel).all()
