@@ -251,7 +251,10 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             if not section.get("applicable", True):
                 not_applicable[artifact] += 1
                 continue
-            if section["ready"]:
+            # 码值看「有没有需要人补的东西」，不看「码表有没有点发布」——
+            # 发布是自动的，待发布对用户没有决策价值，不该占一个状态位。
+            ok = not section["defects"] if artifact == "code_sets" else section["ready"]
+            if ok:
                 ready[artifact] += 1
             for blocker in section["blockers"]:
                 counter[artifact][blocker["code"]] = counter[artifact].get(blocker["code"], 0) + 1

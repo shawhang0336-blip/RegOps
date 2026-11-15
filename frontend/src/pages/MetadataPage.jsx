@@ -509,7 +509,7 @@ export default function MetadataPage({ embedded = false }) {
               <div className="readiness-summary-main">
                 <strong>可出包 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
                 <span className="muted-text">
-                  DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值就绪{' '}
+                  DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值齐备{' '}
                   {readiness.summary.ready.code_sets}
                   {readiness.summary.not_applicable?.code_sets > 0 &&
                     `（另 ${readiness.summary.not_applicable.code_sets} 张无码值引用，不涉及）`}
@@ -521,21 +521,15 @@ export default function MetadataPage({ embedded = false }) {
                 className="button secondary sm"
                 disabled={busy || readyAll === 0}
                 onClick={publishReadyTables}
-                title="只发布 DDL 能落地、码值能灌库、规则原料齐备的表"
+                title="只发布 DDL 能落地、规则原料齐备、码值没有待补缺陷的表；码表会自动跟着发布"
               >
                 批量发布可出包的表
               </button>
-              {readiness.summary.publish_pending_only > 0 && (
-                <p className="readiness-hint">
-                  其中 {readiness.summary.publish_pending_only} 张的码表还没发布——不用单独点，
-                  发布这些表时会自动把检查通过的码表一起发掉；空码表之类的真缺陷才会留给你补。
-                </p>
-              )}
               {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
                 readiness.summary.ready.ddl && (
                 <p className="readiness-hint">
-                  卡口在码值：能建表 {readiness.summary.ready.ddl} 张、能灌码值只有 {readiness.summary.ready.code_sets} 张，
-                  通常是引用的码表还没发布——阶段 2 的规则装配遇到未发布码表会直接报错，码值也进不了产出包。
+                  卡口在码值：能建表 {readiness.summary.ready.ddl} 张、码值齐备只有 {readiness.summary.ready.code_sets} 张。
+                  这些是空码表或码值引用解析不到，需要回原文补码值——发布解决不了。
                 </p>
               )}
             </div>
@@ -565,32 +559,27 @@ export default function MetadataPage({ embedded = false }) {
                       {['ddl', 'rule_materials', 'code_sets'].map((key) => {
                         const section = readinessById[table.id][key]
                         const label = key === 'ddl' ? 'DDL' : key === 'rule_materials' ? '规则原料' : '码值'
-                        // applicable=false：这张表根本没有这一项（例如没有码值引用的报表），
-                        // 显示成「✓」会被误读成「验过了」
+                        // 码值只看「有没有需要人补的东西」：发布是自动的，
+                        // 「待发布」不占状态位，否则用户还要为一个不用他管的动作操心
+                        const defects = section.defects || []
+                        const problems = key === 'code_sets' ? defects : section.blockers || []
+                        // 这张表根本没有这一项（例如没有码值引用的报表）
                         const na = section.applicable === false
-                        // 只差把码表点发布：数据是好的，不该和「空码表」共用红色 ✕
-                        const pendingOnly = !section.ready && !na && (section.defects || []).length === 0
-                        const tone = na ? 'na' : section.ready ? 'ok' : pendingOnly ? 'pending' : 'bad'
                         return (
                           <span
                             key={key}
-                            className={`ready-chip ${tone}`}
+                            className={`ready-chip ${na ? 'na' : problems.length ? 'bad' : 'ok'}`}
                             title={
                               na
                                 ? `${label} 不适用：这张表没有引用任何码表`
-                                : section.ready
-                                  ? `${label} 可以生成`
-                                  : (section.blockers || []).map((item) => item.message).join('；')
+                                : problems.length
+                                  ? problems.map((item) => item.message).join('；')
+                                  : key === 'code_sets'
+                                    ? '码值齐备，不需要补充；码表会在发布时自动发出'
+                                    : `${label} 可以生成`
                             }
                           >
-                            {label}{' '}
-                            {na
-                              ? '—'
-                              : section.ready
-                                ? '✓'
-                                : pendingOnly
-                                  ? `待发布${(section.publish_pending || []).length}`
-                                  : `✕${section.blockers.length}`}
+                            {label} {na ? '—' : problems.length ? `✕${problems.length}` : '✓'}
                           </span>
                         )
                       })}

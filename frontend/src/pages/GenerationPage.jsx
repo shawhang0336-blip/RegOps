@@ -62,17 +62,19 @@ export default function GenerationPage() {
   }, [])
 
   const ddlReady = (id) => readiness[id]?.ddl?.ready !== false
+  // 码值只看「有没有需要人补的东西」：码表发布是自动的（发布表时会发），
+  // 所以「待发布」不参与判定，否则用户会为了一个不用他管的动作被挡住
+  const codeProblems = (section) => section?.defects || []
   const fullyReady = (id) => {
     const item = readiness[id]
     if (!item) return false
-    return item.ddl.ready && item.rule_materials.ready && item.code_sets.ready
+    return item.ddl.ready && item.rule_materials.ready && codeProblems(item.code_sets).length === 0
   }
-  // 只有「质量下降但不阻断装配」的提示才允许确认后继续。
-  // 码值相关的 blocker 会让阶段 2 直接 WorkflowError 退出，确认了也一定失败。
+  // 只有会让阶段 2 直接失败的问题才硬拦。码值这项看真缺陷，不看发布状态。
   const hardBlockers = (id) => {
     const item = readiness[id]
     if (!item) return []
-    return [...(item.rule_materials.blockers || []), ...(item.code_sets.blockers || [])]
+    return [...(item.rule_materials.blockers || []), ...codeProblems(item.code_sets)]
   }
   const pendingWarnings = (id) => {
     const item = readiness[id]
@@ -262,31 +264,29 @@ export default function GenerationPage() {
                         <div className="readiness-row">
                           {ARTIFACTS.map((artifact) => {
                             const section = item[artifact.key]
-                            // 没有码值引用的报表没有「码值」这项，不能渲染成 ✓
+                            // 码值只看「有没有需要人补的东西」：发布是自动的，
+                            // 「待发布」不占状态位
+                            const problems =
+                              artifact.key === 'code_sets'
+                                ? section.defects || []
+                                : section.blockers || []
+                            // 这张表根本没有这一项（例如没有码值引用的报表）
                             const na = section.applicable === false
-                            // 只差把码表点发布：数据是好的，不该和「空码表」共用红色 ✕
-                            const pendingOnly = !section.ready && !na && (section.defects || []).length === 0
-                            const tone = na ? 'na' : section.ready ? 'ok' : pendingOnly ? 'pending' : 'bad'
                             return (
                               <span
                                 key={artifact.key}
-                                className={`ready-chip ${tone}`}
+                                className={`ready-chip ${na ? 'na' : problems.length ? 'bad' : 'ok'}`}
                                 title={
                                   na
                                     ? `${artifact.label} 不适用：这张表没有引用任何码表`
-                                    : section.ready
-                                      ? `${artifact.label} 可以生成（${artifact.hint}）`
-                                      : (section.blockers || []).map((b) => b.message).join('；')
+                                    : problems.length
+                                      ? problems.map((b) => b.message).join('；')
+                                      : artifact.key === 'code_sets'
+                                        ? '码值齐备，不需要补充；码表会在发布时自动发出'
+                                        : `${artifact.label} 可以生成（${artifact.hint}）`
                                 }
                               >
-                                {artifact.label}{' '}
-                                {na
-                                  ? '—'
-                                  : section.ready
-                                    ? '✓'
-                                    : pendingOnly
-                                      ? `待发布${(section.publish_pending || []).length}`
-                                      : `✕${section.blockers.length}`}
+                                {artifact.label} {na ? '—' : problems.length ? `✕${problems.length}` : '✓'}
                               </span>
                             )
                           })}
