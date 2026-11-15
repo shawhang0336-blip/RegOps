@@ -160,8 +160,30 @@ def parse_inline_enum(text: str) -> List[Dict[str, str]]:
         seen.add(code)
         values.append({"value": code, "label_cn": label})
     if len(values) < 2:
+        # 「一般贸易区；自由贸易试验区；保税区；…」——没有数字标记的纯分号名词列表。
+        # 它就是一张内联枚举（TAXFREECODE 就是这种），之前解析不出被误关联到别的码表。
+        fallback = _parse_bare_semicolon_list(text)
+        if fallback:
+            return fallback
         return []
     return values[:200]
+
+
+def _parse_bare_semicolon_list(text: str) -> List[Dict[str, str]]:
+    """纯分号分隔的名词短语列表 → 枚举（value 用序号）。
+
+    只在没有数字标记时兜底用；含「填/为/必须/如/当」这类动词的按句子处理，不算枚举。
+    """
+    if not text or "；" not in text:
+        return []
+    if re.search(r"[填必须当如若为]", text):
+        return []
+    parts = [part.strip() for part in text.split("；") if part.strip()]
+    if len(parts) < 2:
+        return []
+    if not all(1 < len(part) <= 25 for part in parts):
+        return []
+    return [{"value": str(index + 1), "label_cn": part} for index, part in enumerate(parts)]
 
 
 def normalize_code_set_name(raw_name: str) -> str:
@@ -500,6 +522,22 @@ def _stamp_field_ordinal(session: Session, code_set: CodeSetModel, field: FieldM
         code_set.source_ordinal = block.ordinal * 1000 + (field.sort_order or 0) + 1
 
 
+def _values_overlap(session: Session, code_set: CodeSetModel, enum_values: List[Dict[str, str]], sets_with_values: Optional[set]) -> bool:
+    """匹配到的码表取值和枚举值有没有交集。
+
+    只比 label，不比 value——内联枚举的 value 是「1、2、3」这种序号，
+    和任何含数字代码的码表都会撞上（TAXFREECODE 撞上「货物贸易=1」），
+    序号没有比对意义。
+    """
+    labels = {item["label_cn"] for item in enum_values}
+    query = session.query(CodeValueModel.label_cn).filter(
+        CodeValueModel.code_set_id == code_set.id, CodeValueModel.enabled.is_(True)
+    )
+    if sets_with_values is not None and code_set.id not in sets_with_values:
+        return False
+    return any(label and label in labels for (label,) in query.all())
+
+
 def ensure_field_reference(
     session: Session,
     field: FieldMetadataModel,
@@ -557,6 +595,10 @@ def ensure_field_reference(
         if sets_with_values is not None:
             sets_with_values.add(code_set.id)
         session.flush()
+    elif code_set and enum_values and not _values_overlap(session, code_set, enum_values, sets_with_values):
+        # 匹配到的是已有值的码表，但取值和枚举值没有交集——按名字误撞上的，
+        # 退回改用字段自己的内联枚举表，不关联。
+        code_set = None
     if not code_set:
         if enum_values:
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_INLINE_ENUM".upper())[:96]
@@ -636,6 +678,11 @@ def ensure_field_reference(
         else session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.field_id == field.id).first()
     )
     if existing:
+        # 已经标过「外部规范」的引用，这次没匹配到本地码表就保持原样——
+        # 不能一重跑对齐就降级回 UNRESOLVED，否则「需要补」和「本地没有」反复横跳。
+        # 能匹配到（target=RESOLVED）才照常更新。
+        if existing.status == "EXTERNAL" and target_status == "UNRESOLVED":
+            return
         existing.code_set_id = code_set.id
         existing.reference_text = text
         existing.status = target_status

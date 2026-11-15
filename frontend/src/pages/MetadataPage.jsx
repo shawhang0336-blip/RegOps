@@ -423,10 +423,13 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
   const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
 
   const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
-  // 有码值缺陷（空码表、引用解析不到）的表——补数据要去码表页
-  const codeDefectCount = (readiness?.tables || []).filter(
+  // 卡点按「多少张表」分类，比按维度列数字直观：用户关心的是几张能用、几张卡在哪
+  const tablesAll = readiness?.tables || []
+  const codeDefectCount = tablesAll.filter(
     (item) => item.code_sets?.applicable && (item.code_sets.defects || []).length > 0
   ).length
+  const ddlBlockCount = tablesAll.filter((item) => !item.ddl?.ready).length
+  const ruleBlockCount = tablesAll.filter((item) => !item.rule_materials?.ready).length
 
   const pageActions = detail && (
     <>
@@ -483,31 +486,24 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
               <div className="readiness-summary-main">
                 <strong>可直接生成 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
                 <span className="muted-text">
-                  DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值齐备{' '}
-                  {readiness.summary.ready.code_sets}
+                  {[
+                    ddlBlockCount > 0 && `DDL 卡 ${ddlBlockCount}`,
+                    codeDefectCount > 0 && `码值要补 ${codeDefectCount}`,
+                    ruleBlockCount > 0 && `规则原料缺 ${ruleBlockCount}`,
+                  ].filter(Boolean).join(' · ') || '没有卡点'}
                   {readiness.summary.not_applicable?.code_sets > 0 &&
-                    `（另 ${readiness.summary.not_applicable.code_sets} 张无码值引用，不涉及）`}
+                    ` · 另 ${readiness.summary.not_applicable.code_sets} 张没有码值引用，不涉及`}
                   {' · '}校验原文覆盖 {readiness.summary.check_text_coverage}%
                 </span>
               </div>
               <p className="readiness-hint">
                 不用在这里点发布：去第 2 步选表，能用的会直接定稿并生成，不能用会告诉你缺什么。
-              </p>
-              {onOpenCodeSets && codeDefectCount > 0 && (
-                <p className="readiness-hint">
-                  有 {codeDefectCount} 张表的码值需要补（空码表或码值引用解析不到），发布解决不了。
+                {onOpenCodeSets && codeDefectCount > 0 && (
                   <button type="button" className="link-button" onClick={onOpenCodeSets}>
                     去补码值 →
                   </button>
-                </p>
-              )}
-              {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
-                readiness.summary.ready.ddl && (
-                <p className="readiness-hint">
-                  卡口在码值：能建表 {readiness.summary.ready.ddl} 张、码值齐备只有 {readiness.summary.ready.code_sets} 张。
-                  这些是空码表或码值引用解析不到，需要回原文补码值。
-                </p>
-              )}
+                )}
+              </p>
             </div>
           )}
           {visibleTables.length > 0 ? (
