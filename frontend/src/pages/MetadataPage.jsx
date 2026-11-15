@@ -8,7 +8,7 @@ import {
   EvidenceCard,
   RevisionDiffView,
   StatusBadge,
-  ISSUE_LABELS,
+  issueLabel,
   issueSeverity,
   groupValidationIssues,
   friendlyError,
@@ -44,6 +44,7 @@ export default function MetadataPage({ embedded = false }) {
   const [showAdd, setShowAdd] = useState(false)
   const [tab, setTab] = useState(params.get('tab') || 'fields')
   const [fieldSearch, setFieldSearch] = useState('')
+  const [onlyIssues, setOnlyIssues] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -288,29 +289,32 @@ export default function MetadataPage({ embedded = false }) {
     if (!text || ['无', 'N/A', 'NONE', '无引用'].includes(text.toUpperCase())) {
       return null
     }
-    const unresolved = unresolvedRefs.find((r) => r.field_id === field.id)
-    const matchedSet = codeSets.find((s) => s.name === text || s.code === text.toUpperCase())
-    if (unresolved) {
-      return {
-        text,
-        status: 'UNRESOLVED',
-        codeSetId: unresolved.code_set_id || matchedSet?.id,
-      }
-    }
+    const matchedSet =
+      (field.code_set_id && codeSets.find((s) => s.id === field.code_set_id)) ||
+      codeSets.find((s) => s.name === text || s.code === text.toUpperCase())
     if (matchedSet) {
       return {
-        text,
-        status: matchedSet.enabled_value_count > 0 ? 'RESOLVED' : 'UNRESOLVED',
+        text: matchedSet.name,
+        label: text,
+        status: (matchedSet.enabled_value_count ?? matchedSet.value_count ?? 0) > 0 ? 'RESOLVED' : 'UNRESOLVED',
         codeSetId: matchedSet.id,
       }
     }
-    return { text, status: 'DRAFT', codeSetId: null }
+    const unresolved = unresolvedRefs.find((r) => r.field_id === field.id)
+    if (unresolved) {
+      return { text, label: text, status: 'UNRESOLVED', codeSetId: unresolved.code_set_id }
+    }
+    return { text, label: text, status: 'DRAFT', codeSetId: null }
   }
 
   const totalIssues = (detail?.validations || []).reduce(
     (acc, v) => acc + (Array.isArray(v.issues) ? groupValidationIssues(v.issues).length : 0),
     0
   )
+
+  const visibleTables = onlyIssues
+    ? tables.filter((table) => (table.review_issue_count || 0) > 0)
+    : tables
 
   const pageActions = detail && (
     <>
@@ -345,14 +349,19 @@ export default function MetadataPage({ embedded = false }) {
           <div className="panel-heading">
             <div>
               <h2>报表清单</h2>
-              <p>共 {tables.length} 张表</p>
+              <p>共 {tables.length} 张表{onlyIssues ? `（${visibleTables.length} 张有待复核项）` : ''}</p>
             </div>
             <StatusBadge tone="neutral">{tables.length}</StatusBadge>
           </div>
 
-          {tables.length > 0 ? (
+          <label className="inline-option" style={{ marginBottom: 10 }}>
+            <input type="checkbox" checked={onlyIssues} onChange={(e) => setOnlyIssues(e.target.checked)} />
+            只看有待复核项的报表
+          </label>
+
+          {visibleTables.length > 0 ? (
             <div className="list-stack">
-              {tables.map((table) => (
+              {visibleTables.map((table) => (
                 <button
                   type="button"
                   className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
@@ -370,12 +379,20 @@ export default function MetadataPage({ embedded = false }) {
                     当前 v{table.current_version}
                     {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
                   </em>
+                  {table.review_issue_count > 0 && (
+                    <em className="danger-text">
+                      {table.review_issue_count} 项待复核
+                      {table.review_field_count > 0 ? ` · 涉及 ${table.review_field_count} 个字段` : ''}
+                    </em>
+                  )}
                 </button>
               ))}
             </div>
           ) : (
             <div className="empty">
-              当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。
+              {onlyIssues
+                ? '当前没有带待复核项的报表。'
+                : '当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。'}
             </div>
           )}
         </div>
@@ -652,7 +669,7 @@ export default function MetadataPage({ embedded = false }) {
                               <td>
                                 {codeMeta ? (
                                   <div className="row-actions">
-                                    <span>{codeMeta.text}</span>
+                                    <span title={codeMeta.label || codeMeta.text}>{codeMeta.text}</span>
                                     <StatusBadge status={codeMeta.status} />
                                     <button
                                       type="button"
@@ -725,7 +742,7 @@ export default function MetadataPage({ embedded = false }) {
                                   <StatusBadge status={issueSeverity(issue)} />
                                   <div>
                                     <strong>
-                                      {issue.field_en ? `字段 ${issue.field_en}` : '整表提示'} · {ISSUE_LABELS[issue.code] || issue.code}
+                                      {issue.field_en ? `字段 ${issue.field_en}` : '整表提示'} · {issueLabel(issue.code)}
                                     </strong>
                                     <p>{friendlyError(issue.message || '请对照原文确认该字段的识别结果。')}</p>
                                     {issue.field_en && detail.fields.some((field) => field.field_en === issue.field_en) && (

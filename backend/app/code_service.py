@@ -51,6 +51,12 @@ CODE_NAME_SYNONYMS = {
     "地区": "中国大陆行政区划",
     "交易编码": "交易代码",
     "交易代码": "交易代码",
+    # "国际收支交易编码表"与"涉外收支交易分类与代码"是同一张 6 位交易代码表的两种叫法
+    "国际收支交易": "交易",
+    "国际收支交易编码": "交易",
+    "涉外收支交易": "交易",
+    "涉外收支交易分类": "交易",
+    "涉外收支交易分类与代码": "交易",
     "对方与本机构的关系": "对方与本机构被代理居民机构委托人的关系",
     "对方与本机构被代理居民机构委托人的关系": "对方与本机构被代理居民机构委托人的关系",
     "外债的债务类型": "债务类型",
@@ -58,30 +64,104 @@ CODE_NAME_SYNONYMS = {
 
 
 CIRCLED_NUM = "①②③④⑤⑥⑦⑧⑨⑩"
+CIRCLED_INDEX = {char: str(index + 1) for index, char in enumerate(CIRCLED_NUM)}
+
+# 内联枚举里的噪声片段：默认值说明、填写要求等。原文常写成
+# "Y-是；N-否；默认N"，旧的整段解析会因为这个片段而全盘放弃。
+ENUM_NOISE_RE = re.compile(r"^(?:默认|默认为|不填|留空|可选|必填|填写|请填|说明|注[：:]|见[：:])")
+_ENUM_TOKENS = r"A-Za-z0-9" + CIRCLED_NUM
+_ENUM_FORWARD_RE = re.compile(rf"^([{_ENUM_TOKENS}]+)\s*[\-—–－:：、]\s*(.+)$")
+_ENUM_GLUED_RE = re.compile(rf"^([{_ENUM_TOKENS}]{{1,6}})([^\x00-\x7F].*)$")
+_ENUM_REVERSE_RE = re.compile(rf"^(.+?)\s*[\-—–－:：、]\s*([{_ENUM_TOKENS}]+)$")
+
+
+def _split_enum_fragments(text: str) -> List[str]:
+    """按圆圈序号或中英文分隔符切成候选片段，丢弃序号之前的说明文字。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    positions = [index for index, char in enumerate(raw) if char in CIRCLED_INDEX]
+    if len(positions) >= 2:
+        # "按九个子部门码值填列：①政府；②央行…" → 从第一个序号开始切
+        body = raw[positions[0]:]
+        return [part.strip() for part in re.split(rf"(?=[{CIRCLED_NUM}])", body) if part.strip()]
+    return [part.strip() for part in re.split(r"[；;，,、\n]", raw) if part.strip()]
+
+
+def _parse_enum_pair(part: str) -> Optional[Tuple[str, str]]:
+    """把单个片段解析成 (码值, 名称)；不是"码-值"结构就返回 None。"""
+    text = (part or "").strip().strip("。.;；,，、:： ")
+    if not text:
+        return None
+    match = _ENUM_FORWARD_RE.match(text) or _ENUM_GLUED_RE.match(text)
+    if match:
+        code, label = match.group(1).strip(), match.group(2).strip()
+    else:
+        match = _ENUM_REVERSE_RE.match(text)
+        if not match:
+            return None
+        label, code = match.group(1).strip(), match.group(2).strip()
+    label = label.strip("。.;；,，、 ")
+    if not code or not label or code == label:
+        return None
+    if len(code) > 8 or len(label) > 80:
+        return None
+    if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", label):
+        return None
+    return CIRCLED_INDEX.get(code, code)[:20], label[:80]
+
+
+_ENUM_LIST_RE = re.compile(r"\[([^\[\]]{4,2000})\]")
+
+
+def _parse_enum_list(text: str) -> List[Dict[str, str]]:
+    """解析 AI 复核给出的 ENUM：["上市普通股","非上市普通股（但可交易）"] 这种形式。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if not re.search(r"\bENUM\b", raw, re.IGNORECASE) and not raw.startswith("["):
+        return []
+    match = _ENUM_LIST_RE.search(raw)
+    if not match:
+        return []
+    labels = re.findall(r"[\"“]([^\"”]{1,80})[\"”]", match.group(1))
+    if len(labels) < 2:
+        return []
+    return [
+        {"value": str(index + 1), "label_cn": label.strip()[:80]}
+        for index, label in enumerate(labels)
+        if label.strip()
+    ]
 
 
 def parse_inline_enum(text: str) -> List[Dict[str, str]]:
-    """把 "Y-是；N-否" / "①政府；②央行" / "是-Y，否-N" 这类内联枚举解析成码值对；解析失败返回空。"""
-    parts = [p.strip() for p in re.split(r"[；;，,]", text or "") if p.strip()]
-    if len(parts) < 2:
+    """把 "Y-是；N-否" / "①政府；②央行" / "是-Y，否-N" 这类内联枚举解析成码值对；解析失败返回空。
+
+    逐片段解析：个别片段（如"默认N""填写N"）解析不出来只跳过它，不再整段放弃；
+    至少要有 2 个有效码值才认为是枚举，避免把普通句子误判成码表。
+    """
+    listed = _parse_enum_list(text)
+    if listed:
+        return listed
+    values: List[Dict[str, str]] = []
+    seen = set()
+    for part in _split_enum_fragments(text):
+        if ENUM_NOISE_RE.match(part):
+            continue
+        pair = _parse_enum_pair(part)
+        if pair is None and re.search(r"[：:]", part):
+            # "交易方式枚举：1-线下" —— 去掉说明前缀再试一次
+            pair = _parse_enum_pair(re.split(r"[：:]", part)[-1])
+        if pair is None:
+            continue
+        code, label = pair
+        if code in seen:
+            continue
+        seen.add(code)
+        values.append({"value": code, "label_cn": label})
+    if len(values) < 2:
         return []
-    values = []
-    for part in parts:
-        match = re.match(r"^([A-Za-z0-9①②③④⑤⑥⑦⑧⑨⑩]+)\s*[\-—:：、]?\s*(.+)$", part)
-        if match:
-            code, label = match.group(1).strip(), match.group(2).strip()
-        else:
-            reverse = re.match(r"^(.+?)\s*[\-—:：、]\s*([A-Za-z0-9①②③④⑤⑥⑦⑧⑨⑩]+)$", part)
-            if not reverse:
-                return []
-            label, code = reverse.group(1).strip(), reverse.group(2).strip()
-        if code in CIRCLED_NUM:
-            code = str(CIRCLED_NUM.index(code) + 1)
-        values.append({"value": code[:20], "label_cn": label[:80]})
-    codes = [item["value"] for item in values]
-    if len(set(codes)) != len(codes):
-        return []
-    return values
+    return values[:200]
 
 
 def normalize_code_set_name(raw_name: str) -> str:
@@ -90,10 +170,18 @@ def normalize_code_set_name(raw_name: str) -> str:
     text = raw_name.strip()
     # 先去掉括号及内容（如"（3位字母代码）"），避免其污染核心名
     text = re.sub(r"[（(][^）)]*[）)]", "", text)
-    text = re.sub(r"^(?:参?见|参照|本制度|数据采集规范最新版本中的相关代码表或本制度)+", "", text)
+    text = re.sub(
+        r"^(?:参?见|参照|本制度|数据采集规范最新版本中的相关代码表或本制度|数据采集规范(?:最新版本)?(?:中|中的)?的?)+",
+        "",
+        text,
+    )
     # 去掉"附录"残留（括号在上一步已移除）
     text = re.sub(r"(?:五、附录|附[录表])", "", text)
+    # "…代码表填列"这类尾巴：先摘掉"填列/填报"，否则后面的"代码表"剥离会被挡住
+    text = re.sub(r"(?:填写|填报|填列|填制|填用)$", "", text)
     text = re.sub(r"(?:代码表|分类标准表|分类标准|代码|名录|表|填写|填)+$", "", text)
+    # 剥离后缀后可能留下连接词（"涉外收支交易分类与代码" → "…分类与"）
+    text = re.sub(r"[与和及或等的]+$", "", text)
     text = re.sub(r"[\s/（）()—\-·:：，,。]", "", text)
     return CODE_NAME_SYNONYMS.get(text, text)
 
@@ -166,49 +254,192 @@ def refresh_reference_status(session: Session, code_set_id: str) -> None:
     session.flush()
 
 
+def _set_has_values(
+    session: Session,
+    code_set: CodeSetModel,
+    sets_with_values: Optional[set] = None,
+) -> bool:
+    if sets_with_values is not None:
+        return code_set.id in sets_with_values
+    return (
+        session.query(CodeValueModel)
+        .filter(CodeValueModel.code_set_id == code_set.id, CodeValueModel.enabled.is_(True))
+        .count()
+        > 0
+    )
+
+
+def _reference_name_variants(text: str) -> List[str]:
+    """把"境内主体类型代码表/境外主体类型代码表"拆成多个候选名，逐个去匹配真实码表。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    for match in re.finditer(r"[（(]([^）)]{2,40})[）)]", raw):
+        inner = match.group(1).strip()
+        if inner and inner not in variants:
+            variants.append(inner)
+    for match in re.finditer(r"([A-Z][A-Z0-9_]{2,})\s*内联枚举", raw):
+        # "（F0105 内联枚举）"指向另一字段的内联枚举表，按代码直接找
+        code_name = f"{match.group(1)}_INLINE_ENUM"
+        if code_name not in variants:
+            variants.append(code_name)
+    for pattern in (r"\s*/\s*", r"／", r"\s*、\s*", r"[；;。\n]", r"或"):
+        for piece in re.split(pattern, raw):
+            piece = piece.strip(" 　。.；;，,")
+            if piece and piece not in variants:
+                variants.append(piece)
+    return variants
+
+
 def _find_matching_code_set(
     session: Session,
     reference_text: str,
     by_name: Optional[Dict[str, CodeSetModel]] = None,
     by_code: Optional[Dict[str, CodeSetModel]] = None,
     by_norm: Optional[Dict[str, Optional[CodeSetModel]]] = None,
+    sets_with_values: Optional[set] = None,
+    candidate_norms: Optional[List[Tuple[str, CodeSetModel]]] = None,
 ) -> Optional[CodeSetModel]:
-    if by_name is not None and reference_text in by_name:
-        return by_name[reference_text]
-    if by_code is not None and reference_text.upper() in by_code:
-        return by_code[reference_text.upper()]
-    norm_target = normalize_code_set_name(reference_text)
-    if by_norm is not None and norm_target:
-        return by_norm.get(norm_target)
+    """按"精确名 → 精确码 → 归一化名 → 核心名包含"的顺序找码表，并优先返回已有值的码表。
 
-    exact = session.query(CodeSetModel).filter(CodeSetModel.name == reference_text).first()
-    if exact:
-        return exact
-    code_match = session.query(CodeSetModel).filter(CodeSetModel.code == reference_text.upper()).first()
-    if code_match:
-        return code_match
-    if not norm_target:
+    系统会为找不到码表的字段建"占位码表"（名字就是引用原文、没有任何取值）。占位表
+    会和真实码表抢同一个归一化名，所以这里把"名称与引用原文完全相同且无值"的候选降级，
+    避免占位表把真正有 200 条码值的码表遮蔽掉。
+    """
+    text = (reference_text or "").strip()
+    if not text:
         return None
-    candidates = session.query(CodeSetModel).all()
-    for cs in candidates:
-        if normalize_code_set_name(cs.name) == norm_target:
-            return cs
-    # 核心名包含匹配：一方包含另一方且长度接近，容忍"附录/参照/（3位字母代码）"等残留修饰
-    contains = []
-    for cs in candidates:
-        norm_cs = normalize_code_set_name(cs.name)
-        if len(norm_cs) < 2:
+    names = _reference_name_variants(text)
+
+    scored: List[Tuple[Tuple[int, int], CodeSetModel]] = []
+    seen_ids = set()
+
+    def collect(rank: int, code_set: Optional[CodeSetModel]) -> None:
+        if code_set is None or code_set.id in seen_ids:
+            return
+        seen_ids.add(code_set.id)
+        has_values = _set_has_values(session, code_set, sets_with_values)
+        effective_rank = rank
+        if not has_values and code_set.source_type == "DOCUMENT_REFERENCE":
+            # 由引用原文自建的占位表一律降级：只要库里有真正带取值的码表，就优先用真实的
+            effective_rank += 10
+        scored.append(((effective_rank, 0 if has_values else 1), code_set))
+
+    for name in names:
+        if by_name is not None:
+            collect(0, by_name.get(name))
+        if by_code is not None:
+            collect(1, by_code.get(name.upper()))
+
+    for name in names:
+        if not by_norm:
             continue
-        shorter, longer = (norm_target, norm_cs) if len(norm_target) <= len(norm_cs) else (norm_cs, norm_target)
-        if len(shorter) >= 2 and shorter in longer and len(longer) - len(shorter) <= 6:
-            contains.append(cs)
-    if contains:
-        with_values = [
-            cs for cs in contains
-            if session.query(CodeValueModel).filter(CodeValueModel.code_set_id == cs.id).count() > 0
-        ]
-        return (with_values or contains)[0]
-    return None
+        norm_name = normalize_code_set_name(name)
+        if norm_name:
+            collect(2, by_norm.get(norm_name))
+
+    if not scored:
+        # 非批量场景（未预置索引）：直接查库
+        for name in names:
+            collect(0, session.query(CodeSetModel).filter(CodeSetModel.name == name).first())
+            collect(1, session.query(CodeSetModel).filter(CodeSetModel.code == name.upper()).first())
+
+    norms = candidate_norms
+    if norms is None:
+        norms = [(normalize_code_set_name(cs.name), cs) for cs in session.query(CodeSetModel).all()]
+
+    if not scored:
+        for name in names:
+            norm_name = normalize_code_set_name(name)
+            if not norm_name:
+                continue
+            for norm_cs, code_set in norms:
+                if norm_cs and norm_cs == norm_name:
+                    collect(2, code_set)
+
+    # 核心名包含匹配：一方包含另一方且长度接近，容忍"附录/参照/（3位字母代码）"等残留修饰。
+    # 即使前面已有命中也要跑——占位表会以 rank 10 参与排序，真实码表 rank 5 可以反超。
+    for name in names:
+        norm_name = normalize_code_set_name(name)
+        if len(norm_name) < 2:
+            continue
+        for norm_cs, code_set in norms:
+            if len(norm_cs) < 2:
+                continue
+            shorter, longer = (
+                (norm_name, norm_cs) if len(norm_name) <= len(norm_cs) else (norm_cs, norm_name)
+            )
+            if not (len(shorter) >= 2 and shorter in longer):
+                continue
+            # 引用本身是短缩写时不做"补全式"绑定（"国家" ≠ "国家和地区"，属语义推断而非匹配）
+            if norm_name == shorter and longer.startswith(shorter) and len(longer) - len(shorter) >= 3:
+                continue
+            # 前缀包含允许更大的长度差（"境内主体类型" vs "境内主体类型代码表境外主体类型"）
+            limit = 12 if longer.startswith(shorter) else 6
+            if len(longer) - len(shorter) <= limit:
+                collect(5, code_set)
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
+def _compact_code_set_name(text: str) -> str:
+    """把"投资工具类型代码：1-股票；2-债券…"压成"投资工具类型代码"这样的可读表名。"""
+    raw = (text or "").strip()
+    head = re.split(r"[：:；;、，,。]", raw)[0].strip()
+    if len(head) < 4:
+        return raw[:60]
+    return head[:60]
+
+
+def _fill_code_values(
+    session: Session,
+    code_set: CodeSetModel,
+    enum_values: List[Dict[str, str]],
+    source_text: str,
+) -> int:
+    """把解析出来的内联枚举补进已有码表（通常是由引用原文建的占位表）。"""
+    existing = {
+        row.value
+        for row in session.query(CodeValueModel)
+        .filter(CodeValueModel.code_set_id == code_set.id)
+        .all()
+    }
+    order = len(existing)
+    added = 0
+    for item in enum_values:
+        if item["value"] in existing:
+            continue
+        session.add(
+            CodeValueModel(
+                id=str(uuid.uuid4()),
+                code_set_id=code_set.id,
+                value=item["value"][:128],
+                label_cn=item["label_cn"][:255],
+                label_en="",
+                definition="",
+                sort_order=order,
+                enabled=True,
+                source_locator={},
+            )
+        )
+        existing.add(item["value"])
+        order += 1
+        added += 1
+    if not added:
+        return 0
+    if code_set.source_type == "DOCUMENT_REFERENCE":
+        code_set.source_type = "INLINE_ENUM"
+        code_set.name = _compact_code_set_name(source_text)[:255]
+        if code_set.status == "DRAFT":
+            code_set.status = "AI_SELF_VALIDATED"
+    code_set.definition = (
+        f"{(code_set.definition or '').strip()}\n由引用原文自动补齐 {added} 项码值：{source_text}"
+    ).strip()[:1000]
+    return added
 
 
 def ensure_field_reference(
@@ -219,13 +450,30 @@ def ensure_field_reference(
     by_norm: Optional[Dict[str, Optional[CodeSetModel]]] = None,
     sets_with_values: Optional[set] = None,
     existing_ref_by_field: Optional[Dict[str, FieldCodeReferenceModel]] = None,
+    candidate_norms: Optional[List[Tuple[str, CodeSetModel]]] = None,
 ) -> None:
     text = (field.code_reference_text or "").strip()
     if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
         return
-    code_set = _find_matching_code_set(session, text, by_name=by_name, by_code=by_code, by_norm=by_norm)
+    code_set = _find_matching_code_set(
+        session,
+        text,
+        by_name=by_name,
+        by_code=by_code,
+        by_norm=by_norm,
+        sets_with_values=sets_with_values,
+        candidate_norms=candidate_norms,
+    )
+    enum_values = parse_inline_enum(text)
+    if code_set and enum_values and not _set_has_values(session, code_set, sets_with_values):
+        # 命中的是占位码表，但引用原文本身就把码值列出来了（如"1-股票；2-债券…"），
+        # 直接补进这张表，避免又建一张重复的"（内联枚举）"表。
+        _fill_code_values(session, code_set, enum_values, text)
+        enum_values = []
+        if sets_with_values is not None:
+            sets_with_values.add(code_set.id)
+        session.flush()
     if not code_set:
-        enum_values = parse_inline_enum(text)
         if enum_values:
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_INLINE_ENUM".upper())[:96]
             code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
@@ -233,8 +481,8 @@ def ensure_field_reference(
                 code_set = CodeSetModel(
                     id=str(uuid.uuid4()),
                     code=code,
-                    name=text[:255],
-                    definition=f"字段 {field.field_en} 的内联枚举",
+                    name=f"{field.field_cn or field.field_en}（内联枚举）"[:255],
+                    definition=f"字段 {field.field_en} 的内联枚举：{text}"[:1000],
                     source_type="INLINE_ENUM",
                     status="AI_SELF_VALIDATED",
                     current_version=1,
@@ -259,6 +507,12 @@ def ensure_field_reference(
                     by_code[code] = code_set
                 if sets_with_values is not None:
                     sets_with_values.add(code_set.id)
+            elif not _set_has_values(session, code_set, sets_with_values):
+                # 之前建过同名的内联枚举表但没写进取值，这里补上
+                _fill_code_values(session, code_set, enum_values, text)
+                if sets_with_values is not None:
+                    sets_with_values.add(code_set.id)
+                session.flush()
         else:
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())
             code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
@@ -347,6 +601,13 @@ def auto_link_all_references(session: Session) -> int:
     existing_ref_by_field = {
         r.field_id: r for r in session.query(FieldCodeReferenceModel).all()
     }
+    # 已有引用若已指向"有值码表"，按原引用原文锚定，保证重跑幂等（表名被压缩后仍能命中同一张表）
+    by_id = {cs.id: cs for cs in all_sets}
+    for ref in existing_ref_by_field.values():
+        anchor = by_id.get(ref.code_set_id)
+        if anchor is not None and ref.reference_text and anchor.id in sets_with_values:
+            by_name.setdefault(ref.reference_text, anchor)
+    candidate_norms = [(normalize_code_set_name(cs.name), cs) for cs in all_sets]
     for field in session.query(FieldMetadataModel).all():
         text = (field.code_reference_text or "").strip()
         if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
@@ -359,6 +620,7 @@ def auto_link_all_references(session: Session) -> int:
             by_norm=by_norm,
             sets_with_values=sets_with_values,
             existing_ref_by_field=existing_ref_by_field,
+            candidate_norms=candidate_norms,
         )
 
     for ref in session.query(FieldCodeReferenceModel).all():

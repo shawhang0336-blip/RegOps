@@ -78,14 +78,21 @@ def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
 
 
 @router.get("")
-def list_code_sets(document_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_code_sets(document_id: Optional[str] = None, include_placeholders: bool = False) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
         query = session.query(CodeSetModel)
         if document_id:
             ids = document_code_set_ids(session, document_id)
             query = query.filter(CodeSetModel.id.in_(ids))
         rows = query.order_by(CodeSetModel.updated_at.desc()).all()
-        return [code_set_summary(session, row) for row in rows]
+        result = []
+        for row in rows:
+            summary = code_set_summary(session, row)
+            # 默认隐藏"引用占位"（0 值的 DOCUMENT_REFERENCE），它们只是匹配失败的产物，不是可维护的码表
+            if not include_placeholders and summary["source_type"] == "DOCUMENT_REFERENCE" and summary["value_count"] == 0:
+                continue
+            result.append(summary)
+        return result
 
 
 @router.post("", status_code=201)
@@ -182,6 +189,24 @@ def unresolved_references(document_id: Optional[str] = None) -> List[Dict[str, A
             }
             for row in rows
         ]
+
+
+@router.post("/references/relink")
+def relink_references() -> Dict[str, Any]:
+    """重新对齐"字段引用 → 码值表"，并把引用原文里自带的内联枚举补成码值。
+
+    运维用：调整匹配规则或导入新码表后调用一次，无需重新解析文档。
+    """
+    with SessionLocal() as session:
+        resolved = auto_link_all_references(session)
+        session.commit()
+        total = session.query(FieldCodeReferenceModel).count()
+        unresolved = (
+            session.query(FieldCodeReferenceModel)
+            .filter(FieldCodeReferenceModel.status == "UNRESOLVED")
+            .count()
+        )
+    return {"total": total, "resolved": resolved, "unresolved": unresolved}
 
 
 @router.get("/{code_set_id}")

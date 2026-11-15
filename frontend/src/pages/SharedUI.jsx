@@ -86,6 +86,41 @@ export const ISSUE_LABELS = {
   LOW_CONFIDENCE: '识别置信度较低',
   MISSING_EVIDENCE: '缺少原文依据',
   SOURCE_PARSE_REVIEW_REQUIRED: '来源内容需要核对',
+  TYPE_MISMATCH: '字段类型与原文不一致',
+  TYPE_LENGTH_MISMATCH: '类型与长度都与原文不一致',
+  LENGTH_MISMATCH: '字段长度与原文不一致',
+  MISSING_OPERATOR: '校验条件缺少运算符',
+  MISSING_ENUM: '原文列出的取值未录入',
+  MISSING_COND_REQUIRED: '条件必填缺少说明',
+  COND_REQUIRED_MISSING: '条件必填缺少说明',
+  CODE_REF_MISSING: '码值表引用缺失',
+  MISSING_FIELD: '原文提及的字段未识别',
+}
+
+// AI 复核给出的问题码是自由文本，实际有几百种。按前缀归到人能手判的类别，
+// 比直接把 TYPE_MISMATCH_B0615 这种原始码丢给用户看要有用得多。
+const ISSUE_FAMILIES = [
+  [/^(TYPE_|VALUE_TYPE)/, '字段类型与原文不一致'],
+  [/^(LENGTH_|UNVERIFIED_LENGTH|UNDOCUMENTED_LENGTH|TYPE_LENGTH)/, '字段长度需确认'],
+  [/^MISSING_/, '原文要求未落到字段上'],
+  [/^(COND_|REQUIRED_|UNRESOLVED_COND)/, '条件必填规则待确认'],
+  [/^(CODE_|ENUM|UNRESOLVED_CODE)/, '码值待确认'],
+  [/^(TEXT_|SOURCE_)/, '校验原文有残留或歧义'],
+  [/^(FORMAT_|PATTERN_|REGEX)/, '格式规则待确认'],
+  [/^(DEFAULT_|NULL_)/, '默认值/空值规则待确认'],
+  [/^UNIT_/, '计量单位未定义'],
+  [/^(AI_)/, 'AI 复核说明'],
+  [/CONFIDENCE/, '识别置信度较低'],
+]
+
+export function issueLabel(code) {
+  const key = String(code || '').trim()
+  if (!key) return '复核提示'
+  if (ISSUE_LABELS[key]) return ISSUE_LABELS[key]
+  for (const [pattern, label] of ISSUE_FAMILIES) {
+    if (pattern.test(key)) return label
+  }
+  return key
 }
 
 export function issueSeverity(issue) {

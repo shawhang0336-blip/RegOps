@@ -79,9 +79,15 @@ def table_detail(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
         .limit(30)
         .all()
     )
+    refs = {
+        ref.field_id: ref.code_set_id
+        for ref in session.query(FieldCodeReferenceModel)
+        .filter(FieldCodeReferenceModel.field_id.in_([field.id for field in fields]))
+        .all()
+    }
     return {
         **table_summary(table),
-        "fields": [_field_view(field) for field in fields],
+        "fields": [{**_field_view(field), "code_set_id": refs.get(field.id)} for field in fields],
         "validations": [
             {
                 "validator_kind": item.validator_kind,

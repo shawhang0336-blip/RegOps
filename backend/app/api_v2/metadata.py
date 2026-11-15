@@ -5,7 +5,14 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..asset_models import FieldMetadataModel, MetadataRevisionModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from ..asset_models import (
+    FieldMetadataModel,
+    MetadataRevisionModel,
+    MetadataValidationModel,
+    RawBlockModel,
+    SourceDocumentModel,
+    TableMetadataModel,
+)
 from ..code_service import extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
@@ -82,10 +89,37 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
         if document_id:
             query = query.filter(TableMetadataModel.document_id == document_id)
         rows = query.order_by(TableMetadataModel.updated_at.desc()).all()
+        # 表级状态是"任意一条告警就整表待复核"，列表里必须把问题落到条数和字段上，
+        # 否则用户只看到一个红色的"需要核对"，无法判断到底有几处、要不要动手。
+        stats: Dict[str, Dict[str, Any]] = {}
+        for validation in session.query(MetadataValidationModel).all():
+            entry = stats.setdefault(validation.table_id, {"issue_count": 0, "fields": set(), "codes": {}})
+            for issue in validation.issues_json or []:
+                entry["issue_count"] += 1
+                code = str(issue.get("code") or "").strip()
+                if code:
+                    entry["codes"][code] = entry["codes"].get(code, 0) + 1
+                field_en = str(issue.get("field_en") or "").strip()
+                if field_en:
+                    entry["fields"].add(field_en)
         result = []
         for row in rows:
             field_count = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == row.id).count()
-            result.append({**table_summary(row), "field_count": field_count})
+            entry = stats.get(row.id) or {}
+            top_codes = sorted(
+                (entry.get("codes") or {}).items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:3]
+            result.append(
+                {
+                    **table_summary(row),
+                    "field_count": field_count,
+                    "review_issue_count": entry.get("issue_count", 0),
+                    "review_field_count": len(entry.get("fields") or set()),
+                    "review_top_codes": [code for code, _ in top_codes],
+                }
+            )
         return result
 
 
