@@ -10,3 +10,4 @@ frontend/node_modules/
 frontend/dist/
 外汇业务数据采集规范_1.4版_公开资料/*.pdf
 *.log
+.workbuddy/

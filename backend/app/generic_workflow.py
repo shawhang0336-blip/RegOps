@@ -14,8 +14,9 @@ from .compiler import compile_rule_query
 from .asset_models import ApprovalModel, ArtifactModel, AuditCaseDefinitionModel, GenerationPlanModel, GeneratorDefinitionModel, SchemaDefinitionModel
 from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
+from .errors import WorkflowError
 from .events import append_event
-from .generic_ai import RealDesignLlm, spec_payload
+from .generic_ai import LlmTimeoutError, RealDesignLlm, spec_payload
 from .generic_domain import (
     bind_audit_cases,
     bind_generators,
@@ -26,7 +27,36 @@ from .generic_domain import (
 from .generic_oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
 from .models import EventModel, RuleModel, RunModel, SpecificationModel
 from .rules import RuleValidationError
-from .workflow import WorkflowError, _pending_rules, _upsert_rule
+
+
+def _upsert_rule(session: Session, run: RunModel, rule: RuleDefinition, status: str) -> None:
+    existing = (
+        session.query(RuleModel)
+        .filter(RuleModel.run_id == run.id, RuleModel.rule_hash == rule.rule_hash)
+        .one_or_none()
+    )
+    if existing:
+        if existing.status == "REJECTED" and status == "PENDING":
+            existing.status = "PENDING"
+        return
+    session.add(
+        RuleModel(
+            row_id=str(uuid.uuid4()),
+            run_id=run.id,
+            spec_id=run.spec_id,
+            table_code=rule.table_code,
+            rule_key=rule.rule_key,
+            rule_hash=rule.rule_hash,
+            source=rule.source,
+            status=status,
+            definition_json=rule.model_dump(),
+        )
+    )
+    session.flush()
+
+
+def _pending_rules(session: Session, run_id: str) -> List[RuleModel]:
+    return session.query(RuleModel).filter(RuleModel.run_id == run_id, RuleModel.status == "PENDING").all()
 
 
 def _specs(session: Session, spec_id: str) -> List[SpecDocument]:
@@ -52,9 +82,61 @@ def _code_set_context(field_code_sets, table_code: str, field: str) -> Dict[str,
     }
 
 
+STAGE_BY_TOOL = {
+    "assign_generation_plan": "generation_planner",
+    "assign_schema": "schema_mapper",
+    "assign_rules": "rule_binder",
+    "assign_generators": "data_generator_binder",
+    "assign_audit_cases": "audit_case_binder",
+}
+
+ERROR_SUGGESTIONS = {
+    "timeout": "模型响应超时（已重试一次仍失败）。可调大 LLM_TIMEOUT，或检查模型服务状态与队列。",
+    "model_error": "模型调用失败或未返回工具调用。检查 API key、模型名与服务可用性。",
+    "validation": "AI 返回的参数连续两次未通过确定性校验。检查工具契约与输入 payload。",
+    "internal": "非模型错误。查看 message 与后端日志定位。",
+}
+
+
+def _locate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    table_code = payload.get("table_code") or (payload.get("table") or {}).get("table_code")
+    fields = payload.get("fields") or []
+    field = None
+    if isinstance(fields, list) and len(fields) == 1 and isinstance(fields[0], dict):
+        field = fields[0].get("name")
+    return {"table_code": table_code, "field": field}
+
+
+def _fail_context(tool_name: str, payload: Dict[str, Any], error_kind: str, retried: bool = False) -> Dict[str, Any]:
+    context = {
+        "tool_name": tool_name,
+        "stage": STAGE_BY_TOOL.get(tool_name, tool_name),
+        "error_kind": error_kind,
+        "retried": retried,
+    }
+    context.update(_locate_payload(payload))
+    return context
+
+
+def _error_details(exc: BaseException, fallback_stage: str) -> Dict[str, Any]:
+    context = getattr(exc, "context", None) or {}
+    kind = context.get("error_kind") or "internal"
+    return {
+        "stage": context.get("stage") or fallback_stage,
+        "error_type": type(exc).__name__,
+        "error_kind": kind,
+        "tool_name": context.get("tool_name"),
+        "table_code": context.get("table_code"),
+        "field": context.get("field"),
+        "retried_after_timeout": context.get("retried"),
+        "suggestion": ERROR_SUGGESTIONS.get(kind, ERROR_SUGGESTIONS["internal"]),
+    }
+
+
 def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None):
     feedback = None
     rejection = None
+    retried_after_timeout = False
     for _ in range(2):
         try:
             if timeout is None:
@@ -64,13 +146,29 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
             result = validator(arguments)
             if rejection:
                 trace["previous_rejection"] = rejection
+            if retried_after_timeout:
+                trace["retried_after_timeout"] = True
             return result, trace
+        except LlmTimeoutError as exc:
+            if retried_after_timeout:
+                raise WorkflowError(
+                    f"{tool_name} model call timed out after retry: {type(exc).__name__}",
+                    context=_fail_context(tool_name, payload, "timeout", retried=True),
+                ) from exc
+            retried_after_timeout = True
+            continue
         except (httpx.HTTPError, RuntimeError) as exc:
-            raise WorkflowError(f"{tool_name} model call failed without retry: {type(exc).__name__}: {exc}") from exc
+            raise WorkflowError(
+                f"{tool_name} model call failed without retry: {type(exc).__name__}: {exc}",
+                context=_fail_context(tool_name, payload, "model_error"),
+            ) from exc
         except (RuleValidationError, ValueError, KeyError, TypeError) as exc:
             rejection = str(exc)
             feedback = rejection
-    raise WorkflowError(f"{tool_name} failed deterministic validation twice: {rejection}")
+    raise WorkflowError(
+        f"{tool_name} failed deterministic validation twice: {rejection}",
+        context=_fail_context(tool_name, payload, "validation"),
+    )
 
 
 def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocument], worker) -> List[Any]:
@@ -123,7 +221,6 @@ def _plan_stage(session, run, specs, llm, budget):
             "根据表复杂度自行决定必做规则数、拓展规则数、黄金数据量和每规则变异数，并说明理由；不得超出输入预算。",
             {**spec_payload(spec), "budget": budget},
             lambda args: _validate_plan(args, budget),
-            timeout=45,
         )
 
     results = _fanout(session, run, "generation_planner", specs, worker)
@@ -158,7 +255,6 @@ def _schema_stage(session, run, specs, llm):
             "为每个白名单字段赋予物理存储类型和长度。必须逐字段全覆盖，不得改变数值字段语义。",
             spec_payload(spec),
             lambda args: bind_schema(spec, args.get("fields", [])),
-            timeout=30,
         )
 
     results = _fanout(session, run, "schema_mapper", specs, worker)
@@ -216,7 +312,6 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                     "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。",
                     payload,
                     lambda args: bind_rules(spec, args.get("rules", [])),
-                    timeout=40,
                 )
                 traces.append(trace)
                 if not rules:
@@ -294,7 +389,6 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
             "装配跨表 FOREIGN_KEY 规则。rule 必须额外带 table_code；references_table 必须来自已确认表。可返回 golden_overrides 对齐引用值。",
             payload,
             cross_validator,
-            timeout=45,
         )
         append_event(session, run, "AI_TOOL_ASSIGNED", "cross_rule_binder", trace)
         for rule in cross_rules:
@@ -417,7 +511,6 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 "只为输入的一个字段赋予黄金合规生成器。FIXED 使用 params.value；ENUM 使用 params.values。必须满足相关规则和引用值。若提供 published_code_set，ENUM 的 values 只能是其子集。",
                 payload,
                 validate_one,
-                timeout=35,
             )
 
         with ThreadPoolExecutor(max_workers=min(4, len(spec.fields))) as field_executor:
@@ -511,7 +604,6 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 instruction,
                 payload,
                 lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys),
-                timeout=35,
             )
 
         targets = [None] + table_rules
@@ -642,7 +734,6 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
             "根据失败记录修正当前规则赋值。最大长度用 LENGTH_MAX，精确长度用 LENGTH；只返回修正后的一条规则。",
             payload,
             validate_revision,
-            timeout=40,
         )
         append_event(
             session,
@@ -717,13 +808,18 @@ def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=No
         "table_confirmation",
         {"spec_id": spec_id, "provider": "REAL_GLM", "confirmation": specification.content_json.get("confirmation")},
     )
+    current_stage = "created"
     try:
+        current_stage = "generation_planner"
         plans = _plan_stage(session, run, specs, llm, generation_budget) if generation_budget else None
         session.commit()
+        current_stage = "schema_mapper"
         _schema_stage(session, run, specs, llm)
         session.commit()
+        current_stage = "rule_binder"
         pending_count = _rules_stage(session, run, specs, llm, plans)
         session.commit()
+        current_stage = "oracle_asset_builder"
         schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
         generated_rules = [
             RuleDefinition.model_validate(row.definition_json)
@@ -736,8 +832,14 @@ def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=No
             session,
             run,
             "RUN_FAILED",
-            run.current_node,
-            {"node": run.current_node, "result": {"error": f"{type(exc).__name__}: {exc}"}},
+            current_stage,
+            {
+                "node": current_stage,
+                "result": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_details": _error_details(exc, current_stage),
+                },
+            },
         )
         session.commit()
         return run
@@ -960,12 +1062,19 @@ def continue_generic_run(session: Session, run: RunModel, settings: Settings, ll
     try:
         return _continue_generic_run(session, run, settings, llm)
     except Exception as exc:
+        fallback_stage = run.current_node or "oracle_executor"
         append_event(
             session,
             run,
             "RUN_FAILED",
-            run.current_node,
-            {"node": run.current_node, "result": {"error": f"{type(exc).__name__}: {exc}"}},
+            fallback_stage,
+            {
+                "node": fallback_stage,
+                "result": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_details": _error_details(exc, fallback_stage),
+                },
+            },
         )
         session.commit()
         return run

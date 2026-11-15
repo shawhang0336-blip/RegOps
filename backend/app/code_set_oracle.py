@@ -15,7 +15,7 @@ from .asset_models import (
 from .compiler import quote_identifier
 from .domain import RuleDefinition, SpecDocument
 from .generic_domain import GeneratorBinding
-from .workflow import WorkflowError
+from .errors import WorkflowError
 
 
 def stable_code_set_table(code: str) -> str:

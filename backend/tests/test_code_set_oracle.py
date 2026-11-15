@@ -14,9 +14,9 @@ from app.domain import RuleDefinition
 from app.generic_domain import GeneratorBinding
 from app.generic_workflow import _code_set_context
 from app.metadata_service import metadata_to_spec, publish_table
-from app.workflow import WorkflowError
+from app.errors import WorkflowError
 from .test_metadata_service import make_metadata
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 def make_published_code_reference(session):

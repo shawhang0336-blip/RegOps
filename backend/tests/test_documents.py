@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from app.api_v2 import code_sets, documents, metadata
 from app.asset_models import CodeSetModel, CodeValueModel, DocumentArchitectureModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
 from app.config import Settings
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 def make_document(session, digest=None):

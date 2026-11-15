@@ -6,7 +6,7 @@ from app.asset_models import FieldMetadataModel, MetadataValidationModel, RawBlo
 from app.config import Settings
 from app.metadata_domain import MetadataFieldDraft, MetadataTableDraft, validate_metadata_draft
 from app.metadata_service import _deterministic_field_draft, _persist_draft, extract_metadata_for_block, metadata_to_spec, publish_table, update_field
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 def make_metadata(session):

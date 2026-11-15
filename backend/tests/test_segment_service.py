@@ -3,7 +3,7 @@ import uuid
 from app.asset_models import RawBlockModel, TableMetadataModel
 from app.segment_service import _split_segments, analyze_block_segments, merge_metadata_tables
 from .test_metadata_service import make_metadata
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 class SegmentFixtureLlm:

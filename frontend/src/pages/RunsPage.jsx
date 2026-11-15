@@ -14,6 +14,24 @@ const PIPELINE_STEPS = [
   { num: '05', label: '确认结果并下载', match: ['COMPLETE', 'DONE', 'RETRY', 'EXPORT', 'TEST_CONFIRMATION'] },
 ]
 
+const STAGE_LABELS = {
+  generation_planner: '生成计划',
+  schema_mapper: '表结构映射',
+  rule_binder: '规则装配',
+  data_generator_binder: '测试数据生成',
+  audit_case_binder: '审计用例生成',
+  oracle_asset_builder: 'Oracle 建表',
+  oracle_executor: 'Oracle 测试执行',
+  created: '初始化',
+}
+
+const ERROR_KIND_LABELS = {
+  timeout: '模型响应超时',
+  model_error: '模型调用失败',
+  validation: '参数校验失败',
+  internal: '内部错误',
+}
+
 function resolveStepIndex(run) {
   if (!run) return -1
   if (run.status === 'COMPLETED') return 4
@@ -382,6 +400,48 @@ export default function RunsPage() {
                 <strong>{outcome.title}</strong>
                 <span>{outcome.description}</span>
               </section>
+
+              {active.status === 'FAILED' && active.result?.error_details && (
+                <section className="panel error-detail-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <h2>失败原因</h2>
+                      <p className="muted-text">{active.result.error}</p>
+                    </div>
+                  </div>
+                  <div className="error-detail-grid">
+                    <div>
+                      <span>失败阶段</span>
+                      <strong>{STAGE_LABELS[active.result.error_details.stage] || active.result.error_details.stage}</strong>
+                    </div>
+                    <div>
+                      <span>错误类型</span>
+                      <strong>{ERROR_KIND_LABELS[active.result.error_details.error_kind] || active.result.error_details.error_kind}</strong>
+                    </div>
+                    {active.result.error_details.table_code && (
+                      <div>
+                        <span>报表</span>
+                        <strong><code>{active.result.error_details.table_code}</code></strong>
+                      </div>
+                    )}
+                    {active.result.error_details.field && (
+                      <div>
+                        <span>字段</span>
+                        <strong><code>{active.result.error_details.field}</code></strong>
+                      </div>
+                    )}
+                    {active.result.error_details.tool_name && (
+                      <div>
+                        <span>AI 工具</span>
+                        <strong><code>{active.result.error_details.tool_name}</code></strong>
+                      </div>
+                    )}
+                  </div>
+                  {active.result.error_details.suggestion && (
+                    <p className="error-suggestion">{active.result.error_details.suggestion}</p>
+                  )}
+                </section>
+              )}
 
               <div className="pipeline-stepper">
                 {PIPELINE_STEPS.map((step, idx) => {

@@ -11,6 +11,15 @@ from .domain import SpecDocument
 
 LLM_CALL_SEMAPHORE = threading.BoundedSemaphore(4)
 
+
+class LlmTimeoutError(RuntimeError):
+    """模型调用超时。重试是安全的：模型侧很可能根本没处理到该请求。
+
+    与参数校验失败（RuleValidationError）不同，超时不意味着参数有问题，
+    因此重试时不应把超时信息作为 feedback 回喂给模型。
+    """
+
+
 FIELD_PROPERTIES = {
     "field": {"type": "string"},
     "storage_type": {"type": "string", "enum": ["TEXT", "NUMBER"]},
@@ -284,8 +293,10 @@ class RealDesignLlm:
         instruction: str,
         payload: Dict[str, Any],
         feedback: Optional[str] = None,
-        timeout: int = 90,
+        timeout: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if timeout is None:
+            timeout = self.settings.llm_timeout
         schema = TOOL_SCHEMAS[tool_name]
         prompt = (
             "你是监管报送装配器，只能调用指定工具进行结构化参数赋值，禁止输出 SQL。"
@@ -299,25 +310,30 @@ class RealDesignLlm:
         if feedback:
             prompt += f"\n上次参数被确定性门禁拒绝，请修正：{feedback}"
         started_at = time.monotonic()
+        request_json = {
+            "model": self.settings.llm_model,
+            "messages": [
+                {"role": "system", "content": "只进行工具参数赋值，不输出自由文本。"},
+                {"role": "user", "content": prompt},
+            ],
+            "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
+            "tool_choice": {"type": "function", "function": {"name": tool_name}},
+            "temperature": 0,
+            "max_tokens": 8192,
+        }
+        if self.settings.llm_thinking:
+            request_json["thinking"] = {"type": self.settings.llm_thinking}
         try:
             with LLM_CALL_SEMAPHORE:
                 response = httpx.post(
                     f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},
-                    json={
-                        "model": self.settings.llm_model,
-                        "messages": [
-                            {"role": "system", "content": "只进行工具参数赋值，不输出自由文本。"},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
-                        "tool_choice": {"type": "function", "function": {"name": tool_name}},
-                        "temperature": 0,
-                        "thinking": {"type": "low"},
-                        "max_tokens": 8192,
-                    },
+                    json=request_json,
                     timeout=timeout,
                 )
+        except httpx.TimeoutException as exc:
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise LlmTimeoutError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
         except httpx.HTTPError as exc:
             elapsed = round(time.monotonic() - started_at, 2)
             raise RuntimeError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc

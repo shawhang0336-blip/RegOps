@@ -99,14 +99,3 @@ def compile_mysql_ddl(spec: SpecDocument) -> str:
         f"CREATE TABLE IF NOT EXISTS {quote_identifier(spec.table_code)} (\n  {body}\n) "
         "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
     )
-
-
-def compile_oracle_ddl(spec: SpecDocument, physical_table: str) -> str:
-    columns = ['"record_id" VARCHAR2(64 CHAR) PRIMARY KEY']
-    for field in spec.fields:
-        if field.data_type == "NUMBER":
-            data_type = f"NUMBER({field.length},{field.decimal_places or 0})"
-        else:
-            data_type = f"VARCHAR2({field.length} CHAR)"
-        columns.append(f"{quote_identifier(field.name, 'oracle')} {data_type} NULL")
-    return f"CREATE TABLE {quote_identifier(physical_table, 'oracle')} (\n  " + ",\n  ".join(columns) + "\n)"

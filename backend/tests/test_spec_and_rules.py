@@ -1,7 +1,6 @@
 import pytest
 
 from app.domain import Evidence, RuleDefinition, calculate_rule_hash
-from app.llm import ScriptedLlm, bind_rule_candidate
 from app.rules import RuleValidationError, build_explicit_rules, validate_rule
 
 
@@ -27,21 +26,6 @@ def test_explicit_rules_have_source_backed_hashes(organization_spec):
     assert len({rule.rule_hash for rule in rules}) == 12
     for rule in rules:
         assert rule.rule_hash == calculate_rule_hash(rule, organization_spec.source_sha256)
-
-
-def test_candidate_factory_cannot_set_explicit_source(organization_spec):
-    candidates = ScriptedLlm().propose(organization_spec)
-    assert len(candidates) == 1
-    assert candidates[0].source == "AI_EXPANDED"
-    assert candidates[0].field == "POSTCODE"
-
-
-def test_unknown_field_is_rejected(organization_spec):
-    with pytest.raises(KeyError):
-        bind_rule_candidate(
-            organization_spec,
-            {"field": "HALLUCINATED_FIELD", "operator": "REQUIRED", "params": {}},
-        )
 
 
 def test_tampered_explicit_evidence_is_rejected(organization_spec):

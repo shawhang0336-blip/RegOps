@@ -7,8 +7,8 @@ from app.models import RunModel
 from app.production import compile_production_mysql_ddl, compile_production_oracle_ddl, compile_production_rule_query, inline_sql_literals
 from app.production_service import build_production_bundle
 from app.rules import build_explicit_rules
-from app.workflow import WorkflowError
-from .test_workflow import make_session
+from app.errors import WorkflowError
+from .helpers import make_session
 
 
 def test_production_sql_has_no_sandbox_artifacts(organization_spec):

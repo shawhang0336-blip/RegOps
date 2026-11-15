@@ -1,12 +1,11 @@
+import httpx
 import pytest
 
 from app.config import Settings
-from app.generic_ai import RealDesignLlm
+from app.generic_ai import LlmTimeoutError, RealDesignLlm
 
 
-def test_glm_uses_low_thinking_and_records_call_timing(monkeypatch):
-    captured = {}
-
+def _ok_response():
     class Response:
         status_code = 200
         is_error = False
@@ -29,20 +28,65 @@ def test_glm_uses_low_thinking_and_records_call_timing(monkeypatch):
                 }],
             }
 
+    return Response()
+
+
+def test_default_omits_thinking_and_records_call_timing(monkeypatch):
+    captured = {}
+
     def post(url, headers, json, timeout):
         captured["json"] = json
         captured["timeout"] = timeout
-        return Response()
+        return _ok_response()
 
     monkeypatch.setattr("app.generic_ai.httpx.post", post)
     _, trace = RealDesignLlm(Settings(llm_api_key="offline-test")).assign(
         "assign_generation_plan", "test", {}, timeout=12
     )
 
-    assert captured["json"]["thinking"] == {"type": "low"}
+    assert "thinking" not in captured["json"]
     assert captured["timeout"] == 12
     assert trace["http_status"] == 200
     assert trace["elapsed_seconds"] >= 0
+
+
+def test_configured_thinking_is_sent(monkeypatch):
+    captured = {}
+
+    def post(url, headers, json, timeout):
+        captured["json"] = json
+        return _ok_response()
+
+    monkeypatch.setattr("app.generic_ai.httpx.post", post)
+    RealDesignLlm(Settings(llm_api_key="offline-test", llm_thinking="low")).assign(
+        "assign_generation_plan", "test", {}, timeout=12
+    )
+
+    assert captured["json"]["thinking"] == {"type": "low"}
+
+
+def test_assign_defaults_to_configured_timeout(monkeypatch):
+    captured = {}
+
+    def post(url, headers, json, timeout):
+        captured["timeout"] = timeout
+        return _ok_response()
+
+    monkeypatch.setattr("app.generic_ai.httpx.post", post)
+    RealDesignLlm(Settings(llm_api_key="offline-test", llm_timeout=77)).assign(
+        "assign_generation_plan", "test", {}
+    )
+
+    assert captured["timeout"] == 77
+
+
+def test_timeout_raises_llm_timeout_error(monkeypatch):
+    def post(url, headers, json, timeout):
+        raise httpx.ReadTimeout("read timeout")
+
+    monkeypatch.setattr("app.generic_ai.httpx.post", post)
+    with pytest.raises(LlmTimeoutError):
+        RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
 
 def test_missing_tool_call_records_response_diagnostics(monkeypatch):

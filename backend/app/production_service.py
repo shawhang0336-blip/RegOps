@@ -15,7 +15,7 @@ from .generic_domain import SchemaBinding
 from .generic_workflow import _latest_payload, _specs
 from .models import RuleModel, RunModel
 from .production import compile_production_mysql_ddl, compile_production_oracle_ddl, compile_production_rule_query
-from .workflow import WorkflowError
+from .errors import WorkflowError
 
 
 def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> Tuple[str, bytes]:

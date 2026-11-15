@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     llm_model: str = "GLM-5.3-Flash"
     llm_api_key: Optional[str] = None
+    # 是否启用 GLM thinking（推理增强）。默认 None = 不发送 thinking 参数。
+    # 实测发现硬编码 {"type": "low"} 会导致部分请求 400（code 1210）且显著拉高延迟，
+    # 因此默认关闭；确需启用时再设置（取值以所接入模型文档为准，如 "low"/"enabled"）。
+    llm_thinking: Optional[str] = None
+    # LLM 单次工具调用超时（秒）。单字段实测约 40s，默认 60s 留出余量。
+    llm_timeout: int = 60
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")

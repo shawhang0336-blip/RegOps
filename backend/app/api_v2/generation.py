@@ -16,7 +16,7 @@ from ..generic_workflow import start_generic_run
 from ..metadata_service import metadata_to_spec
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
-from ..workflow import WorkflowError
+from ..errors import WorkflowError
 
 router = APIRouter(prefix="/generation", tags=["generation"])
 

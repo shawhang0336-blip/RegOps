@@ -5,7 +5,7 @@ import pytest
 
 from app.asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.structure_service import _apply_plan, _validate_plan, latest_document_architecture
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 def make_document_with_blocks(session):
@@ -70,7 +70,7 @@ import uuid
 
 from app.asset_models import RawBlockModel, SourceDocumentModel
 from app.structure_service import analyze_document_structure
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 class SingleCallLlm:

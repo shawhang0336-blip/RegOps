@@ -6,11 +6,13 @@ from app.catalog import parse_document_catalog
 from app.config import Settings, get_settings
 from app.generic_domain import bind_generators, bind_rules, bind_schema
 from app.generic_oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
-from app.generic_workflow import _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
+from app.generic_ai import LlmTimeoutError
+from app.generic_workflow import _call_validated, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
 from app.production_service import build_production_bundle
 from app.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.rules import RuleValidationError
-from .test_workflow import make_session
+from app.errors import WorkflowError
+from .helpers import make_session
 
 
 class FixtureDesignLlm:
@@ -258,3 +260,68 @@ def test_assets_precede_rule_approval_and_export_follows_test_confirmation(organ
     assert build_production_bundle(session, run, str(tmp_path))[1]
     kinds = [event.kind for event in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
     assert kinds.index("ORACLE_ASSETS_PREPARED") < kinds.index("HUMAN_DECISIONS_RECORDED") < kinds.index("AUDIT_STARTED") < kinds.index("TEST_CONFIRMATION_REQUIRED") < kinds.index("TEST_RESULTS_CONFIRMED")
+
+
+def test_call_validated_retries_once_after_timeout():
+    class FlakyLlm:
+        def __init__(self):
+            self.calls = 0
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise LlmTimeoutError("ReadTimeout after 1s")
+            return {"ok": True}, {"provider": "test"}
+
+    llm = FlakyLlm()
+    result, trace = _call_validated(llm, "assign_rules", "instr", {}, lambda args: args)
+
+    assert llm.calls == 2
+    assert result == {"ok": True}
+    assert trace["retried_after_timeout"] is True
+    assert "previous_rejection" not in trace
+
+
+def test_call_validated_fails_after_two_timeouts():
+    class AlwaysTimeout:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            raise LlmTimeoutError("ReadTimeout")
+
+    with pytest.raises(WorkflowError, match="timed out after retry"):
+        _call_validated(AlwaysTimeout(), "assign_rules", "instr", {}, lambda args: args)
+
+
+def test_call_validated_timeout_error_carries_structured_context():
+    class AlwaysTimeout:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            raise LlmTimeoutError("ReadTimeout")
+
+    payload = {"table_code": "SAFE_6_1_ORGANIZATION", "fields": [{"name": "POSTCODE"}]}
+    with pytest.raises(WorkflowError) as error:
+        _call_validated(AlwaysTimeout(), "assign_rules", "instr", payload, lambda args: args)
+
+    ctx = error.value.context
+    assert ctx["error_kind"] == "timeout"
+    assert ctx["tool_name"] == "assign_rules"
+    assert ctx["stage"] == "rule_binder"
+    assert ctx["table_code"] == "SAFE_6_1_ORGANIZATION"
+    assert ctx["field"] == "POSTCODE"
+    assert ctx["retried"] is True
+
+
+def test_call_validated_validation_error_carries_structured_context():
+    class BadLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            return {"rules": []}, {"provider": "test"}
+
+    def reject(args):
+        raise RuleValidationError("nope")
+
+    payload = {"table_code": "SAFE_6_1_ORGANIZATION", "fields": [{"name": "POSTCODE"}]}
+    with pytest.raises(WorkflowError) as error:
+        _call_validated(BadLlm(), "assign_rules", "instr", payload, reject)
+
+    ctx = error.value.context
+    assert ctx["error_kind"] == "validation"
+    assert ctx["stage"] == "rule_binder"
+    assert ctx["field"] == "POSTCODE"

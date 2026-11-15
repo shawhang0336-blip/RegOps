@@ -23,11 +23,10 @@ from .config import get_settings
 from .db import SessionLocal, init_db
 from .events import fold_events
 from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
-from .llm import LlmConfigurationError
 from .models import EventModel, RuleModel, RunModel, SpecificationModel
 from .oracle_sandbox import OracleSandbox
 from .spec_parser import SpecParseError
-from .workflow import WorkflowError
+from .errors import WorkflowError
 
 
 @asynccontextmanager
@@ -303,7 +302,7 @@ def create_run(request: RunRequest, session: Session = Depends(db_session)) -> D
         raise HTTPException(status_code=422, detail="The production path requires provider=live and programmatic GLM calls")
     try:
         run = start_generic_run(session, request.spec_id, settings)
-    except (WorkflowError, LlmConfigurationError, RuntimeError, ValueError) as exc:
+    except (WorkflowError, RuntimeError, ValueError) as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return run_view(session, run)

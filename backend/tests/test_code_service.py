@@ -10,7 +10,7 @@ from app.config import Settings
 from app.extractors import extract_xlsx
 from app.metadata_service import publish_table
 from .test_metadata_service import make_metadata
-from .test_workflow import make_session
+from .helpers import make_session
 
 
 def test_unresolved_reference_blocks_then_value_unlocks():
