@@ -574,15 +574,13 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   </button>
                   <div className="list-row-top">
                     <strong>{table.table_name}</strong>
-                    <StatusBadge status={table.status} />
+                    {/* 「已发布 / 自动检查完成」是流程状态机，发布已自动化，显示出来只会
+                        让人以为还有手续没走。真正要看的三个 chip 在下面。 */}
+                    {table.status === 'NEEDS_REVIEW' && <StatusBadge tone="red">待处理</StatusBadge>}
                   </div>
                   <span>
                     <code>{table.table_code}</code> · {table.field_count} 个字段
                   </span>
-                  <em>
-                    当前 v{table.current_version}
-                    {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
-                  </em>
                   {readinessById[table.id] && (
                     <div className="readiness-row">
                       {['ddl', 'rule_materials', 'code_sets'].map((key) => {

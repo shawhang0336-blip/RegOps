@@ -150,7 +150,10 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
     from .code_set_readiness import evaluate_code_set, is_reference_placeholder
 
     for code_set_id, code_set in code_sets.items():
-        verdict = evaluate_code_set(session, code_set)
+        # 按这张表的视角检查：码值超长是相对引用字段长度说的，
+        # 不带 table_id 会把别的表短字段的超长问题算到这张表头上，
+        # 用户看到 ✕ 点进码表页却找不到要改什么。
+        verdict = evaluate_code_set(session, code_set, table_id=table.id)
         if is_reference_placeholder(verdict):
             # 占位不是码表，用户没法补；引用它的字段上面已经按 UNRESOLVED 报过了
             continue

@@ -25,7 +25,19 @@ def _issue(severity: str, code: str, message: str) -> Dict[str, Any]:
     return {"severity": severity, "code": code, "message": message}
 
 
-def evaluate_code_set(session: Session, row: CodeSetModel) -> Dict[str, Any]:
+def evaluate_code_set(
+    session: Session,
+    row: CodeSetModel,
+    table_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """检查一张码表能不能用。
+
+    table_id 只在「从某张表的角度看」时传：码值超长是相对引用字段的长度说的，
+    同一个码表被 3 位长的字段和 128 位长的字段同时引用时，前者会撞 ORA-12899、
+    后者完全没问题。不传就是全局视角（码表页、自动发布用），
+    传了只看这张表自己的字段——否则每张引用过它的表都会背上别人的问题，
+    用户点进去发现自己的字段根本不超长。
+    """
     total_values = (
         session.query(CodeValueModel)
         .filter(CodeValueModel.code_set_id == row.id)
@@ -34,12 +46,14 @@ def evaluate_code_set(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     )
     total_value_count = len(total_values)
     values = [value for value in total_values if value.enabled]
-    refs = (
+    refs_query = (
         session.query(FieldCodeReferenceModel, FieldMetadataModel)
         .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
         .filter(FieldCodeReferenceModel.code_set_id == row.id)
-        .all()
     )
+    if table_id:
+        refs_query = refs_query.filter(FieldMetadataModel.table_id == table_id)
+    refs = refs_query.all()
     blockers: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
 
