@@ -752,12 +752,109 @@ def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]
     return rules + added
 
 
+def _length_backfill_candidates(specs, rules) -> List[tuple]:
+    """找出「字典声明了长度、但规则集里没有任何长度约束」的文本字段。
+
+    「字符型，28」能推出且只能推出「最多 28 位」，这是机械结论，不该由模型决定
+    要不要生成。实测同一份原文三次运行给出了三个答案：
+    LENGTH=28（错，误杀短值）、LENGTH_MAX=28（对）、完全没有长度规则（漏）。
+    """
+    covered = {
+        (rule.table_code, rule.field)
+        for rule in rules
+        if rule.operator in {"LENGTH", "LENGTH_MAX"}
+    }
+    candidates = []
+    for spec in specs:
+        for field in spec.fields:
+            if (spec.table_code, field.name) in covered:
+                continue
+            if (field.data_type or "").upper() != "VARCHAR":
+                continue
+            # 长度 0 或超 Oracle VARCHAR2 上限的不是「声明了列宽」，交给码值/格式规则去管
+            if not (0 < (field.length or 0) <= 4000):
+                continue
+            candidates.append((spec, field))
+    return candidates
+
+
+def _declaration_quote(spec, field) -> str:
+    """从字典原文里取该字段那一行做证据；取不到就退回类型声明本身。"""
+    want = (field.name or "").lower()
+    for line in (spec.dictionary_text or "").splitlines():
+        low = line.lower()
+        if want and want in low and str(field.length) in line:
+            return " ".join(line.split())
+    return f"{field.name} 类型（长度）列：{field.data_type}({field.length})"
+
+
+def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
+    """按类型（长度）列机械补齐 LENGTH_MAX。
+
+    LENGTH 已从模型的算子白名单里移除，因为「字符型，N」是列宽上限而不是定长，
+    卡成「必须正好 N 位」会把所有短值判违规。但移除之后模型干脆不生成任何长度
+    规则了（实测第三个 run 的 EXGUARANCODE 只剩 REQUIRED），
+    等于用漏规则换掉错规则。所以这里按声明确定性补上。
+    """
+    added: List[RuleDefinition] = []
+    for spec, field in _length_backfill_candidates(specs, rules):
+        rule_key = f"{spec.table_code}_{field.name}_LENGTH_MAX"
+        try:
+            bound = bind_rules(
+                spec,
+                [
+                    {
+                        "field": field.name,
+                        "operator": "LENGTH_MAX",
+                        "params": {"length": int(field.length)},
+                        "rule_key": rule_key,
+                        "evidence_kind": "DICTIONARY",
+                        "rationale": (
+                            f"数据字典类型（长度）列声明 {field.data_type}({field.length})，"
+                            f"故 {field.name} 最多 {field.length} 位（由元数据机械补齐，非 AI 生成）"
+                        ),
+                    }
+                ],
+            )
+        except (RuleValidationError, WorkflowError) as exc:
+            append_event(
+                session,
+                run,
+                "RULE_BACKFILL_GAP",
+                "rule_backfill",
+                {"table_code": spec.table_code, "field": field.name, "operator": "LENGTH_MAX", "error": str(exc)},
+            )
+            continue
+        bound[0].evidence.quote = _declaration_quote(spec, field)
+        bound[0].rule_hash = calculate_rule_hash(bound[0], spec.source_sha256)
+        _upsert_rule(session, run, bound[0], "APPROVED")
+        added.append(bound[0])
+    if added:
+        session.flush()
+        append_event(
+            session,
+            run,
+            "RULE_BACKFILL",
+            "rule_backfill",
+            {
+                "total": len(added),
+                "rules": [
+                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
+                    for rule in added
+                ],
+                "note": "字典声明了列宽但 AI 未生成长度规则，已按 LENGTH_MAX 确定性补齐",
+            },
+        )
+    return rules + added
+
+
 def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None):
     _, field_code_sets = load_published_code_sets(session, specs)
 
     def worker(spec):
         table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
         active_keys = {rule.rule_key for rule in table_rules}
+        rule_index = {rule.rule_key: (rule.field, rule.operator, rule.params) for rule in table_rules}
 
         gaps: List[Dict[str, Any]] = []
 
@@ -804,7 +901,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 "assign_audit_cases",
                 instruction,
                 payload,
-                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys),
+                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index),
             )
 
         targets = [None] + table_rules
@@ -955,7 +1052,8 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
             revised, trace = _call_validated(
                 llm,
                 "assign_rules",
-                "根据失败记录修正当前规则赋值。最大长度用 LENGTH_MAX，精确长度用 LENGTH；只返回修正后的一条规则。",
+                "根据失败记录修正当前规则赋值。长度一律用 LENGTH_MAX（列宽是上限）；"
+                "要卡「必须正好 N 位」请用 REGEXP 写死格式；只返回修正后的一条规则。",
                 payload,
                 validate_revision,
             )
@@ -1188,6 +1286,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
     rules = _backfill_required_rules(session, run, specs, rules)
+    rules = _backfill_length_rules(session, run, specs, rules)
     prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
     golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans)
     session.commit()

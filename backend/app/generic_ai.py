@@ -7,7 +7,7 @@ import httpx
 from json_repair import repair_json
 
 from .config import Settings
-from .domain import SpecDocument
+from .domain import LLM_OPERATORS, SpecDocument
 
 LLM_CALL_SEMAPHORE = threading.BoundedSemaphore(4)
 
@@ -33,7 +33,8 @@ RULE_PROPERTIES = {
     "field": {"type": "string"},
     "operator": {
         "type": "string",
-        "enum": ["REQUIRED", "ENUM", "NOT_IN", "COND_REQUIRED", "LENGTH", "LENGTH_MAX", "REGEXP", "FOREIGN_KEY"],
+        # 只暴露 LLM_OPERATORS：不含 LENGTH（列宽是上限，不是定长）
+        "enum": list(LLM_OPERATORS),
     },
     "params": {"type": "object"},
     "evidence_kind": {"type": "string", "enum": ["DICTIONARY", "TERM_INFERENCE"]},
@@ -311,8 +312,11 @@ class RealDesignLlm:
             "所有字段必须来自输入白名单。DICTIONARY 仅用于数据字典明确表达的规则；"
             "术语推理、额外格式限制或不确定拓展必须使用 TERM_INFERENCE。"
             "算子参数契约：REQUIRED={}；ENUM/NOT_IN={values:[...]}；"
-            "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；LENGTH={length:整数}；"
-            "LENGTH={length:精确长度}；LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}。"
+            "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；"
+            "LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}。"
+            "长度口径：字典或表结构里的「字符型，N」是列宽上限，只能推出「最多 N 位」，用 LENGTH_MAX。"
+            "不要用精确长度约束——变长字段填短值是合法的，卡成「必须正好 N 位」会把正常数据判成违规。"
+            "确实需要「必须正好 N 位」（如统一社会信用代码 18 位、YYYYMMDD 8 位）时，用 REGEXP 把格式写死。"
             f"任务：{instruction}\n输入：{json.dumps(payload, ensure_ascii=False)}"
         )
         if feedback:

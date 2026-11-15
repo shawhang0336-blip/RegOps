@@ -55,6 +55,24 @@ class RuleDefinition(BaseModel):
     rule_hash: str = ""
 
 
+# LLM 允许使用的算子子集，不含 LENGTH（精确长度）。
+#
+# 字典/表结构里的「字符型，N」是列宽上限，`VARCHAR2(N)` 本身也只约束上限，
+# 短值插得进去。把它卡成「必须正好 N 位」会把业务里所有短值判成违规——
+# 报送场景下误报比漏报更致命，正常数据会被自己的校验拦住发不出去。
+# 实测同一份原文两次运行，一次出 LENGTH=28 一次出 LENGTH_MAX=28，答案本应唯一，
+# 所以干脆不给模型这个选择；确实需要「必须正好 N 位」时用 REGEXP 写死格式。
+LLM_OPERATORS = (
+    "REQUIRED",
+    "ENUM",
+    "NOT_IN",
+    "COND_REQUIRED",
+    "LENGTH_MAX",
+    "REGEXP",
+    "FOREIGN_KEY",
+)
+
+
 class AuditCase(BaseModel):
     case_id: str
     record: Dict[str, Any]

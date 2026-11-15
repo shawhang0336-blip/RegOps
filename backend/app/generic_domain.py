@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from .domain import Evidence, RuleDefinition, SpecDocument, calculate_rule_hash
+from .domain import LLM_OPERATORS, Evidence, RuleDefinition, SpecDocument, calculate_rule_hash
 from .rules import RuleValidationError, validate_rule
 from .spec_parser import field_map
 
@@ -61,6 +61,12 @@ def bind_rules(
         source = "DOC_EXPLICIT" if evidence_kind == "DICTIONARY" else "AI_EXPANDED"
         quote = metadata.check_text if source == "DOC_EXPLICIT" else f"{spec.terms_text[:500]}｜数据字典：{metadata.check_text}"
         operator = item["operator"]
+        if operator not in LLM_OPERATORS:
+            # enum 约束只是提示，模型仍可能硬返回 LENGTH；这里做硬拦
+            raise RuleValidationError(
+                f"算子 {operator} 不允许由模型生成。长度类请用 LENGTH_MAX（列宽是上限），"
+                "需要「必须正好 N 位」请用 REGEXP 写死格式。"
+            )
         params = item.get("params", {})
         if operator == "FOREIGN_KEY":
             if selected_table_codes is None or params.get("references_table") not in selected_table_codes:
@@ -93,6 +99,25 @@ def bind_rules(
     return rules
 
 
+def _as_number(value: Any) -> Any:
+    """把 JSON 里写成字符串的数字收敛成数值。
+
+    实测出现过 SEQUENCE 的 start/step 都写成 "1000.00" / "100.00"，
+    于是 index=1 时 `"1000.00" + 1 * "100.00"` 走成了字符串拼接，
+    生成出 "1000.00100.00"，插 NUMBER 列直接 ORA-01722 整次审计失败。
+    """
+    if isinstance(value, bool):
+        raise ValueError("布尔值不是数字")
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(text)
+    if re.fullmatch(r"[+-]?\d+\.\d+", text):
+        return float(text)
+    raise ValueError(f"不是数字：{value!r}")
+
+
 def bind_generators(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[GeneratorBinding]:
     bindings = [GeneratorBinding.model_validate(item) for item in items]
     expected = field_map(spec)
@@ -103,8 +128,24 @@ def bind_generators(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[Gen
             raise RuleValidationError(f"{item.field} FIXED generator requires a value")
         if item.generator == "ENUM" and not item.params.get("values"):
             raise RuleValidationError(f"{item.field} ENUM generator requires values")
-        if item.generator == "SEQUENCE" and "start" not in item.params:
-            raise RuleValidationError(f"{item.field} SEQUENCE generator requires start")
+        if item.generator == "SEQUENCE":
+            if "start" not in item.params:
+                raise RuleValidationError(f"{item.field} SEQUENCE generator requires start")
+            for key in ("start", "step"):
+                if key not in item.params:
+                    continue
+                try:
+                    item.params[key] = _as_number(item.params[key])
+                except ValueError as exc:
+                    raise RuleValidationError(
+                        f"{item.field} SEQUENCE 的 {key} 必须是数字（不能是带单位的文本）：{exc}"
+                    ) from exc
+            for key in ("padding", "width"):
+                if key in item.params and item.params[key] is not None:
+                    try:
+                        item.params[key] = int(item.params[key])
+                    except (TypeError, ValueError) as exc:
+                        raise RuleValidationError(f"{item.field} SEQUENCE 的 {key} 必须是整数") from exc
     return bindings
 
 
@@ -118,21 +159,67 @@ def materialize_golden_record(spec: SpecDocument, bindings: List[GeneratorBindin
             record[item.field] = values[index % len(values)]
         else:
             value = item.params["start"] + index * item.params.get("step", 1)
-            padding = int(item.params.get("padding", 0))
-            record[item.field] = str(value).zfill(padding) if padding else str(value)
+            # AI 有时写 width 有时写 padding，两个都认
+            padding = int(item.params.get("padding") or item.params.get("width") or 0)
+            text = str(value).zfill(padding) if padding else str(value)
+            record[item.field] = f"{item.params.get('prefix') or ''}{text}"
     return record
+
+
+# 只在单个字段上判定的算子：要打死它们，变异必须落在那个字段上
+SELF_FIELD_OPERATORS = {"REQUIRED", "ENUM", "NOT_IN", "LENGTH", "LENGTH_MAX", "REGEXP"}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or not str(value).strip()
+
+
+def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any) -> bool:
+    """在 Python 侧预判这个取值是否真的违反规则。
+
+    目的是把「空转用例」挡在绑定阶段：实测出现过 REMARK_LENGTH_MAX_C5 声称
+    把备注改到超过 256，实际给的字符串没超，于是审计报「该命中未命中」，
+    回流去改规则——可长度就是 256，改不动，白跑一轮。
+
+    判定不了的（COND_REQUIRED / FOREIGN_KEY / 非法正则）返回 None，不做结论。
+    """
+    if operator == "REQUIRED":
+        return _is_blank(value)
+    if operator == "ENUM":
+        return not _is_blank(value) and str(value) not in {str(v) for v in params.get("values", [])}
+    if operator == "NOT_IN":
+        return not _is_blank(value) and str(value) in {str(v) for v in params.get("values", [])}
+    if operator in {"LENGTH", "LENGTH_MAX"}:
+        if value is None or params.get("length") is None:
+            return None
+        size = len(str(value))
+        if operator == "LENGTH":
+            return size != int(params["length"])
+        return size > int(params["length"])
+    if operator == "REGEXP":
+        pattern = params.get("pattern")
+        if not pattern or value is None:
+            return None
+        try:
+            # Oracle 的 REGEXP_LIKE 是「包含匹配」，用 search 对齐
+            return re.search(pattern, str(value)) is None
+        except re.error:
+            return None
+    return None
 
 
 def bind_audit_cases(
     spec: SpecDocument,
     items: List[Dict[str, Any]],
     active_rule_keys: set,
+    rule_index: Optional[Dict[str, tuple]] = None,
 ) -> List[AuditCaseBinding]:
     cases = [AuditCaseBinding.model_validate(item) for item in items]
     if not cases:
         raise RuleValidationError("At least one audit case is required")
     case_ids = set()
     for case in cases:
+
         if case.case_id in case_ids:
             raise RuleValidationError("Duplicate audit case ID")
         case_ids.add(case.case_id)
@@ -149,4 +236,27 @@ def bind_audit_cases(
             raise RuleValidationError(
                 f"变异用例 {case.case_id} 必须声明至少一条 expected_rule_keys，否则无法判断它验证了什么"
             )
+        for rule_key in case.expected_rule_keys:
+            info = (rule_index or {}).get(rule_key)
+            if not info:
+                continue
+            field, operator = info[0], info[1]
+            params = info[2] if len(info) > 2 else {}
+            if operator in SELF_FIELD_OPERATORS and field not in case.overrides:
+                # 实测出现过「FIELD_ABSENT」这种用例：名字说字段缺失，overrides 里
+                # 却根本没有这个键，于是继承了黄金值，什么都没变异，只是把该规则
+                # 的漏测伪装成一条有效用例。JSON 表达不了「缺键」，字段缺失必须写 null。
+                raise RuleValidationError(
+                    f"用例 {case.case_id} 期望命中 {rule_key}，但 overrides 里没有 {field}，"
+                    f"该字段并没有被变异，这条用例测不到任何东西。"
+                    f"要测字段缺失请显式写成 \"{field}\": null。"
+                )
+            if field in case.overrides:
+                verdict = violates_single_field_rule(operator, params, case.overrides[field])
+                if verdict is False:
+                    raise RuleValidationError(
+                        f"用例 {case.case_id} 声称会触发 {rule_key}"
+                        f"（{operator} {params}），但取值 {case.overrides[field]!r} 并不违规，"
+                        "这条用例跑到 Oracle 也不会命中，白白消耗一轮审计。请给出真正越界或缺失的值。"
+                    )
     return cases
