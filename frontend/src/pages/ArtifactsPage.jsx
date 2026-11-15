@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
 import PageHeader from './PageHeader.jsx'
@@ -10,6 +10,14 @@ const TABS = [
   ['ddl', '表结构'],
   ['codes', '码表'],
   ['audit', '验证结果'],
+]
+
+const STATUS_FILTERS = [
+  ['all', '全部'],
+  ['ungenerated', '未生成'],
+  ['running', '生成中'],
+  ['verified', '已验证'],
+  ['failed', '验证失败'],
 ]
 
 function runTone(row) {
@@ -39,6 +47,9 @@ export default function ArtifactsPage() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [expandedRule, setExpandedRule] = useState(null)
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [docFilter, setDocFilter] = useState('all')
+  const [search, setSearch] = useState('')
 
   async function load(preferredId) {
     const data = await v2('/artifacts')
@@ -58,12 +69,34 @@ export default function ArtifactsPage() {
     load().catch((err) => setError(err.message))
   }, [])
 
+  const documents = useMemo(() => {
+    const map = new Map()
+    tables.forEach((item) => {
+      if (item.document_id) map.set(item.document_id, item.document_name || item.document_id)
+    })
+    return [...map.entries()]
+  }, [tables])
+
+  const filteredTables = useMemo(() => {
+    return tables.filter((row) => {
+      if (statusFilter === 'ungenerated' && row.generated) return false
+      if (statusFilter === 'running' && !(row.generated && !['COMPLETED', 'FAILED'].includes(row.run_status))) return false
+      if (statusFilter === 'verified' && !(row.run_status === 'COMPLETED' && row.all_passed)) return false
+      if (statusFilter === 'failed' && row.run_status !== 'FAILED') return false
+      if (docFilter !== 'all' && row.document_id !== docFilter) return false
+      const q = search.trim().toLowerCase()
+      if (q && !row.table_name.toLowerCase().includes(q) && !row.table_code.toLowerCase().includes(q)) return false
+      return true
+    })
+  }, [tables, statusFilter, docFilter, search])
+
   function toggle(id) {
     setSelected(selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id])
   }
 
-  async function generate() {
-    if (!selected.length) {
+  async function generate(tableIds) {
+    const ids = tableIds || selected
+    if (!ids.length) {
       setError('请先勾选要生成的报表。')
       return
     }
@@ -72,9 +105,9 @@ export default function ArtifactsPage() {
     try {
       const run = await v2('/generation/runs', {
         method: 'POST',
-        body: JSON.stringify({ table_ids: selected, provider: 'live' }),
+        body: JSON.stringify({ table_ids: ids, provider: 'live' }),
       })
-      setNotice(`已启动生成，正在跳转执行中心。`)
+      setNotice('已启动生成，正在跳转执行中心。')
       navigate(`/runs?run=${run.id}`)
     } catch (err) {
       setError(err.message)
@@ -101,7 +134,7 @@ export default function ArtifactsPage() {
             type="button"
             className="button primary"
             disabled={busy || !selected.length}
-            onClick={generate}
+            onClick={() => generate()}
           >
             {busy ? '正在启动...' : `开始生成 (${selected.length} 张报表)`}
           </button>
@@ -114,11 +147,35 @@ export default function ArtifactsPage() {
           <div className="panel-heading">
             <div>
               <h2>报表清单</h2>
-              <p>{tables.length} 张 · 已选择 {selected.length} 张</p>
+              <p>{filteredTables.length} / {tables.length} 张 · 已选择 {selected.length} 张</p>
             </div>
           </div>
+          <div className="list-filter-bar">
+            <input
+              type="search"
+              placeholder="检索表名或代码..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              {STATUS_FILTERS.map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            {documents.length > 1 && (
+              <select value={docFilter} onChange={(e) => setDocFilter(e.target.value)}>
+                <option value="all">全部文件</option>
+                {documents.map(([id, name]) => (
+                  <option key={id} value={id}>{name}</option>
+                ))}
+              </select>
+            )}
+          </div>
           <div className="list-stack">
-            {tables.map((row) => (
+            {filteredTables.length === 0 && (
+              <div className="empty">没有符合筛选的报表。</div>
+            )}
+            {filteredTables.map((row) => (
               <div
                 key={row.id}
                 className={`list-row ${currentId === row.id ? 'selected' : ''}`}
@@ -169,8 +226,28 @@ export default function ArtifactsPage() {
                 </div>
                 {detail.run && (
                   <div className="actions">
+                    <button
+                      type="button"
+                      className="button secondary sm"
+                      disabled={busy}
+                      onClick={() => generate([detail.table.id])}
+                    >
+                      重新生成这张表
+                    </button>
                     <button type="button" className="button secondary sm" onClick={downloadBundle}>
                       下载产出包
+                    </button>
+                  </div>
+                )}
+                {!detail.run && (
+                  <div className="actions">
+                    <button
+                      type="button"
+                      className="button primary sm"
+                      disabled={busy}
+                      onClick={() => generate([detail.table.id])}
+                    >
+                      生成这张表
                     </button>
                   </div>
                 )}
@@ -202,6 +279,8 @@ export default function ArtifactsPage() {
                   groups={detail.rule_groups}
                   expandedRule={expandedRule}
                   onToggle={setExpandedRule}
+                  onSaved={() => select(currentId)}
+                  onNotice={setNotice}
                 />
               )}
 
@@ -264,7 +343,11 @@ export default function ArtifactsPage() {
   )
 }
 
-function RulesView({ rules, groups, expandedRule, onToggle }) {
+function RulesView({ rules, groups, expandedRule, onToggle, onSaved, onNotice }) {
+  const [operatorFilter, setOperatorFilter] = useState('all')
+  const [fieldSearch, setFieldSearch] = useState('')
+  const [editingRule, setEditingRule] = useState(null)
+
   if (!rules.length) {
     return <div className="empty">这张表还没有生成校验规则。</div>
   }
@@ -272,18 +355,35 @@ function RulesView({ rules, groups, expandedRule, onToggle }) {
   const sorted = [...rules].sort(
     (a, b) => order.indexOf(a.operator) - order.indexOf(b.operator) || a.field.localeCompare(b.field)
   )
+  const visible = sorted.filter((rule) => {
+    if (operatorFilter !== 'all' && rule.operator !== operatorFilter) return false
+    const q = fieldSearch.trim().toLowerCase()
+    if (q && !rule.field.toLowerCase().includes(q) && !rule.rule_key.toLowerCase().includes(q)) return false
+    return true
+  })
+
   return (
     <div className="rules-workspace">
-      <div className="rule-groups-bar">
-        {Object.entries(groups).map(([op, count]) => (
-          <span key={op} className="basis-pill">
-            {rules.find((rule) => rule.operator === op)?.operator_label || op} {count}
-          </span>
-        ))}
+      <div className="list-filter-bar rule-filter-bar">
+        <select value={operatorFilter} onChange={(e) => setOperatorFilter(e.target.value)}>
+          <option value="all">全部算子 ({rules.length})</option>
+          {Object.entries(groups).map(([op, count]) => (
+            <option key={op} value={op}>
+              {rules.find((rule) => rule.operator === op)?.operator_label || op} ({count})
+            </option>
+          ))}
+        </select>
+        <input
+          type="search"
+          placeholder="按字段或规则名检索..."
+          value={fieldSearch}
+          onChange={(e) => setFieldSearch(e.target.value)}
+        />
       </div>
       <div className="rule-card-list">
-        {sorted.map((rule) => {
+        {visible.map((rule) => {
           const expanded = expandedRule === rule.rule_key
+          const editing = editingRule === rule.row_id
           return (
             <div key={rule.rule_key} className="rule-card">
               <div className="rule-card-head" onClick={() => onToggle(expanded ? null : rule.rule_key)}>
@@ -296,6 +396,16 @@ function RulesView({ rules, groups, expandedRule, onToggle }) {
                   {rule.status === 'APPROVED' ? '已批准' : rule.status === 'PENDING' ? '待审' : rule.status}
                 </StatusBadge>
                 <span className="rule-expand">{expanded ? '收起' : '展开'}</span>
+                <button
+                  type="button"
+                  className="button-link rule-edit-btn"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setEditingRule(editing ? null : rule.row_id)
+                  }}
+                >
+                  {editing ? '收起编辑' : '编辑参数'}
+                </button>
               </div>
               {Object.keys(rule.params || {}).length > 0 && (
                 <div className="rule-params">
@@ -307,7 +417,18 @@ function RulesView({ rules, groups, expandedRule, onToggle }) {
                 </div>
               )}
               {rule.sql && <pre className="rule-sql">{rule.sql}</pre>}
-              {expanded && (
+              {editing && (
+                <RuleEditForm
+                  rule={rule}
+                  onCancel={() => setEditingRule(null)}
+                  onSaved={() => {
+                    setEditingRule(null)
+                    onNotice?.(`已保存「${rule.rule_key}」的参数，点「重新生成这张表」验证改动。`)
+                    onSaved?.()
+                  }}
+                />
+              )}
+              {expanded && !editing && (
                 <div className="rule-detail">
                   <p className="rule-rationale">{rule.rationale}</p>
                   {rule.evidence && (
@@ -323,6 +444,7 @@ function RulesView({ rules, groups, expandedRule, onToggle }) {
             </div>
           )
         })}
+        {visible.length === 0 && <div className="empty">没有符合筛选的规则。</div>}
       </div>
     </div>
   )
@@ -348,6 +470,156 @@ function AuditView({ audit, runId }) {
         <div><span>共触发</span><strong>{audit.co_triggered_count ?? '—'}</strong></div>
         <div><span>覆盖完整</span><strong>{audit.coverage_complete ? '是' : '否'}</strong></div>
       </div>
+    </div>
+  )
+}
+
+function RuleEditForm({ rule, onCancel, onSaved }) {
+  const [params, setParams] = useState({ ...(rule.params || {}) })
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  function set(key, value) {
+    setParams({ ...params, [key]: value })
+  }
+
+  async function save() {
+    setBusy(true)
+    setError('')
+    try {
+      const payload = { ...params }
+      if (Array.isArray(payload.values)) {
+        payload.values = payload.values.map((item) => String(item).trim()).filter(Boolean)
+      }
+      if (Array.isArray(payload.if_values)) {
+        payload.if_values = payload.if_values.map((item) => String(item).trim()).filter(Boolean)
+      }
+      await v2(`/artifacts/rules/${rule.row_id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ params: payload, reason }),
+      })
+      onSaved()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const operator = rule.operator
+  return (
+    <div className="rule-edit-form" onClick={(event) => event.stopPropagation()}>
+      <h4>编辑参数 · {rule.field}（{rule.operator_label}）</h4>
+
+      {operator === 'REQUIRED' && (
+        <p className="muted-text">必填规则没有参数，整条规则就是「去掉空白后必须有值」。</p>
+      )}
+
+      {(operator === 'LENGTH' || operator === 'LENGTH_MAX') && (
+        <label>
+          <span>{operator === 'LENGTH' ? '定长' : '最大长度'}（字符数）</span>
+          <input
+            type="number"
+            min="1"
+            value={params.length ?? ''}
+            onChange={(e) => set('length', Number(e.target.value))}
+          />
+        </label>
+      )}
+
+      {(operator === 'ENUM' || operator === 'NOT_IN') && (
+        <label>
+          <span>允许取值（每行一个）</span>
+          <textarea
+            rows={Math.min(8, (params.values || []).length + 1)}
+            value={(params.values || []).join('\n')}
+            onChange={(e) => set('values', e.target.value.split('\n'))}
+          />
+        </label>
+      )}
+
+      {operator === 'REGEXP' && (
+        <label>
+          <span>正则（Oracle REGEXP_LIKE 语义）</span>
+          <input
+            value={params.pattern ?? ''}
+            onChange={(e) => set('pattern', e.target.value)}
+            placeholder="^\d{8}$"
+          />
+        </label>
+      )}
+
+      {operator === 'COND_REQUIRED' && (
+        <>
+          <label>
+            <span>条件字段</span>
+            <input
+              value={params.if_field ?? ''}
+              onChange={(e) => set('if_field', e.target.value)}
+            />
+          </label>
+          <label>
+            <span>条件</span>
+            <select
+              value={params.if_operator ?? 'EQ'}
+              onChange={(e) => set('if_operator', e.target.value)}
+            >
+              <option value="EQ">等于（EQ）</option>
+              <option value="NE">不等于（NE）</option>
+            </select>
+          </label>
+          <label>
+            <span>条件取值（每行一个）</span>
+            <textarea
+              rows={Math.min(6, (params.if_values || []).length + 1)}
+              value={(params.if_values || []).join('\n')}
+              onChange={(e) => set('if_values', e.target.value.split('\n'))}
+            />
+          </label>
+        </>
+      )}
+
+      {operator === 'FOREIGN_KEY' && (
+        <>
+          <label>
+            <span>引用表</span>
+            <input
+              value={params.references_table ?? ''}
+              onChange={(e) => set('references_table', e.target.value)}
+            />
+          </label>
+          <label>
+            <span>引用字段</span>
+            <input
+              value={params.references_field ?? ''}
+              onChange={(e) => set('references_field', e.target.value)}
+            />
+          </label>
+        </>
+      )}
+
+      {operator !== 'REQUIRED' && (
+        <label>
+          <span>修改原因（可选）</span>
+          <input
+            placeholder="例：原文限 28，业务实际允许 32"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </label>
+      )}
+
+      {error && <p className="danger-text">{error}</p>}
+      <div className="actions">
+        <button type="button" className="button primary sm" disabled={busy || operator === 'REQUIRED'} onClick={save}>
+          {busy ? '保存中...' : '保存参数'}
+        </button>
+        <button type="button" className="button secondary sm" onClick={onCancel}>
+          取消
+        </button>
+      </div>
+      <p className="muted-text">保存后不会自动重跑验证，点上方「重新生成这张表」确认改动是否通过。</p>
     </div>
   )
 }

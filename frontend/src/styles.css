@@ -1801,3 +1801,67 @@
 .audit-metrics strong {
   font-size: 20px;
 }
+
+/* 筛选栏 */
+.list-filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.list-filter-bar input[type="search"] {
+  flex: 1;
+  min-width: 160px;
+}
+
+.list-filter-bar select {
+  min-width: 110px;
+}
+
+.rule-filter-bar {
+  margin-bottom: 14px;
+}
+
+.rule-edit-btn {
+  font-size: 12px;
+}
+
+.rule-edit-form {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px dashed var(--brand-border);
+  border-radius: var(--radius-md);
+  background: var(--brand-light);
+  display: grid;
+  gap: 10px;
+}
+
+.rule-edit-form h4 {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+.rule-edit-form label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.rule-edit-form label > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rule-edit-form input,
+.rule-edit-form select,
+.rule-edit-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.rule-edit-form textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
