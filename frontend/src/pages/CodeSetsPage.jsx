@@ -30,9 +30,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
       setDetail(null)
       return
     }
-    const readinessQuery = documentId
-      ? `?document_id=${encodeURIComponent(documentId)}&referenced_only=true`
-      : '?referenced_only=true'
+    // 不带 referenced_only：汇总数要和下面的列表张数对得上，
+    // 也要拿到每张码表自己的 blockers 才能显示「齐备 / 需补」
+    const readinessQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     const [setList, unresolvedList, readinessPayload] = await Promise.all([
       v2(`/code-sets${scopeQuery}`),
       v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
@@ -216,6 +216,13 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     }
   }
 
+  // 码表对用户只有两种状态：齐备、要补。内部的 DRAFT / AI_SELF_VALIDATED /
+  // PUBLISHED 是流程痕迹（发布已自动化），显示出来只会让人以为还有事没做。
+  const readinessById = Object.fromEntries(
+    (readiness?.code_sets || []).map((item) => [item.code_set_id, item])
+  )
+  const verdictOf = (id) => readinessById[id]
+
   const filteredSets = sets.filter((s) => {
     if (!setSearch.trim()) return true
     const q = setSearch.toLowerCase()
@@ -360,7 +367,16 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   </button>
                   <div className="list-row-top">
                     <strong>{set.name}</strong>
-                    <StatusBadge status={set.status} />
+                    {(() => {
+                      const verdict = verdictOf(set.id)
+                      const problems = verdict?.blockers || []
+                      if (!verdict) return <StatusBadge tone="neutral">未评估</StatusBadge>
+                      return problems.length ? (
+                        <StatusBadge tone="red">需补 {problems.length} 项</StatusBadge>
+                      ) : (
+                        <StatusBadge tone="green">齐备</StatusBadge>
+                      )
+                    })()}
                   </div>
                   <span>
                     <code>{set.code}</code> · 启用 {set.enabled_value_count ?? set.value_count}/{set.value_count} 项
@@ -408,11 +424,20 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   <div className="actions">
                     <h2>{detail.name}</h2>
                     <code>{detail.code}</code>
-                    <StatusBadge status={detail.status} />
-                    <StatusBadge status={detail.source_type}>{detail.source_type === 'MANUAL' ? '人工维护' : '文档识别'}</StatusBadge>
+                    {(() => {
+                      const problems = verdictOf(detail.id)?.blockers || []
+                      return problems.length ? (
+                        <StatusBadge tone="red">需补 {problems.length} 项</StatusBadge>
+                      ) : (
+                        <StatusBadge tone="green">齐备</StatusBadge>
+                      )
+                    })()}
+                    <StatusBadge status={detail.source_type}>
+                      {detail.source_type === 'MANUAL' ? '人工维护' : '文档识别'}
+                    </StatusBadge>
                   </div>
                   <p>
-                    {detail.definition || '暂无字典定义'} · 当前版本 v{detail.current_version}
+                    {detail.definition || '暂无字典定义'} · {detail.value_count} 项取值
                   </p>
                 </div>
                 <div className="actions">
@@ -443,7 +468,8 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                     <strong>程序检查与 AI 独立复核</strong>
                     {detail.validations.slice(0, 4).map((validation, index) => (
                       <StatusBadge key={`${validation.validator_kind}-${validation.created_at}-${index}`} tone={validation.status === 'PASSED' ? 'green' : 'amber'}>
-                        {validation.validator_kind === 'AI_REVIEW' ? 'AI 复核' : '程序检查'} · {validation.status === 'PASSED' ? '通过' : '需核对'} · {validation.issues?.length || 0} 项
+                        {validation.validator_kind === 'AI_REVIEW' ? 'AI 复核' : '程序检查'} ·{' '}
+                        {validation.status === 'PASSED' ? '无异常' : `${validation.issues?.length || 0} 条提示`}
                       </StatusBadge>
                     ))}
                   </div>
