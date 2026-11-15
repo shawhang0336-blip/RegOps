@@ -36,8 +36,10 @@ export default function GenerationPage() {
     async function init() {
       setChecking(true)
       try {
+        // 不再只列 PUBLISHED：定稿是进入这一步时自动完成的，
+        // 只筛已发布会把 121 张能用的表挡成 3 张。
         const [list, readinessPayload] = await Promise.all([
-          v2('/metadata/tables?status=PUBLISHED'),
+          v2('/metadata/tables'),
           v2('/metadata/readiness').catch(() => null),
         ])
         const map = Object.fromEntries(
@@ -50,7 +52,7 @@ export default function GenerationPage() {
         if (preferredTableId && list.some((t) => t.id === preferredTableId)) {
           setSelected([preferredTableId])
         } else {
-          setSelected(list.filter((t) => map[t.id]?.ddl?.ready).map((t) => t.id))
+          setSelected([])
         }
       } catch (err) {
         setError(err.message)
@@ -62,7 +64,7 @@ export default function GenerationPage() {
   }, [])
 
   const ddlReady = (id) => readiness[id]?.ddl?.ready !== false
-  // 码值只看「有没有需要人补的东西」：码表发布是自动的（发布表时会发），
+  // 码值只看「有没有需要人补的东西」：码表发布是自动的（定稿时会发），
   // 所以「待发布」不参与判定，否则用户会为了一个不用他管的动作被挡住
   const codeProblems = (section) => section?.defects || []
   const fullyReady = (id) => {
@@ -76,6 +78,22 @@ export default function GenerationPage() {
     if (!item) return []
     return [...(item.rule_materials.blockers || []), ...codeProblems(item.code_sets)]
   }
+  // 这张表能不能进生成：待复核的表后端会 409，前端先排除掉
+  const selectable = (id) => {
+    const table = tables.find((item) => item.id === id)
+    if (!table || table.status === 'NEEDS_REVIEW') return false
+    return fullyReady(id)
+  }
+  const blockReason = (id) => {
+    const table = tables.find((item) => item.id === id)
+    if (table?.status === 'NEEDS_REVIEW') return '这张表还有违反原文的字段问题，先去元数据页处理标红项'
+    const item = readiness[id]
+    if (!item) return '未评估'
+    if (!item.ddl.ready) return item.ddl.blockers[0]?.message || '字段定义不完整'
+    const hard = hardBlockers(id)
+    if (hard.length) return hard[0].message
+    return ''
+  }
   const pendingWarnings = (id) => {
     const item = readiness[id]
     if (!item) return []
@@ -86,25 +104,17 @@ export default function GenerationPage() {
   }
 
   function toggle(id) {
-    const item = readiness[id]
-    if (item) {
-      const blocked = hardBlockers(id)
-      if (blocked.length) {
-        const first = blocked[0]
-        setError(
-          `${item.table_code} 还不能装配：${first.message}。请先在码表页批量发布（或补齐缺失码值）后再选。`
-        )
-        return
-      }
-      if (!item.ddl.ready) {
-        const reason = item.ddl.blockers[0]?.message || '字段定义不完整'
-        setError(`${item.table_code} 还不能生成 DDL：${reason}`)
-        return
-      }
+    if (selected.includes(id)) {
+      setSelected(selected.filter((item) => item !== id))
+      return
     }
-    setSelected(
-      selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]
-    )
+    const reason = blockReason(id)
+    if (reason) {
+      const table = tables.find((item) => item.id === id)
+      setError(`${table?.table_code || id} 还不能生成：${reason}`)
+      return
+    }
+    setSelected([...selected, id])
   }
 
   function selectAllReady() {
@@ -166,7 +176,7 @@ export default function GenerationPage() {
     }
   }
 
-  const fullCount = tables.filter((t) => fullyReady(t.id)).length
+  const fullCount = tables.filter((t) => selectable(t.id)).length
   const ddlBlockedCount = tables.filter((t) => !ddlReady(t.id)).length
   const warnedSelected = selected.filter((id) => pendingWarnings(id).length > 0).length
 
@@ -223,16 +233,16 @@ export default function GenerationPage() {
         <div className="panel-heading">
           <div>
             <h2>选择本次要生成的报表</h2>
-            <p>只列出已发布的报表。规则由本阶段的 AI 依据校验原文生成，这里只保证原料齐备。</p>
+            <p>列出全部报表。可用的直接定稿并生成，不能用的会标出缺什么；规则由本阶段的 AI 依据校验原文生成。</p>
           </div>
           <div className="actions">
             <button type="button" className="button secondary sm" onClick={selectAllReady}>
-              选择三项就绪 ({fullCount})
+              全选可生成 ({fullCount})
             </button>
             <button
               type="button"
               className="button secondary sm"
-              onClick={() => setSelected(tables.filter((t) => ddlReady(t.id)).map((t) => t.id))}
+              onClick={() => setSelected(tables.filter((t) => selectable(t.id)).map((t) => t.id))}
             >
               选择 DDL 就绪 ({tables.length - ddlBlockedCount})
             </button>
@@ -247,8 +257,8 @@ export default function GenerationPage() {
             {tables.map((table) => {
               const item = readiness[table.id]
               const isSelected = selected.includes(table.id)
-              const blockers = item?.ddl?.blockers || []
-              const blocked = item ? !item.ddl.ready : false
+              const reason = blockReason(table.id)
+              const blocked = reason !== ''
               return (
                 <div
                   key={table.id}
@@ -301,27 +311,24 @@ export default function GenerationPage() {
                     </div>
                     <div className="generation-card-meta">
                       <code>{table.table_code}</code>
-                      <StatusBadge tone="neutral">发布版 v{table.published_version}</StatusBadge>
+                      <StatusBadge tone={table.published_version ? 'neutral' : 'warn'}>
+                        {table.published_version ? `已定稿 v${table.published_version}` : '未定稿 · 选中即定稿'}
+                      </StatusBadge>
                       <span className="muted-text">{table.field_count} 个字段 · 更新于 {formatTime(table.updated_at)}</span>
                     </div>
 
                     {blocked && (
                       <div className="blocker-alert-list" onClick={(e) => e.stopPropagation()}>
-                        {blockers.slice(0, 3).map((b, idx) => (
-                          <div key={idx} className="blocker-alert-item">
-                            <span>{b.message}</span>
-                            <button
-                              type="button"
-                              className="button secondary sm"
-                              onClick={() => navigate(`/metadata?table=${table.id}`)}
-                            >
-                              去处理 →
-                            </button>
-                          </div>
-                        ))}
-                        {blockers.length > 3 && (
-                          <div className="muted-text">另有 {blockers.length - 3} 项…</div>
-                        )}
+                        <div className="blocker-alert-item">
+                          <span>{reason}</span>
+                          <button
+                            type="button"
+                            className="button secondary sm"
+                            onClick={() => navigate(`/metadata?table=${table.id}`)}
+                          >
+                            去处理 →
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -331,7 +338,7 @@ export default function GenerationPage() {
           </div>
         ) : (
           <div className="empty">
-            当前没有已发布的报表。请先在「核对字段」里把三项就绪的表批量发布。
+            没有可用的报表。请先在第 1 步把字段元数据准备好。
           </div>
         )}
       </section>
