@@ -16,7 +16,7 @@ const PIPELINE_STAGES = [
 const ARTIFACTS = [
   { key: 'ddl', label: 'DDL', hint: '表名/字段名要能落成 Oracle 标识符' },
   { key: 'rule_materials', label: '规则原料', hint: '校验原文在、码值白名单拿得到' },
-  { key: 'code_sets', label: '码值', hint: '码表已发布、有值，能灌进 Oracle' },
+  { key: 'code_sets', label: '码值', hint: '检查通过会自动发布，不用手点；有缺失才拦' },
 ]
 
 export default function GenerationPage() {
@@ -67,17 +67,38 @@ export default function GenerationPage() {
     if (!item) return false
     return item.ddl.ready && item.rule_materials.ready && item.code_sets.ready
   }
-  const pendingWarnings = (id) => {
+  // 只有「质量下降但不阻断装配」的提示才允许确认后继续。
+  // 码值相关的 blocker 会让阶段 2 直接 WorkflowError 退出，确认了也一定失败。
+  const hardBlockers = (id) => {
     const item = readiness[id]
     if (!item) return []
     return [...(item.rule_materials.blockers || []), ...(item.code_sets.blockers || [])]
   }
+  const pendingWarnings = (id) => {
+    const item = readiness[id]
+    if (!item) return []
+    return [
+      ...(item.rule_materials.warnings || []),
+      ...(item.code_sets.warnings || []),
+    ].filter((w) => w.severity !== 'ERROR')
+  }
 
   function toggle(id) {
-    if (readiness[id] && !readiness[id].ddl.ready) {
-      const reason = readiness[id].ddl.blockers[0]?.message || '字段定义不完整'
-      setError(`${readiness[id].table_code} 还不能生成 DDL：${reason}`)
-      return
+    const item = readiness[id]
+    if (item) {
+      const blocked = hardBlockers(id)
+      if (blocked.length) {
+        const first = blocked[0]
+        setError(
+          `${item.table_code} 还不能装配：${first.message}。请先在码表页批量发布（或补齐缺失码值）后再选。`
+        )
+        return
+      }
+      if (!item.ddl.ready) {
+        const reason = item.ddl.blockers[0]?.message || '字段定义不完整'
+        setError(`${item.table_code} 还不能生成 DDL：${reason}`)
+        return
+      }
     }
     setSelected(
       selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]
@@ -93,13 +114,21 @@ export default function GenerationPage() {
       setError('请至少勾选一张已发布的元数据表。')
       return
     }
+    const blocked = selected.filter((id) => hardBlockers(id).length > 0)
+    if (blocked.length) {
+      const first = hardBlockers(blocked[0])[0]
+      setError(
+        `勾选的表里有 ${blocked.length} 张码值未就绪（例如 ${first.message}）。这一项无法确认跳过——阶段 2 会直接报错退出，请先在码表页批量发布或补齐码值。`
+      )
+      return
+    }
     if (selected.some((id) => !ddlReady(id))) {
       setError('勾选的表里有 DDL 不就绪的（字段名超长或类型无法映射），请先处理。')
       return
     }
     const warned = selected.filter((id) => pendingWarnings(id).length > 0)
     if (warned.length > 0 && !acceptWarnings) {
-      setError('勾选的表里有规则或码值未就绪的，会导致规则缺失或阶段 2 报错；确认已知风险后再继续。')
+      setError('勾选的表里有规则原料不全的，AI 只能凭字段名猜规则；确认已知风险后再继续。')
       return
     }
 
@@ -114,7 +143,15 @@ export default function GenerationPage() {
           accept_warnings: acceptWarnings,
         }),
       })
-      setNotice('生成运行已启动，正在跳转至执行与审计中心跟踪实时进度。')
+      const auto = Object.values(run.auto_published_code_sets || {}).reduce(
+        (total, list) => total + (list || []).length,
+        0
+      )
+      setNotice(
+        auto > 0
+          ? `已自动发布 ${auto} 张检查通过的码表，生成运行已启动，正在跳转至执行与审计中心。`
+          : '生成运行已启动，正在跳转至执行与审计中心跟踪实时进度。'
+      )
       navigate(`/runs?run=${run.id}`)
     } catch (err) {
       setError(err.message)

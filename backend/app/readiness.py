@@ -265,10 +265,15 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             publish_pending_only.append(item["table_code"])
 
     def passing(item) -> bool:
-        """所有适用的项都就绪；不适用的项不参与判定。"""
-        return all(
-            item[artifact]["ready"] if item[artifact].get("applicable", True) else True
-            for artifact in ARTIFACTS
+        """能发布进阶段 2：DDL 能落地、规则原料够、码值没有需要人补的缺陷。
+
+        码表「待发布」不算不合格——发布表的时候会自动把它发掉。
+        只有真缺陷（空码表、码值超长、引用解析不到）才需要人来处理。
+        """
+        return (
+            item["ddl"]["ready"]
+            and item["rule_materials"]["ready"]
+            and not item["code_sets"]["defects"]
         )
 
     return {
@@ -280,11 +285,14 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "not_applicable": not_applicable,
         # 可推进阶段 2 的表数（含「某项不适用」的表）
         "ready_all": sum(1 for item in results if passing(item)),
-        # 三项都实际适用、且都就绪的表数——这才是字面意义的「三项齐」
+        # 字面意义的「三项齐」：三项都适用，且三项都真正就绪。
+        # 「码表待发布」不算——那种表能出包，但码值项本身还没走完；
+        # 「码值不适用」也不算——它本来就只有两项。
         "ready_all_full": sum(
             1
             for item in results
-            if passing(item) and all(item[artifact].get("applicable", True) for artifact in ARTIFACTS)
+            if all(item[artifact].get("applicable", True) for artifact in ARTIFACTS)
+            and all(item[artifact]["ready"] for artifact in ARTIFACTS)
         ),
         # 只差发布码表就能出包的表 —— 数据本身没问题，缺的是一个动作
         "publish_pending_only": len(publish_pending_only),
@@ -294,6 +302,27 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             for artifact, codes in counter.items()
         },
     }
+
+
+def split_preflight_issues(readiness: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """把一张表的就绪问题分成「阶段 2 一定失败」和「只是质量下降」。
+
+    hard：码表未发布、码值引用解析不到。`load_published_code_sets` 遇到这些是
+    `raise WorkflowError`，阶段 2 直接退出——所以不能给「确认风险继续」的逃生口，
+    确认了照样失败，只是让人白点一次。
+    soft：没有校验原文之类。AI 只能凭字段名猜规则，但流程能跑完。
+    """
+    hard = list(readiness["rule_materials"]["blockers"]) + list(readiness["code_sets"]["blockers"])
+    # 同一个问题会在两个维度各报一次（码表未发布：code_sets 是 ERROR 进不了包，
+    # rule_materials 是 WARNING 拿不到白名单）。hard 既然已经拦住了，
+    # soft 里再重复一遍只会让确认框出现无意义的内容。
+    hard_keys = {(item.get("code"), item.get("field_en")) for item in hard}
+    soft = [
+        item
+        for item in list(readiness["rule_materials"].get("warnings") or []) + list(readiness["code_sets"].get("warnings") or [])
+        if item.get("severity") != "ERROR" and (item.get("code"), item.get("field_en")) not in hard_keys
+    ]
+    return {"hard": hard, "soft": soft}
 
 
 def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:

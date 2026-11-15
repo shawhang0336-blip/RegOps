@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from ..api_v2.settings import get_budget
 from ..asset_models import GenerationPlanModel, TableMetadataModel
 from ..code_service import generation_blockers
+from ..code_set_readiness import auto_publish_referenced_code_sets
 from ..config import get_settings
 from ..db import SessionLocal
 from ..domain import canonical_json
@@ -19,7 +20,7 @@ from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_service import metadata_to_spec
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
-from ..readiness import evaluate_table
+from ..readiness import evaluate_table, split_preflight_issues
 from ..errors import WorkflowError
 
 router = APIRouter(prefix="/generation", tags=["generation"])
@@ -108,11 +109,24 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail="Metadata table not found")
         specs = []
         pending_warnings: List[Dict[str, Any]] = []
+        auto_published: Dict[str, List[Dict[str, Any]]] = {}
+        # 第一遍：取规格 + 自动发布码表。
+        # 「发布」不再让人逐张点：检查通过就自动发，不通过才留给人补数据。
+        # 几百张码表挨个确认本来就确认不过来，而不发的话阶段 2 直接报错退出。
         for table in tables:
             try:
                 specs.append(metadata_to_spec(session, table))
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=f"{table.table_code}: {exc}") from exc
+            auto = auto_publish_referenced_code_sets(session, table)
+            if auto["published"]:
+                auto_published[table.table_code] = auto["published"]
+        # 先落库：下面任何一项检查抛 409 都会让 session 回滚，
+        # 已经发出去的码表不能跟着一起丢掉，否则用户重试还得再发一遍。
+        if auto_published:
+            session.commit()
+        # 第二遍：就绪度检查
+        for table in tables:
             readiness = evaluate_table(session, table)
             if not readiness["ddl"]["ready"]:
                 blocker = readiness["ddl"]["blockers"][0]
@@ -125,12 +139,32 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
                         "message": blocker["message"],
                     },
                 )
-            unresolved = readiness["rule_materials"]["blockers"] + readiness["code_sets"]["blockers"]
-            if unresolved:
+            # 码值和解析不到的码值引用，阶段 2 会直接 WorkflowError 退出
+            # （load_published_code_sets 里 raise），所以不能给「确认风险继续」这种
+            # 假逃生口——确认了也一定会失败，等于让人白点一次。
+            issues = split_preflight_issues(readiness)
+            hard_blockers = issues["hard"]
+            if hard_blockers:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "stage": "code_sets",
+                        "table_code": table.table_code,
+                        "blockers": hard_blockers,
+                        "message": (
+                            "码值未就绪，阶段 2 无法装配："
+                            + hard_blockers[0]["message"]
+                            + "。请先在码表页补齐缺失码值后再选这张表（能自动发布的已经替你发了）。"
+                        ),
+                    },
+                )
+            # 这些只是质量下降，不阻断装配，才允许确认后继续
+            soft_warnings = issues["soft"]
+            if soft_warnings:
                 pending_warnings.append(
                     {
                         "table_code": table.table_code,
-                        "blockers": unresolved,
+                        "blockers": soft_warnings,
                     }
                 )
             table_blockers = generation_blockers(session, table)
@@ -177,4 +211,7 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
 
     with SessionLocal() as session:
         run = session.get(RunModel, run_id)
-        return run_view(session, run)
+        payload = run_view(session, run)
+        if auto_published:
+            payload["auto_published_code_sets"] = auto_published
+        return payload

@@ -423,7 +423,11 @@ export default function MetadataPage({ embedded = false }) {
     }
     const naCodes = readiness?.summary?.not_applicable?.code_sets || 0
     const naNote = naCodes ? `（其中 ${naCodes} 张没有码值引用，不涉及码值项）` : ''
-    if (!window.confirm(`将发布 ${target} 张所有适用项都就绪的表${naNote}，发布后内容不可直接修改。继续？`)) {
+    if (
+      !window.confirm(
+        `将发布 ${target} 张可出包的表${naNote}。发布时会把检查通过的码表一起发布，发布后内容不可直接修改。继续？`
+      )
+    ) {
       return
     }
     setBusy(true)
@@ -523,8 +527,8 @@ export default function MetadataPage({ embedded = false }) {
               </button>
               {readiness.summary.publish_pending_only > 0 && (
                 <p className="readiness-hint">
-                  另有 {readiness.summary.publish_pending_only} 张表只差「把码表点发布」——码值本身是齐的，
-                  去码表页批量发布后就能出包，不需要补数据。
+                  其中 {readiness.summary.publish_pending_only} 张的码表还没发布——不用单独点，
+                  发布这些表时会自动把检查通过的码表一起发掉；空码表之类的真缺陷才会留给你补。
                 </p>
               )}
               {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <

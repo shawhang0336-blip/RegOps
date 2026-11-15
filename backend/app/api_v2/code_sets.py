@@ -370,12 +370,24 @@ def edit_value(code_set_id: str, value_id: str, request: VersionRequest) -> Dict
 
 @router.post("/{code_set_id}/publish")
 def publish_code_set(code_set_id: str, request: VersionRequest) -> Dict[str, Any]:
+    from ..code_set_readiness import evaluate_code_set
+
     with SessionLocal() as session:
         row = session.get(CodeSetModel, code_set_id)
         if not row:
             raise HTTPException(status_code=404, detail="Code set not found")
         if row.current_version != request.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+        # 批量发布有质量门，单张发布没有——空码表也能直接发出去，
+        # 然后阶段 2 的 load_published_code_sets 再抛「published code set has no enabled values」。
+        # 门只有一道，不能因为入口不同就绕过去。
+        result = evaluate_code_set(session, row)
+        if not result["ready"]:
+            blocker = result["blockers"][0]
+            raise HTTPException(
+                status_code=409,
+                detail={"code": blocker["code"], "message": blocker["message"]},
+            )
         row.status = "PUBLISHED"
         row.published_version = row.current_version
         auto_link_all_references(session)

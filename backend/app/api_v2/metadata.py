@@ -461,8 +461,11 @@ def publish_batch(request: PublishBatchRequest) -> Dict[str, Any]:
                     }
                 )
                 continue
+            # publish_table 会顺手把检查通过的码表一起发掉，所以「码表待发布」
+            # 不该拦发布，只有真缺陷（空码表、引用解析不到）才拦
             pending = [
-                item["code"] for item in result["rule_materials"]["blockers"] + result["code_sets"]["blockers"]
+                item["code"]
+                for item in result["rule_materials"]["blockers"] + result["code_sets"]["defects"]
             ]
             if request.scope == "all_ready" and pending:
                 skipped.append({"table_code": table.table_code, "reason": "RULE_OR_CODE_NOT_READY", "detail": "、".join(pending[:3])})

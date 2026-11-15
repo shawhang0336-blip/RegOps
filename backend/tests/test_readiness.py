@@ -10,7 +10,7 @@ from app.asset_models import (
     TableMetadataModel,
 )
 from app.metadata_service import publish_table
-from app.readiness import evaluate_document, evaluate_table, summarize
+from app.readiness import evaluate_document, evaluate_table, split_preflight_issues, summarize
 from .helpers import make_session
 
 
@@ -195,7 +195,13 @@ def test_publish_is_gated_by_ddl_readiness():
     assert table.status != "PUBLISHED"
 
 
-def test_publish_records_rule_readiness_in_snapshot():
+def test_publish_records_readiness_and_auto_publishes_code_sets():
+    """表发布时顺手把检查通过的码表一起发掉。
+
+    码表「发布」原本是独立的人工动作，但没人会为了 165 张码表挨个点；
+    不点的话阶段 2 的 load_published_code_sets 又直接抛错。
+    发布快照要记下「替它发了哪些」和「哪些还需要人补」。
+    """
     session = make_session()
     table = make_table(
         session,
@@ -204,7 +210,7 @@ def test_publish_records_rule_readiness_in_snapshot():
     )
     publish_table(session, table, "tester", 1)
     assert table.status == "PUBLISHED"
-    from app.asset_models import MetadataRevisionModel
+    from app.asset_models import CodeSetModel, MetadataRevisionModel
 
     revision = (
         session.query(MetadataRevisionModel)
@@ -212,8 +218,37 @@ def test_publish_records_rule_readiness_in_snapshot():
         .one()
     )
     assert revision.new_value_json["readiness"]["rule_materials_ready"] is True
+    # 码表在发布表时被自动发了，所以码值项也是就绪的
+    assert revision.new_value_json["readiness"]["code_sets_ready"] is True
+    assert revision.new_value_json["auto_published_code_sets"] == ["CURRENCY"]
+
+    code_set = session.query(CodeSetModel).filter(CodeSetModel.code == "CURRENCY").one()
+    assert code_set.status == "PUBLISHED"
+    assert code_set.published_version == code_set.current_version
+
+
+def test_publish_records_code_sets_that_still_need_work():
+    """空码表不会被自动发布，要留在快照里提醒人补数据。"""
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表", "required": True}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    from app.asset_models import CodeValueModel, MetadataRevisionModel
+
+    session.query(CodeValueModel).delete()
+    session.commit()
+
+    publish_table(session, table, "tester", 1)
+    revision = (
+        session.query(MetadataRevisionModel)
+        .filter(MetadataRevisionModel.table_id == table.id, MetadataRevisionModel.revision_kind == "PUBLISHED")
+        .one()
+    )
     assert revision.new_value_json["readiness"]["code_sets_ready"] is False
-    assert "CODE_SET_NOT_PUBLISHED" in revision.new_value_json["readiness"]["code_set_blockers"]
+    assert revision.new_value_json["auto_published_code_sets"] == []
+    assert revision.new_value_json["code_sets_needing_work"][0]["reason"] == "EMPTY_CODE_SET"
 
 
 def test_evaluate_document_scopes_by_document():
@@ -297,5 +332,82 @@ def test_summary_counts_tables_that_only_need_publishing():
     )
     summary = summarize([evaluate_table(session, table) for table in session.query(TableMetadataModel).all()])
     assert summary["publish_pending_only"] == 1
-    assert summary["ready_all"] == 0
+    # 码表待发布不再拦「可出包」——发布表的时候会自动把它发掉
+    assert summary["ready_all"] == 1
+    # 但字面意义的「三项都适用且都就绪」还不成立
+    assert summary["ready_all_full"] == 0
     assert summary["publish_pending_tables"] == ["ONLYPENDING"]
+
+
+def test_unpublished_code_set_is_a_hard_blocker_not_confirmable():
+    """阶段 2 的 load_published_code_sets 遇到未发布码表是 raise。
+
+    所以不能给它「确认风险继续」的逃生口——确认了照样 WorkflowError，
+    只是让人白点一次。用户看到「确认后继续」就以为能跑，实际必然失败。
+    """
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    issues = split_preflight_issues(evaluate_table(session, table))
+    assert [item["code"] for item in issues["hard"]] == ["CODE_SET_NOT_PUBLISHED"]
+    assert issues["soft"] == []
+
+
+def test_missing_check_text_is_soft_and_confirmable():
+    """没有校验原文只是让 AI 猜规则，流程能跑完，属于可确认项。"""
+    session = make_session()
+    table = make_table(session, fields=[{"en": "REMARK", "length": 256, "check": ""}])
+    issues = split_preflight_issues(evaluate_table(session, table))
+    assert issues["hard"] == []
+    assert [item["code"] for item in issues["soft"]] == ["NO_CHECK_TEXT"]
+
+
+def test_auto_publish_takes_over_the_manual_publish_step():
+    """码表「发布」不再让人逐张点：检查通过就自动发。
+
+    几百张码表挨个确认本来就确认不过来，而没发的话阶段 2 的
+    load_published_code_sets 直接抛错退出。
+    """
+    from app.code_set_readiness import auto_publish_referenced_code_sets
+
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    result = auto_publish_referenced_code_sets(session, table)
+    assert [item["code"] for item in result["published"]] == ["CURRENCY"]
+    assert result["skipped"] == []
+
+    # 就绪度随之通过，不再卡在「待发布」
+    codes = evaluate_table(session, table)["code_sets"]
+    assert codes["ready"] is True
+    assert codes["publish_pending"] == []
+
+    # 幂等：已经发布的不会再发一次
+    assert auto_publish_referenced_code_sets(session, table)["published"] == []
+
+
+def test_auto_publish_refuses_empty_code_set():
+    """空码表不能自动发出去——那正是需要人补数据的情况。"""
+    from app.asset_models import CodeValueModel
+    from app.code_set_readiness import auto_publish_referenced_code_sets
+
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    session.query(CodeValueModel).delete()
+    session.commit()
+
+    result = auto_publish_referenced_code_sets(session, table)
+    assert result["published"] == []
+    assert result["skipped"][0]["reason"] == "EMPTY_CODE_SET"
+    # 仍然卡住，需要人来处理
+    assert evaluate_table(session, table)["code_sets"]["ready"] is False

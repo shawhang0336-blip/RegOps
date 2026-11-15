@@ -798,12 +798,22 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
     ensure_table_references(session, table)
     session.flush()
 
-    # 发布是阶段 2 的唯一入口，这里必须回答"能不能落成 DDL"；规则/码值的问题
+    # 表发布是阶段 2 的唯一入口，这里必须回答"能不能落成 DDL"；规则/码值的问题
     # 不阻断发布，但要写进发布快照，避免阶段 2 才炸。
     readiness = evaluate_table(session, table)
     if not readiness["ddl"]["ready"]:
         first = readiness["ddl"]["blockers"][0]
         raise ValueError(f"NOT_READY_FOR_DDL：{first['message']}")
+
+    # 顺手把它引用的、检查通过的码表一起发布。
+    # 码表「发布」原本是独立的人工动作，但没人会为了 165 张码表挨个点，
+    # 不点的话阶段 2 的 load_published_code_sets 又直接抛错。检查不通过的
+    # （空码表、码值超长）留给人补数据，那才是真需要动手的地方。
+    from .code_set_readiness import auto_publish_referenced_code_sets
+
+    auto = auto_publish_referenced_code_sets(session, table)
+    if auto["published"]:
+        readiness = evaluate_table(session, table)
 
     table.status = "PUBLISHED"
     table.published_version = table.current_version
@@ -822,6 +832,8 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
                     "rule_material_blockers": [item["code"] for item in readiness["rule_materials"]["blockers"]],
                     "code_set_blockers": [item["code"] for item in readiness["code_sets"]["blockers"]],
                 },
+                "auto_published_code_sets": [item["code"] for item in auto["published"]],
+                "code_sets_needing_work": auto["skipped"],
             },
             editor=approver,
             reason="Human published immutable metadata",

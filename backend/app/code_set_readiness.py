@@ -122,3 +122,51 @@ def evaluate_code_sets(
     if referenced_only:
         results = [item for item in results if item["reference_count"] > 0]
     return {"summary": summarize_code_sets(results), "code_sets": results}
+
+
+def auto_publish_referenced_code_sets(session: Session, table) -> Dict[str, List[Dict[str, Any]]]:
+    """把这张表引用、且检查通过的码表直接发布。
+
+    「发布」原本是让逐张点的人工动作，但 AI 从原文抽出来的码表有几百张，
+    人不会挨个看——点了也只是走个形式，不点的话阶段 2 又直接报错。
+    所以把判断交给机械检查：通过就自动发布，不通过才留给人工。
+
+    注意：发布只写 status/published_version，不动码值内容；产物包仍记录版本，
+    事后能追溯用的是哪一版。
+    """
+    from .asset_models import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel
+
+    published: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    field_ids = [
+        row[0]
+        for row in session.query(FieldMetadataModel.id).filter(FieldMetadataModel.table_id == table.id).all()
+    ]
+    if not field_ids:
+        return {"published": published, "skipped": skipped}
+    references = (
+        session.query(FieldCodeReferenceModel)
+        .filter(FieldCodeReferenceModel.field_id.in_(field_ids))
+        .all()
+    )
+    seen = set()
+    for reference in references:
+        if not reference.code_set_id or reference.code_set_id in seen:
+            continue
+        seen.add(reference.code_set_id)
+        row = session.get(CodeSetModel, reference.code_set_id)
+        if not row:
+            continue
+        if row.status == "PUBLISHED" and row.published_version == row.current_version:
+            continue
+        result = evaluate_code_set(session, row)
+        if not result["ready"]:
+            blocker = result["blockers"][0]
+            skipped.append({"code": row.code, "reason": blocker["code"], "message": blocker["message"]})
+            continue
+        row.status = "PUBLISHED"
+        row.published_version = row.current_version
+        published.append({"code": row.code, "value_count": result["value_count"]})
+    if published or skipped:
+        session.flush()
+    return {"published": published, "skipped": skipped}
