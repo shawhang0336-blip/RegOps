@@ -130,11 +130,12 @@ def test_long_identifier_blocks_ddl_only():
     assert result["rule_materials"]["ready"] is True
 
 
-def test_unpublished_code_set_blocks_code_values_but_only_warns_rule_materials():
-    """码表未发布：码值进不了产出包（阻断），规则原料只是少一份白名单（提示）。
+def test_unpublished_code_set_is_no_longer_a_blocker():
+    """码表发布已自动化：选表生成时会自动发出去，所以「未发布」不再是问题。
 
-    规则是阶段 2 让 AI 依据校验原文生成的，"有没有原文可读"和"码表发没发布"
-    是两件事；混在一项里会让人误以为大半张表连校验原文都没有。
+    以前这里是个 ERROR，导致 96 张只差发布的表全被拦住，用户还得
+    先去另一个页面点一次批量发布。现在码表质量只认 code_set_readiness，
+    它只看数据本身（空码表、缺标签、码值超长）。
     """
     session = make_session()
     table = make_table(
@@ -145,9 +146,8 @@ def test_unpublished_code_set_blocks_code_values_but_only_warns_rule_materials()
     result = evaluate_table(session, table)
     assert result["ddl"]["ready"] is True
     assert result["rule_materials"]["ready"] is True
-    assert any(item["code"] == "CODE_SET_NOT_PUBLISHED" for item in result["rule_materials"]["warnings"])
-    assert result["code_sets"]["ready"] is False
-    assert result["code_sets"]["blockers"][0]["code"] == "CODE_SET_NOT_PUBLISHED"
+    assert result["code_sets"]["ready"] is True
+    assert result["code_sets"]["blockers"] == []
 
 
 def test_published_code_set_unblocks_rules():
@@ -304,55 +304,25 @@ def test_summary_separates_not_applicable_from_ready():
     assert summary["ready_all_full"] == 1
 
 
-def test_publish_pending_is_separated_from_real_defects():
-    """「码表没发布」是动作没做，「码表是空的」是数据缺失。
-
-    两者都是阻断，但混在同一个 ✕ 里，96 张「只差点发布」的表看起来和 22 张
-    「真缺码值」一样，用户根本看不出哪张要动手补数据。
-    """
-    session = make_session()
-    table = make_table(
-        session,
-        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
-        code_set_status="AI_SELF_VALIDATED",
-    )
-    result = evaluate_table(session, table)["code_sets"]
-    assert result["ready"] is False
-    assert len(result["publish_pending"]) == 1
-    assert result["defects"] == []
-
-
-def test_summary_counts_tables_that_only_need_publishing():
-    session = make_session()
-    make_table(
-        session,
-        table_code="ONLYPENDING",
-        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
-        code_set_status="AI_SELF_VALIDATED",
-    )
-    summary = summarize([evaluate_table(session, table) for table in session.query(TableMetadataModel).all()])
-    assert summary["publish_pending_only"] == 1
-    # 码表待发布不再拦「可出包」——发布表的时候会自动把它发掉
-    assert summary["ready_all"] == 1
-    # 但字面意义的「三项都适用且都就绪」还不成立
-    assert summary["ready_all_full"] == 0
-    assert summary["publish_pending_tables"] == ["ONLYPENDING"]
-
-
-def test_unpublished_code_set_is_a_hard_blocker_not_confirmable():
-    """阶段 2 的 load_published_code_sets 遇到未发布码表是 raise。
+def test_empty_code_set_is_a_hard_blocker_not_confirmable():
+    """空码表是数据缺失，阶段 2 的 load_published_code_sets 会 raise。
 
     所以不能给它「确认风险继续」的逃生口——确认了照样 WorkflowError，
-    只是让人白点一次。用户看到「确认后继续」就以为能跑，实际必然失败。
+    只是让人白点一次。自动发布也发不出去（检查不通过），必须人去补。
     """
+    from app.asset_models import CodeValueModel
+
     session = make_session()
     table = make_table(
         session,
         fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
         code_set_status="AI_SELF_VALIDATED",
     )
+    session.query(CodeValueModel).delete()
+    session.commit()
+
     issues = split_preflight_issues(evaluate_table(session, table))
-    assert [item["code"] for item in issues["hard"]] == ["CODE_SET_NOT_PUBLISHED"]
+    assert [item["code"] for item in issues["hard"]] == ["EMPTY_CODE_SET"]
     assert issues["soft"] == []
 
 
@@ -383,10 +353,10 @@ def test_auto_publish_takes_over_the_manual_publish_step():
     assert [item["code"] for item in result["published"]] == ["CURRENCY"]
     assert result["skipped"] == []
 
-    # 就绪度随之通过，不再卡在「待发布」
+    # 就绪度随之通过
     codes = evaluate_table(session, table)["code_sets"]
     assert codes["ready"] is True
-    assert codes["publish_pending"] == []
+    assert codes["defects"] == []
 
     # 幂等：已经发布的不会再发一次
     assert auto_publish_referenced_code_sets(session, table)["published"] == []

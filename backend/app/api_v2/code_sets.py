@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel, RawBlockModel, TableMetadataModel
-from ..code_set_readiness import evaluate_code_sets, evaluate_code_set
+from ..code_set_readiness import evaluate_code_sets, evaluate_code_set, is_reference_placeholder
 from ..code_service import (
     auto_link_all_references,
     code_set_summary,
@@ -110,7 +110,7 @@ def list_code_sets(document_id: Optional[str] = None, include_placeholders: bool
         for row in rows:
             summary = code_set_summary(session, row)
             # 默认隐藏"引用占位"（0 值的 DOCUMENT_REFERENCE），它们只是匹配失败的产物，不是可维护的码表
-            if not include_placeholders and summary["source_type"] == "DOCUMENT_REFERENCE" and summary["value_count"] == 0:
+            if not include_placeholders and is_reference_placeholder(summary):
                 continue
             result.append(summary)
         return result

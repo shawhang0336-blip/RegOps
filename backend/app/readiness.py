@@ -79,6 +79,7 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
     ddl: List[Dict[str, Any]] = []
     materials: List[Dict[str, Any]] = []
     codes: List[Dict[str, Any]] = []
+    code_set_fields: Dict[str, set] = {}
 
     if not fields:
         ddl.append(_issue("ERROR", "NO_FIELDS", "这张表没有字段，无法建表"))
@@ -137,43 +138,39 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
                     _issue(severity, "CODE_REFERENCE_UNRESOLVED", f"码值引用「{ref.reference_text}」没解析到码表", name)
                 )
                 continue
-            if code_set.status != "PUBLISHED" or code_set.published_version != code_set.current_version:
-                # 码表没发布影响的是"码值能不能进包"，不是"AI 有没有原文可读"，
-                # 所以这里只提示：ENUM 白名单拿不到，规则质量会掉。
-                materials.append(
-                    _issue(
-                        "WARNING",
-                        "CODE_SET_NOT_PUBLISHED",
-                        f"引用的码表「{code_set.code}」未发布，AI 生成 ENUM 时拿不到白名单，可能编码值",
-                        name,
-                    )
-                )
-                codes.append(
-                    _issue(
-                        "ERROR",
-                        "CODE_SET_NOT_PUBLISHED",
-                        f"码表「{code_set.code}」未发布，码值不会进入产出包",
-                        name,
-                    )
-                )
+            code_set_fields.setdefault(code_set.id, set()).add(name)
 
     duplicates = [name for name, count in seen.items() if count > 1]
     if duplicates:
         ddl.append(_issue("ERROR", "DUPLICATE_FIELD", f"字段名重复：{'、'.join(duplicates[:5])}"))
 
+    # 码表质量只认 code_set_readiness 那一套判断。
+    # 以前这里又写了一遍（未发布=ERROR、码值 0=ERROR…），两套逻辑必然漂移，
+    # 结果就是码表页说「86 张齐备 83」，元数据页却报 110 个码值问题，数字对不上。
+    from .code_set_readiness import evaluate_code_set, is_reference_placeholder
+
     for code_set_id, code_set in code_sets.items():
-        value_count = (
-            session.query(CodeValueModel)
-            .filter(CodeValueModel.code_set_id == code_set_id, CodeValueModel.enabled.is_(True))
-            .count()
-        )
-        if value_count == 0:
-            codes.append(_issue("ERROR", "EMPTY_CODE_SET", f"码表「{code_set.code}」没有可用码值，灌不进 Oracle"))
+        verdict = evaluate_code_set(session, code_set)
+        if is_reference_placeholder(verdict):
+            # 占位不是码表，用户没法补；引用它的字段上面已经按 UNRESOLVED 报过了
+            continue
+        affected = "、".join(sorted(code_set_fields.get(code_set_id, []))[:3])
+        for blocker in verdict["blockers"]:
+            codes.append(
+                _issue(
+                    "ERROR",
+                    blocker["code"],
+                    f"码表「{code_set.code}」{blocker['message']}" + (f"（字段 {affected}）" if affected else ""),
+                    affected,
+                )
+            )
+        if not verdict["value_count"]:
             materials.append(
                 _issue(
                     "WARNING",
                     "EMPTY_CODE_SET",
                     f"码表「{code_set.code}」没有码值，AI 会自己编 ENUM 白名单",
+                    affected,
                 )
             )
 
@@ -186,12 +183,6 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
 
     def pack(items: List[Dict[str, Any]], warnings: List[Dict[str, Any]], applicable: bool = True) -> Dict[str, Any]:
         blockers = [item for item in items if item["severity"] == "ERROR"]
-        # 「码表没发布」和「码表是空的」都是阻断，但性质完全不同：
-        # 前者是动作没做（点一下批量发布就解决），后者是数据缺失（要人去补码值）。
-        # 混在同一个 ✕ 里，96 张「只差点发布」的表看起来和 22 张「真缺码值」一样，
-        # 用户根本看不出哪张要动手补数据。
-        publish_pending = [item for item in blockers if item["code"] == "CODE_SET_NOT_PUBLISHED"]
-        defects = [item for item in blockers if item["code"] != "CODE_SET_NOT_PUBLISHED"]
         return {
             # applicable=False 表示这张表根本没有这一项交付物。
             # 报表字段和码值没有必然联系：备注、金额、日期都不该有码值引用。
@@ -200,10 +191,9 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
             "applicable": applicable,
             "ready": not blockers,
             "blockers": blockers,
-            # 只差发布：数据本身是好的
-            "publish_pending": publish_pending,
-            # 需要补数据：空码表、引用解析不到
-            "defects": defects,
+            # defects 就是 blockers 的全部：码表发布已经自动化，
+            # 「未发布」不再是一种阻断，剩下的全是需要人补的数据问题
+            "defects": blockers,
             "warnings": warnings,
         }
 
@@ -244,35 +234,19 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     counter: Dict[str, Dict[str, int]] = {artifact: {} for artifact in ARTIFACTS}
     ready = {artifact: 0 for artifact in ARTIFACTS}
     not_applicable = {artifact: 0 for artifact in ARTIFACTS}
-    publish_pending_only: List[str] = []
     for item in results:
         for artifact in ARTIFACTS:
             section = item[artifact]
             if not section.get("applicable", True):
                 not_applicable[artifact] += 1
                 continue
-            # 码值看「有没有需要人补的东西」，不看「码表有没有点发布」——
-            # 发布是自动的，待发布对用户没有决策价值，不该占一个状态位。
-            ok = not section["defects"] if artifact == "code_sets" else section["ready"]
-            if ok:
+            if section["ready"]:
                 ready[artifact] += 1
             for blocker in section["blockers"]:
                 counter[artifact][blocker["code"]] = counter[artifact].get(blocker["code"], 0) + 1
-        # 只差「把码表点发布」就能出包的表：其它都齐，没有需要补数据的缺陷
-        if (
-            item["ddl"]["ready"]
-            and item["rule_materials"]["ready"]
-            and not item["code_sets"]["defects"]
-            and item["code_sets"]["publish_pending"]
-        ):
-            publish_pending_only.append(item["table_code"])
 
     def passing(item) -> bool:
-        """能发布进阶段 2：DDL 能落地、规则原料够、码值没有需要人补的缺陷。
-
-        码表「待发布」不算不合格——发布表的时候会自动把它发掉。
-        只有真缺陷（空码表、码值超长、引用解析不到）才需要人来处理。
-        """
+        """能进阶段 2：DDL 能落地、规则原料够、码值没有需要人补的缺陷。"""
         return (
             item["ddl"]["ready"]
             and item["rule_materials"]["ready"]
@@ -288,18 +262,13 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "not_applicable": not_applicable,
         # 可推进阶段 2 的表数（含「某项不适用」的表）
         "ready_all": sum(1 for item in results if passing(item)),
-        # 字面意义的「三项齐」：三项都适用，且三项都真正就绪。
-        # 「码表待发布」不算——那种表能出包，但码值项本身还没走完；
-        # 「码值不适用」也不算——它本来就只有两项。
+        # 字面意义的「三项齐」：三项都适用，且三项都真正就绪
         "ready_all_full": sum(
             1
             for item in results
             if all(item[artifact].get("applicable", True) for artifact in ARTIFACTS)
             and all(item[artifact]["ready"] for artifact in ARTIFACTS)
         ),
-        # 只差发布码表就能出包的表 —— 数据本身没问题，缺的是一个动作
-        "publish_pending_only": len(publish_pending_only),
-        "publish_pending_tables": publish_pending_only[:50],
         "blocker_codes": {
             artifact: sorted(codes.items(), key=lambda pair: pair[1], reverse=True)
             for artifact, codes in counter.items()
@@ -310,13 +279,13 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 def split_preflight_issues(readiness: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """把一张表的就绪问题分成「阶段 2 一定失败」和「只是质量下降」。
 
-    hard：码表未发布、码值引用解析不到。`load_published_code_sets` 遇到这些是
-    `raise WorkflowError`，阶段 2 直接退出——所以不能给「确认风险继续」的逃生口，
+    hard：空码表、码值超长、码值引用解析不到。`load_published_code_sets` 遇到这些
+    是 `raise WorkflowError`，阶段 2 直接退出——所以不能给「确认风险继续」的逃生口，
     确认了照样失败，只是让人白点一次。
     soft：没有校验原文之类。AI 只能凭字段名猜规则，但流程能跑完。
     """
     hard = list(readiness["rule_materials"]["blockers"]) + list(readiness["code_sets"]["blockers"])
-    # 同一个问题会在两个维度各报一次（码表未发布：code_sets 是 ERROR 进不了包，
+    # 同一个问题会在两个维度各报一次（空码表：code_sets 是 ERROR 进不了包，
     # rule_materials 是 WARNING 拿不到白名单）。hard 既然已经拦住了，
     # soft 里再重复一遍只会让确认框出现无意义的内容。
     hard_keys = {(item.get("code"), item.get("field_en")) for item in hard}
@@ -328,12 +297,36 @@ def split_preflight_issues(readiness: Dict[str, Any]) -> Dict[str, List[Dict[str
     return {"hard": hard, "soft": soft}
 
 
-def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:
+def latest_table_rows(
+    session: Session,
+    document_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> List[TableMetadataModel]:
+    """每张表只留最新版本行。
+
+    同一个表重新提取会追加一条新版本行，旧行保留用于追溯。列表接口一直是这么去重的，
+    但就绪度这边没有，于是出现「汇总 151 张、列表 150 张」——差的就是 SAFE_6_9_2
+    的两个版本行。统计口径和列表必须看到同一批数据，否则用户会以为系统在瞎报。
+    """
     query = session.query(TableMetadataModel)
+    if status:
+        query = query.filter(TableMetadataModel.status == status)
     if document_id:
         query = query.filter(TableMetadataModel.document_id == document_id)
-    tables = query.order_by(
+    rows = query.order_by(
         TableMetadataModel.source_ordinal.asc(), TableMetadataModel.table_code.asc()
     ).all()
+    latest: Dict[tuple, TableMetadataModel] = {}
+    for row in rows:
+        key = (row.document_id, row.table_code)
+        current = latest.get(key)
+        if current is None or (row.current_version or 0) >= (current.current_version or 0):
+            latest[key] = row
+    live_ids = {row.id for row in latest.values()}
+    return [row for row in rows if row.id in live_ids]
+
+
+def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:
+    tables = latest_table_rows(session, document_id=document_id)
     results = [evaluate_table(session, table) for table in tables]
     return {"summary": summarize(results), "tables": results}

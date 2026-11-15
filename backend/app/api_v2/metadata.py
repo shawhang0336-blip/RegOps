@@ -23,7 +23,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_domain import MetadataFieldDraft
-from ..readiness import evaluate_document, evaluate_table
+from ..readiness import evaluate_document, evaluate_table, latest_table_rows
 from ..metadata_service import (
     apply_field_type_import,
     metadata_to_spec,
@@ -98,22 +98,9 @@ def extract_metadata(request: ExtractRequest) -> Dict[str, Any]:
 @router.get("/tables")
 def list_tables(status: Optional[str] = None, document_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
-        query = session.query(TableMetadataModel)
-        if status:
-            query = query.filter(TableMetadataModel.status == status)
-        if document_id:
-            query = query.filter(TableMetadataModel.document_id == document_id)
-        # 按文件中的出现顺序（来源块 ordinal）排，符合阅读习惯；没有来源的排最后
-        rows = query.order_by(TableMetadataModel.source_ordinal.asc(), TableMetadataModel.table_code.asc()).all()
-        # 同一张表重新提取会生成新的版本行（旧行保留用于追溯），列表里只留最新版本
-        latest: Dict[tuple, Any] = {}
-        for row in rows:
-            key = (row.document_id, row.table_code)
-            current = latest.get(key)
-            if current is None or (row.current_version or 0) >= (current.current_version or 0):
-                latest[key] = row
-        live_ids = {row.id for row in latest.values()}
-        rows = [row for row in rows if row.id in live_ids]
+        # 和就绪度汇总共用同一套「每张表只留最新版本」的规则，
+        # 否则用户会看到「汇总 151 张、列表 150 张」
+        rows = latest_table_rows(session, document_id=document_id, status=status)
         # 表级状态是"任意一条告警就整表待复核"，列表里必须把问题落到条数和字段上，
         # 否则用户只看到一个红色的"需要核对"，无法判断到底有几处、要不要动手。
         stats: Dict[str, Dict[str, Any]] = {}

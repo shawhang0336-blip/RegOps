@@ -217,6 +217,9 @@ def code_set_summary(session: Session, row: CodeSetModel) -> Dict[str, Any]:
         "current_version": row.current_version,
         "published_version": row.published_version,
         "value_count": value_count,
+        # 和 evaluate_code_set 对齐：占位判断要看「一条码值都没有」，
+        # 而不是「没有启用的」。同名不同义是最难查的一类 bug。
+        "total_value_count": value_count,
         "enabled_value_count": enabled_count,
         "unresolved_reference_count": unresolved,
     }

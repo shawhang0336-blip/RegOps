@@ -26,12 +26,14 @@ def _issue(severity: str, code: str, message: str) -> Dict[str, Any]:
 
 
 def evaluate_code_set(session: Session, row: CodeSetModel) -> Dict[str, Any]:
-    values = (
+    total_values = (
         session.query(CodeValueModel)
-        .filter(CodeValueModel.code_set_id == row.id, CodeValueModel.enabled.is_(True))
+        .filter(CodeValueModel.code_set_id == row.id)
         .order_by(CodeValueModel.sort_order, CodeValueModel.value)
         .all()
     )
+    total_value_count = len(total_values)
+    values = [value for value in total_values if value.enabled]
     refs = (
         session.query(FieldCodeReferenceModel, FieldMetadataModel)
         .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
@@ -75,15 +77,35 @@ def evaluate_code_set(session: Session, row: CodeSetModel) -> Dict[str, Any]:
         "code": row.code,
         "name": row.name,
         "status": row.status,
+        "source_type": row.source_type,
         "current_version": row.current_version,
         "published_version": row.published_version,
         "value_count": len(values),
+        # 全部码值数（含被禁用的）。占位判断要看这个——一条都没有才算占位，
+        # 全部被禁用是「有数据但没启用」，不是占位。
+        "total_value_count": total_value_count,
         "reference_count": len(refs),
         "referencing_tables": sorted({field.table_id for _, field in refs}),
         "ready": not blockers,
         "blockers": blockers,
         "warnings": warnings,
     }
+
+
+def is_reference_placeholder(item: Dict[str, Any]) -> bool:
+    """匹配失败留下的空壳，不是可维护的码表。
+
+    字段说"取值见 XXX 码表"但原文里没找到那张表时，会建一条 DOCUMENT_REFERENCE
+    且 0 码值的占位，好让字段的引用有地方挂。它既不该出现在码表列表里（用户没法
+    补，那不是表，是没解析到），也不该算进"需补码值"——那是"引用没解析到"，
+    归元数据页的 CODE_REFERENCE_UNRESOLVED 管。
+    """
+    if item.get("source_type") != "DOCUMENT_REFERENCE":
+        return False
+    total = item.get("total_value_count")
+    if total is None:
+        total = item.get("value_count", 0)
+    return total == 0
 
 
 def summarize_code_sets(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -119,6 +141,8 @@ def evaluate_code_sets(
         query = query.filter(CodeSetModel.id.in_(ids))
     rows = query.order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
     results = [evaluate_code_set(session, row) for row in rows]
+    # 和列表接口用同一套可见性规则，否则就会出现「汇总 96 张、列表 86 张」这种对不上
+    results = [item for item in results if not is_reference_placeholder(item)]
     if referenced_only:
         results = [item for item in results if item["reference_count"] > 0]
     return {"summary": summarize_code_sets(results), "code_sets": results}
