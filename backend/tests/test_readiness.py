@@ -1,0 +1,225 @@
+import uuid
+
+from app.asset_models import (
+    CodeSetModel,
+    CodeValueModel,
+    FieldCodeReferenceModel,
+    FieldMetadataModel,
+    RawBlockModel,
+    SourceDocumentModel,
+    TableMetadataModel,
+)
+from app.metadata_service import publish_table
+from app.readiness import evaluate_document, evaluate_table, summarize
+from .helpers import make_session
+
+
+def make_table(session, table_code="T1", fields=None, code_set_status=None):
+    document = SourceDocumentModel(
+        id=str(uuid.uuid4()),
+        file_name="sample.pdf",
+        file_type="pdf",
+        sha256=uuid.uuid4().hex,
+        blob_uri="blob://test",
+        spec_version="TEST",
+        status="RAW_EXTRACTED",
+        block_count=1,
+    )
+    block = RawBlockModel(
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        ordinal=3,
+        block_type="TABLE_METADATA",
+        raw_content="",
+        source_locator={},
+        content_json={},
+        raw_hash="abc",
+    )
+    table = TableMetadataModel(
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        block_id=block.id,
+        table_code=table_code,
+        table_name="测试表",
+        table_definition="测试",
+        status="DRAFT",
+        current_version=1,
+        source_ordinal=3,
+    )
+    session.add_all([document, block, table])
+
+    code_set = None
+    if code_set_status:
+        code_set = CodeSetModel(
+            id=str(uuid.uuid4()),
+            code="CURRENCY",
+            name="币种代码表",
+            definition="",
+            source_type="DOCUMENT_TABLE",
+            status=code_set_status,
+            current_version=1,
+            published_version=1 if code_set_status == "PUBLISHED" else None,
+        )
+        session.add(code_set)
+        session.add(
+            CodeValueModel(
+                id=str(uuid.uuid4()),
+                code_set_id=code_set.id,
+                value="USD",
+                label_cn="美元",
+                sort_order=0,
+                enabled=True,
+                source_locator={},
+            )
+        )
+
+    for index, item in enumerate(fields or []):
+        field = FieldMetadataModel(
+            id=str(uuid.uuid4()),
+            table_id=table.id,
+            field_cn=item.get("cn", "字段"),
+            field_en=item["en"],
+            field_definition="说明",
+            check_text_raw=item.get("check", "必填项"),
+            data_type=item.get("type", "VARCHAR"),
+            length=item.get("length", 32),
+            decimal_places=item.get("decimals", 0),
+            required=item.get("required", False),
+            code_reference_text=item.get("code_ref", ""),
+            confidence=0.9,
+            evidence_json={},
+            sort_order=index,
+            ai_value_json={},
+            type_basis=item.get("basis", "SOURCE"),
+        )
+        session.add(field)
+        if code_set and item.get("code_ref"):
+            session.add(
+                FieldCodeReferenceModel(
+                    id=str(uuid.uuid4()),
+                    field_id=field.id,
+                    code_set_id=code_set.id,
+                    reference_text=item["code_ref"],
+                    status="RESOLVED",
+                    condition_json={},
+                )
+            )
+    session.commit()
+    return table
+
+
+def test_clean_table_is_ready_for_all_three():
+    session = make_session()
+    table = make_table(session, fields=[{"en": "CUSTCODE", "type": "VARCHAR", "length": 18}])
+    result = evaluate_table(session, table)
+    assert result["ddl"]["ready"] is True
+    assert result["rule_materials"]["ready"] is True
+    assert result["code_sets"]["ready"] is True
+
+
+def test_long_identifier_blocks_ddl_only():
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "of_which_bond_maturity_early_redemption_principal_interest", "length": 22}],
+    )
+    result = evaluate_table(session, table)
+    assert result["ddl"]["ready"] is False
+    assert result["ddl"]["blockers"][0]["code"] == "IDENTIFIER_TOO_LONG"
+    # 规则不受影响：字段名长不影响绑规则
+    assert result["rule_materials"]["ready"] is True
+
+
+def test_unpublished_code_set_blocks_code_values_but_only_warns_rule_materials():
+    """码表未发布：码值进不了产出包（阻断），规则原料只是少一份白名单（提示）。
+
+    规则是阶段 2 让 AI 依据校验原文生成的，"有没有原文可读"和"码表发没发布"
+    是两件事；混在一项里会让人误以为大半张表连校验原文都没有。
+    """
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表", "required": True}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    result = evaluate_table(session, table)
+    assert result["ddl"]["ready"] is True
+    assert result["rule_materials"]["ready"] is True
+    assert any(item["code"] == "CODE_SET_NOT_PUBLISHED" for item in result["rule_materials"]["warnings"])
+    assert result["code_sets"]["ready"] is False
+    assert result["code_sets"]["blockers"][0]["code"] == "CODE_SET_NOT_PUBLISHED"
+
+
+def test_published_code_set_unblocks_rules():
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表", "required": True}],
+        code_set_status="PUBLISHED",
+    )
+    result = evaluate_table(session, table)
+    assert result["rule_materials"]["ready"] is True
+    assert result["code_sets"]["ready"] is True
+
+
+def test_invalid_number_precision_blocks_ddl():
+    session = make_session()
+    table = make_table(session, fields=[{"en": "AMT", "type": "NUMBER", "length": 6, "decimals": 6}])
+    result = evaluate_table(session, table)
+    assert result["ddl"]["ready"] is False
+    assert result["ddl"]["blockers"][0]["code"] == "INVALID_SCALE"
+
+
+def test_summary_counts_and_blocker_ranking():
+    session = make_session()
+    make_table(session, table_code="OK_TABLE", fields=[{"en": "CUSTCODE", "length": 18}])
+    bad = make_table(session, table_code="BAD_TABLE", fields=[{"en": "X" * 40, "length": 18}])
+    summary = summarize([evaluate_table(session, bad)] + [
+        evaluate_table(session, t)
+        for t in session.query(TableMetadataModel).filter(TableMetadataModel.table_code == "OK_TABLE").all()
+    ])
+    assert summary["table_count"] == 2
+    assert summary["ready"]["ddl"] == 1
+    assert ("IDENTIFIER_TOO_LONG", 1) in summary["blocker_codes"]["ddl"]
+
+
+def test_publish_is_gated_by_ddl_readiness():
+    session = make_session()
+    table = make_table(session, fields=[{"en": "X" * 40, "length": 18}])
+    try:
+        publish_table(session, table, "tester", 1)
+    except ValueError as exc:
+        assert "NOT_READY_FOR_DDL" in str(exc)
+    else:
+        raise AssertionError("DDL 不就绪时不应允许发布")
+    assert table.status != "PUBLISHED"
+
+
+def test_publish_records_rule_readiness_in_snapshot():
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表", "required": True}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    publish_table(session, table, "tester", 1)
+    assert table.status == "PUBLISHED"
+    from app.asset_models import MetadataRevisionModel
+
+    revision = (
+        session.query(MetadataRevisionModel)
+        .filter(MetadataRevisionModel.table_id == table.id, MetadataRevisionModel.revision_kind == "PUBLISHED")
+        .one()
+    )
+    assert revision.new_value_json["readiness"]["rule_materials_ready"] is True
+    assert revision.new_value_json["readiness"]["code_sets_ready"] is False
+    assert "CODE_SET_NOT_PUBLISHED" in revision.new_value_json["readiness"]["code_set_blockers"]
+
+
+def test_evaluate_document_scopes_by_document():
+    session = make_session()
+    make_table(session, table_code="T1", fields=[{"en": "CUSTCODE", "length": 18}])
+    document_id = session.query(TableMetadataModel).first().document_id
+    payload = evaluate_document(session, document_id)
+    assert payload["summary"]["table_count"] == 1
+    assert payload["tables"][0]["table_code"] == "T1"

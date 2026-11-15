@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel, RawBlockModel, TableMetadataModel
+from ..code_set_readiness import evaluate_code_sets, evaluate_code_set
 from ..code_service import (
     auto_link_all_references,
     code_set_summary,
@@ -226,6 +227,71 @@ def relink_references() -> Dict[str, Any]:
             .count()
         )
     return {"total": total, "resolved": resolved, "unresolved": unresolved}
+
+
+class PublishBatchRequest(BaseModel):
+    document_id: Optional[str] = None
+    code_set_ids: Optional[List[str]] = None
+    referenced_only: bool = True
+    dry_run: bool = False
+
+
+@router.get("/readiness")
+def code_set_readiness(document_id: Optional[str] = None, referenced_only: bool = False) -> Dict[str, Any]:
+    """码表发布前的检查：空表、缺中文含义、码值超过字段长度。"""
+    with SessionLocal() as session:
+        return evaluate_code_sets(session, document_id=document_id, referenced_only=referenced_only)
+
+
+@router.post("/publish-batch")
+def publish_code_sets_batch(request: PublishBatchRequest) -> Dict[str, Any]:
+    """批量发布码表。
+
+    358 张码表逐张点不现实，而阶段 2 只认已发布码表。这里只发"检查通过"的，
+    其余连原因一起返回，避免把空表或超长码值带进产出包。
+    """
+    published: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    with SessionLocal() as session:
+        query = session.query(CodeSetModel)
+        if request.code_set_ids:
+            query = query.filter(CodeSetModel.id.in_(request.code_set_ids))
+        elif request.document_id:
+            ids = document_code_set_ids(session, request.document_id)
+            query = query.filter(CodeSetModel.id.in_(ids))
+        rows = query.order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
+        for row in rows:
+            result = evaluate_code_set(session, row)
+            if request.referenced_only and result["reference_count"] == 0:
+                skipped.append({"code": row.code, "reason": "NOT_REFERENCED"})
+                continue
+            if row.status == "PUBLISHED" and row.published_version == row.current_version:
+                skipped.append({"code": row.code, "reason": "ALREADY_PUBLISHED"})
+                continue
+            if not result["ready"]:
+                skipped.append(
+                    {
+                        "code": row.code,
+                        "reason": result["blockers"][0]["code"],
+                        "detail": result["blockers"][0]["message"],
+                    }
+                )
+                continue
+            if not request.dry_run:
+                row.status = "PUBLISHED"
+                row.published_version = row.current_version
+            published.append({"code": row.code, "value_count": result["value_count"], "referenced": result["reference_count"]})
+        if request.dry_run:
+            session.rollback()
+        else:
+            session.commit()
+    return {
+        "published": len(published),
+        "skipped": len(skipped),
+        "details": published[:100],
+        "skipped_details": skipped[:100],
+        "dry_run": request.dry_run,
+    }
 
 
 @router.get("/{code_set_id}")

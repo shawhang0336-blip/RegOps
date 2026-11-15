@@ -793,8 +793,18 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
     )
     require_valid_metadata(draft)
     from .code_service import ensure_table_references
+    from .readiness import evaluate_table
 
     ensure_table_references(session, table)
+    session.flush()
+
+    # 发布是阶段 2 的唯一入口，这里必须回答"能不能落成 DDL"；规则/码值的问题
+    # 不阻断发布，但要写进发布快照，避免阶段 2 才炸。
+    readiness = evaluate_table(session, table)
+    if not readiness["ddl"]["ready"]:
+        first = readiness["ddl"]["blockers"][0]
+        raise ValueError(f"NOT_READY_FOR_DDL：{first['message']}")
+
     table.status = "PUBLISHED"
     table.published_version = table.current_version
     session.add(
@@ -804,7 +814,15 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
             field_id=None,
             revision_kind="PUBLISHED",
             old_value_json=None,
-            new_value_json={"version": table.current_version},
+            new_value_json={
+                "version": table.current_version,
+                "readiness": {
+                    "rule_materials_ready": readiness["rule_materials"]["ready"],
+                    "code_sets_ready": readiness["code_sets"]["ready"],
+                    "rule_material_blockers": [item["code"] for item in readiness["rule_materials"]["blockers"]],
+                    "code_set_blockers": [item["code"] for item in readiness["code_sets"]["blockers"]],
+                },
+            },
             editor=approver,
             reason="Human published immutable metadata",
         )

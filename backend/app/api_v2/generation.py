@@ -19,6 +19,7 @@ from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_service import metadata_to_spec
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
+from ..readiness import evaluate_table
 from ..errors import WorkflowError
 
 router = APIRouter(prefix="/generation", tags=["generation"])
@@ -28,6 +29,8 @@ class GenerationRequest(BaseModel):
     table_ids: List[str]
     approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     provider: str = "live"
+    # 规则/码值不就绪时默认拒绝；确认过风险才允许推进
+    accept_warnings: bool = False
 
 
 @router.get("/blockers/{table_id}")
@@ -104,14 +107,45 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
         if any(not table for table in tables):
             raise HTTPException(status_code=404, detail="Metadata table not found")
         specs = []
+        pending_warnings: List[Dict[str, Any]] = []
         for table in tables:
             try:
                 specs.append(metadata_to_spec(session, table))
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=f"{table.table_code}: {exc}") from exc
+            readiness = evaluate_table(session, table)
+            if not readiness["ddl"]["ready"]:
+                blocker = readiness["ddl"]["blockers"][0]
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "table_code": table.table_code,
+                        "stage": "ddl",
+                        "blockers": readiness["ddl"]["blockers"],
+                        "message": blocker["message"],
+                    },
+                )
+            unresolved = readiness["rule_materials"]["blockers"] + readiness["code_sets"]["blockers"]
+            if unresolved:
+                pending_warnings.append(
+                    {
+                        "table_code": table.table_code,
+                        "blockers": unresolved,
+                    }
+                )
             table_blockers = generation_blockers(session, table)
             if table_blockers:
                 raise HTTPException(status_code=409, detail={"table_code": table.table_code, "blockers": table_blockers})
+        if pending_warnings and not request.accept_warnings:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "stage": "preflight",
+                    "requires_ack": True,
+                    "message": "有表的规则或码值未就绪，继续推进会导致规则缺失或阶段 2 直接报错",
+                    "tables": pending_warnings,
+                },
+            )
         snapshot_material = [
             {"table_id": table.id, "version": table.published_version, "spec_sha256": spec.source_sha256}
             for table, spec in zip(tables, specs)

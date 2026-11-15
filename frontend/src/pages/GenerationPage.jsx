@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
-import { BLOCKER_REASONS, StatusBadge, formatTime } from './SharedUI.jsx'
+import { StatusBadge, formatTime } from './SharedUI.jsx'
 
 const PIPELINE_STAGES = [
   ['01', '生成表结构、码表和规则', '生成 DDL、码表和校验 SQL，并在 Oracle 空表上空跑验证'],
@@ -13,13 +13,20 @@ const PIPELINE_STAGES = [
   ['05', '确认结果并下载', '确认测试结果后下载码表、表结构和校验 SQL'],
 ]
 
+const ARTIFACTS = [
+  { key: 'ddl', label: 'DDL', hint: '表名/字段名要能落成 Oracle 标识符' },
+  { key: 'rule_materials', label: '规则原料', hint: '校验原文在、码值白名单拿得到' },
+  { key: 'code_sets', label: '码值', hint: '码表已发布、有值，能灌进 Oracle' },
+]
+
 export default function GenerationPage() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
 
   const [tables, setTables] = useState([])
   const [selected, setSelected] = useState([])
-  const [blockers, setBlockers] = useState({})
+  const [readiness, setReadiness] = useState({})
+  const [acceptWarnings, setAcceptWarnings] = useState(false)
   const [checking, setChecking] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -29,25 +36,21 @@ export default function GenerationPage() {
     async function init() {
       setChecking(true)
       try {
-        const list = await v2('/metadata/tables?status=PUBLISHED')
-        setTables(list)
-        const blockerEntries = await Promise.all(
-          list.map(async (t) => {
-            const res = await v2(`/generation/blockers/${t.id}`).catch(() => ({ blockers: [] }))
-            return [t.id, res.blockers || []]
-          })
+        const [list, readinessPayload] = await Promise.all([
+          v2('/metadata/tables?status=PUBLISHED'),
+          v2('/metadata/readiness').catch(() => null),
+        ])
+        const map = Object.fromEntries(
+          (readinessPayload?.tables || []).map((item) => [item.table_id, item])
         )
-        const blockerMap = Object.fromEntries(blockerEntries)
-        setBlockers(blockerMap)
+        setTables(list)
+        setReadiness(map)
 
         const preferredTableId = params.get('table')
         if (preferredTableId && list.some((t) => t.id === preferredTableId)) {
           setSelected([preferredTableId])
         } else {
-          const readyIds = list
-            .filter((t) => !(blockerMap[t.id] && blockerMap[t.id].length > 0))
-            .map((t) => t.id)
-          setSelected(readyIds)
+          setSelected(list.filter((t) => map[t.id]?.ddl?.ready).map((t) => t.id))
         }
       } catch (err) {
         setError(err.message)
@@ -58,17 +61,31 @@ export default function GenerationPage() {
     init()
   }, [])
 
+  const ddlReady = (id) => readiness[id]?.ddl?.ready !== false
+  const fullyReady = (id) => {
+    const item = readiness[id]
+    if (!item) return false
+    return item.ddl.ready && item.rule_materials.ready && item.code_sets.ready
+  }
+  const pendingWarnings = (id) => {
+    const item = readiness[id]
+    if (!item) return []
+    return [...(item.rule_materials.blockers || []), ...(item.code_sets.blockers || [])]
+  }
+
   function toggle(id) {
+    if (readiness[id] && !readiness[id].ddl.ready) {
+      const reason = readiness[id].ddl.blockers[0]?.message || '字段定义不完整'
+      setError(`${readiness[id].table_code} 还不能生成 DDL：${reason}`)
+      return
+    }
     setSelected(
       selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]
     )
   }
 
   function selectAllReady() {
-    const readyIds = tables
-      .filter((t) => !(blockers[t.id] && blockers[t.id].length > 0))
-      .map((t) => t.id)
-    setSelected(readyIds)
+    setSelected(tables.filter((t) => fullyReady(t.id)).map((t) => t.id))
   }
 
   async function create() {
@@ -76,9 +93,13 @@ export default function GenerationPage() {
       setError('请至少勾选一张已发布的元数据表。')
       return
     }
-    const blockedSelected = selected.filter((id) => (blockers[id] || []).length > 0)
-    if (blockedSelected.length > 0) {
-      setError('当前勾选的表中存在未解决的码值引用阻断项，请先点击卡片上的「前往消解码值」处理后再启动生成。')
+    if (selected.some((id) => !ddlReady(id))) {
+      setError('勾选的表里有 DDL 不就绪的（字段名超长或类型无法映射），请先处理。')
+      return
+    }
+    const warned = selected.filter((id) => pendingWarnings(id).length > 0)
+    if (warned.length > 0 && !acceptWarnings) {
+      setError('勾选的表里有规则或码值未就绪的，会导致规则缺失或阶段 2 报错；确认已知风险后再继续。')
       return
     }
 
@@ -87,7 +108,11 @@ export default function GenerationPage() {
     try {
       const run = await v2('/generation/runs', {
         method: 'POST',
-        body: JSON.stringify({ table_ids: selected, provider: 'live' }),
+        body: JSON.stringify({
+          table_ids: selected,
+          provider: 'live',
+          accept_warnings: acceptWarnings,
+        }),
       })
       setNotice('生成运行已启动，正在跳转至执行与审计中心跟踪实时进度。')
       navigate(`/runs?run=${run.id}`)
@@ -98,8 +123,9 @@ export default function GenerationPage() {
     }
   }
 
-  const readyCount = tables.filter((t) => !(blockers[t.id] && blockers[t.id].length > 0)).length
-  const blockedCount = tables.length - readyCount
+  const fullCount = tables.filter((t) => fullyReady(t.id)).length
+  const ddlBlockedCount = tables.filter((t) => !ddlReady(t.id)).length
+  const warnedSelected = selected.filter((id) => pendingWarnings(id).length > 0).length
 
   return (
     <>
@@ -123,38 +149,49 @@ export default function GenerationPage() {
 
       <section className="metrics metrics-three">
         <div>
-          <span>可以生成</span>
-          <strong>{readyCount} 张</strong>
-          <small>字段和码值均已就绪</small>
+          <span>三项就绪</span>
+          <strong>{fullCount} 张</strong>
+          <small>能建表、能灌码值、规则原料齐</small>
         </div>
         <div>
-          <span>需要先处理</span>
-          <strong>{blockedCount} 张</strong>
-          <small>{blockedCount > 0 ? '请补充缺失的码值' : '当前没有待处理项'}</small>
+          <span>DDL 卡住</span>
+          <strong>{ddlBlockedCount} 张</strong>
+          <small>{ddlBlockedCount > 0 ? '字段名超长或类型无法映射' : '当前没有卡住项'}</small>
         </div>
         <div>
           <span>本次已选择</span>
           <strong>{selected.length} 张</strong>
-          <small>可以选择一张或多张报表</small>
+          <small>{warnedSelected > 0 ? `其中 ${warnedSelected} 张带已知风险` : '可以选择一张或多张报表'}</small>
         </div>
       </section>
+
+      {warnedSelected > 0 && (
+        <label className="inline-option warn-ack">
+          <input
+            type="checkbox"
+            checked={acceptWarnings}
+            onChange={(e) => setAcceptWarnings(e.target.checked)}
+          />
+          我已知悉：勾选的 {warnedSelected} 张表里，部分字段的规则或码值尚未就绪，继续推进会产生缺失的规则或让阶段 2 报错。
+        </label>
+      )}
 
       <section className="panel generation-panel">
         <div className="panel-heading">
           <div>
             <h2>选择本次要生成的报表</h2>
-            <p>只能选择已发布的报表；如果提示缺少码值，请先完成补充。</p>
+            <p>只列出已发布的报表。规则由本阶段的 AI 依据校验原文生成，这里只保证原料齐备。</p>
           </div>
           <div className="actions">
             <button type="button" className="button secondary sm" onClick={selectAllReady}>
-              选择所有可生成报表 ({readyCount})
+              选择三项就绪 ({fullCount})
             </button>
             <button
               type="button"
               className="button secondary sm"
-              onClick={() => setSelected(tables.map((t) => t.id))}
+              onClick={() => setSelected(tables.filter((t) => ddlReady(t.id)).map((t) => t.id))}
             >
-              全选全部 ({tables.length})
+              选择 DDL 就绪 ({tables.length - ddlBlockedCount})
             </button>
             <button type="button" className="button secondary sm" onClick={() => setSelected([])}>
               清空选择
@@ -165,13 +202,14 @@ export default function GenerationPage() {
         {tables.length > 0 ? (
           <div className="generation-table-list">
             {tables.map((table) => {
-              const tableBlockers = blockers[table.id] || []
-              const hasBlocker = tableBlockers.length > 0
+              const item = readiness[table.id]
               const isSelected = selected.includes(table.id)
+              const blockers = item?.ddl?.blockers || []
+              const blocked = item ? !item.ddl.ready : false
               return (
                 <div
                   key={table.id}
-                  className={`generation-table-card ${isSelected ? 'selected' : ''} ${hasBlocker ? 'has-blocker' : ''}`}
+                  className={`generation-table-card ${isSelected ? 'selected' : ''} ${blocked ? 'has-blocker' : ''}`}
                   onClick={() => toggle(table.id)}
                 >
                   <input
@@ -183,9 +221,28 @@ export default function GenerationPage() {
                   <div className="generation-card-body">
                     <div className="generation-card-top">
                       <strong>{table.table_name}</strong>
-                      <StatusBadge tone={hasBlocker ? 'red' : 'green'}>
-                        {hasBlocker ? `缺少 ${tableBlockers.length} 项码值` : '可以生成'}
-                      </StatusBadge>
+                      {item ? (
+                        <div className="readiness-row">
+                          {ARTIFACTS.map((artifact) => {
+                            const section = item[artifact.key]
+                            return (
+                              <span
+                                key={artifact.key}
+                                className={`ready-chip ${section.ready ? 'ok' : 'bad'}`}
+                                title={
+                                  section.ready
+                                    ? `${artifact.label} 可以生成（${artifact.hint}）`
+                                    : section.blockers.map((b) => b.message).join('；')
+                                }
+                              >
+                                {artifact.label} {section.ready ? '✓' : `✕${section.blockers.length}`}
+                              </span>
+                            )
+                          })}
+                        </div>
+                      ) : (
+                        <StatusBadge tone="neutral">未评估</StatusBadge>
+                      )}
                     </div>
                     <div className="generation-card-meta">
                       <code>{table.table_code}</code>
@@ -193,28 +250,23 @@ export default function GenerationPage() {
                       <span className="muted-text">{table.field_count} 个字段 · 更新于 {formatTime(table.updated_at)}</span>
                     </div>
 
-                    {hasBlocker && (
+                    {blocked && (
                       <div className="blocker-alert-list" onClick={(e) => e.stopPropagation()}>
-                        {tableBlockers.map((b, idx) => (
+                        {blockers.slice(0, 3).map((b, idx) => (
                           <div key={idx} className="blocker-alert-item">
-                            <span>
-                              字段 <code>{b.field_en}</code>：{BLOCKER_REASONS[b.reason] || b.reason}
-                            </span>
+                            <span>{b.message}</span>
                             <button
                               type="button"
                               className="button secondary sm"
-                              onClick={() =>
-                                navigate(
-                                  b.code_set_id
-                                    ? `/code-sets?set=${b.code_set_id}`
-                                    : `/metadata?table=${table.id}`
-                                )
-                              }
+                              onClick={() => navigate(`/metadata?table=${table.id}`)}
                             >
-                              去补充 →
+                              去处理 →
                             </button>
                           </div>
                         ))}
+                        {blockers.length > 3 && (
+                          <div className="muted-text">另有 {blockers.length - 3} 项…</div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -224,7 +276,7 @@ export default function GenerationPage() {
           </div>
         ) : (
           <div className="empty">
-            当前没有可生成的报表。请先在“核对字段”中检查并发布报表。
+            当前没有已发布的报表。请先在「核对字段」里把三项就绪的表批量发布。
           </div>
         )}
       </section>

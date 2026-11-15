@@ -22,6 +22,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_domain import MetadataFieldDraft
+from ..readiness import evaluate_document, evaluate_table
 from ..metadata_service import (
     apply_field_type_import,
     metadata_to_spec,
@@ -414,6 +415,77 @@ def publish(table_id: str, request: PublishRequest) -> Dict[str, Any]:
             session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return table_detail(session, table)
+
+
+class PublishBatchRequest(BaseModel):
+    document_id: Optional[str] = None
+    table_ids: Optional[List[str]] = None
+    # all_ready = 三项都就绪才发；ddl_only = 只要 DDL 能落地就发（规则/码值问题写进快照）
+    scope: str = "all_ready"
+    dry_run: bool = False
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
+
+
+@router.get("/readiness")
+def metadata_readiness(document_id: Optional[str] = None) -> Dict[str, Any]:
+    """每张表能出哪些产物：DDL / 规则 / 码值，以及卡在哪一项。"""
+    with SessionLocal() as session:
+        return evaluate_document(session, document_id)
+
+
+@router.post("/tables/publish-batch")
+def publish_batch(request: PublishBatchRequest) -> Dict[str, Any]:
+    """批量发布：150 张表逐张点不现实，按就绪度一次推进。"""
+    if request.scope not in {"all_ready", "ddl_only"}:
+        raise HTTPException(status_code=422, detail="scope 只支持 all_ready / ddl_only")
+    published: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    with SessionLocal() as session:
+        query = session.query(TableMetadataModel)
+        if request.table_ids:
+            query = query.filter(TableMetadataModel.id.in_(request.table_ids))
+        elif request.document_id:
+            query = query.filter(TableMetadataModel.document_id == request.document_id)
+        tables = query.order_by(TableMetadataModel.source_ordinal.asc()).all()
+        for table in tables:
+            if table.status == "PUBLISHED" and table.published_version == table.current_version:
+                skipped.append({"table_code": table.table_code, "reason": "ALREADY_PUBLISHED"})
+                continue
+            result = evaluate_table(session, table)
+            if not result["ddl"]["ready"]:
+                skipped.append(
+                    {
+                        "table_code": table.table_code,
+                        "reason": result["ddl"]["blockers"][0]["code"],
+                        "detail": result["ddl"]["blockers"][0]["message"],
+                    }
+                )
+                continue
+            pending = [
+                item["code"] for item in result["rule_materials"]["blockers"] + result["code_sets"]["blockers"]
+            ]
+            if request.scope == "all_ready" and pending:
+                skipped.append({"table_code": table.table_code, "reason": "RULE_OR_CODE_NOT_READY", "detail": "、".join(pending[:3])})
+                continue
+            if request.dry_run:
+                published.append({"table_code": table.table_code, "warnings": pending})
+                continue
+            try:
+                publish_table(session, table, request.approver, table.current_version)
+                published.append({"table_code": table.table_code, "warnings": pending})
+            except ValueError as exc:
+                skipped.append({"table_code": table.table_code, "reason": "PUBLISH_FAILED", "detail": str(exc)})
+        if request.dry_run:
+            session.rollback()
+        else:
+            session.commit()
+    return {
+        "published": len(published),
+        "skipped": len(skipped),
+        "details": published,
+        "skipped_details": skipped[:50],
+        "dry_run": request.dry_run,
+    }
 
 
 @router.get("/tables/{table_id}/spec")

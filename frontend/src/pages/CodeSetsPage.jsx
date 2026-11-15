@@ -17,6 +17,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   const [setSearch, setSetSearch] = useState('')
   const [includeInline, setIncludeInline] = useState(true)
   const [dragging, setDragging] = useState(false)
+  const [readiness, setReadiness] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -29,12 +30,17 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
       setDetail(null)
       return
     }
-    const [setList, unresolvedList] = await Promise.all([
+    const readinessQuery = documentId
+      ? `?document_id=${encodeURIComponent(documentId)}&referenced_only=true`
+      : '?referenced_only=true'
+    const [setList, unresolvedList, readinessPayload] = await Promise.all([
       v2(`/code-sets${scopeQuery}`),
       v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
+      v2(`/code-sets/readiness${readinessQuery}`).catch(() => null),
     ])
     setSets(setList)
     setUnresolved(unresolvedList)
+    setReadiness(readinessPayload)
 
     const paramSetId = params.get('set')
     const paramName = params.get('name')
@@ -189,6 +195,29 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     }
   }
 
+  async function publishReadyCodeSets() {
+    const documentId = params.get('document_id')
+    const target = readiness?.summary?.ready_and_referenced || 0
+    if (!target) return
+    if (!window.confirm(`将发布 ${target} 张被引用的码表。发布后这些码值会进入阶段 2 的产出包。继续？`)) {
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const result = await v2('/code-sets/publish-batch', {
+        method: 'POST',
+        body: JSON.stringify({ document_id: documentId || undefined, referenced_only: true }),
+      })
+      setNotice(`已发布 ${result.published} 张码表，跳过 ${result.skipped} 张。`)
+      await load(detail?.id)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function importExcel(event) {
     const file = event.target.files?.[0]
     event.target.value = ''
@@ -260,6 +289,31 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
         同时提取字段说明中列出的取值
       </label>
 
+      {readiness && readiness.summary.ready_and_referenced > 0 && (
+        <div className="readiness-summary">
+          <div className="readiness-summary-main">
+            <strong>
+              还有 {readiness.summary.ready_and_referenced} 张被引用的码表可以发布
+            </strong>
+            <span className="muted-text">
+              已发布 {readiness.summary.published} / 被引用 {readiness.summary.referenced} 张 ·
+              卡点：{readiness.summary.blocker_codes.length
+                ? readiness.summary.blocker_codes.map(([code, count]) => `${code} ${count}`).join('、')
+                : '无'}
+            </span>
+          </div>
+          <button type="button" className="button secondary sm" disabled={busy} onClick={publishReadyCodeSets}>
+            批量发布可发布的码表
+          </button>
+          {readiness.summary.blocker_codes.length > 0 && (
+            <p className="readiness-hint">
+              空占位码表（没有码值）和被引用字段更短的码值不会被发布——阶段 2 只认已发布码表，
+              发进去的脏数据会直接进产出包。
+            </p>
+          )}
+        </div>
+      )}
+
       {unresolved.length > 0 && (
         <div className="unresolved-banner">
           <div className="unresolved-banner-header">
@@ -281,6 +335,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
           </div>
         </div>
       )}
+
 
       <section className="workspace-grid code-layout">
         <div className="panel list-panel">

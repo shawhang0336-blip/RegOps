@@ -60,6 +60,7 @@ export default function MetadataPage({ embedded = false }) {
   const [showTypeImport, setShowTypeImport] = useState(false)
   const [typeImportFile, setTypeImportFile] = useState(null)
   const [typeImportResult, setTypeImportResult] = useState(null)
+  const [readiness, setReadiness] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -72,14 +73,16 @@ export default function MetadataPage({ embedded = false }) {
       setDetail(null)
       return
     }
-    const [tableList, unresolvedList, codeSetList] = await Promise.all([
+    const [tableList, unresolvedList, codeSetList, readinessPayload] = await Promise.all([
       v2(`/metadata/tables${scopeQuery}`),
       v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
       v2(`/code-sets${scopeQuery}`).catch(() => []),
+      v2(`/metadata/readiness${scopeQuery}`).catch(() => null),
     ])
     setTables(tableList)
     setUnresolvedRefs(unresolvedList)
     setCodeSets(codeSetList)
+    setReadiness(readinessPayload)
 
     const requestedId = params.get('table')
     const currentId = detail?.id
@@ -404,6 +407,39 @@ export default function MetadataPage({ embedded = false }) {
   const inferredTableCount = tables.filter((table) => (table.type_inferred_count || 0) > 0).length
   const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
 
+  const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
+  const readyAll = readiness?.summary?.ready_all || 0
+
+  async function publishReadyTables() {
+    const documentId = params.get('document_id')
+    if (!documentId) {
+      setError('请先在「当前文件」里选定一份文件，批量发布会按文件范围执行。')
+      return
+    }
+    const target = readiness?.summary?.ready_all || 0
+    if (target <= 0) {
+      setError('当前没有三项都就绪的表，先处理下方列出的卡点。')
+      return
+    }
+    if (!window.confirm(`将发布 ${target} 张「DDL / 规则 / 码值」都就绪的表，发布后内容不可直接修改。继续？`)) {
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const result = await v2('/metadata/tables/publish-batch', {
+        method: 'POST',
+        body: JSON.stringify({ document_id: documentId, scope: 'all_ready' }),
+      })
+      setNotice(`已发布 ${result.published} 张，跳过 ${result.skipped} 张。`)
+      await load(detail?.id)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const pageActions = detail && (
     <>
       {isPublished ? (
@@ -461,6 +497,33 @@ export default function MetadataPage({ embedded = false }) {
             </label>
           </div>
 
+
+          {readiness && (
+            <div className="readiness-summary">
+              <div className="readiness-summary-main">
+                <strong>可出包 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
+                <span className="muted-text">
+                  DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值就绪{' '}
+                  {readiness.summary.ready.code_sets} · 校验原文覆盖 {readiness.summary.check_text_coverage}%
+                </span>
+              </div>
+              <button
+                type="button"
+                className="button secondary sm"
+                disabled={busy || readyAll === 0}
+                onClick={publishReadyTables}
+                title="只发布 DDL 能落地、码值能灌库、规则原料齐备的表"
+              >
+                批量发布三项齐备的表
+              </button>
+              {readiness.summary.ready.code_sets < readiness.summary.ready.ddl && (
+                <p className="readiness-hint">
+                  卡口在码值：能建表 {readiness.summary.ready.ddl} 张、能灌码值只有 {readiness.summary.ready.code_sets} 张，
+                  通常是引用的码表还没发布——阶段 2 的规则装配遇到未发布码表会直接报错，码值也进不了产出包。
+                </p>
+              )}
+            </div>
+          )}
           {visibleTables.length > 0 ? (
             <div className="list-stack">
               {visibleTables.map((table) => (
@@ -481,6 +544,27 @@ export default function MetadataPage({ embedded = false }) {
                     当前 v{table.current_version}
                     {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
                   </em>
+                  {readinessById[table.id] && (
+                    <div className="readiness-row">
+                      {['ddl', 'rule_materials', 'code_sets'].map((key) => {
+                        const section = readinessById[table.id][key]
+                        const label = key === 'ddl' ? 'DDL' : key === 'rule_materials' ? '规则原料' : '码值'
+                        return (
+                          <span
+                            key={key}
+                            className={`ready-chip ${section.ready ? 'ok' : 'bad'}`}
+                            title={
+                              section.ready
+                                ? `${label} 可以生成`
+                                : section.blockers.map((item) => item.message).join('；')
+                            }
+                          >
+                            {label} {section.ready ? '✓' : `✕${section.blockers.length}`}
+                          </span>
+                        )
+                      })}
+                    </div>
+                  )}
                   <div className="type-basis-line">
                     <span className="basis-pill basis-source">{table.type_source_count || 0} 原文有依据</span>
                     <span className={`basis-pill basis-inferred ${table.type_inferred_count ? 'warn' : ''}`}>
