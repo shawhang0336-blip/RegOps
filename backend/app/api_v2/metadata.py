@@ -281,8 +281,6 @@ def add_field(table_id: str, request: FieldCreateRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail="Metadata table not found")
         if table.current_version != request.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-        if table.status == "PUBLISHED":
-            raise HTTPException(status_code=409, detail="PUBLISHED_TABLE_IS_IMMUTABLE")
         draft = MetadataFieldDraft.model_validate(request.field)
         field = FieldMetadataModel(
             id=str(uuid.uuid4()),
@@ -319,8 +317,6 @@ def delete_field(table_id: str, field_id: str, request: EditRequest) -> Dict[str
             raise HTTPException(status_code=404, detail="Field not found")
         if table.current_version != request.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-        if table.status == "PUBLISHED":
-            raise HTTPException(status_code=409, detail="PUBLISHED_TABLE_IS_IMMUTABLE")
         old = {"field_en": field.field_en, "field_cn": field.field_cn}
         session.delete(field)
         table.current_version += 1

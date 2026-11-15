@@ -185,7 +185,7 @@ export default function GenerationPage() {
       <PageHeader
         eyebrow="第 2 步 · 共 3 步"
         title="生成表结构、码表和规则"
-        description="根据已发布字段生成 DDL、码表和校验 SQL，在 Oracle 验证库建表后，由您确认规则。"
+        description="选择要生成的报表，系统会自动定稿并生成 DDL、码表和校验 SQL，在 Oracle 验证库建表后，由您确认规则。"
         actions={
           <button
             type="button"

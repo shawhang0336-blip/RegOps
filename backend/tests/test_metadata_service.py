@@ -70,8 +70,12 @@ def test_publish_edit_version_and_spec():
     assert table.status == "PUBLISHED"
     spec = metadata_to_spec(session, table)
     assert spec.fields[0].name == "CUSTNAME"
-    with pytest.raises(ValueError, match="PUBLISHED_TABLE_IS_IMMUTABLE"):
-        update_field(session, table, field, {"field_cn": "修改"}, 1, "编辑员", "test")
+    # 已发布也能改：改完状态退回 DRAFT、版本号 +1，
+    # 下次进阶段 2 会重新自动定稿。旧版本靠 run 里的 spec 快照复现，
+    # 不需要靠冻结这一行来防改。
+    update_field(session, table, field, {"field_cn": "修改"}, 1, "编辑员", "test")
+    assert table.status == "DRAFT"
+    assert table.current_version == 2
 
 
 def test_optimistic_lock_rejects_stale_edit():

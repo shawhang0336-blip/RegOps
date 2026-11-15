@@ -216,7 +216,9 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     [detail, editReason, baselineFields]
   )
 
-  const isPublished = detail?.status === 'PUBLISHED'
+  // 「已发布不可改」已经取消——编辑后状态退回草稿，下次进阶段 2 会重新自动定稿。
+  // 保留这个名字只是为了少改引用点。
+  const isPublished = false
   const activeField = detail?.fields?.find((f) => f.id === editingFieldId) || null
   const filteredFields = (detail?.fields || []).filter((f) => {
     if (!fieldSearch.trim()) return true
@@ -318,26 +320,6 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     }
   }
 
-  async function publish() {
-    setBusy(true)
-    setError('')
-    try {
-      const body = await v2(`/metadata/tables/${detail.id}/publish`, {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-        }),
-      })
-      setDetail(body)
-      await load(body.id)
-      setNotice(`已正式发布 ${body.table_name} (${body.table_code}) v${body.published_version}，现可前往「生成与预检」启动规则装配。`)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   async function downloadTypeTemplate() {
     const documentId = params.get('document_id')
     const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
@@ -381,25 +363,6 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
         )
         await load(detail?.id)
       }
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function createDraft() {
-    setBusy(true)
-    setError('')
-    try {
-      const body = await v2(`/metadata/tables/${detail.id}/draft`, {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-        }),
-      })
-      await load(body.id)
-      setNotice(`已从发布基线派生可编辑草稿版本 v${body.current_version}。`)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -467,20 +430,12 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
 
   const pageActions = detail && (
     <>
-      {isPublished ? (
-        <>
-          <button type="button" className="button secondary" disabled={busy} onClick={createDraft}>新建修改版本</button>
-          <button type="button" className="button primary" onClick={() => navigate(`/generation?table=${detail.id}`)}>前往生成 →</button>
-        </>
-      ) : (
-        <>
-          <button type="button" className="button secondary" onClick={() => setShowTypeImport(!showTypeImport)}>
-            {showTypeImport ? '收起批量导入' : '批量导入类型修正'}
-          </button>
-          <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
-          <button type="button" className="button primary" disabled={busy} onClick={publish}>发布此表</button>
-        </>
-      )}
+      {/* 没有「发布」这一步了——去第 2 步选表就会定稿。表本身随时可改。 */}
+      <button type="button" className="button secondary" onClick={() => setShowTypeImport(!showTypeImport)}>
+        {showTypeImport ? '收起批量导入' : '批量导入类型修正'}
+      </button>
+      <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
+      <button type="button" className="button primary" onClick={() => navigate(`/generation?table=${detail.id}`)}>前往生成 →</button>
     </>
   )
 
@@ -489,7 +444,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
       {!embedded && <PageHeader
         eyebrow="第 1 步 · 共 3 步"
         title="核对报表字段"
-        description="检查系统识别的字段、类型和校验要求；确认无误后发布，即可生成校验规则。"
+        description="检查系统识别的字段、类型和校验要求；能用的去第 2 步选表即可，不能用会告诉你缺什么。"
         actions={pageActions}
       />}
       {embedded && <div className="embedded-page-actions">{pageActions}</div>}
@@ -687,12 +642,9 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   <div className="actions">
                     <h2>{detail.table_name}</h2>
                     <code>{detail.table_code}</code>
-                    <StatusBadge status={detail.status} />
+                    {(detail.review_blocking_count || 0) > 0 && <StatusBadge tone="red">待处理</StatusBadge>}
                   </div>
-                  <p>
-                    {detail.table_definition || '暂无表级业务说明'} · 当前版本 v{detail.current_version}
-                    {detail.published_version ? `（已发布版本 v${detail.published_version}）` : ''}
-                  </p>
+                  <p>{detail.table_definition || '暂无表级业务说明'} · 版本 v{detail.current_version}</p>
                   <div className="type-basis-line">
                     <span className="basis-pill basis-source">{detailBasis.source} 个字段类型有原文依据</span>
                     <span className={`basis-pill basis-inferred ${detailBasis.inferred ? 'warn' : ''}`}>
@@ -873,7 +825,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   <span>
                     {blockingIssues.length > 0
                       ? `这张表有 ${blockingIssues.length} 项需要处理${advisoryIssues.length ? `，另有 ${advisoryIssues.length} 条提示` : ''}。`
-                      : `这张表有 ${advisoryIssues.length} 条提示，没有阻断项，可以直接发布。`}
+                      : `这张表有 ${advisoryIssues.length} 条提示，没有阻断项。`}
                   </span>
                   <button type="button" className="button secondary sm" onClick={() => setTab('validation')}>查看核对明细</button>
                 </div>
@@ -920,9 +872,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                             查看或修改字段：{activeField.field_cn} (<code>{activeField.field_en}</code>)
                           </h2>
                           <p>
-                            {isPublished
-                              ? '已发布内容不可直接修改；如需调整，请先点击“新建修改版本”。'
-                              : '修改后请点击保存；字段原文和自动识别依据可在下方查看。'}
+                            修改后请点击保存；字段原文和自动识别依据可在下方查看。
                           </p>
                         </div>
                         <div className="actions">

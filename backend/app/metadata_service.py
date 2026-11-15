@@ -728,8 +728,9 @@ def update_field(
 ) -> None:
     if table.current_version != expected_version:
         raise ValueError("VERSION_CONFLICT")
-    if table.status == "PUBLISHED":
-        raise ValueError("PUBLISHED_TABLE_IS_IMMUTABLE")
+    # 已发布不再不可改：改完 status 变 DRAFT、版本号 +1，
+    # 下次进阶段 2 会重新自动定稿。「不可变」这个要求本来就没有依据——
+    # 旧版本靠 run 里的 spec 快照复现，不靠这一行冻结。
     allowed = {
         "field_cn",
         "field_en",
