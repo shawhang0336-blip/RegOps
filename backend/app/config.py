@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # tool_choice 模式：auto = 模型自决（deepseek thinking 模型只支持 auto）；
     # forced = 强制调用指定工具（GLM 支持，可提升小任务稳定性）。
     llm_tool_choice: str = "auto"
+    # 结构切块交给 AI 的范围：adaptive = 只把"有判断空间"的章节交给 AI（多块、无结构、有告警）；
+    # all = 每个块都让 AI 重新决策（成本高，适合首次校准切块规则时用）。
+    structure_ai_scope: str = "adaptive"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")

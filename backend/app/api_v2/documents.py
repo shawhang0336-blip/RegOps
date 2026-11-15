@@ -188,8 +188,13 @@ def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool 
         document = session.get(SourceDocumentModel, document_id)
         status = document.status if document else ""
     if status == "OVERVIEW_FAILED":
-        progress_finish(document_id, status="FAILED", detail="结构检查未完成，请点击“重新检查并解析”")
-        return
+        # 体检只是个前置判断，切块本身按文件类型走确定性路径，
+        # 所以这里继续往下走，让切块阶段的 AI 决策仍然有机会纠正结构。
+        progress_update(
+            document_id,
+            detail="结构体检未完成，继续按文件类型切块",
+            log="结构体检失败，跳过诊断信息，直接进入切块",
+        )
 
     progress_update(
         document_id,
