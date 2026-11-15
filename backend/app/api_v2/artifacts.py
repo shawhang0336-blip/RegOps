@@ -87,11 +87,13 @@ def artifacts_status() -> Dict[str, Any]:
             summary = (run.result_json or {}).get("audit_summary") if run else {}
             result.append(
                 {
+                    "id": table.id,
                     "table_id": table.id,
                     "table_code": table.table_code,
                     "table_name": table.table_name,
                     "document_id": table.document_id,
                     "document_name": doc_names.get(table.document_id, ""),
+                    "status": table.status,
                     "generated": run_id is not None,
                     "run_id": run_id,
                     "run_status": run.status if run else None,

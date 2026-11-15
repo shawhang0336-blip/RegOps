@@ -39,6 +39,7 @@ export default function ArtifactsPage() {
   const [params] = useSearchParams()
 
   const [tables, setTables] = useState([])
+  const [readinessById, setReadinessById] = useState({})
   const [selected, setSelected] = useState([])
   const [currentId, setCurrentId] = useState('')
   const [detail, setDetail] = useState(null)
@@ -52,8 +53,15 @@ export default function ArtifactsPage() {
   const [search, setSearch] = useState('')
 
   async function load(preferredId) {
-    const data = await v2('/artifacts')
+    const [data, readinessPayload] = await Promise.all([
+      v2('/artifacts'),
+      v2('/metadata/readiness').catch(() => null),
+    ])
     setTables(data.tables || [])
+    const map = Object.fromEntries(
+      (readinessPayload?.tables || []).map((item) => [item.table_id, item])
+    )
+    setReadinessById(map)
     const target = preferredId || params.get('table') || data.tables[0]?.id
     if (target) await select(target)
   }
@@ -77,6 +85,36 @@ export default function ArtifactsPage() {
     return [...map.entries()]
   }, [tables])
 
+  // 这张表现在能不能选，以及不能选的原因。和「跑没跑过」是两个维度：
+  // 生成状态（未生成/已验证）在右侧标签，可生成性和卡点原因在这里。
+  const codeProblems = (section) => section?.defects || []
+  // 三态：评估中（readiness 还没回来）/ 可选 / 不可选。
+  // readiness 接口要遍历全表，加载慢；空数据就显示「可选」会把加载中的状态
+  // 渲染成「149 张全部可选」，等接口回来突然变成 139，用户会看到数字跳变。
+  const selectable = (id) => {
+    const item = readinessById[id]
+    if (!Object.keys(readinessById).length) return null
+    if (!item) return null
+    if (tables.find((row) => row.id === id)?.status === 'NEEDS_REVIEW') return false
+    return item.ddl.ready && item.rule_materials.ready && codeProblems(item.code_sets).length === 0
+  }
+  const blockReason = (id) => {
+    const row = tables.find((item) => item.id === id)
+    if (row?.status === 'NEEDS_REVIEW') return '有违反原文的字段问题，先去元数据页处理标红项'
+    const item = readinessById[id]
+    if (!item) return ''
+    if (!item.ddl.ready) return item.ddl.blockers[0]?.message || '字段定义无法落成 Oracle 表'
+    const hard = [...(item.rule_materials.blockers || []), ...codeProblems(item.code_sets)]
+    if (hard.length) return hard[0].message
+    return ''
+  }
+  const selectableCount = useMemo(() => {
+    const ok = tables.filter((row) => selectable(row.id) === true).length
+    const bad = tables.filter((row) => selectable(row.id) === false).length
+    const pending = tables.length - ok - bad
+    return { ok, bad, pending }
+  }, [tables, readinessById])
+
   const filteredTables = useMemo(() => {
     return tables.filter((row) => {
       if (statusFilter === 'ungenerated' && row.generated) return false
@@ -91,7 +129,17 @@ export default function ArtifactsPage() {
   }, [tables, statusFilter, docFilter, search])
 
   function toggle(id) {
-    setSelected(selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id])
+    if (selected.includes(id)) {
+      setSelected(selected.filter((item) => item !== id))
+      return
+    }
+    if (selectable(id) !== true) {
+      const reason = blockReason(id)
+      const row = tables.find((item) => item.id === id)
+      setError(reason ? `${row?.table_code || id} 还不能生成：${reason}` : '就绪度还在评估中，稍后再试。')
+      return
+    }
+    setSelected([...selected, id])
   }
 
   async function generate(tableIds) {
@@ -147,7 +195,10 @@ export default function ArtifactsPage() {
           <div className="panel-heading">
             <div>
               <h2>报表清单</h2>
-              <p>{filteredTables.length} / {tables.length} 张 · 已选择 {selected.length} 张</p>
+              <p>
+                可选 {selectableCount.ok} 张 / 不可选 {selectableCount.bad} 张
+                {selectableCount.pending > 0 && ` / 评估中 ${selectableCount.pending} 张`} · 已选择 {selected.length} 张
+              </p>
             </div>
           </div>
           <div className="list-filter-bar">
@@ -196,14 +247,24 @@ export default function ArtifactsPage() {
                 <span>
                   <code>{row.table_code}</code>
                 </span>
+                {selectable(row.id) === false && (
+                  <em className="danger-text" title={blockReason(row.id)}>
+                    {blockReason(row.id)}
+                  </em>
+                )}
                 <div className="row-actions" onClick={(event) => event.stopPropagation()}>
                   <label className="inline-option">
                     <input
                       type="checkbox"
                       checked={selected.includes(row.id)}
+                      disabled={selectable(row.id) !== true}
                       onChange={() => toggle(row.id)}
                     />
-                    加入本次生成
+                    {selectable(row.id) === true
+                      ? '加入本次生成'
+                      : selectable(row.id) === false
+                        ? '暂不可生成'
+                        : '评估中...'}
                   </label>
                 </div>
               </div>
