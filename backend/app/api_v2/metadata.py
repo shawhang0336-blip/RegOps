@@ -1,7 +1,11 @@
+import csv
+import io
 import uuid
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
+from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -16,8 +20,10 @@ from ..asset_models import (
 from ..code_service import extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
+from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_domain import MetadataFieldDraft
 from ..metadata_service import (
+    apply_field_type_import,
     metadata_to_spec,
     publish_table,
     table_detail,
@@ -36,21 +42,21 @@ class ExtractRequest(BaseModel):
 
 class EditRequest(BaseModel):
     expected_version: int
-    editor: str = Field(min_length=1, max_length=80)
+    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     reason: str = ""
     changes: Dict[str, Any]
 
 
 class FieldCreateRequest(BaseModel):
     expected_version: int
-    editor: str = Field(min_length=1, max_length=80)
+    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     reason: str = ""
     field: Dict[str, Any]
 
 
 class PublishRequest(BaseModel):
     expected_version: int
-    approver: str = Field(min_length=1, max_length=80)
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
 
 
 @router.post("/extract", status_code=202)
@@ -88,13 +94,28 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
             query = query.filter(TableMetadataModel.status == status)
         if document_id:
             query = query.filter(TableMetadataModel.document_id == document_id)
-        rows = query.order_by(TableMetadataModel.updated_at.desc()).all()
+        # 按文件中的出现顺序（来源块 ordinal）排，符合阅读习惯；没有来源的排最后
+        rows = query.order_by(TableMetadataModel.source_ordinal.asc(), TableMetadataModel.table_code.asc()).all()
+        # 同一张表重新提取会生成新的版本行（旧行保留用于追溯），列表里只留最新版本
+        latest: Dict[tuple, Any] = {}
+        for row in rows:
+            key = (row.document_id, row.table_code)
+            current = latest.get(key)
+            if current is None or (row.current_version or 0) >= (current.current_version or 0):
+                latest[key] = row
+        live_ids = {row.id for row in latest.values()}
+        rows = [row for row in rows if row.id in live_ids]
         # 表级状态是"任意一条告警就整表待复核"，列表里必须把问题落到条数和字段上，
         # 否则用户只看到一个红色的"需要核对"，无法判断到底有几处、要不要动手。
         stats: Dict[str, Dict[str, Any]] = {}
-        for validation in session.query(MetadataValidationModel).all():
+        # 每次重新提取都会追加一轮校验记录，历史轮次的问题不能继续算在"待处理"里，
+        # 否则修好之后列表仍然显示旧问题，用户看到的永远是过时状态。
+        latest_by_kind: Dict[tuple, Any] = {}
+        for validation in session.query(MetadataValidationModel).order_by(MetadataValidationModel.created_at).all():
+            latest_by_kind[(validation.table_id, validation.validator_kind)] = validation
+        for (table_id, _kind), validation in latest_by_kind.items():
             entry = stats.setdefault(
-                validation.table_id,
+                table_id,
                 {"issue_count": 0, "blocking": 0, "advisory": 0, "fields": set(), "codes": {}},
             )
             for issue in validation.issues_json or []:
@@ -113,9 +134,20 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
                     field_en = str(issue.get("field_en") or "").strip()
                     if field_en:
                         entry["fields"].add(field_en)
+        basis_stats: Dict[str, Dict[str, int]] = {}
+        for field in session.query(FieldMetadataModel).all():
+            entry = basis_stats.setdefault(field.table_id, {"source": 0, "inferred": 0, "manual": 0})
+            basis = (field.type_basis or "UNKNOWN").upper()
+            if basis == "SOURCE":
+                entry["source"] += 1
+            elif basis == "INFERRED":
+                entry["inferred"] += 1
+            elif basis == "MANUAL":
+                entry["manual"] += 1
         result = []
         for row in rows:
             field_count = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == row.id).count()
+            basis = basis_stats.get(row.id, {"source": 0, "inferred": 0, "manual": 0})
             entry = stats.get(row.id) or {}
             top_codes = sorted(
                 (entry.get("codes") or {}).items(),
@@ -131,6 +163,11 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
                     "review_advisory_count": entry.get("advisory", 0),
                     "review_field_count": len(entry.get("fields") or set()),
                     "review_top_codes": [code for code, _ in top_codes],
+                    "type_source_count": basis["source"],
+                    "type_inferred_count": basis["inferred"],
+                    "type_manual_count": basis["manual"],
+                    # 整表没有一个字段在原文里有类型声明，说明类型全靠推断，需要单独提示
+                    "type_all_inferred": field_count > 0 and basis["source"] == 0 and basis["manual"] == 0,
                 }
             )
         return result
@@ -159,6 +196,85 @@ def edit_field(table_id: str, field_id: str, request: EditRequest) -> Dict[str, 
             session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return table_detail(session, table)
+
+
+@router.get("/types/template")
+def download_type_template(document_id: Optional[str] = None) -> Response:
+    """导出类型修正模板（CSV）：把当前字段和类型一起给出来，用户只改要改的那几列。"""
+    lines = ["报表代码,字段英文名,字段中文名,当前类型,长度,小数位,目标类型,目标长度,目标小数位,说明"]
+    with SessionLocal() as session:
+        query = (
+            session.query(FieldMetadataModel, TableMetadataModel)
+            .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+        )
+        if document_id:
+            query = query.filter(TableMetadataModel.document_id == document_id)
+        for field, table in query.order_by(TableMetadataModel.source_ordinal, FieldMetadataModel.sort_order).all():
+            lines.append(
+                ",".join(
+                    [
+                        table.table_code,
+                        field.field_en or "",
+                        (field.field_cn or "").replace(",", "，"),
+                        field.data_type or "",
+                        "" if field.length is None else str(field.length),
+                        "" if field.decimal_places is None else str(field.decimal_places),
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
+            )
+    body = "\ufeff" + "\n".join(lines) + "\n"
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="field_type_template.csv"'},
+    )
+
+
+def _read_import_rows(filename: str, content: bytes) -> List[List[str]]:
+    lowered = (filename or "").lower()
+    if lowered.endswith((".xlsx", ".xlsm")):
+        workbook = load_workbook(BytesIO(content), data_only=True)
+        sheet = workbook.active
+        return [[("" if cell is None else str(cell).strip()) for cell in row] for row in sheet.iter_rows(values_only=True)]
+    text = None
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            text = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise HTTPException(status_code=422, detail="无法识别文件编码，请另存为 UTF-8 或 xlsx")
+    return [[cell.strip() for cell in row] for row in csv.reader(io.StringIO(text))]
+
+
+@router.post("/types/import")
+async def import_field_types(
+    file: UploadFile = File(...),
+    editor: str = Form(default=OPERATOR_PLACEHOLDER),
+    reason: str = Form(default="批量导入类型修正"),
+    document_id: Optional[str] = Form(default=None),
+    dry_run: bool = Form(default=False),
+) -> Dict[str, Any]:
+    """批量修正字段类型。一行一个字段，只写要改的列；导入的行标成 MANUAL。"""
+    rows = _read_import_rows(file.filename or "", await file.read())
+    with SessionLocal() as session:
+        try:
+            return apply_field_type_import(
+                session,
+                rows,
+                editor=editor,
+                reason=reason,
+                document_id=document_id or None,
+                dry_run=dry_run,
+            )
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/tables/{table_id}/fields")

@@ -242,6 +242,51 @@ def document_code_set_ids(session: Session, document_id: str) -> set:
     return referenced_ids | sourced_ids
 
 
+def document_code_set_ordinals(session: Session, document_id: str, code_set_ids: set) -> Dict[str, int]:
+    """按"在当前文件里出现的先后"给码表定位。
+
+    优先用码表自身（码值来源块）的位置——附录里的码值表就排到附录那一块；
+    内联枚举没有独立的原文块，退回它所在字段的报表位置。
+    两者都定位不到的（例如只是被本文件引用、定义在别的文件里）返回 None，列表排最后。
+    """
+    ordinals: Dict[str, int] = {}
+    if not code_set_ids:
+        return ordinals
+    block_ordinal = {
+        row.id: row.ordinal
+        for row in session.query(RawBlockModel)
+        .filter(RawBlockModel.document_id == document_id)
+        .all()
+    }
+    located: set = set()
+    for value in session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(code_set_ids)).all():
+        block_id = (value.source_locator or {}).get("block_id")
+        if block_id in block_ordinal:
+            located.add(value.code_set_id)
+            candidate = block_ordinal[block_id] * 1000
+            if candidate < ordinals.get(value.code_set_id, candidate + 1):
+                ordinals[value.code_set_id] = candidate
+    rows = (
+        session.query(
+            FieldCodeReferenceModel.code_set_id,
+            TableMetadataModel.source_ordinal,
+            FieldMetadataModel.sort_order,
+        )
+        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+        .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+        .filter(TableMetadataModel.document_id == document_id)
+        .all()
+    )
+    for code_set_id, table_ordinal, field_order in rows:
+        if table_ordinal is None or code_set_id in located:
+            continue
+        # +400 起是为了排在"该表自身的码值表"之后、下一张表之前
+        candidate = table_ordinal * 1000 + 400 + int(field_order or 0)
+        if candidate < ordinals.get(code_set_id, candidate + 1):
+            ordinals[code_set_id] = candidate
+    return ordinals
+
+
 def refresh_reference_status(session: Session, code_set_id: str) -> None:
     session.flush()
     has_values = session.query(CodeValueModel).filter(
@@ -442,6 +487,16 @@ def _fill_code_values(
     return added
 
 
+def _stamp_field_ordinal(session: Session, code_set: CodeSetModel, field: FieldMetadataModel) -> None:
+    """内联枚举码表的排序位置取自它所在字段的报表位置。"""
+    if code_set.source_ordinal is not None:
+        return
+    table = session.get(TableMetadataModel, field.table_id) if field.table_id else None
+    block = session.get(RawBlockModel, table.block_id) if table and table.block_id else None
+    if block is not None:
+        code_set.source_ordinal = block.ordinal * 1000 + (field.sort_order or 0) + 1
+
+
 def ensure_field_reference(
     session: Session,
     field: FieldMetadataModel,
@@ -489,6 +544,7 @@ def ensure_field_reference(
                 )
                 session.add(code_set)
                 session.flush()
+                _stamp_field_ordinal(session, code_set, field)
                 for index, item in enumerate(enum_values):
                     session.add(
                         CodeValueModel(
@@ -528,6 +584,7 @@ def ensure_field_reference(
                 )
                 session.add(code_set)
                 session.flush()
+                _stamp_field_ordinal(session, code_set, field)
                 if by_name is not None:
                     by_name[text] = code_set
                 if by_code is not None:
@@ -684,6 +741,11 @@ def _upsert_code_set_draft(
         session.add(row)
         session.flush()
 
+    # 记下码表在原文里的位置，左侧列表才能按出现顺序排（×1000 给同块内留出插入空间）
+    if row.source_ordinal is None and locator.get("block_id"):
+        source_block = session.get(RawBlockModel, locator["block_id"])
+        if source_block is not None:
+            row.source_ordinal = source_block.ordinal * 1000
     existing_vals = {
         item.value: item
         for item in session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).all()

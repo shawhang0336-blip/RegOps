@@ -20,6 +20,7 @@ from .blobs import LocalBlobStore
 from .business import BusinessDatabaseError, ReadOnlyBusinessDatabase
 from .catalog import parse_document_catalog
 from .config import get_settings
+from .identity import OPERATOR_PLACEHOLDER
 from .db import SessionLocal, init_db
 from .events import append_event, fold_events
 from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
@@ -90,11 +91,11 @@ class RunRequest(BaseModel):
 
 class ConfirmationRequest(BaseModel):
     table_codes: List[str]
-    approver: str = Field(min_length=1, max_length=80)
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
 
 
 class TestConfirmationRequest(BaseModel):
-    approver: str = Field(min_length=1, max_length=80)
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
 
 
 class Decision(BaseModel):
@@ -103,7 +104,7 @@ class Decision(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    approver: str = Field(min_length=1, max_length=80)
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     decisions: List[Decision]
     provider: str = "live"
 

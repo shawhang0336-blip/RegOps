@@ -20,7 +20,12 @@ from .db import SessionLocal
 from .domain import FieldSpec, SpecDocument
 from .generic_ai import RealDesignLlm
 from .metadata_domain import MetadataFieldDraft, MetadataTableDraft, require_valid_metadata, validate_metadata_draft
-from .spec_parser import _parse_type_from_entry, extract_code_reference_from_text, extract_inline_enum_values
+from .spec_parser import (
+    _parse_type_from_entry,
+    extract_code_reference_from_text,
+    extract_inline_enum_values,
+    lookup_term_definition,
+)
 
 METADATA_BATCH_SIZE = 10
 
@@ -205,6 +210,20 @@ def table_needs_review(issues: List[Dict[str, Any]]) -> bool:
     return any(str(item.get("severity") or "").upper() == "ERROR" for item in issues)
 
 
+TYPE_BASIS_SOURCE = "SOURCE"
+TYPE_BASIS_INFERRED = "INFERRED"
+TYPE_BASIS_MANUAL = "MANUAL"
+
+
+def type_basis_for(raw_context: str, field_en: str) -> str:
+    """字段类型是原文写的，还是我们推断的。
+
+    SOURCE = 原文给了类型声明（哪怕没给长度）；INFERRED = 原文没提，类型是兜底猜的。
+    两者的可信度差一个量级，界面上必须能分开看。
+    """
+    return TYPE_BASIS_INFERRED if _field_declares_length(raw_context, field_en) is None else TYPE_BASIS_SOURCE
+
+
 def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
     return {
         "id": field.id,
@@ -218,6 +237,7 @@ def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
         "required": field.required,
         "code_reference_text": field.code_reference_text,
         "confidence": field.confidence,
+        "type_basis": (field.type_basis or "UNKNOWN"),
         "evidence_json": field.evidence_json,
         "sort_order": field.sort_order,
         "ai_value_json": field.ai_value_json,
@@ -357,6 +377,12 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
             table_definition=draft.table_definition,
             status="DRAFT",
             current_version=next_ver,
+            # 新版本行沿用原表在原文中的位置，否则列表里会掉到最前面
+            source_ordinal=(
+                existing.source_ordinal
+                if existing and existing.source_ordinal is not None
+                else block.ordinal
+            ),
         )
         session.add(table)
         session.flush()
@@ -365,7 +391,16 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
         values = field.model_dump()
         if not values["evidence_json"]:
             values["evidence_json"] = block.source_locator
-        session.add(FieldMetadataModel(id=str(uuid.uuid4()), table_id=table.id, sort_order=index, ai_value_json=values, **values))
+        session.add(
+            FieldMetadataModel(
+                id=str(uuid.uuid4()),
+                table_id=table.id,
+                sort_order=index,
+                ai_value_json=values,
+                type_basis=type_basis_for(block.raw_content, values["field_en"]),
+                **values,
+            )
+        )
     session.add(
         MetadataRevisionModel(
             id=str(uuid.uuid4()),
@@ -411,7 +446,10 @@ def _deterministic_field_draft(
 
     # Find term definition in terms_text if available
     field_def = field_cn
-    if terms_text and field_cn:
+    term_definition = lookup_term_definition(terms_text, field_cn)
+    if term_definition:
+        field_def = term_definition[:500]
+    elif terms_text and field_cn:
         idx = terms_text.find(field_cn)
         if idx >= 0:
             snippet = re.sub(r"\s+", " ", terms_text[idx : idx + 240]).strip()
@@ -443,6 +481,33 @@ def _deterministic_field_draft(
         confidence=0.5 if fallback_reason else (0.65 if "row" in raw_field and type_warnings else 0.95),
         evidence_json=evidence,
     )
+
+
+def _apply_source_definitions(
+    fields: List[MetadataFieldDraft],
+    chunk: List[Dict[str, Any]],
+    terms_text: str,
+) -> None:
+    """术语解释表里有的字段，定义一律取原文，不用模型转述。
+
+    模型拿到的是带折行的原始文本，它按自己的理解把两列拼回去，很容易把上一行的
+    名称残片写进定义里（"…不产生新的人 存款编号 民币结构性存款编号…"）。术语表已
+    经在解析阶段重排成"名称\\t定义"，这里直接覆盖，让定义始终可溯源。
+    """
+    if not terms_text:
+        return
+    label_by_en = {
+        str(item.get("name") or "").strip().upper(): str(item.get("content") or "").strip()
+        for item in chunk
+    }
+    for field in fields:
+        spec_cn = label_by_en.get((field.field_en or "").strip().upper(), "")
+        definition = lookup_term_definition(terms_text, spec_cn) or lookup_term_definition(terms_text, field.field_cn)
+        if not definition:
+            continue
+        if spec_cn and len(spec_cn) > len(field.field_cn or ""):
+            field.field_cn = spec_cn
+        field.field_definition = definition[:500]
 
 
 def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> str:
@@ -496,6 +561,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                     draft = MetadataTableDraft.model_validate(candidate)
                     if len(draft.fields) == len(chunk):
                         require_valid_metadata(draft)
+                        _apply_source_definitions(draft.fields, chunk, terms_text)
                         return draft.fields, draft.table_definition, trace
                 except Exception as exc:
                     err_msg = f"{type(exc).__name__}: {exc}"
@@ -675,12 +741,22 @@ def update_field(
         "required",
         "code_reference_text",
         "confidence",
+        "type_basis",
     }
     if any(key not in allowed for key in changes):
         raise ValueError("INVALID_FIELD_CHANGE")
+    if "type_basis" in changes and str(changes["type_basis"]).upper() not in {
+        TYPE_BASIS_SOURCE,
+        TYPE_BASIS_INFERRED,
+        TYPE_BASIS_MANUAL,
+    }:
+        raise ValueError("INVALID_TYPE_BASIS")
     old = _field_view(field)
     for key, value in changes.items():
         setattr(field, key, value)
+    # 人工改过类型/长度，就不再是"原文声明"或"AI 推断"，标成人工口径
+    if {"data_type", "length", "decimal_places"} & set(changes) and "type_basis" not in changes:
+        field.type_basis = TYPE_BASIS_MANUAL
     table.current_version += 1
     table.status = "DRAFT"
     session.add(
@@ -710,7 +786,7 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
             {
                 key: value
                 for key, value in _field_view(field).items()
-                if key not in {"id", "sort_order", "ai_value_json"}
+                if key not in {"id", "sort_order", "ai_value_json", "type_basis"}
             }
             for field in fields
         ],
@@ -764,3 +840,193 @@ def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocumen
         terms_text=block.raw_content,
         dictionary_text=block.raw_content,
     )
+
+
+# ---------------------------------------------------------------------------
+# 批量修正字段类型
+#
+# 用户拿到的规范里，类型常常整表缺失（例如统计制度只有"数值型"没给长度），
+# 逐个字段点开改不现实。这里用一张表（CSV/XLSX）一次性给出口径，
+# 导入的行一律标成 MANUAL——手工给的口径不该再显示成"原文声明"或"推断"。
+# ---------------------------------------------------------------------------
+
+TYPE_ALIASES = {
+    "varchar": "VARCHAR",
+    "字符型": "VARCHAR",
+    "字符": "VARCHAR",
+    "字符串": "VARCHAR",
+    "文本": "VARCHAR",
+    "string": "VARCHAR",
+    "char": "VARCHAR",
+    "number": "NUMBER",
+    "numeric": "NUMBER",
+    "decimal": "NUMBER",
+    "数值型": "NUMBER",
+    "数值": "NUMBER",
+    "数字": "NUMBER",
+    "整数型": "NUMBER",
+}
+
+IMPORT_HEADER_ALIASES = {
+    "table_code": "table_code",
+    "报表代码": "table_code",
+    "表代码": "table_code",
+    "表号": "table_code",
+    "field_en": "field_en",
+    "字段英文名": "field_en",
+    "字段": "field_en",
+    "英文名": "field_en",
+    "字段名": "field_en",
+    "data_type": "data_type",
+    "目标类型": "data_type",
+    "类型": "data_type",
+    "数据类型": "data_type",
+    "length": "length",
+    "目标长度": "length",
+    "长度": "length",
+    "decimal_places": "decimal_places",
+    "目标小数位": "decimal_places",
+    "小数位": "decimal_places",
+    "reason": "reason",
+    "说明": "reason",
+    "备注": "reason",
+}
+
+
+def normalize_type_name(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    return TYPE_ALIASES.get(raw.lower()) or TYPE_ALIASES.get(raw) or ""
+
+
+def apply_field_type_import(
+    session: Session,
+    rows: List[List[str]],
+    *,
+    editor: str,
+    reason: str = "批量导入类型修正",
+    document_id: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """按表里的行修正字段类型，返回改动明细与未导入行。
+
+    表头通过别名识别（报表代码/字段英文名/目标类型/目标长度/目标小数位/说明），
+    只写需要改的列即可；找不到字段或类型写错的行整体跳过并报行号，不中断整批。
+    """
+    if not rows:
+        raise ValueError("文件没有内容")
+    header = [str(cell or "").strip() for cell in rows[0]]
+    indexes = {IMPORT_HEADER_ALIASES[name]: index for index, name in enumerate(header) if name in IMPORT_HEADER_ALIASES}
+    if "field_en" not in indexes:
+        raise ValueError("缺少必需列：字段英文名（field_en）")
+    if not {"data_type", "length", "decimal_places"} & set(indexes):
+        raise ValueError("至少要有一列要改的内容：目标类型/长度/小数位")
+
+    def cell(values: List[str], key: str) -> str:
+        index = indexes.get(key)
+        if index is None or index >= len(values):
+            return ""
+        return str(values[index] or "").strip()
+
+    updated: List[Dict[str, Any]] = []
+    unchanged: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    tables = {
+        table.table_code.upper(): table
+        for table in session.query(TableMetadataModel).all()
+        if not document_id or table.document_id == document_id
+    }
+    versions: Dict[str, int] = {}
+    for line_no, values in enumerate(rows[1:], start=2):
+        if not any(str(item or "").strip() for item in values):
+            continue
+        field_en = cell(values, "field_en").upper()
+        table_code = cell(values, "table_code").upper()
+        if not field_en:
+            errors.append({"line": line_no, "message": "缺少字段英文名"})
+            continue
+        raw_type = cell(values, "data_type")
+        target_type = normalize_type_name(raw_type)
+        if raw_type and not target_type:
+            errors.append({"line": line_no, "message": f"无法识别的类型：{raw_type}"})
+            continue
+        try:
+            target_length = int(cell(values, "length")) if cell(values, "length") else None
+            target_dec = int(cell(values, "decimal_places")) if cell(values, "decimal_places") else None
+        except ValueError:
+            errors.append({"line": line_no, "message": "长度/小数位必须是整数"})
+            continue
+
+        candidates = [tables[table_code]] if table_code and table_code in tables else list(tables.values())
+        field = None
+        table = None
+        for candidate in candidates:
+            field = (
+                session.query(FieldMetadataModel)
+                .filter(FieldMetadataModel.table_id == candidate.id, FieldMetadataModel.field_en == field_en)
+                .first()
+            )
+            if field:
+                table = candidate
+                break
+        if not field or not table:
+            errors.append(
+                {
+                    "line": line_no,
+                    "message": f"找不到字段 {field_en}" + (f"（报表 {table_code}）" if table_code else ""),
+                }
+            )
+            continue
+
+        changes: Dict[str, Any] = {}
+        if target_type and (field.data_type or "").upper() != target_type:
+            changes["data_type"] = target_type
+        if target_length is not None and int(field.length or 0) != target_length:
+            changes["length"] = target_length
+        if target_dec is not None and int(field.decimal_places or 0) != target_dec:
+            changes["decimal_places"] = target_dec
+        if not changes:
+            unchanged.append({"line": line_no, "table_code": table.table_code, "field_en": field_en})
+            continue
+        if table.status == "PUBLISHED":
+            errors.append({"line": line_no, "message": f"{table.table_code}.{field_en} 已发布，不可直接修改"})
+            continue
+        old = {
+            "data_type": field.data_type,
+            "length": field.length,
+            "decimal_places": field.decimal_places,
+            "type_basis": field.type_basis,
+        }
+        for key, value in changes.items():
+            setattr(field, key, value)
+        field.type_basis = TYPE_BASIS_MANUAL
+        if not dry_run:
+            versions.setdefault(table.id, table.current_version)
+            table.current_version = versions[table.id] + 1
+            versions[table.id] += 1
+            table.status = "DRAFT"
+            session.add(
+                MetadataRevisionModel(
+                    id=str(uuid.uuid4()),
+                    table_id=table.id,
+                    field_id=field.id,
+                    revision_kind="HUMAN_EDIT",
+                    old_value_json=old,
+                    new_value_json={**old, **changes, "type_basis": TYPE_BASIS_MANUAL},
+                    editor=editor,
+                    reason=(cell(values, "reason") or reason)[:200],
+                )
+            )
+        updated.append({"line": line_no, "table_code": table.table_code, "field_en": field_en, "changes": changes})
+    if dry_run:
+        session.rollback()
+    else:
+        session.commit()
+    return {
+        "updated": len(updated),
+        "unchanged": len(unchanged),
+        "errors": errors,
+        "details": updated,
+        "dry_run": dry_run,
+    }

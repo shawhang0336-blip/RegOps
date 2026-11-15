@@ -11,6 +11,7 @@ from .spec_parser import (
     _parse_fields,
     extract_code_reference_from_text,
     extract_inline_enum_values,
+    reflow_spec_terms,
 )
 
 MARKERS = {"数据术语解释", "数据格式", "数据字典"}
@@ -95,6 +96,7 @@ def _parse_chapter6_catalog(full_text: str, path: Path, digest: str) -> List[Dic
             terms_text = section_text[terms_marker.end():format_marker.start()] if terms_marker else ""
             format_text = section_text[format_marker.end():local_markers[-1].start()]
             dictionary_text = section_text[local_markers[-1].end():]
+            terms_text = reflow_spec_terms(terms_text)
             fields = _parse_fields(
                 format_text,
                 dictionary_text,

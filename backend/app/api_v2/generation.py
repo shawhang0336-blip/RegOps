@@ -15,6 +15,7 @@ from ..db import SessionLocal
 from ..domain import canonical_json
 from ..events import append_event
 from ..generic_workflow import _create_run, _execute_run
+from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_service import metadata_to_spec
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/generation", tags=["generation"])
 
 class GenerationRequest(BaseModel):
     table_ids: List[str]
-    approver: str = Field(min_length=1, max_length=80)
+    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     provider: str = "live"
 
 

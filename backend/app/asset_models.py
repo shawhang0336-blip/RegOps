@@ -70,6 +70,8 @@ class TableMetadataModel(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     published_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # 码表在原文中的出现顺序（来源块的 ordinal），列表按它排序才符合阅读顺序
+    source_ordinal: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -84,6 +86,8 @@ class FieldMetadataModel(Base):
     field_en: Mapped[str] = mapped_column(String(128))
     field_definition: Mapped[str] = mapped_column(Text)
     check_text_raw: Mapped[str] = mapped_column(Text)
+    # SOURCE=原文声明了类型 / INFERRED=推断或默认 / MANUAL=人工确认过 / UNKNOWN=历史数据
+    type_basis: Mapped[str] = mapped_column(String(16), default="UNKNOWN", server_default="UNKNOWN")
     data_type: Mapped[str] = mapped_column(String(32))
     length: Mapped[int] = mapped_column(Integer)
     decimal_places: Mapped[int] = mapped_column(Integer, default=0)
@@ -134,6 +138,8 @@ class CodeSetModel(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     published_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # 码表在原文中的出现顺序（来源块的 ordinal）
+    source_ordinal: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

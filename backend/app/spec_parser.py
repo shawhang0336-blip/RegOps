@@ -110,6 +110,178 @@ NON_XML_FIELD_CODE_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# PDF 表格折行重排
+#
+# pdftotext -layout 保留列位置，但一个单元格的字数超过列宽时会折到下一行，且
+# 另一列（常见是"校验""定义"）也可能同时折行。直接把文本按 \s+ 压平再按字段名
+# 锚点切片，就会把"列 2 的折行残片"拼进"列 4 的校验原文"：
+#   STRDECODE  人民币结构性存  字符型，28  必填项，唯一性编码。
+#              款编号
+#   → content=人民币结构性存（截断）、check_text=必填项，唯一性编码。款编号（串行）
+# 这里按列位置把折行拼回各自所属的单元格，保证下游切片的输入是"一行一条记录"。
+# ---------------------------------------------------------------------------
+
+_TYPE_DECL = (
+    "定长字符型|变长字符型|定长数字型|变长数值型|长整数型|定长型|变长型|"
+    "字符型|数值型|日期型|整数型|时间型|日期时间型"
+)
+_TYPE_DECL_RE = re.compile(rf"(?:{_TYPE_DECL})\s*[，,]?\s*\d+(?:\.\d+)?|(?:{_TYPE_DECL})")
+_ROW_HEADER_RE = re.compile(r"^\s*(?:字段|基础数据项|数据项|序号|栏目)\s")
+_PAGE_NOISE_RE = re.compile(r"^\s*\d{1,4}\s*$|国家外汇管理局.*采集规范|^\s*[-—]?\s*\d+\s*[-—]?\s*$")
+# 跨页重复的表头可能只剩后半截（"内容  类型（长度）  校验"），不能当成续行拼接
+_HEADER_TOKEN_RE = re.compile(r"字段(?:名|英文名|代码)?|内容|类型（长度）|类型|数据长度|长度|校验|名称")
+
+
+def _is_header_residue(stripped: str) -> bool:
+    remainder = _HEADER_TOKEN_RE.sub("", stripped)
+    return not re.sub(r"[\s（）()／/|、，,]", "", remainder)
+
+
+def _is_noise_line(line: str) -> bool:
+    stripped = line.replace("\f", "").strip()
+    if not stripped:
+        return True
+    if _PAGE_NOISE_RE.search(stripped):
+        return True
+    if _ROW_HEADER_RE.match(stripped):
+        return True
+    if "类型" in stripped and _is_header_residue(stripped):
+        return True
+    # 跨页重复的表头：字段 内容 类型（长度） 校验
+    if re.match(r"^字段\s", stripped) and ("类型" in stripped or "内容" in stripped):
+        return True
+    return False
+
+
+def _next_nonspace(text: str, start: int) -> Optional[int]:
+    for index in range(start, len(text)):
+        if not text[index].isspace():
+            return index
+    return None
+
+
+def _second_token_start(line: str) -> Optional[int]:
+    """返回同一行第二个"词"的起始列，用来定位第二列的列位。"""
+    lead = len(line) - len(line.lstrip())
+    cursor = lead
+    while cursor < len(line) and not line[cursor].isspace():
+        cursor += 1
+    return _next_nonspace(line, cursor)
+
+
+def reflow_dictionary_rows(text: str) -> str:
+    """把 4 列数据字典（字段/内容/类型（长度）/校验）的折行拼回单行记录。
+
+    输出每行形如 ``FIELD_EN 中文名 类型，长度 校验原文``，下游压平后按字段锚点
+    切片即可得到干净的单元格，不再串列。
+    """
+    if not text:
+        return text
+    rows: List[Dict[str, Any]] = []
+    for raw_line in text.replace("\f", "").split("\n"):
+        if _is_noise_line(raw_line):
+            continue
+        decl = _TYPE_DECL_RE.search(raw_line)
+        if decl:
+            name_start = len(raw_line) - len(raw_line.lstrip())
+            type_start = decl.start()
+            check_start = _next_nonspace(raw_line, decl.end())
+            rows.append(
+                {
+                    "name": raw_line[name_start:type_start].strip(),
+                    "decl": decl.group(0).strip(),
+                    "check": raw_line[check_start:].strip() if check_start is not None else "",
+                    "name_start": name_start,
+                    "type_start": type_start,
+                    "check_start": check_start if check_start is not None else decl.end(),
+                }
+            )
+            continue
+        if not rows:
+            continue
+        current = rows[-1]
+        name_part = raw_line[current["name_start"] : current["type_start"]].strip()
+        check_part = raw_line[current["check_start"] :].strip()
+        if name_part:
+            current["name"] += re.sub(r"\s+", "", name_part)
+        if check_part:
+            current["check"] += check_part
+    return "\n".join(f"{row['name']} {row['decl']} {row['check']}".strip() for row in rows)
+
+
+def reflow_spec_terms(text: str) -> str:
+    """把「基础数据项 / 定义」两列折行拼回 ``名称 \\t 定义`` 的单行形式。
+
+    定义列宽度固定，名称折行时续行只有名称列有字。识别新术语的条件是：该行定义列
+    有内容，且上一条定义已以句末标点收尾；否则视为上一条的名称续行。
+    """
+    if not text:
+        return text
+    lines = [line.replace("\f", "") for line in text.split("\n")]
+    def_col: Optional[int] = None
+    for line in lines:
+        if _is_noise_line(line):
+            continue
+        second = _second_token_start(line)
+        if second is not None:
+            def_col = second
+            break
+    if def_col is None or def_col < 4:
+        return text
+
+    entries: List[Dict[str, str]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        name_part = line[:def_col].strip()
+        def_part = line[def_col:].strip() if len(line) > def_col else ""
+        if "定义" in name_part and not def_part:
+            continue
+        if "定义" in def_part and not entries:
+            continue
+        if not entries:
+            if name_part and def_part:
+                entries.append({"name": name_part, "definition": def_part})
+            continue
+        current = entries[-1]
+        if not def_part:
+            if name_part:
+                current["name"] += re.sub(r"\s+", "", name_part)
+            continue
+        if not name_part:
+            current["definition"] += def_part
+            continue
+        finished = current["definition"].rstrip().endswith(("。", "；", "！", "？"))
+        if finished or len(name_part) > 8:
+            entries.append({"name": name_part, "definition": def_part})
+        else:
+            current["name"] += re.sub(r"\s+", "", name_part)
+            current["definition"] += def_part
+    if not entries:
+        return text
+    return "\n".join(f"{entry['name']}\t{entry['definition']}" for entry in entries)
+
+
+def lookup_term_definition(terms_text: str, field_cn: str) -> str:
+    """在（已重排的）术语文本里取该字段的定义，取不到返回空串。"""
+    name = (field_cn or "").strip()
+    if not name or not terms_text:
+        return ""
+    for line in terms_text.split("\n"):
+        if "\t" not in line:
+            continue
+        term, definition = line.split("\t", 1)
+        if term.strip() == name:
+            return definition.strip()
+    index = terms_text.find(name)
+    if index < 0:
+        return ""
+    tail = terms_text[index + len(name) :].split("\n", 1)[0]
+    return tail.strip(" \t：:")
+
+
 def extract_code_reference_from_text(text: str) -> str:
     if not text:
         return ""
@@ -399,8 +571,11 @@ def _find_field_anchor(compact: str, compact_lower: str, candidate: str, start: 
     按字符串首次出现定位会把 A0117 的起点落到公式里，导致该字段的类型/长度解析失败、
     校验原文退化成 "+"。真正的字段起点两侧不会紧邻运算符。
     """
-    # 公式里字段名两侧常是运算符或连接词（A0130x和A0131x、A0117+A0118）
-    formula_neighbors = "+-=—<>≤≥（(【[、，,和及与加减乘除"
+    # 公式里字段名两侧常是运算符或连接词（A0130x和A0131x、A0117+A0118）。
+    # 注意这里只能用"符号 + 单字连接词"做集合判断：早先写成字符串包含判断，
+    # 里面混进了"加减乘除"四个字，导致前面一个字是"除"的正常行（…D-删除ACTIONDESC）
+    # 被当成公式命中而跳过，字段锚点丢失、整行被上一条吞掉。
+    formula_neighbors = {"+", "-", "=", "—", "<", ">", "≤", "≥", "（", "(", "【", "[", "、", "，", ",", "和", "及", "与"}
     pos = max(0, start)
     while True:
         index = compact_lower.find(candidate, pos)
@@ -411,7 +586,7 @@ def _find_field_anchor(compact: str, compact_lower: str, candidate: str, start: 
         if after and after in formula_neighbors:
             pos = index + 1
             continue
-        if before and before in "=+—<>≤≥和及与加减乘除":
+        if before and before in formula_neighbors:
             pos = index + 1
             continue
         return index
@@ -544,12 +719,20 @@ def _parse_fields(
     repair_layout: bool = True,
     parse_warnings: Optional[List[str]] = None,
 ) -> List[FieldSpec]:
+    # 折行重排必须在切分之前：按字段名锚点切片时，折行残片会串到相邻单元格。
+    # 少数表（6.1）原文列本身错位，重排反而更乱，因此保留原文兜底。
+    reflowed = reflow_dictionary_rows(dictionary_text)
+    if reflowed != dictionary_text:
+        try:
+            return _parse_fields_strict(format_text, reflowed, evidence_page, expected_fields, repair_layout)
+        except SpecParseError:
+            pass
     try:
         return _parse_fields_strict(format_text, dictionary_text, evidence_page, expected_fields, repair_layout)
     except SpecParseError:
         if expected_fields or repair_layout:
             raise
-        return _parse_fields_flexible(format_text, dictionary_text, evidence_page, parse_warnings)
+        return _parse_fields_flexible(format_text, reflowed, evidence_page, parse_warnings)
 
 
 def _parse_location(

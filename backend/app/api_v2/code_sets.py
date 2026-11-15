@@ -8,9 +8,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel, RawBlockModel, TableMetadataModel
-from ..code_service import auto_link_all_references, code_set_summary, document_code_set_ids, extract_parallel_for_blocks, refresh_reference_status
+from ..code_service import (
+    auto_link_all_references,
+    code_set_summary,
+    document_code_set_ids,
+    document_code_set_ordinals,
+    extract_parallel_for_blocks,
+    refresh_reference_status,
+)
 from ..config import get_settings
 from ..db import SessionLocal
+from ..identity import OPERATOR_PLACEHOLDER
 from ..structure_service import analyze_document_structure
 from .documents import ingest_uploaded_file
 
@@ -26,14 +34,14 @@ class CodeSetRequest(BaseModel):
 
 class VersionRequest(BaseModel):
     expected_version: int
-    editor: str = Field(min_length=1, max_length=80)
+    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     reason: str = ""
     changes: Dict[str, Any] = {}
 
 
 class CodeValueRequest(BaseModel):
     expected_version: int
-    editor: str = Field(min_length=1, max_length=80)
+    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
     value: str = Field(min_length=1)
     label_cn: str = Field(min_length=1)
     label_en: str = ""
@@ -81,10 +89,21 @@ def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
 def list_code_sets(document_id: Optional[str] = None, include_placeholders: bool = False) -> List[Dict[str, Any]]:
     with SessionLocal() as session:
         query = session.query(CodeSetModel)
+        local_ordinals: Dict[str, int] = {}
         if document_id:
             ids = document_code_set_ids(session, document_id)
             query = query.filter(CodeSetModel.id.in_(ids))
-        rows = query.order_by(CodeSetModel.updated_at.desc()).all()
+            local_ordinals = document_code_set_ordinals(session, document_id, ids)
+        rows = query.all()
+        # 单文件视图按"在本文件里出现的顺序"排；全部码表按各自的来源顺序排。
+        # 定位不到来源的排最后（而不是排最前），避免一堆 NULL 打乱阅读顺序。
+        def sort_key(row: CodeSetModel):
+            ordinal = local_ordinals.get(row.id) if document_id else None
+            if ordinal is None:
+                ordinal = row.source_ordinal
+            return (ordinal is None, ordinal if ordinal is not None else 0, row.code)
+
+        rows.sort(key=sort_key)
         result = []
         for row in rows:
             summary = code_set_summary(session, row)
