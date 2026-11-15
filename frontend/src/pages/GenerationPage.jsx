@@ -177,7 +177,6 @@ export default function GenerationPage() {
   }
 
   const fullCount = tables.filter((t) => selectable(t.id)).length
-  const ddlBlockedCount = tables.filter((t) => !ddlReady(t.id)).length
   const warnedSelected = selected.filter((id) => pendingWarnings(id).length > 0).length
 
   return (
@@ -202,14 +201,14 @@ export default function GenerationPage() {
 
       <section className="metrics metrics-three">
         <div>
-          <span>三项就绪</span>
-          <strong>{fullCount} 张</strong>
+          <span>共 {tables.length} 张报表</span>
+          <strong>{fullCount} 张可生成</strong>
           <small>能建表、能灌码值、规则原料齐</small>
         </div>
         <div>
-          <span>DDL 卡住</span>
-          <strong>{ddlBlockedCount} 张</strong>
-          <small>{ddlBlockedCount > 0 ? '字段名超长或类型无法映射' : '当前没有卡住项'}</small>
+          <span>不能生成</span>
+          <strong>{tables.length - fullCount} 张</strong>
+          <small>待复核 / DDL 卡住 / 码值或规则原料缺，下方标了原因</small>
         </div>
         <div>
           <span>本次已选择</span>
@@ -238,13 +237,6 @@ export default function GenerationPage() {
           <div className="actions">
             <button type="button" className="button secondary sm" onClick={selectAllReady}>
               全选可生成 ({fullCount})
-            </button>
-            <button
-              type="button"
-              className="button secondary sm"
-              onClick={() => setSelected(tables.filter((t) => selectable(t.id)).map((t) => t.id))}
-            >
-              选择 DDL 就绪 ({tables.length - ddlBlockedCount})
             </button>
             <button type="button" className="button secondary sm" onClick={() => setSelected([])}>
               清空选择
