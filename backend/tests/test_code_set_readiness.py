@@ -122,5 +122,21 @@ def test_summary_counts_ready_and_referenced():
     summary = payload["summary"]
     assert summary["total"] == 1
     assert summary["referenced"] == 1
-    assert summary["ready_and_referenced"] == 1
+    assert summary["ready"] == 1
+    assert summary["blocked"] == 0
     assert summarize_code_sets([])["total"] == 0
+
+
+def test_summary_does_not_report_publish_state():
+    """码表发布已经自动化，「已发布多少张」对用户没有意义。
+
+    用户只需要知道：哪些齐备、哪些要回原文补。留着「已发布/待发布」只会让人
+    以为还要去哪点一下。
+    """
+    session = make_session()
+    make_set(session, values=[("USD", "美元")])
+    summary = evaluate_code_sets(session)["summary"]
+    assert "published" not in summary
+    assert "ready_to_publish" not in summary
+    assert "ready_and_referenced" not in summary
+    assert set(summary) >= {"total", "ready", "blocked", "referenced", "referenced_ready", "blocker_codes"}

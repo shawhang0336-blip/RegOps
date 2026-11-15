@@ -195,51 +195,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     }
   }
 
-  async function publish() {
-    setBusy(true)
-    setError('')
-    try {
-      const body = await v2(`/code-sets/${detail.id}/publish`, {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          reason: '正式发布码值表版本',
-          changes: {},
-        }),
-      })
-      setDetail(body)
-      await load(body.id)
-      setNotice(`已发布码值表「${body.name}」v${body.published_version}，所有关联字段的码值引用状态已同步更新。`)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function publishReadyCodeSets() {
-    const documentId = params.get('document_id')
-    const target = readiness?.summary?.ready_and_referenced || 0
-    if (!target) return
-    if (!window.confirm(`将发布 ${target} 张被引用的码表。发布后这些码值会进入阶段 2 的产出包。继续？`)) {
-      return
-    }
-    setBusy(true)
-    setError('')
-    try {
-      const result = await v2('/code-sets/publish-batch', {
-        method: 'POST',
-        body: JSON.stringify({ document_id: documentId || undefined, referenced_only: true }),
-      })
-      setNotice(`已发布 ${result.published} 张码表，跳过 ${result.skipped} 张。`)
-      await load(detail?.id)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   async function importExcel(event) {
     const file = event.target.files?.[0]
     event.target.value = ''
@@ -286,7 +241,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
       {!embedded && <PageHeader
         eyebrow="第 1 步 · 共 3 步"
         title="维护码值"
-        description="检查字段可使用的取值，补充缺失内容并发布；已就绪的码值才能用于生成和验证。"
+        description="检查字段可使用的取值，补充缺失内容。码值表不用手动发布，选表生成时会自动带出去。"
       />}
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
@@ -311,26 +266,24 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
         同时提取字段说明中列出的取值
       </label>
 
-      {readiness && readiness.summary.ready_and_referenced > 0 && (
+      {readiness && (
         <div className="readiness-summary">
           <div className="readiness-summary-main">
             <strong>
-              还有 {readiness.summary.ready_and_referenced} 张被引用的码表可以发布
+              码值表 {readiness.summary.total} 张 · 齐备 {readiness.summary.ready} 张
+              {readiness.summary.blocked > 0 ? ` · 需补 ${readiness.summary.blocked} 张` : ''}
             </strong>
             <span className="muted-text">
-              已发布 {readiness.summary.published} / 被引用 {readiness.summary.referenced} 张 ·
-              卡点：{readiness.summary.blocker_codes.length
-                ? readiness.summary.blocker_codes.map(([code, count]) => `${code} ${count}`).join('、')
-                : '无'}
+              被字段引用 {readiness.summary.referenced} 张
+              {readiness.summary.blocker_codes.length
+                ? ` · 卡点：${readiness.summary.blocker_codes.map(([code, count]) => `${code} ${count}`).join('、')}`
+                : ''}
             </span>
           </div>
-          <button type="button" className="button secondary sm" disabled={busy} onClick={publishReadyCodeSets}>
-            批量发布可发布的码表
-          </button>
-          {readiness.summary.blocker_codes.length > 0 && (
+          {readiness.summary.blocked > 0 && (
             <p className="readiness-hint">
-              空占位码表（没有码值）和被引用字段更短的码值不会被发布——阶段 2 只认已发布码表，
-              发进去的脏数据会直接进产出包。
+              这些是空占位码表（没有码值）、缺中文含义，或码值比引用字段更长的——要回原文补。
+              齐备的码值表不用在这里发布，选表生成时会自动发出去。
             </p>
           )}
         </div>
@@ -415,7 +368,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   {set.unresolved_reference_count > 0 ? (
                     <em className="danger-text">还有 {set.unresolved_reference_count} 个字段待关联</em>
                   ) : (
-                    <em>{set.published_version ? `已发布 v${set.published_version}` : '尚未发布'} · {set.value_count} 项取值</em>
+                    <em>{set.value_count} 项取值</em>
                   )}
                 </div>
               ))}
@@ -460,7 +413,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   </div>
                   <p>
                     {detail.definition || '暂无字典定义'} · 当前版本 v{detail.current_version}
-                    {detail.published_version ? `（已发布 v${detail.published_version}）` : ''}
                   </p>
                 </div>
                 <div className="actions">
@@ -480,9 +432,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                       onChange={importExcel}
                     />
                   </label>
-                  <button type="button" className="button primary" disabled={busy} onClick={publish}>
-                    发布此码值表
-                  </button>
                 </div>
               </div>
 

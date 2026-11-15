@@ -91,16 +91,16 @@ def summarize_code_sets(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     for item in results:
         for blocker in item["blockers"]:
             blockers[blocker["code"]] = blockers.get(blocker["code"], 0) + 1
-    published = sum(1 for item in results if item["status"] == "PUBLISHED")
     referenced = [item for item in results if item["reference_count"] > 0]
+    ready = sum(1 for item in results if not item["blockers"])
     return {
         "total": len(results),
-        "published": published,
+        # 码表「发布」已经自动化（选表生成时自动发），所以「已发布多少张」对用户没有意义。
+        # 用户要看的只有两类：齐备的、以及需要回原文补的。
+        "ready": ready,
+        "blocked": len(results) - ready,
         "referenced": len(referenced),
-        "ready_to_publish": sum(1 for item in results if item["ready"] and item["status"] != "PUBLISHED"),
-        "ready_and_referenced": sum(
-            1 for item in referenced if item["ready"] and item["status"] != "PUBLISHED"
-        ),
+        "referenced_ready": sum(1 for item in referenced if not item["blockers"]),
         "blocker_codes": sorted(blockers.items(), key=lambda pair: pair[1], reverse=True),
     }
 
