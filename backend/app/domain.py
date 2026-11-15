@@ -12,6 +12,9 @@ class FieldSpec(BaseModel):
     length: int = 255
     decimal_places: Optional[int] = None
     check_text: str = ""
+    # AI 抽取时填的「码值引用」原文。它不是校验文字的一部分，但固定值约束
+    # （「本项固定填“中国”」）只在这里出现，规则生成要用到。
+    code_reference: str = ""
     evidence_page: str
 
 

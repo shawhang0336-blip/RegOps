@@ -513,6 +513,18 @@ def ensure_field_reference(
     text = (field.code_reference_text or "").strip()
     if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
         return
+    fixed = parse_fixed_value(text)
+    if fixed:
+        # 固定值不是码表引用：不建占位码表，也不该在「码值待补」里出现。
+        # 值本身留在 code_reference_text 里，阶段 2 的 AI 依据校验原文生成 ENUM。
+        session.flush()
+        existing_fixed = session.query(FieldCodeReferenceModel).filter(
+            FieldCodeReferenceModel.field_id == field.id
+        ).first()
+        if existing_fixed:
+            session.delete(existing_fixed)
+            session.flush()
+        return
     code_set = _find_matching_code_set(
         session,
         text,
@@ -626,6 +638,46 @@ def ensure_field_reference(
         session.add(ref)
         if existing_ref_by_field is not None:
             existing_ref_by_field[field.id] = ref
+
+
+# 「本项固定填“中国”」「个人主体固定取值“N/A”」——这是固定值约束，不是码表引用。
+# AI 抽取时把这类表述填进了 code_reference_text，于是一路变成"码表引用解析不到"，
+# 在码值页堆出一堆要补的占位码表。用户点进去只看到一张空表，完全不知道要改什么。
+FIXED_VALUE_HINT_RE = re.compile(r"(?:本项)?(?:固定|恒)\s*(?:填|填报|填写|取\s*值|取|为|值)?\s*[:：]?\s*")
+_QUOTES = "\"'“”‘’「」『』《》【】[]()（） "
+
+
+def parse_fixed_value(text: str) -> Optional[str]:
+    """从引用原文里提取固定值。
+
+    「本项固定填“中国”」→ 中国；「0 或 1」这种多值、或者根本不是固定值表述的，返回 None。
+    """
+    if not text:
+        return None
+    match = FIXED_VALUE_HINT_RE.search(text)
+    if not match:
+        return None
+    rest = text[match.end():].strip()
+    value = rest.split("，")[0].split("。")[0].strip(_QUOTES).strip()
+    value = re.split(r"[，。；;、\s]", value, maxsplit=1)[0].strip(_QUOTES)
+    if not value or len(value) > 30:
+        return None
+    # 「0 或 1」是两个取值，不是固定值
+    if "或" in rest[: len(value) + 4]:
+        return None
+    return value
+
+
+def is_conditional_phrase(text: str) -> bool:
+    """这句话是不是只在某个前提下成立。
+
+    「如为个人主体，则此项填写 N/A」是条件取值——非个人主体时要填真实名称，
+    卡成无条件 ENUM 会把正常数据全判违规。判断依据必须看校验原文，
+    不能只看「固定取值」那句引用摘要。
+    """
+    if not text:
+        return False
+    return bool(re.search(r"(如|若|当|如果)[^。；]{0,40}(则|时|的|，)", text))
 
 
 def ensure_table_references(session: Session, table: TableMetadataModel) -> None:

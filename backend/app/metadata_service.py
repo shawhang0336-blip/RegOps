@@ -895,6 +895,7 @@ def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocumen
                 length=field.length,
                 decimal_places=field.decimal_places,
                 check_text=field.check_text_raw,
+                code_reference=field.code_reference_text or "",
                 evidence_page=str(field.evidence_json.get("page", field.evidence_json)),
             )
             for field in fields

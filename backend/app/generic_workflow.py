@@ -848,6 +848,84 @@ def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
     return rules + added
 
 
+def _fixed_value_candidates(specs, rules) -> List[tuple]:
+    """找出「原文明确要求本项固定填某个值」的字段。
+
+    这类表述原来被当成码表引用，在码值页堆出一堆空占位表等人去补，
+    其实根本没有码表可补。无条件固定值直接生成 ENUM 即可；
+    条件性的（「如为个人主体，则填写 N/A」）不在这里处理——非个人主体时
+    要填真实名称，卡成固定值会把正常数据全判违规。
+    """
+    from .code_service import is_conditional_phrase, parse_fixed_value
+
+    covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
+    candidates = []
+    for spec in specs:
+        for field in spec.fields:
+            if (spec.table_code, field.name) in covered:
+                continue
+            value = parse_fixed_value(field.code_reference or "") or parse_fixed_value(field.check_text or "")
+            if not value:
+                continue
+            if is_conditional_phrase(field.check_text or ""):
+                continue
+            candidates.append((spec, field, value))
+    return candidates
+
+
+def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefinition]:
+    """按原文的固定值要求补齐 ENUM。"""
+    added: List[RuleDefinition] = []
+    for spec, field, value in _fixed_value_candidates(specs, rules):
+        rule_key = f"{spec.table_code}_{field.name}_FIXED_VALUE_ENUM"
+        try:
+            bound = bind_rules(
+                spec,
+                [
+                    {
+                        "field": field.name,
+                        "operator": "ENUM",
+                        "params": {"values": [value]},
+                        "rule_key": rule_key,
+                        "evidence_kind": "DICTIONARY",
+                        "rationale": (
+                            f"原文要求本项固定为「{value}」"
+                            f"（{(field.code_reference or field.check_text)[:60]}），"
+                            "故取值只能是这一个（由元数据机械补齐，非 AI 生成）"
+                        ),
+                    }
+                ],
+            )
+        except (RuleValidationError, WorkflowError) as exc:
+            append_event(
+                session,
+                run,
+                "RULE_BACKFILL_GAP",
+                "rule_backfill",
+                {"table_code": spec.table_code, "field": field.name, "value": value, "error": str(exc)},
+            )
+            continue
+        _upsert_rule(session, run, bound[0], "APPROVED")
+        added.append(bound[0])
+    if added:
+        session.flush()
+        append_event(
+            session,
+            run,
+            "RULE_BACKFILL",
+            "rule_backfill",
+            {
+                "total": len(added),
+                "rules": [
+                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
+                    for rule in added
+                ],
+                "note": "原文要求固定取值但 AI 未生成 ENUM 规则，已确定性补齐",
+            },
+        )
+    return rules + added
+
+
 def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None):
     _, field_code_sets = load_published_code_sets(session, specs)
 
@@ -1287,6 +1365,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
     rules = _backfill_required_rules(session, run, specs, rules)
     rules = _backfill_length_rules(session, run, specs, rules)
+    rules = _backfill_fixed_value_rules(session, run, specs, rules)
     prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
     golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans)
     session.commit()
