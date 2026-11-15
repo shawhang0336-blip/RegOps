@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
-import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import {
@@ -29,13 +28,25 @@ const emptyField = {
   evidence_json: { source: 'HUMAN' },
 }
 
+// 类型是原文写的，还是程序推断的，可信度差一个量级，界面上必须一眼能分开
+const TYPE_BASIS_META = {
+  SOURCE: { label: '原文有依据', tone: 'green' },
+  INFERRED: { label: '类型是推断', tone: 'amber' },
+  MANUAL: { label: '人工确认', tone: 'blue' },
+  UNKNOWN: { label: '待确认', tone: 'neutral' },
+}
+
+function typeBasisMeta(basis) {
+  return TYPE_BASIS_META[String(basis || 'UNKNOWN').toUpperCase()] || TYPE_BASIS_META.UNKNOWN
+}
+
 export default function MetadataPage({ embedded = false }) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
-  const { requireOperator } = useOperator()
 
   const [tables, setTables] = useState([])
   const [detail, setDetail] = useState(null)
+  const [baselineFields, setBaselineFields] = useState({})
   const [unresolvedRefs, setUnresolvedRefs] = useState([])
   const [codeSets, setCodeSets] = useState([])
   const [editingFieldId, setEditingFieldId] = useState(null)
@@ -45,6 +56,10 @@ export default function MetadataPage({ embedded = false }) {
   const [tab, setTab] = useState(params.get('tab') || 'fields')
   const [fieldSearch, setFieldSearch] = useState('')
   const [onlyIssues, setOnlyIssues] = useState(false)
+  const [onlyInferred, setOnlyInferred] = useState(false)
+  const [showTypeImport, setShowTypeImport] = useState(false)
+  const [typeImportFile, setTypeImportFile] = useState(null)
+  const [typeImportResult, setTypeImportResult] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -82,6 +97,7 @@ export default function MetadataPage({ embedded = false }) {
   async function select(id, resetTab = false) {
     const data = await v2(`/metadata/tables/${id}`)
     setDetail(data)
+    setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
     setEditingFieldId(null)
     if (resetTab) setTab('fields')
   }
@@ -96,8 +112,31 @@ export default function MetadataPage({ embedded = false }) {
   const saveField = useCallback(
     async (field) => {
       if (!field || !detail) return
-      const editor = requireOperator(setError)
-      if (!editor) return
+      // 只提交真正改过的项：把没动的类型一起提交会让后端把"原文声明"错标成人工口径
+      const base = baselineFields[field.id] || {}
+      const candidates = {
+        field_cn: field.field_cn,
+        field_en: field.field_en,
+        field_definition: field.field_definition,
+        check_text_raw: field.check_text_raw,
+        data_type: field.data_type,
+        length: Number(field.length),
+        decimal_places: Number(field.decimal_places),
+        required: Boolean(field.required),
+        code_reference_text: field.code_reference_text,
+        type_basis: field.type_basis,
+      }
+      const changes = {}
+      Object.entries(candidates).forEach(([key, value]) => {
+        const before = key === 'required' ? Boolean(base[key]) : base[key]
+        if (value !== before && !(key === 'type_basis' && !value)) {
+          changes[key] = value
+        }
+      })
+      if (Object.keys(changes).length === 0) {
+        setNotice('字段内容没有变化，无需保存。')
+        return
+      }
       setBusy(true)
       setError('')
       try {
@@ -105,22 +144,12 @@ export default function MetadataPage({ embedded = false }) {
           method: 'PATCH',
           body: JSON.stringify({
             expected_version: detail.current_version,
-            editor,
             reason: editReason || '人工复核元数据',
-            changes: {
-              field_cn: field.field_cn,
-              field_en: field.field_en,
-              field_definition: field.field_definition,
-              check_text_raw: field.check_text_raw,
-              data_type: field.data_type,
-              length: Number(field.length),
-              decimal_places: Number(field.decimal_places),
-              required: Boolean(field.required),
-              code_reference_text: field.code_reference_text,
-            },
+            changes,
           }),
         })
         setDetail(body)
+        setBaselineFields(Object.fromEntries((body.fields || []).map((item) => [item.id, { ...item }])))
         await load(body.id)
         setNotice(`字段「${field.field_cn} (${field.field_en})」已保存，当前表升级为草稿 v${body.current_version}。`)
       } catch (err) {
@@ -129,7 +158,7 @@ export default function MetadataPage({ embedded = false }) {
         setBusy(false)
       }
     },
-    [detail, editReason, requireOperator]
+    [detail, editReason, baselineFields]
   )
 
   const isPublished = detail?.status === 'PUBLISHED'
@@ -179,8 +208,7 @@ export default function MetadataPage({ embedded = false }) {
   }, [activeField, tab, isPublished, busy, filteredFields, saveField])
 
   async function removeField(field) {
-    const editor = requireOperator(setError)
-    if (!editor || !window.confirm(`确认删除字段「${field.field_cn} (${field.field_en})」吗？`)) return
+    if (!window.confirm(`确认删除字段「${field.field_cn} (${field.field_en})」吗？`)) return
     setBusy(true)
     setError('')
     try {
@@ -188,7 +216,6 @@ export default function MetadataPage({ embedded = false }) {
         method: 'DELETE',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          editor,
           reason: '人工删除字段',
           changes: {},
         }),
@@ -205,8 +232,6 @@ export default function MetadataPage({ embedded = false }) {
   }
 
   async function addField() {
-    const editor = requireOperator(setError)
-    if (!editor) return
     if (!newField.field_cn.trim() || !newField.field_en.trim()) {
       setError('请填写新字段的中文名称和英文列名。')
       return
@@ -218,7 +243,6 @@ export default function MetadataPage({ embedded = false }) {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          editor,
           reason: '人工补充字段',
           field: {
             ...newField,
@@ -240,8 +264,6 @@ export default function MetadataPage({ embedded = false }) {
   }
 
   async function publish() {
-    const editor = requireOperator(setError)
-    if (!editor) return
     setBusy(true)
     setError('')
     try {
@@ -249,7 +271,6 @@ export default function MetadataPage({ embedded = false }) {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          approver: editor,
         }),
       })
       setDetail(body)
@@ -262,9 +283,57 @@ export default function MetadataPage({ embedded = false }) {
     }
   }
 
+  async function downloadTypeTemplate() {
+    const documentId = params.get('document_id')
+    const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
+    const response = await fetch(`/api/v2/metadata/types/template${query}`)
+    if (!response.ok) {
+      setError('模板下载失败，请稍后重试。')
+      return
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '字段类型修正模板.csv'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  async function submitTypeImport(dryRun) {
+    if (!typeImportFile) {
+      setError('请先选择要导入的文件（CSV 或 XLSX）。')
+      return
+    }
+    setBusy(true)
+    setError('')
+    setTypeImportResult(null)
+    try {
+      const form = new FormData()
+      form.append('file', typeImportFile)
+      form.append('dry_run', dryRun ? 'true' : 'false')
+      const documentId = params.get('document_id')
+      if (documentId) form.append('document_id', documentId)
+      const result = await v2('/metadata/types/import', { method: 'POST', body: form })
+      setTypeImportResult(result)
+      if (!dryRun) {
+        setNotice(
+          result.updated > 0
+            ? `已更新 ${result.updated} 个字段的类型，${result.errors.length} 行未导入。`
+            : '没有需要更新的字段。'
+        )
+        await load(detail?.id)
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function createDraft() {
-    const editor = requireOperator(setError)
-    if (!editor) return
     setBusy(true)
     setError('')
     try {
@@ -272,7 +341,6 @@ export default function MetadataPage({ embedded = false }) {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          approver: editor,
         }),
       })
       await load(body.id)
@@ -317,9 +385,24 @@ export default function MetadataPage({ embedded = false }) {
   })
   const totalIssues = blockingIssues.length + advisoryIssues.length
 
-  const visibleTables = onlyIssues
-    ? tables.filter((table) => (table.review_blocking_count || 0) > 0)
-    : tables
+  const detailBasis = (detail?.fields || []).reduce(
+    (acc, field) => {
+      const key = String(field.type_basis || 'UNKNOWN').toUpperCase()
+      if (key === 'SOURCE') acc.source += 1
+      else if (key === 'INFERRED') acc.inferred += 1
+      else if (key === 'MANUAL') acc.manual += 1
+      else acc.unknown += 1
+      return acc
+    },
+    { source: 0, inferred: 0, manual: 0, unknown: 0 }
+  )
+
+  const visibleTables = tables
+    .filter((table) => (onlyIssues ? (table.review_blocking_count || 0) > 0 : true))
+    .filter((table) => (onlyInferred ? (table.type_inferred_count || 0) > 0 : true))
+
+  const inferredTableCount = tables.filter((table) => (table.type_inferred_count || 0) > 0).length
+  const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
 
   const pageActions = detail && (
     <>
@@ -330,6 +413,9 @@ export default function MetadataPage({ embedded = false }) {
         </>
       ) : (
         <>
+          <button type="button" className="button secondary" onClick={() => setShowTypeImport(!showTypeImport)}>
+            {showTypeImport ? '收起批量导入' : '批量导入类型修正'}
+          </button>
           <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
           <button type="button" className="button primary" disabled={busy} onClick={publish}>发布此表</button>
         </>
@@ -354,15 +440,26 @@ export default function MetadataPage({ embedded = false }) {
           <div className="panel-heading">
             <div>
               <h2>报表清单</h2>
-              <p>共 {tables.length} 张表{onlyIssues ? `（${visibleTables.length} 张有待复核项）` : ''}</p>
+              <p>
+                共 {tables.length} 张表
+                {onlyIssues ? `（${visibleTables.length} 张有待复核项）` : ''}
+                {inferredTableCount ? ` · ${inferredTableCount} 张含推断类型` : ''}
+              </p>
             </div>
             <StatusBadge tone="neutral">{tables.length}</StatusBadge>
           </div>
 
-          <label className="inline-option" style={{ marginBottom: 10 }}>
-            <input type="checkbox" checked={onlyIssues} onChange={(e) => setOnlyIssues(e.target.checked)} />
-            只看有待复核项的报表
-          </label>
+          <div className="list-filters">
+            <label className="inline-option">
+              <input type="checkbox" checked={onlyIssues} onChange={(e) => setOnlyIssues(e.target.checked)} />
+              只看有待复核项的报表
+            </label>
+            <label className="inline-option">
+              <input type="checkbox" checked={onlyInferred} onChange={(e) => setOnlyInferred(e.target.checked)} />
+              只看类型需要确认的报表
+              {allInferredTableCount > 0 && <span className="muted-text">（{allInferredTableCount} 张整表推断）</span>}
+            </label>
+          </div>
 
           {visibleTables.length > 0 ? (
             <div className="list-stack">
@@ -384,6 +481,16 @@ export default function MetadataPage({ embedded = false }) {
                     当前 v{table.current_version}
                     {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
                   </em>
+                  <div className="type-basis-line">
+                    <span className="basis-pill basis-source">{table.type_source_count || 0} 原文有依据</span>
+                    <span className={`basis-pill basis-inferred ${table.type_inferred_count ? 'warn' : ''}`}>
+                      {table.type_inferred_count || 0} 推断
+                    </span>
+                    {(table.type_manual_count || 0) > 0 && (
+                      <span className="basis-pill basis-manual">{table.type_manual_count} 人工</span>
+                    )}
+                    {table.type_all_inferred && <span className="basis-pill basis-inferred warn">整表类型均无原文依据</span>}
+                  </div>
                   {(table.review_blocking_count || 0) > 0 ? (
                     <em className="danger-text">
                       {table.review_blocking_count} 项需要处理
@@ -400,7 +507,9 @@ export default function MetadataPage({ embedded = false }) {
             <div className="empty">
               {onlyIssues
                 ? '当前没有带待复核项的报表。'
-                : '当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。'}
+                : onlyInferred
+                  ? '当前没有带推断类型的报表。'
+                  : '当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。'}
             </div>
           )}
         </div>
@@ -419,6 +528,15 @@ export default function MetadataPage({ embedded = false }) {
                     {detail.table_definition || '暂无表级业务说明'} · 当前版本 v{detail.current_version}
                     {detail.published_version ? `（已发布版本 v${detail.published_version}）` : ''}
                   </p>
+                  <div className="type-basis-line">
+                    <span className="basis-pill basis-source">{detailBasis.source} 个字段类型有原文依据</span>
+                    <span className={`basis-pill basis-inferred ${detailBasis.inferred ? 'warn' : ''}`}>
+                      {detailBasis.inferred} 个类型是推断
+                    </span>
+                    {(detailBasis.manual > 0 || detailBasis.unknown > 0) && (
+                      <span className="basis-pill basis-manual">{detailBasis.manual + detailBasis.unknown} 个人工确认</span>
+                    )}
+                  </div>
                 </div>
                 <div className="actions">
                   <input
@@ -429,6 +547,82 @@ export default function MetadataPage({ embedded = false }) {
                   />
                 </div>
               </div>
+
+              {showTypeImport && !isPublished && (
+                <div className="type-import-panel">
+                  <div className="type-import-head">
+                    <div>
+                      <strong>批量修正字段类型</strong>
+                      <p className="muted-text">
+                        表格按「报表代码 / 字段英文名 / 目标类型 / 目标长度 / 目标小数位」填写，只写要改的行；导入后这些字段标为「人工确认」。
+                      </p>
+                    </div>
+                    <div className="actions">
+                      <button type="button" className="button secondary sm" onClick={downloadTypeTemplate}>
+                        下载模板（含当前字段）
+                      </button>
+                      <label className="button secondary sm file-button">
+                        选择文件
+                        <input
+                          type="file"
+                          accept=".csv,.xlsx"
+                          onChange={(e) => {
+                            setTypeImportFile(e.target.files?.[0] || null)
+                            setTypeImportResult(null)
+                          }}
+                        />
+                      </label>
+                      <span className="muted-text">{typeImportFile ? typeImportFile.name : '未选择文件'}</span>
+                    </div>
+                  </div>
+                  <div className="actions" style={{ marginTop: 10 }}>
+                    <button type="button" className="button secondary sm" disabled={busy || !typeImportFile} onClick={() => submitTypeImport(true)}>
+                      先预览（不改数据）
+                    </button>
+                    <button type="button" className="button primary sm" disabled={busy || !typeImportFile} onClick={() => submitTypeImport(false)}>
+                      确认导入
+                    </button>
+                  </div>
+                  {typeImportResult && (
+                    <div className="type-import-result">
+                      <div className="actions">
+                        <StatusBadge tone={typeImportResult.updated > 0 ? 'green' : 'neutral'}>
+                          {typeImportResult.dry_run ? '预览结果' : '已导入'} · {typeImportResult.updated} 行
+                        </StatusBadge>
+                        <span className="muted-text">
+                          无变化 {typeImportResult.unchanged} 行 · 未导入 {typeImportResult.errors.length} 行
+                        </span>
+                      </div>
+                      {(typeImportResult.details || []).length > 0 && (
+                        <ul className="type-import-list">
+                          {typeImportResult.details.slice(0, 12).map((item) => (
+                            <li key={`${item.line}-${item.field_en}`}>
+                              <code>{item.table_code}.{item.field_en}</code>
+                              <span>
+                                {Object.entries(item.changes)
+                                  .map(([key, value]) => `${key}=${value}`)
+                                  .join('，')}
+                              </span>
+                            </li>
+                          ))}
+                          {typeImportResult.details.length > 12 && (
+                            <li className="muted-text">另有 {typeImportResult.details.length - 12} 行…</li>
+                          )}
+                        </ul>
+                      )}
+                      {(typeImportResult.errors || []).length > 0 && (
+                        <ul className="type-import-list danger-text">
+                          {typeImportResult.errors.slice(0, 12).map((item) => (
+                            <li key={`err-${item.line}`}>
+                              第 {item.line} 行：{item.message}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {showAdd && !isPublished && (
                 <div className="add-field-form">
@@ -628,6 +822,20 @@ export default function MetadataPage({ embedded = false }) {
                           <span>关联码值表</span>
                           <input disabled={isPublished} placeholder="无关联码值表可留空" value={activeField.code_reference_text} onChange={(e) => changeFieldProp(activeField.id, 'code_reference_text', e.target.value)} />
                         </label>
+                        <label>
+                          <span>类型依据</span>
+                          <select
+                            disabled={isPublished}
+                            value={String(activeField.type_basis || 'UNKNOWN').toUpperCase()}
+                            onChange={(e) => changeFieldProp(activeField.id, 'type_basis', e.target.value)}
+                            title="改了类型/长度会自动记为人工确认"
+                          >
+                            <option value="SOURCE">原文有依据</option>
+                            <option value="INFERRED">类型是推断</option>
+                            <option value="MANUAL">人工确认</option>
+                            <option value="UNKNOWN">待确认</option>
+                          </select>
+                        </label>
                         <label className="check-label">
                           <input type="checkbox" disabled={isPublished} checked={Boolean(activeField.required)} onChange={(e) => changeFieldProp(activeField.id, 'required', e.target.checked)} />
                           必填字段
@@ -678,6 +886,9 @@ export default function MetadataPage({ embedded = false }) {
                                   {field.data_type}({field.length}
                                   {field.decimal_places ? `,${field.decimal_places}` : ''})
                                 </code>
+                                <StatusBadge tone={typeBasisMeta(field.type_basis).tone}>
+                                  {typeBasisMeta(field.type_basis).label}
+                                </StatusBadge>
                                 <StatusBadge tone={field.required ? 'amber' : 'neutral'}>
                                   {field.required ? '必填' : '选填'}
                                 </StatusBadge>

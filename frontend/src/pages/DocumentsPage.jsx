@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { v2 } from '../api.js'
-import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { SourceLocatorTag, StatusBadge, formatTime, friendlyError } from './SharedUI.jsx'
@@ -256,7 +255,6 @@ function ImportProgressPanel({ progress, onClose }) {
 
 export default function DocumentsPage({ embedded = false, importOnly = false, autoParse = false, onShowAssets, onSelectDocument }) {
   const navigate = useNavigate()
-  const { requireOperator } = useOperator()
   const [documents, setDocuments] = useState([])
   const [detail, setDetail] = useState(null)
   const [selected, setSelected] = useState([])
@@ -535,14 +533,12 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   }
 
   async function confirmBlock(block) {
-    const editor = requireOperator(setError)
-    if (!editor) return
     setBusy(true)
     setError('')
     try {
       await v2(`/documents/${detail.id}/blocks/${block.id}/structure`, {
         method: 'PATCH',
-        body: JSON.stringify({ human_required: false, editor }),
+        body: JSON.stringify({ human_required: false }),
       })
       await selectDocument(detail.id)
       setNotice(`已确认「${block.table_name || block.source_locator?.section || '当前内容'}」无误。`)

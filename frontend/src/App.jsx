@@ -1,5 +1,5 @@
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
-import { OperatorProvider } from './context/OperatorContext.jsx'
+import { ThemeProvider } from './context/ThemeContext.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
 import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
 import GenerationPage from './pages/GenerationPage.jsx'
@@ -101,10 +101,10 @@ function WorkbenchLayout() {
 
 export default function App() {
   return (
-    <OperatorProvider>
+    <ThemeProvider>
       <BrowserRouter>
         <WorkbenchLayout />
       </BrowserRouter>
-    </OperatorProvider>
+    </ThemeProvider>
   )
 }

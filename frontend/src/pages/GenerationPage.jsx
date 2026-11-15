@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
-import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { BLOCKER_REASONS, StatusBadge, formatTime } from './SharedUI.jsx'
@@ -17,7 +16,6 @@ const PIPELINE_STAGES = [
 export default function GenerationPage() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
-  const { requireOperator } = useOperator()
 
   const [tables, setTables] = useState([])
   const [selected, setSelected] = useState([])
@@ -74,8 +72,6 @@ export default function GenerationPage() {
   }
 
   async function create() {
-    const approver = requireOperator(setError)
-    if (!approver) return
     if (!selected.length) {
       setError('请至少勾选一张已发布的元数据表。')
       return
@@ -91,7 +87,7 @@ export default function GenerationPage() {
     try {
       const run = await v2('/generation/runs', {
         method: 'POST',
-        body: JSON.stringify({ table_ids: selected, approver, provider: 'live' }),
+        body: JSON.stringify({ table_ids: selected, provider: 'live' }),
       })
       setNotice('生成运行已启动，正在跳转至执行与审计中心跟踪实时进度。')
       navigate(`/runs?run=${run.id}`)

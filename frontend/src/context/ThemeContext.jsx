@@ -1,26 +1,14 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 
-const STORAGE_KEY = 'regops_operator_name'
 const THEME_KEY = 'regops_theme_mode'
 
-const OperatorContext = createContext({
-  operator: '',
-  setOperator: () => {},
-  requireOperator: () => false,
+const ThemeContext = createContext({
   theme: 'light',
   setTheme: () => {},
   toggleTheme: () => {},
 })
 
-export function OperatorProvider({ children }) {
-  const [operator, setOperatorState] = useState(() => {
-    try {
-      return window.localStorage.getItem(STORAGE_KEY) || '合规审核员'
-    } catch {
-      return '合规审核员'
-    }
-  })
-
+export function ThemeProvider({ children }) {
   const [theme, setThemeState] = useState(() => {
     try {
       const saved = window.localStorage.getItem(THEME_KEY)
@@ -30,15 +18,6 @@ export function OperatorProvider({ children }) {
       return 'light'
     }
   })
-
-  function setOperator(value) {
-    setOperatorState(value)
-    try {
-      window.localStorage.setItem(STORAGE_KEY, value)
-    } catch {
-      // ignore storage errors
-    }
-  }
 
   function setTheme(nextTheme) {
     setThemeState(nextTheme)
@@ -52,14 +31,6 @@ export function OperatorProvider({ children }) {
   function toggleTheme() {
     setTheme(theme === 'dark' ? 'light' : 'dark')
   }
-
-  useEffect(() => {
-    try {
-      if (operator) window.localStorage.setItem(STORAGE_KEY, operator)
-    } catch {
-      // ignore
-    }
-  }, [operator])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -85,24 +56,13 @@ export function OperatorProvider({ children }) {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
 
-  function requireOperator(onError) {
-    const trimmed = (operator || '').trim()
-    if (!trimmed) {
-      if (onError) onError('请先在页面右上角填写「当前操作人 / 审批人」身份（填写后全站自动记忆）。')
-      return ''
-    }
-    return trimmed
-  }
-
   return (
-    <OperatorContext.Provider
-      value={{ operator, setOperator, requireOperator, theme, setTheme, toggleTheme }}
-    >
+    <ThemeContext.Provider value={{ theme, setTheme, toggleTheme }}>
       {children}
-    </OperatorContext.Provider>
+    </ThemeContext.Provider>
   )
 }
 
-export function useOperator() {
-  return useContext(OperatorContext)
+export function useTheme() {
+  return useContext(ThemeContext)
 }

@@ -1,14 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
-import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeverity } from './SharedUI.jsx'
 
 export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   const [params] = useSearchParams()
-  const { requireOperator } = useOperator()
 
   const [sets, setSets] = useState([])
   const [unresolved, setUnresolved] = useState([])
@@ -123,8 +121,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   }
 
   async function addValue() {
-    const editor = requireOperator(setError)
-    if (!editor) return
     if (!newValue.value.trim() || !newValue.label_cn.trim()) {
       setError('请填写码值编码和中文含义。')
       return
@@ -136,7 +132,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          editor,
           ...newValue,
         }),
       })
@@ -152,8 +147,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   }
 
   async function toggle(value) {
-    const editor = requireOperator(setError)
-    if (!editor) return
     setBusy(true)
     setError('')
     try {
@@ -161,7 +154,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
         method: 'PATCH',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          editor,
           reason: '人工启停码值项',
           changes: { enabled: !value.enabled },
         }),
@@ -176,8 +168,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   }
 
   async function publish() {
-    const editor = requireOperator(setError)
-    if (!editor) return
     setBusy(true)
     setError('')
     try {
@@ -185,7 +175,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
-          editor,
           reason: '正式发布码值表版本',
           changes: {},
         }),
@@ -201,10 +190,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   }
 
   async function importExcel(event) {
-    const editor = requireOperator(setError)
     const file = event.target.files?.[0]
     event.target.value = ''
-    if (!editor || !file) return
+    if (!file) return
     const form = new FormData()
     form.append('file', file)
     form.append('expected_version', detail.current_version)

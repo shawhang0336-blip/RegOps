@@ -25,13 +25,11 @@ function App() {
   const [selectedSpecId, setSelectedSpecId] = useState('')
   const [specDetail, setSpecDetail] = useState(null)
   const [activeRun, setActiveRun] = useState(null)
-  const [approver, setApprover] = useState('')
   const [decisions, setDecisions] = useState({})
   const [artifact, setArtifact] = useState(null)
   const [provider] = useState('live')
   const [tableFilter, setTableFilter] = useState('ALL')
   const [selectedTables, setSelectedTables] = useState([])
-  const [confirmer, setConfirmer] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -116,8 +114,8 @@ function App() {
   }
 
   async function confirmTables() {
-    if (!selectedTables.length || !confirmer.trim()) {
-      setError('请选择至少一张符合条件的表，并填写确认人。')
+    if (!selectedTables.length) {
+      setError('请选择至少一张符合条件的表。')
       return
     }
     setBusy(true)
@@ -125,7 +123,7 @@ function App() {
     try {
       const confirmed = await api(`/api/specs/${selectedSpecId}/confirm`, {
         method: 'POST',
-        body: JSON.stringify({ table_codes: selectedTables, approver: confirmer }),
+        body: JSON.stringify({ table_codes: selectedTables }),
       })
       setNotice(`已确认 ${confirmed.table_count} 张表。只有这个不可变快照可以进入后续 AI 装配和 Oracle 建表。`)
       await loadSpecs()
@@ -170,10 +168,6 @@ function App() {
   }
 
   async function submitDecisions() {
-    if (!approver.trim()) {
-      setError('请填写审批人，审批身份会写入事件账本。')
-      return
-    }
     const payload = pendingRules.map((rule) => ({
       rule_hash: rule.rule_hash,
       decision: decisions[rule.rule_hash],
@@ -187,7 +181,7 @@ function App() {
     try {
       await api(`/api/runs/${activeRun.id}/approvals`, {
         method: 'POST',
-        body: JSON.stringify({ approver, decisions: payload, provider }),
+        body: JSON.stringify({ decisions: payload, provider }),
       })
       setNotice('审批事实已入账，运行状态已由事件流重新推进。')
       setDecisions({})
@@ -287,7 +281,7 @@ function App() {
                     <input type="checkbox" disabled={!table.eligible} checked={selectedTables.includes(table.table_code)} onChange={(event) => setSelectedTables(event.target.checked ? [...selectedTables, table.table_code] : selectedTables.filter((code) => code !== table.table_code))} />
                     <span><strong>{table.table_name}</strong><small>{table.eligible ? `${table.field_count} 字段 · ${table.reason}` : table.reason}</small></span>
                   </label>)}</div>
-                  <div className="confirm-bar"><input value={confirmer} onChange={(event) => setConfirmer(event.target.value)} placeholder="表范围确认人" /><button className="button primary" disabled={busy || !selectedTables.length} onClick={confirmTables}>确认 {selectedTables.length} 张表</button></div>
+                  <div className="confirm-bar"><button className="button primary" disabled={busy || !selectedTables.length} onClick={confirmTables}>确认 {selectedTables.length} 张表</button></div>
                 </>}
                 {specDetail.document_kind !== 'CATALOG' && specDetail.tables && <div className="table-chip-list">{specDetail.tables.map((table) => <div key={table.table_code}><strong>{table.table_name}</strong><span>{table.field_count} 字段</span></div>)}</div>}
                 <details className="field-drawer">
@@ -370,7 +364,7 @@ function App() {
                     </div>
                   </div>
                 ))}
-                <div className="approval-submit"><input value={approver} onChange={(event) => setApprover(event.target.value)} placeholder="审批人姓名 / 工号" /><button className="button primary" disabled={busy} onClick={submitDecisions}>写入审批并继续</button></div>
+                <div className="approval-submit"><button className="button primary" disabled={busy} onClick={submitDecisions}>写入审批并继续</button></div>
               </section>
             )}
 

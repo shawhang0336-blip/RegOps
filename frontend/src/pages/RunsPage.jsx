@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api, v2 } from '../api.js'
-import { useOperator } from '../context/OperatorContext.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { DataTableModal, StatusBadge, formatTime } from './SharedUI.jsx'
@@ -46,7 +45,6 @@ function resolveStepIndex(run) {
 
 export default function RunsPage() {
   const [params] = useSearchParams()
-  const { requireOperator } = useOperator()
 
   const [runs, setRuns] = useState([])
   const [active, setActive] = useState(null)
@@ -126,8 +124,6 @@ export default function RunsPage() {
   )
 
   const submitApprovals = useCallback(async () => {
-    const approver = requireOperator(setError)
-    if (!approver) return
     if (pending.some((rule) => !decisions[rule.rule_hash])) {
       setError('请对每条新增规则选择“批准”或“拒绝”，再提交确认。')
       return
@@ -138,7 +134,6 @@ export default function RunsPage() {
       const body = await api(`/api/runs/${active.id}/approvals`, {
         method: 'POST',
         body: JSON.stringify({
-          approver,
           provider: 'live',
           decisions: pending.map((rule) => ({
             rule_hash: rule.rule_hash,
@@ -158,7 +153,7 @@ export default function RunsPage() {
     } finally {
       setBusy(false)
     }
-  }, [active?.id, decisions, load, pending, requireOperator])
+  }, [active?.id, decisions, load, pending])
 
   // Keyboard shortcuts for rapid rule approval
   useEffect(() => {
@@ -242,14 +237,12 @@ export default function RunsPage() {
   }
 
   async function confirmTests() {
-    const approver = requireOperator(setError)
-    if (!approver) return
     setBusy(true)
     setError('')
     try {
       const body = await api(`/api/runs/${active.id}/test-confirmation`, {
         method: 'POST',
-        body: JSON.stringify({ approver }),
+        body: JSON.stringify({}),
       })
       setActive(body)
       await load(body.id)

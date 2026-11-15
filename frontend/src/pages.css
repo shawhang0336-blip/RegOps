@@ -31,10 +31,10 @@
 }
 
 .list-row.selected {
-  background: #e8f5ee;
-  border-color: var(--green-border);
-  border-left: 4px solid var(--green);
-  box-shadow: 0 2px 6px rgba(20, 108, 78, 0.08);
+  background: #fdeced;
+  border-color: var(--brand-border);
+  border-left: 4px solid var(--brand);
+  box-shadow: 0 2px 6px rgba(219, 0, 17, 0.08);
 }
 
 .list-row-top {
@@ -58,9 +58,13 @@
 
 .list-row em {
   font-size: 11.5px;
-  color: var(--green);
+  color: var(--muted);
   font-style: normal;
   font-weight: 600;
+}
+
+.list-row.selected em {
+  color: var(--brand);
 }
 
 /* Upload Dropzone & Document Blocks */
@@ -69,8 +73,8 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  background: linear-gradient(135deg, #f2faf5 0%, #ffffff 100%);
-  border: 1.5px dashed #8bc4a6;
+  background: linear-gradient(135deg, #fbfaf9 0%, #ffffff 100%);
+  border: 1.5px dashed #b6b0ad;
   border-radius: var(--radius-lg);
   padding: 18px 22px;
   margin-bottom: 20px;
@@ -80,8 +84,8 @@
 
 .upload-dropzone:hover,
 .upload-dropzone.dragging {
-  border-color: var(--green);
-  background: #e7f6ed;
+  border-color: var(--brand);
+  background: #fdeced;
 }
 
 .upload-dropzone-text strong {
@@ -130,13 +134,13 @@
 }
 
 .block-row:hover {
-  border-color: var(--green-border);
-  background: #fafdfb;
+  border-color: var(--brand-border);
+  background: #fbfaf9;
 }
 
 .block-row.active-block {
-  border-color: var(--green);
-  background: #eef8f2;
+  border-color: var(--brand);
+  background: #fdf3f3;
 }
 
 .block-row.ineligible {
@@ -147,7 +151,7 @@
 .block-row input[type="checkbox"] {
   width: 17px;
   height: 17px;
-  accent-color: var(--green);
+  accent-color: var(--brand);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -186,8 +190,8 @@
 .raw-panel pre {
   max-height: 360px;
   overflow: auto;
-  background: #142620;
-  color: #def3e8;
+  background: #1e1c1b;
+  color: #f0eeec;
   padding: 16px;
   border-radius: var(--radius-md);
   font-size: 12.5px;
@@ -225,20 +229,20 @@
 }
 
 .tab-bar button.active {
-  background: var(--green-light);
-  color: var(--green);
-  border-color: var(--green-border);
+  background: var(--brand-light);
+  color: var(--brand);
+  border-color: var(--brand-border);
 }
 
 /* Metadata Field Inspector & Editor Drawer */
 .field-row-active {
-  background: #f0f8f3 !important;
+  background: #fdf3f3 !important;
 }
 
 .field-editor-drawer {
   margin-top: 16px;
-  background: #f8fbf9;
-  border: 1px solid var(--green-border);
+  background: #fdf7f6;
+  border: 1px solid var(--brand-border);
   border-radius: var(--radius-lg);
   padding: 20px;
   box-shadow: var(--shadow-sm);
@@ -287,7 +291,7 @@
 .check-label input[type="checkbox"] {
   width: 16px;
   height: 16px;
-  accent-color: var(--green);
+  accent-color: var(--brand);
 }
 
 .row-actions {
@@ -318,9 +322,9 @@
 .locator-pill {
   display: inline-flex;
   align-items: center;
-  background: #edf3ef;
-  color: #2c4c3e;
-  border: 1px solid #d5e2da;
+  background: #f2f0ef;
+  color: #3d3d3d;
+  border: 1px solid #e3dfdd;
   border-radius: 6px;
   padding: 2px 8px;
   font-size: 11.5px;
@@ -367,7 +371,7 @@
   margin: 0;
   padding: 10px 14px;
   background: var(--surface-subtle);
-  border-left: 3px solid var(--green);
+  border-left: 3px solid var(--brand);
   border-radius: 0 6px 6px 0;
   font-size: 12.5px;
   color: var(--ink-secondary);
@@ -515,8 +519,8 @@
 .raw-diff-drawer pre {
   max-height: 280px;
   overflow: auto;
-  background: #142620;
-  color: #dcf2e6;
+  background: #1e1c1b;
+  color: #f0eeec;
   padding: 12px;
   border-radius: var(--radius-sm);
   font-size: 12px;
@@ -645,7 +649,7 @@
 .inline-form summary {
   cursor: pointer;
   font-weight: 650;
-  color: var(--green);
+  color: var(--brand);
   font-size: 13px;
 }
 
@@ -688,13 +692,13 @@
 }
 
 .generation-table-card:hover {
-  border-color: #9ec5b0;
-  background: #fafdfb;
+  border-color: #b8b2af;
+  background: #fbfaf9;
 }
 
 .generation-table-card.selected {
-  border-color: var(--green);
-  background: #edf8f2;
+  border-color: var(--brand);
+  background: #fdf3f3;
 }
 
 .generation-table-card.has-blocker {
@@ -705,7 +709,7 @@
 .generation-table-card input[type="checkbox"] {
   width: 18px;
   height: 18px;
-  accent-color: var(--green);
+  accent-color: var(--brand);
   margin-top: 2px;
 }
 
@@ -773,15 +777,15 @@
 }
 
 .pipeline-step.done {
-  background: #ecf7f1;
-  border-color: #b5dec7;
+  background: #f7f6f5;
+  border-color: #d8d3d0;
 }
 
 .pipeline-step.current {
-  background: var(--green);
-  border-color: var(--green);
+  background: var(--brand);
+  border-color: var(--brand);
   color: #fff;
-  box-shadow: 0 4px 12px rgba(20, 108, 78, 0.22);
+  box-shadow: 0 4px 12px rgba(219, 0, 17, 0.22);
 }
 
 .pipeline-step.failed {
@@ -798,11 +802,11 @@
 }
 
 .pipeline-step.done .pipeline-step-num {
-  color: var(--green);
+  color: var(--brand);
 }
 
 .pipeline-step.current .pipeline-step-num {
-  color: #b8f5d2;
+  color: #f0626b;
 }
 
 .pipeline-step strong {
@@ -952,8 +956,8 @@
 }
 
 .oracle-table-btn:hover {
-  border-color: var(--green);
-  background: var(--green-light);
+  border-color: var(--brand);
+  background: var(--brand-light);
 }
 
 /* Timeline Events */
@@ -977,8 +981,8 @@
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  background: var(--green-light);
-  color: var(--green);
+  background: var(--brand-light);
+  color: var(--brand);
   display: grid;
   place-items: center;
   font-size: 12px;
@@ -1009,15 +1013,15 @@
 .event-payload summary {
   font-size: 12px;
   font-weight: 600;
-  color: var(--green);
+  color: var(--brand);
   cursor: pointer;
 }
 
 .event-payload pre {
   max-height: 320px;
   overflow: auto;
-  background: #13251f;
-  color: #d8eee1;
+  background: #1c1b1a;
+  color: #ececea;
   border-radius: var(--radius-sm);
   padding: 12px;
   font-size: 12px;

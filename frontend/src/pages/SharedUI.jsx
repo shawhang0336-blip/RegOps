@@ -362,8 +362,8 @@ export function RevisionDiffView({ revision }) {
           >
             {REVISION_LABELS[kind] || kind}
           </StatusBadge>
-          <strong>操作人：{revision.editor || '系统'}</strong>
-          <span className="muted-text">{revision.reason}</span>
+          <strong>{revision.reason || '变更记录'}</strong>
+          <span className="muted-text">{revision.editor || '系统'}</span>
         </div>
         <div className="revision-actions">
           <span className="revision-time">{formatTime(revision.created_at)}</span>
