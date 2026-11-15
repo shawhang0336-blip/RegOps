@@ -630,7 +630,10 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   const evidenceBlocks = allBlocks.filter(evidenceBlock)
   const eligibleBlocks = allBlocks.filter((b) => b.eligible !== false)
   const totalInlineCodeSets = tableBlocks.reduce((acc, b) => acc + (b.inline_code_count || 0), 0)
-  const reviewBlocks = allBlocks.filter((b) => b.human_required)
+  // 切块自检发现的问题也要进"需要确认"清单：公式错位、折行串行这类不用等 AI 复核
+  const reviewBlocks = allBlocks.filter(
+    (b) => b.human_required || (Array.isArray(b.quality_issues) && b.quality_issues.length > 0)
+  )
   const reviewCount = reviewBlocks.length
 
   const visibleBlocks = allBlocks.filter((b) => {
@@ -893,7 +896,18 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
                       <div className="confirmation-item" key={block.id}>
                         <div>
                           <strong>{block.table_name || block.source_locator?.section || `内容 ${block.ordinal + 1}`}</strong>
-                          <p>{friendlyError(block.structure_warnings?.[0] || block.reason || '程序无法完全确认这部分结构，请对照原文检查。')}</p>
+                          <p>
+                            {(() => {
+                              const issues = Array.isArray(block.quality_issues) ? block.quality_issues : []
+                              const first = issues.find((item) => item.severity === 'ERROR') || issues[0]
+                              if (first) {
+                                return `${first.field ? `${first.field}：` : ''}${first.message}${issues.length > 1 ? `（另有 ${issues.length - 1} 项）` : ''}`
+                              }
+                              return friendlyError(
+                                block.structure_warnings?.[0] || block.reason || '程序无法完全确认这部分结构，请对照原文检查。'
+                              )
+                            })()}
+                          </p>
                         </div>
                         <div className="actions">
                           <button type="button" className="button secondary sm" onClick={() => showRaw(block.id)}>查看原文</button>

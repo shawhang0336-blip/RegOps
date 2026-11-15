@@ -448,12 +448,19 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                 args, trace = llm.assign(
                     "assign_document_structure",
                     (
-                        "你在决定这份监管文档如何切成可解析的单元。根据章节原文和已解析结构，"
-                        "判断每个块的 role（TABLE_METADATA/CODE_SET/NARRATIVE/IGNORE），"
-                        "跨页断开的同一张表用多个 source_block_ids 合并，混杂多种内容的块用 split_markers 拆分，"
-                        "并给出准确的 title 和 column_mapping。"
-                        "已经解析出字段结构的块（parsed_spec）只允许保留或改角色，不得拆分。"
-                        "不得虚构块内容，必须覆盖本章节的全部候选块。"
+                        "你在决定这份监管文档如何切成可解析的单元。按下面的清单逐项检查候选块，"
+                        "发现问题才动手，没发现问题就原样返回。\n"
+                        "1. 跨页断裂：某块结尾明显没写完（最后一行缺列、句子中断），或下一块开头是同一张表的重复表头"
+                        "（字段/内容/类型（长度）/校验）→ 用多个 source_block_ids 合并成一块。\n"
+                        "2. 内容混杂：一个块里同时有指标解释段落和字段表、或同时装了多张不同的表 → "
+                        "用 split_markers 在分界文本处切开（marker 必须是原文里逐字出现的片段）。\n"
+                        "3. 角色判断错误：块内容其实是码表（成对的值-名称、没有类型列）→ role=CODE_SET；"
+                        "是校验规则说明或纯叙述 → NARRATIVE；是封面/目录/页眉/修订记录 → IGNORE。\n"
+                        "4. 标题不准：parsed_spec 或首行已经给出表号表名，但 title 是空的或写错 → 用原文的准确标题。\n"
+                        "硬约束：已解析出字段结构的块（parsed_spec）只能保留或改角色，不得拆分；"
+                        "不得虚构任何块内容；必须覆盖本章节全部候选块。\n"
+                        "重要：如果没有发现上述任一问题，就把每个块原样返回（role/title 保持不变），"
+                        "不要为了\"看起来更整齐\"而合并、拆分或改名。"
                     ),
                     {
                         "file_name": document.file_name,

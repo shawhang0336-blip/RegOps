@@ -25,6 +25,7 @@ from ..import_progress import ensure as progress_ensure
 from ..import_progress import start as progress_start
 from ..import_progress import update as progress_update
 from ..extractors import extract_document
+from ..spec_quality import inspect_block
 from ..structure_service import (
     analyze_document_structure,
     inspect_document_overview,
@@ -103,8 +104,21 @@ def store_initial_blocks(document_id: str) -> SourceDocumentModel:
         document.spec_version = version
         document.status = "UPLOADED"
         document.block_count = len(blocks)
+        flagged = 0
         for block in blocks:
+            issues = inspect_block(block)
+            if issues:
+                flagged += 1
+                block["content_json"] = {
+                    **(block.get("content_json") or {}),
+                    "quality_issues": issues,
+                }
             session.add(RawBlockModel(id=str(uuid.uuid4()), document_id=document.id, **block))
+        if flagged:
+            progress_update(
+                document_id,
+                log=f"切块自检：{flagged}/{len(blocks)} 个块存在疑似解析异常，已标记待核对",
+            )
         session.commit()
         _auto_extract_code_sets(document_id, get_settings())
         return document
@@ -312,6 +326,7 @@ def document_detail(document_id: str) -> Dict[str, Any]:
                     "column_mapping": block.content_json.get("column_mapping", {}),
                     "human_required": block.content_json.get("human_required", False),
                     "structure_warnings": block.content_json.get("structure_warnings", block.content_json.get("parse_warnings", [])),
+                    "quality_issues": block.content_json.get("quality_issues", []),
                 }
                 for block in blocks
             ],

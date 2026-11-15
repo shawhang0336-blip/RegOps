@@ -49,6 +49,54 @@ TYPE_RELATED_PREFIXES = (
 )
 
 
+CONTEXT_BEFORE = 300
+CONTEXT_AFTER = 2200
+CONTEXT_MAX_CHARS = 14000
+
+
+def _excerpt_for_fields(raw: str, field_names: List[str], *, max_chars: int = CONTEXT_MAX_CHARS) -> str:
+    """按字段在原文中的位置截上下文，而不是固定取前 N 个字。
+
+    一个块两万多字时，"取前 6000 字"会让后半段的字段在复核时完全看不到自己的原文，
+    模型只能凭字段名推断——"evidence 在原文里找不到"的误降级就是这么来的。
+    """
+    text = raw or ""
+    if len(text) <= max_chars:
+        return text
+    spans = []
+    for name in field_names:
+        name = str(name or "").strip()
+        if len(name) < 2:
+            continue
+        for match in re.finditer(re.escape(name), text):
+            start = max(0, match.start() - CONTEXT_BEFORE)
+            end = min(len(text), match.start() + CONTEXT_AFTER)
+            spans.append((start, end))
+    if not spans:
+        return text[:max_chars]
+    spans.sort()
+    merged: List[tuple] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    parts: List[str] = []
+    used = 0
+    for start, end in merged:
+        chunk = text[start:end]
+        if used + len(chunk) > max_chars:
+            remain = max_chars - used
+            if remain < 500:
+                break
+            chunk = chunk[:remain]
+        parts.append(chunk)
+        used += len(chunk)
+        if used >= max_chars:
+            break
+    return "\n…\n".join(parts)
+
+
 def _source_declares_type(raw_context: str) -> bool:
     text = raw_context or ""
     return any(hint in text for hint in TYPE_DECLARATION_HINTS)
@@ -427,7 +475,10 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                     "source_locator": block.source_locator,
                     "table": {"table_code": fallback_code, "table_name": fallback_name},
                     "raw_fields": chunk,
-                    "raw_context": block.raw_content[:6000],
+                    "raw_context": _excerpt_for_fields(
+                        block.raw_content,
+                        [item.get("name") or item.get("field_en") or "" for item in chunk],
+                    ),
                 }
                 try:
                     args, trace = llm.assign(
@@ -535,7 +586,9 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "source_locator": block.source_locator,
                         "table": {"table_code": draft.table_code, "table_name": draft.table_name},
                         "fields": [f.model_dump() for f in draft.fields],
-                        "raw_context": block.raw_content[:6000],
+                        "raw_context": _excerpt_for_fields(
+                            block.raw_content, [f.field_en for f in draft.fields]
+                        ),
                     },
                     timeout=60,
                 )
