@@ -17,7 +17,7 @@ from ..domain import canonical_json
 from ..events import append_event
 from ..generic_workflow import _create_run, _execute_run
 from ..identity import OPERATOR_PLACEHOLDER
-from ..metadata_service import metadata_to_spec
+from ..metadata_service import metadata_to_spec, publish_table
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
 from ..readiness import evaluate_table, split_preflight_issues
@@ -110,10 +110,37 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
         specs = []
         pending_warnings: List[Dict[str, Any]] = []
         auto_published: Dict[str, List[Dict[str, Any]]] = {}
-        # 第一遍：取规格 + 自动发布码表。
-        # 「发布」不再让人逐张点：检查通过就自动发，不通过才留给人补数据。
-        # 几百张码表挨个确认本来就确认不过来，而不发的话阶段 2 直接报错退出。
+        auto_finalized: List[str] = []
+        # 第一遍：自动定稿 + 取规格 + 自动发布码表。
+        #
+        # 「发布」不再是一道人工手续。原来要在元数据页点一次批量发布，表才能进
+        # 阶段 2；但发布动作本身干的事（校验字段、查 DDL 能不能落地、发码表、写快照）
+        # 全都应该在这里做——用户选表的那一刻就是"我要用这一版"。
+        # 唯一挡下来的是 NEEDS_REVIEW：那是确实违反原文的表，得人看完再说。
         for table in tables:
+            if table.status == "NEEDS_REVIEW":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "stage": "metadata",
+                        "table_code": table.table_code,
+                        "message": (
+                            f"{table.table_code} 还有违反原文的字段问题没处理完，"
+                            "先到元数据页把标红的问题解决掉再选它。"
+                        ),
+                    },
+                )
+            if not (table.status == "PUBLISHED" and table.published_version == table.current_version):
+                try:
+                    finalized = publish_table(session, table, request.approver, table.current_version)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"stage": "ddl", "table_code": table.table_code, "message": str(exc)},
+                    ) from exc
+                auto_finalized.append(table.table_code)
+                if finalized.get("published"):
+                    auto_published[table.table_code] = finalized["published"]
             try:
                 specs.append(metadata_to_spec(session, table))
             except ValueError as exc:
@@ -122,8 +149,8 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
             if auto["published"]:
                 auto_published[table.table_code] = auto["published"]
         # 先落库：下面任何一项检查抛 409 都会让 session 回滚，
-        # 已经发出去的码表不能跟着一起丢掉，否则用户重试还得再发一遍。
-        if auto_published:
+        # 已经定稿的表和发出去的码表不能跟着一起丢掉，否则用户重试还得再来一遍。
+        if auto_published or auto_finalized:
             session.commit()
         # 第二遍：就绪度检查
         for table in tables:
@@ -214,4 +241,6 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
         payload = run_view(session, run)
         if auto_published:
             payload["auto_published_code_sets"] = auto_published
+        if auto_finalized:
+            payload["auto_finalized_tables"] = auto_finalized
         return payload

@@ -149,9 +149,13 @@ export default function GenerationPage() {
         (total, list) => total + (list || []).length,
         0
       )
+      const finalized = (run.auto_finalized_tables || []).length
+      const parts = []
+      if (finalized > 0) parts.push(`已自动定稿 ${finalized} 张表的字段定义`)
+      if (auto > 0) parts.push(`自动发布 ${auto} 张检查通过的码表`)
       setNotice(
-        auto > 0
-          ? `已自动发布 ${auto} 张检查通过的码表，生成运行已启动，正在跳转至执行与审计中心。`
+        parts.length
+          ? `${parts.join('，')}。生成运行已启动，正在跳转至执行与审计中心。`
           : '生成运行已启动，正在跳转至执行与审计中心跟踪实时进度。'
       )
       navigate(`/runs?run=${run.id}`)

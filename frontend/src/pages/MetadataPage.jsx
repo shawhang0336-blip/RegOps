@@ -408,43 +408,6 @@ export default function MetadataPage({ embedded = false }) {
   const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
 
   const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
-  const readyAll = readiness?.summary?.ready_all || 0
-
-  async function publishReadyTables() {
-    const documentId = params.get('document_id')
-    if (!documentId) {
-      setError('请先在「当前文件」里选定一份文件，批量发布会按文件范围执行。')
-      return
-    }
-    const target = readiness?.summary?.ready_all || 0
-    if (target <= 0) {
-      setError('当前没有可出包的表，先处理下方列出的卡点。')
-      return
-    }
-    const naCodes = readiness?.summary?.not_applicable?.code_sets || 0
-    const naNote = naCodes ? `（其中 ${naCodes} 张没有码值引用，不涉及码值项）` : ''
-    if (
-      !window.confirm(
-        `将发布 ${target} 张可出包的表${naNote}。发布时会把检查通过的码表一起发布，发布后内容不可直接修改。继续？`
-      )
-    ) {
-      return
-    }
-    setBusy(true)
-    setError('')
-    try {
-      const result = await v2('/metadata/tables/publish-batch', {
-        method: 'POST',
-        body: JSON.stringify({ document_id: documentId, scope: 'all_ready' }),
-      })
-      setNotice(`已发布 ${result.published} 张，跳过 ${result.skipped} 张。`)
-      await load(detail?.id)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
 
   const pageActions = detail && (
     <>
@@ -507,7 +470,7 @@ export default function MetadataPage({ embedded = false }) {
           {readiness && (
             <div className="readiness-summary">
               <div className="readiness-summary-main">
-                <strong>可出包 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
+                <strong>可直接生成 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
                 <span className="muted-text">
                   DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值齐备{' '}
                   {readiness.summary.ready.code_sets}
@@ -516,20 +479,14 @@ export default function MetadataPage({ embedded = false }) {
                   {' · '}校验原文覆盖 {readiness.summary.check_text_coverage}%
                 </span>
               </div>
-              <button
-                type="button"
-                className="button secondary sm"
-                disabled={busy || readyAll === 0}
-                onClick={publishReadyTables}
-                title="只发布 DDL 能落地、规则原料齐备、码值没有待补缺陷的表；码表会自动跟着发布"
-              >
-                批量发布可出包的表
-              </button>
+              <p className="readiness-hint">
+                不用在这里点发布：去第 2 步选表，能用的会直接定稿并生成，不能用会告诉你缺什么。
+              </p>
               {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
                 readiness.summary.ready.ddl && (
                 <p className="readiness-hint">
                   卡口在码值：能建表 {readiness.summary.ready.ddl} 张、码值齐备只有 {readiness.summary.ready.code_sets} 张。
-                  这些是空码表或码值引用解析不到，需要回原文补码值——发布解决不了。
+                  这些是空码表或码值引用解析不到，需要回原文补码值。
                 </p>
               )}
             </div>

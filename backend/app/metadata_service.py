@@ -774,7 +774,11 @@ def update_field(
     session.flush()
 
 
-def publish_table(session: Session, table: TableMetadataModel, approver: str, expected_version: int) -> None:
+def publish_table(session: Session, table: TableMetadataModel, approver: str, expected_version: int) -> Dict[str, Any]:
+    """定稿一张表；顺带把它引用、且检查通过的码表一起发布。
+
+    返回自动发布的码表清单，调用方可以据此告诉用户「替你发了什么」。
+    """
     if table.current_version != expected_version:
         raise ValueError("VERSION_CONFLICT")
     fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).order_by(FieldMetadataModel.sort_order).all()
@@ -840,6 +844,7 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
         )
     )
     session.flush()
+    return auto
 
 
 def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocument:
