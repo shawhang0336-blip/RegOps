@@ -118,7 +118,9 @@ export default function GenerationPage() {
   }
 
   function selectAllReady() {
-    setSelected(tables.filter((t) => fullyReady(t.id)).map((t) => t.id))
+    // 必须和卡片/按钮上的 fullCount 用同一套判定，否则写 62 实际勾 77，
+    // 其中混进 15 张待复核的表，点生成直接 409
+    setSelected(tables.filter((t) => selectable(t.id)).map((t) => t.id))
   }
 
   async function create() {

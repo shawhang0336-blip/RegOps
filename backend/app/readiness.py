@@ -125,6 +125,19 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
         for ref in refs_by_field.get(field.id, []):
             code_set = code_sets.get(ref.code_set_id)
             severity = "ERROR" if field.required else "WARNING"
+            if ref.status == "EXTERNAL":
+                # 原文引用了外部规范（见部分债权人代码表、外汇局代码表、QFII 编号等），
+                # 本地没有对应码表可建——这不是缺失，不需要补任何东西。
+                # 但取值约束仍留在原文里，阶段 2 的 AI 能读到。
+                materials.append(
+                    _issue(
+                        "WARNING",
+                        "EXTERNAL_CODE_REFERENCE",
+                        f"码值引用「{ref.reference_text}」指向外部规范，本地没有对应码表，按原文字面约束",
+                        name,
+                    )
+                )
+                continue
             if ref.status == "UNRESOLVED" or not code_set:
                 materials.append(
                     _issue(

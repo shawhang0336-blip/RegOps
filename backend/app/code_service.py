@@ -525,6 +525,16 @@ def ensure_field_reference(
             session.delete(existing_fixed)
             session.flush()
         return
+    if is_rule_reference(text):
+        # 格式/编号规则不是码表引用，同理清掉。规则本体留在 check_text 里。
+        session.flush()
+        existing_rule = session.query(FieldCodeReferenceModel).filter(
+            FieldCodeReferenceModel.field_id == field.id
+        ).first()
+        if existing_rule:
+            session.delete(existing_rule)
+            session.flush()
+        return
     code_set = _find_matching_code_set(
         session,
         text,
@@ -535,6 +545,10 @@ def ensure_field_reference(
         candidate_norms=candidate_norms,
     )
     enum_values = parse_inline_enum(text)
+    if not enum_values:
+        # 引用摘要里只有「（F0102 内联枚举）」这种标记，枚举值其实在校验原文里：
+        # 「按以下两种情况填列：①是；②否」。只看摘要会漏抽，回退到原文再试一次。
+        enum_values = parse_inline_enum(field.check_text_raw or "")
     if code_set and enum_values and not _set_has_values(session, code_set, sets_with_values):
         # 命中的是占位码表，但引用原文本身就把码值列出来了（如"1-股票；2-债券…"），
         # 直接补进这张表，避免又建一张重复的"（内联枚举）"表。
@@ -650,6 +664,25 @@ _QUOTES = "\"'“”‘’「」『』《》【】[]()（） "
 def _has_error_issues(issues: List[Dict[str, Any]]) -> bool:
     """只有 ERROR 才算需要人处理。WARNING（比如 AI 复核不可用）只是提示。"""
     return any(str(item.get("severity") or "").upper() == "ERROR" for item in issues)
+
+
+# 「流水码编制规则」「外债编号统一编号规则」「银行资本项目报送参考规则」
+# 以及 TERM_INFERENCE 的正则——这些是格式约束，不是码表引用。
+# AI 抽取时把它们也填进了 code_reference_text，一路变成"码表引用解析不到"。
+_RULE_NOT_CODE_SET_RE = re.compile(
+    r"(编制规则|编号规则|参考规则|报送规则|填列规则)|TERM_INFERENCE|^\s*[\^\[]"
+    # 「无对应号码…填写"N/A"」「如为个人主体，填写"个人"」——条件性固定值，
+    # 和 E0901 同类，也不是码表引用
+    r"|(?:无对应|如为|若|不涉及)[^。；]{0,30}(?:填写|填)\s*[“\"'「]"
+)
+
+
+def is_rule_reference(text: str) -> bool:
+    """这段「引用」其实是格式规则，不是码表。应从 code_reference_text 里清掉，
+    规则本身留在 check_text 里，阶段 2 会按 REGEXP 处理。"""
+    if not text:
+        return False
+    return bool(_RULE_NOT_CODE_SET_RE.search(text))
 
 
 def parse_fixed_value(text: str) -> Optional[str]:
