@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from .api_v2 import artifacts as artifacts_v2
 from .api_v2 import code_sets as code_sets_v2
 from .api_v2 import documents as documents_v2
 from .api_v2 import generation as generation_v2
@@ -70,6 +71,7 @@ app.include_router(documents_v2.router, prefix="/api/v2")
 app.include_router(metadata_v2.router, prefix="/api/v2")
 app.include_router(code_sets_v2.router, prefix="/api/v2")
 app.include_router(generation_v2.router, prefix="/api/v2")
+app.include_router(artifacts_v2.router, prefix="/api/v2")
 
 
 def db_session():

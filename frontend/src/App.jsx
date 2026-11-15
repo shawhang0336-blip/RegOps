@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 're
 import { ThemeProvider } from './context/ThemeContext.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
 import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
+import ArtifactsPage from './pages/ArtifactsPage.jsx'
 import GenerationPage from './pages/GenerationPage.jsx'
 import RunsPage from './pages/RunsPage.jsx'
 import VersionsPage from './pages/VersionsPage.jsx'
@@ -88,7 +89,7 @@ function WorkbenchLayout() {
           <Route path="/documents" element={<PreparationWorkspace />} />
           <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
           <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
-          <Route path="/generation" element={<GenerationPage />} />
+          <Route path="/generation" element={<ArtifactsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/versions" element={<VersionsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
