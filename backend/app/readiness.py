@@ -185,14 +185,25 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
         )
 
     def pack(items: List[Dict[str, Any]], warnings: List[Dict[str, Any]], applicable: bool = True) -> Dict[str, Any]:
+        blockers = [item for item in items if item["severity"] == "ERROR"]
+        # 「码表没发布」和「码表是空的」都是阻断，但性质完全不同：
+        # 前者是动作没做（点一下批量发布就解决），后者是数据缺失（要人去补码值）。
+        # 混在同一个 ✕ 里，96 张「只差点发布」的表看起来和 22 张「真缺码值」一样，
+        # 用户根本看不出哪张要动手补数据。
+        publish_pending = [item for item in blockers if item["code"] == "CODE_SET_NOT_PUBLISHED"]
+        defects = [item for item in blockers if item["code"] != "CODE_SET_NOT_PUBLISHED"]
         return {
             # applicable=False 表示这张表根本没有这一项交付物。
             # 报表字段和码值没有必然联系：备注、金额、日期都不该有码值引用。
             # 这种「不适用」不能被渲染成「通过」——它既不是齐也不是缺，
             # 混进统计口径会让人以为验过了。
             "applicable": applicable,
-            "ready": not any(item["severity"] == "ERROR" for item in items),
-            "blockers": [item for item in items if item["severity"] == "ERROR"],
+            "ready": not blockers,
+            "blockers": blockers,
+            # 只差发布：数据本身是好的
+            "publish_pending": publish_pending,
+            # 需要补数据：空码表、引用解析不到
+            "defects": defects,
             "warnings": warnings,
         }
 
@@ -233,6 +244,7 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     counter: Dict[str, Dict[str, int]] = {artifact: {} for artifact in ARTIFACTS}
     ready = {artifact: 0 for artifact in ARTIFACTS}
     not_applicable = {artifact: 0 for artifact in ARTIFACTS}
+    publish_pending_only: List[str] = []
     for item in results:
         for artifact in ARTIFACTS:
             section = item[artifact]
@@ -243,6 +255,14 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ready[artifact] += 1
             for blocker in section["blockers"]:
                 counter[artifact][blocker["code"]] = counter[artifact].get(blocker["code"], 0) + 1
+        # 只差「把码表点发布」就能出包的表：其它都齐，没有需要补数据的缺陷
+        if (
+            item["ddl"]["ready"]
+            and item["rule_materials"]["ready"]
+            and not item["code_sets"]["defects"]
+            and item["code_sets"]["publish_pending"]
+        ):
+            publish_pending_only.append(item["table_code"])
 
     def passing(item) -> bool:
         """所有适用的项都就绪；不适用的项不参与判定。"""
@@ -266,6 +286,9 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             for item in results
             if passing(item) and all(item[artifact].get("applicable", True) for artifact in ARTIFACTS)
         ),
+        # 只差发布码表就能出包的表 —— 数据本身没问题，缺的是一个动作
+        "publish_pending_only": len(publish_pending_only),
+        "publish_pending_tables": publish_pending_only[:50],
         "blocker_codes": {
             artifact: sorted(codes.items(), key=lambda pair: pair[1], reverse=True)
             for artifact, codes in counter.items()

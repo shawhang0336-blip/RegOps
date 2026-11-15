@@ -521,6 +521,12 @@ export default function MetadataPage({ embedded = false }) {
               >
                 批量发布可出包的表
               </button>
+              {readiness.summary.publish_pending_only > 0 && (
+                <p className="readiness-hint">
+                  另有 {readiness.summary.publish_pending_only} 张表只差「把码表点发布」——码值本身是齐的，
+                  去码表页批量发布后就能出包，不需要补数据。
+                </p>
+              )}
               {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
                 readiness.summary.ready.ddl && (
                 <p className="readiness-hint">
@@ -558,19 +564,29 @@ export default function MetadataPage({ embedded = false }) {
                         // applicable=false：这张表根本没有这一项（例如没有码值引用的报表），
                         // 显示成「✓」会被误读成「验过了」
                         const na = section.applicable === false
+                        // 只差把码表点发布：数据是好的，不该和「空码表」共用红色 ✕
+                        const pendingOnly = !section.ready && !na && (section.defects || []).length === 0
+                        const tone = na ? 'na' : section.ready ? 'ok' : pendingOnly ? 'pending' : 'bad'
                         return (
                           <span
                             key={key}
-                            className={`ready-chip ${na ? 'na' : section.ready ? 'ok' : 'bad'}`}
+                            className={`ready-chip ${tone}`}
                             title={
                               na
                                 ? `${label} 不适用：这张表没有引用任何码表`
                                 : section.ready
                                   ? `${label} 可以生成`
-                                  : section.blockers.map((item) => item.message).join('；')
+                                  : (section.blockers || []).map((item) => item.message).join('；')
                             }
                           >
-                            {label} {na ? '—' : section.ready ? '✓' : `✕${section.blockers.length}`}
+                            {label}{' '}
+                            {na
+                              ? '—'
+                              : section.ready
+                                ? '✓'
+                                : pendingOnly
+                                  ? `待发布${(section.publish_pending || []).length}`
+                                  : `✕${section.blockers.length}`}
                           </span>
                         )
                       })}

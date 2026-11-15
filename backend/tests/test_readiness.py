@@ -267,3 +267,35 @@ def test_summary_separates_not_applicable_from_ready():
     # 两张都能推进阶段 2，但只有一张是真的三项都适用且都就绪
     assert summary["ready_all"] == 2
     assert summary["ready_all_full"] == 1
+
+
+def test_publish_pending_is_separated_from_real_defects():
+    """「码表没发布」是动作没做，「码表是空的」是数据缺失。
+
+    两者都是阻断，但混在同一个 ✕ 里，96 张「只差点发布」的表看起来和 22 张
+    「真缺码值」一样，用户根本看不出哪张要动手补数据。
+    """
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    result = evaluate_table(session, table)["code_sets"]
+    assert result["ready"] is False
+    assert len(result["publish_pending"]) == 1
+    assert result["defects"] == []
+
+
+def test_summary_counts_tables_that_only_need_publishing():
+    session = make_session()
+    make_table(
+        session,
+        table_code="ONLYPENDING",
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="AI_SELF_VALIDATED",
+    )
+    summary = summarize([evaluate_table(session, table) for table in session.query(TableMetadataModel).all()])
+    assert summary["publish_pending_only"] == 1
+    assert summary["ready_all"] == 0
+    assert summary["publish_pending_tables"] == ["ONLYPENDING"]

@@ -1532,6 +1532,13 @@
   opacity: 0.75;
 }
 
+/* 待发布：数据是好的，只差一个动作。用暖色和真正的缺失（红）区分开 */
+.ready-chip.pending {
+  border-color: var(--amber-border);
+  background: var(--amber-light);
+  color: var(--amber);
+}
+
 .warn-ack {
   display: flex;
   gap: 8px;

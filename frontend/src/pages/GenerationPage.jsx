@@ -227,19 +227,29 @@ export default function GenerationPage() {
                             const section = item[artifact.key]
                             // 没有码值引用的报表没有「码值」这项，不能渲染成 ✓
                             const na = section.applicable === false
+                            // 只差把码表点发布：数据是好的，不该和「空码表」共用红色 ✕
+                            const pendingOnly = !section.ready && !na && (section.defects || []).length === 0
+                            const tone = na ? 'na' : section.ready ? 'ok' : pendingOnly ? 'pending' : 'bad'
                             return (
                               <span
                                 key={artifact.key}
-                                className={`ready-chip ${na ? 'na' : section.ready ? 'ok' : 'bad'}`}
+                                className={`ready-chip ${tone}`}
                                 title={
                                   na
                                     ? `${artifact.label} 不适用：这张表没有引用任何码表`
                                     : section.ready
                                       ? `${artifact.label} 可以生成（${artifact.hint}）`
-                                      : section.blockers.map((b) => b.message).join('；')
+                                      : (section.blockers || []).map((b) => b.message).join('；')
                                 }
                               >
-                                {artifact.label} {na ? '—' : section.ready ? '✓' : `✕${section.blockers.length}`}
+                                {artifact.label}{' '}
+                                {na
+                                  ? '—'
+                                  : section.ready
+                                    ? '✓'
+                                    : pendingOnly
+                                      ? `待发布${(section.publish_pending || []).length}`
+                                      : `✕${section.blockers.length}`}
                               </span>
                             )
                           })}
