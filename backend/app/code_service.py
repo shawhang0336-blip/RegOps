@@ -908,6 +908,7 @@ def extract_parallel_for_blocks(
     block_ids: List[str],
     settings: Settings,
     targets: Optional[List[str]] = None,
+    on_progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run Track A (Table Metadata) and Track B (Code Sets) concurrently across selected blocks, then auto-link in one O(F+C) pass."""
     active_targets = set(targets or ["metadata", "code_sets"])
@@ -974,13 +975,18 @@ def extract_parallel_for_blocks(
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "code_sets", "error": f"{type(exc).__name__}: {exc}"})
 
-        for bid, future in meta_futures.items():
+        for completed, (bid, future) in enumerate(meta_futures.items(), start=1):
             try:
                 table_id = future.result()
                 if table_id:
                     table_ids.append(table_id)
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "metadata", "error": f"{type(exc).__name__}: {exc}"})
+            if callable(on_progress):
+                try:
+                    on_progress(completed, len(meta_futures), len(table_ids))
+                except Exception:
+                    pass
 
     with SessionLocal() as session:
         resolved_count = auto_link_all_references(session)

@@ -112,41 +112,147 @@ const COLUMN_MAPPING_FIELDS = [
   ['length', '字段长度列'],
 ]
 
+async function pollImportProgress(documentId, onUpdate, { interval = 1200, timeout = 20 * 60 * 1000 } = {}) {
+  const startedAt = Date.now()
+  let snapshot = null
+  while (Date.now() - startedAt < timeout) {
+    const next = await v2(`/documents/${documentId}/progress`).catch(() => null)
+    if (next) {
+      snapshot = next
+      onUpdate?.(next)
+      if (!next.processing) return next
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval))
+  }
+  return snapshot
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0))
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  const rest = total % 60
+  return `${minutes}m${String(rest).padStart(2, '0')}s`
+}
+
 function ImportProgressPanel({ progress, onClose }) {
   if (!progress) return null
-  const stages = progress.autoParse ? IMPORT_STAGES : IMPORT_STAGES.slice(0, 3)
-  const currentStage = stages[Math.min(progress.stage, stages.length - 1)]
+
+  const stages = progress.stages?.length
+    ? progress.stages
+    : IMPORT_STAGES.map(([label, description], index) => ({ index: index + 1, label, description }))
+
+  const stage = Number(progress.stage || 0)
+  const counters = progress.counters || {}
+  const status = String(progress.status || 'WORKING').toUpperCase()
+  const working = status === 'WORKING'
+  const failed = status === 'FAILED'
+
+  const blocksTotal = Number(counters.blocks_total || counters.blocks || 0)
+  const blocksDone = Number(counters.blocks_done || 0)
+  const ratio = blocksTotal > 0 ? Math.min(1, blocksDone / blocksTotal) : 0
+
+  // 阶段内按已处理块数推进；阶段整体占 25%，第 4 阶段再多分 25% 给块进度
+  const base = Math.max(0, stage - 1) * 25
+  const inStage = stage === 4 && blocksTotal > 0 ? ratio * 25 : working ? 8 : (status === 'READY' ? 25 : 0)
+  const percent = Math.min(100, Math.round(status === 'DONE' ? 100 : base + inStage))
+
+  const headline = status === 'DONE'
+    ? '解析完成'
+    : failed
+      ? '解析已中断'
+      : status === 'READY'
+        ? '结构已就绪，等待解析'
+        : working
+          ? `正在${stages[Math.min(stage, stages.length) - 1]?.label || '处理'}`
+          : '准备中'
+
   return (
-    <section className={`import-progress-panel ${progress.status.toLowerCase()}`} aria-live="polite">
-      <div className="import-progress-heading">
-        <div>
-          <strong>{progress.status === 'DONE' ? '导入准备完成' : progress.status === 'FAILED' ? '导入准备已暂停' : '正在准备文件内容'}</strong>
-          <span>{progress.fileName}</span>
+    <section className={`import-progress-panel ${status.toLowerCase()}`} aria-live="polite">
+      <header className="import-progress-head">
+        <div className="import-progress-title">
+          <strong>{headline}</strong>
+          <span className="import-progress-file">{progress.file_name}</span>
         </div>
-        {progress.status !== 'WORKING' && <button type="button" className="button-link" onClick={onClose}>关闭</button>}
+        <div className="import-progress-meta">
+          {progress.elapsed > 0 && <span className="import-timer">{formatDuration(progress.elapsed)}</span>}
+          {!working && <button type="button" className="button-link" onClick={onClose}>关闭</button>}
+        </div>
+      </header>
+
+      <div className="import-progress-bar" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
+        <div className={`import-progress-fill ${working ? 'striped' : ''}`} style={{ width: `${percent}%` }} />
       </div>
-      <div className="import-stage-list">
-        {stages.map(([label, description], index) => {
-          const state = progress.status === 'DONE' || index < progress.stage
+
+      <div className="import-progress-summary">
+        <span>{progress.detail || '—'}</span>
+        <div className="import-progress-counters">
+          {counters.blocks ? <span>{counters.blocks} 个内容块</span> : null}
+          {counters.tables ? <span>{counters.tables} 张报表</span> : null}
+          {counters.fields ? <span>{counters.fields} 个字段</span> : null}
+          {counters.code_sets ? <span>{counters.code_sets} 张码表</span> : null}
+        </div>
+      </div>
+
+      <ol className="import-timeline">
+        {stages.map((item) => {
+          const index = item.index
+          const state = status === 'DONE' || index < stage
             ? 'done'
-            : index === progress.stage
-              ? progress.status.toLowerCase()
+            : index === stage
+              ? (working ? 'working' : failed ? 'failed' : 'done')
               : 'pending'
+          const stageLogs = (progress.logs || []).filter((entry) => Number(entry.stage) === index)
           return (
-            <div className={`import-stage ${state}`} key={label}>
-              <span className="import-stage-number">{index + 1}</span>
-              <div><strong>{label}</strong><small>{description}</small></div>
-              <em>{state === 'done' ? '完成' : state === 'working' ? '进行中' : state === 'failed' ? '未完成' : '等待'}</em>
-            </div>
+            <li className={`import-timeline-item ${state}`} key={item.index}>
+              <span className="import-timeline-dot" aria-hidden="true">
+                {state === 'done' ? '✓' : state === 'failed' ? '!' : ''}
+              </span>
+              <div className="import-timeline-body">
+                <div className="import-timeline-row">
+                  <strong>{item.label}</strong>
+                  <em>{state === 'done' ? '完成' : state === 'working' ? '进行中' : state === 'failed' ? '中断' : '等待'}</em>
+                </div>
+                <small>{item.description}</small>
+                {index === 4 && blocksTotal > 0 && (
+                  <div className="import-timeline-detail">
+                    <span>已处理 {blocksDone}/{blocksTotal} 个内容块</span>
+                    <div className="import-mini-bar"><div style={{ width: `${Math.round(ratio * 100)}%` }} /></div>
+                  </div>
+                )}
+                {stageLogs.length > 0 && (
+                  <ul className="import-log">
+                    {stageLogs.slice(-4).map((entry, logIndex) => (
+                      <li key={logIndex}>{entry.text}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </li>
           )
         })}
-      </div>
-      <p className="import-progress-detail">
-        {progress.status === 'DONE' ? '现在可以在下方核对报表字段和码表。' : progress.status === 'FAILED' ? '请根据页面提示处理后重试，已保存的内容不会丢失。' : `当前：${currentStage[0]}，请稍候。`}
-      </p>
+      </ol>
+
+      {progress.logs?.length > 0 && (
+        <details className="import-progress-log">
+          <summary>查看完整记录（{progress.logs.length} 条）</summary>
+          <ul>
+            {progress.logs.map((entry, index) => (
+              <li key={index}>{entry.text}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {failed && (
+        <p className="import-progress-foot">
+          已保存的内容不会丢失。处理后可以重新点击“解析当前文件”。
+        </p>
+      )}
     </section>
   )
 }
+
 
 export default function DocumentsPage({ embedded = false, importOnly = false, autoParse = false, onShowAssets, onSelectDocument }) {
   const navigate = useNavigate()
@@ -230,25 +336,32 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     const prepared = await v2(`/documents/${documentId}`)
     const blockIds = (prepared.blocks || []).filter((block) => block.eligible !== false && !block.superseded).map((block) => block.id)
     if (!blockIds.length) throw new Error('文件中没有可解析的内容')
-    return v2(`/documents/${documentId}/extract-parallel`, {
+    await v2(`/documents/${documentId}/extract-parallel`, {
       method: 'POST',
       body: JSON.stringify({ block_ids: blockIds, targets: ['metadata', 'code_sets'] }),
     })
+    // 接口是 202：真正的结果要轮询进度拿到
+    return pollImportProgress(documentId, setImportProgress)
   }
 
   async function parseCurrentDocument() {
     if (!detail) return
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: detail.file_name, digest: detail.sha256, stage: 3, status: 'WORKING', awaitReextract: false, autoParse: true })
+    setImportProgress({ fileName: detail.file_name, stage: 4, status: 'WORKING', detail: '正在准备解析', counters: {}, logs: [] })
     try {
       const result = await extractPreparedDocument(detail.id)
-      setImportProgress((current) => current ? { ...current, stage: 4, status: result.errors?.length ? 'FAILED' : 'DONE' } : null)
-      setNotice(`解析完成：生成 ${result.table_ids?.length || 0} 张报表、${result.code_set_ids?.length || 0} 张码表。`)
-      if (result.errors?.length) setError(`${result.errors.length} 项内容未完成：${friendlyError(result.errors[0].error)}`)
-      if (onShowAssets) onShowAssets(result.table_ids?.length ? 'fields' : 'codes', result.table_ids?.[0] || result.code_set_ids?.[0] || '')
+      const tables = result?.counters?.tables || 0
+      const codeSets = result?.counters?.code_sets || 0
+      await load(detail.id)
+      if (result?.status === 'FAILED') {
+        setError('解析未完成，请查看进度记录后重试。')
+        return
+      }
+      setNotice(`解析完成：生成 ${tables} 张报表、${codeSets} 张码表。`)
+      if (onShowAssets) onShowAssets(tables ? 'fields' : 'codes', '')
     } catch (err) {
-      setImportProgress((current) => current ? { ...current, status: 'FAILED' } : null)
+      setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
       setBusy(false)
@@ -259,21 +372,40 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     if (!file) return
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: file.name, digest: '', stage: 0, status: 'WORKING', awaitReextract: false, autoParse })
+    setImportProgress({ fileName: file.name, stage: 1, status: 'WORKING', detail: '正在计算文件指纹', counters: {}, logs: [] })
     try {
       const digest = await fileSha256(file)
-      setImportProgress({ fileName: file.name, digest, stage: 0, status: 'WORKING', awaitReextract: false, autoParse })
+      setImportProgress((current) => current ? { ...current, detail: '正在上传文件' } : current)
       const form = new FormData()
       form.append('file', file)
       const document = await v2('/documents', { method: 'POST', body: form })
-      setImportProgress((current) => updateImportProgress(current, document))
-      if (autoParse && document.status !== 'OVERVIEW_FAILED') {
-        const result = await extractPreparedDocument(document.id)
-        setImportProgress((current) => current ? { ...current, stage: 4, status: result.errors?.length ? 'FAILED' : 'DONE' } : null)
+
+      let snapshot = null
+      if (document.processing) {
+        snapshot = await pollImportProgress(document.id, setImportProgress)
+      } else {
+        snapshot = await v2(`/documents/${document.id}/progress`).catch(() => null)
+        setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
+      }
+
+      if (snapshot?.status === 'FAILED') {
         await load(document.id)
-        setNotice(`解析完成：生成 ${result.table_ids?.length || 0} 张报表、${result.code_set_ids?.length || 0} 张码表，可在下方直接核对。`)
-        if (result.errors?.length) setError(`${result.errors.length} 项内容未完成：${friendlyError(result.errors[0].error)}`)
-        if (onShowAssets) onShowAssets(result.table_ids?.length ? 'fields' : 'codes', result.table_ids?.[0] || result.code_set_ids?.[0] || '')
+        setError('结构检查未完成，请根据提示处理后重试。')
+        return
+      }
+
+      if (autoParse) {
+        const result = await extractPreparedDocument(document.id)
+        const tables = result?.counters?.tables || 0
+        const codeSets = result?.counters?.code_sets || 0
+        const failed = result?.status === 'FAILED'
+        await load(document.id)
+        if (failed) {
+          setError('解析未完成，请查看进度记录后重试。')
+          return
+        }
+        setNotice(`解析完成：生成 ${tables} 张报表、${codeSets} 张码表，可在下方直接核对。`)
+        if (onShowAssets) onShowAssets(tables ? 'fields' : 'codes', '')
       } else {
         await load(document.id)
         setNotice(
@@ -283,7 +415,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
         )
       }
     } catch (err) {
-      setImportProgress((current) => current ? { ...current, status: 'FAILED' } : null)
+      setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
       setBusy(false)
@@ -306,30 +438,33 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
   async function prepareDocument() {
     if (!detail) return
-    const hadBlocks = allBlocks.length > 0
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: detail.file_name, digest: detail.sha256, stage: 1, status: 'WORKING', awaitReextract: hadBlocks, autoParse })
+    setImportProgress({ fileName: detail.file_name, stage: 1, status: 'WORKING', detail: '正在重新检查文档结构', counters: {}, logs: [] })
     try {
-      const result = await v2(`/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
-      if (result.status !== 'OVERVIEW_FAILED' && hadBlocks) {
-        await v2(`/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
+      await v2(`/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
+      const snapshot = await pollImportProgress(detail.id, setImportProgress)
+      await load(detail.id)
+      if (snapshot?.status === 'FAILED') {
+        setError('文件结构检查仍未完成，请查看提示后重试。')
+        return
       }
-      setImportProgress((current) => updateImportProgress(current, result))
-      await selectDocument(result.id)
-      if (result.status === 'OVERVIEW_FAILED') {
-        setError('文件结构检查仍未完成，请查看提示后重试；当前尚未进行初步切块。')
-      } else if (autoParse) {
-        const extraction = await extractPreparedDocument(result.id)
-        setImportProgress((current) => current ? { ...current, stage: 4, status: extraction.errors?.length ? 'FAILED' : 'DONE', awaitReextract: false } : null)
-        setNotice(`解析完成：生成 ${extraction.table_ids?.length || 0} 张报表、${extraction.code_set_ids?.length || 0} 张码表。`)
-        if (onShowAssets) onShowAssets(extraction.table_ids?.length ? 'fields' : 'codes', extraction.table_ids?.[0] || extraction.code_set_ids?.[0] || '')
+      if (autoParse) {
+        const extraction = await extractPreparedDocument(detail.id)
+        const tables = extraction?.counters?.tables || 0
+        const codeSets = extraction?.counters?.code_sets || 0
+        await load(detail.id)
+        if (extraction?.status === 'FAILED') {
+          setError('解析未完成，请查看进度记录后重试。')
+          return
+        }
+        setNotice(`解析完成：生成 ${tables} 张报表、${codeSets} 张码表。`)
+        if (onShowAssets) onShowAssets(tables ? 'fields' : 'codes', '')
       } else {
-        setImportProgress((current) => current ? { ...current, stage: 4, status: 'DONE', awaitReextract: false } : null)
         setNotice('文件结构检查和初步切块已完成，可以继续解析。')
       }
     } catch (err) {
-      setImportProgress((current) => current ? { ...current, status: 'FAILED' } : null)
+      setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
       setBusy(false)

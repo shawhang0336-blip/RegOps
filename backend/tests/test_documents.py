@@ -184,9 +184,13 @@ def test_failed_overview_blocks_chunking_and_can_retry(monkeypatch, tmp_path):
     assert session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).count() == 0
 
     should_fail = False
-    prepared = documents.prepare_document(document.id)
-    assert prepared["status"] == "UPLOADED"
-    assert prepared["block_count"] == 1
+    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
+    result = documents.prepare_document(document.id)
+    assert result["status"] == "PREPARING"
+    # 接口立即返回，真实结果落在 document 上
+    prepared = session.get(SourceDocumentModel, document.id)
+    assert prepared.status == "UPLOADED"
+    assert prepared.block_count == 1
 
 
 def test_confirming_block_clears_pending_state(monkeypatch):
@@ -227,16 +231,36 @@ def test_assets_can_be_scoped_to_selected_document(monkeypatch):
     assert [row["id"] for row in code_sets.list_code_sets(document_id=second.id)] == [second_set.id]
 
 
+class _InlineThread:
+    """同步执行 target 的假线程，让后台流程在测试里可断言。"""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+        self.daemon = daemon
+
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
 def test_extraction_records_completion_state(monkeypatch):
     session = make_session()
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     document, block, table = make_document(session)
     monkeypatch.setattr(documents, "analyze_document_structure", lambda *args: None)
-    monkeypatch.setattr(documents, "extract_parallel_for_blocks", lambda *args: {"table_ids": [table.id], "code_set_ids": [], "errors": [], "resolved_reference_count": 0})
+    monkeypatch.setattr(
+        documents,
+        "extract_parallel_for_blocks",
+        lambda *args, **kwargs: {"table_ids": [table.id], "code_set_ids": [], "errors": [], "resolved_reference_count": 0},
+    )
+    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
 
     result = documents.extract_document_parallel(document.id, documents.ParallelExtractRequest(block_ids=[block.id]))
 
-    assert result["table_ids"] == [table.id]
+    # 接口是 202：立刻返回，真正的完成状态落在 document 上
+    assert result["status"] == "EXTRACTING"
     assert session.get(SourceDocumentModel, document.id).status == "EXTRACTED"
     architecture = session.query(DocumentArchitectureModel).filter(DocumentArchitectureModel.document_id == document.id).one()
     assert architecture.plan_json["stage"] == "EXTRACTION"
@@ -247,11 +271,13 @@ def test_extraction_exception_does_not_leave_running_state(monkeypatch):
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     document, block, _ = make_document(session)
     monkeypatch.setattr(documents, "analyze_document_structure", lambda *args: None)
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("offline extraction failure")
     monkeypatch.setattr(documents, "extract_parallel_for_blocks", fail)
+    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
 
-    with pytest.raises(HTTPException):
-        documents.extract_document_parallel(document.id, documents.ParallelExtractRequest(block_ids=[block.id]))
+    # 异步执行：异常不会冒泡给调用方，但必须落到 document 状态上，不能停留在 EXTRACTING
+    documents.extract_document_parallel(document.id, documents.ParallelExtractRequest(block_ids=[block.id]))
+    assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
 
     assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
