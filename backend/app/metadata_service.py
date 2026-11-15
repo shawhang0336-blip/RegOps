@@ -792,6 +792,10 @@ def remove_table(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
     session.query(MetadataRevisionModel).filter(
         MetadataRevisionModel.table_id == table.id
     ).delete(synchronize_session=False)
+    # 校验记录也挂在 table_id 上（带数据库外键），不删会 1451
+    session.query(MetadataValidationModel).filter(
+        MetadataValidationModel.table_id == table.id
+    ).delete(synchronize_session=False)
     session.query(FieldMetadataModel).filter(
         FieldMetadataModel.table_id == table.id
     ).delete(synchronize_session=False)

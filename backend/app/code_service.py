@@ -647,6 +647,11 @@ FIXED_VALUE_HINT_RE = re.compile(r"(?:本项)?(?:固定|恒)\s*(?:填|填报|填
 _QUOTES = "\"'“”‘’「」『』《》【】[]()（） "
 
 
+def _has_error_issues(issues: List[Dict[str, Any]]) -> bool:
+    """只有 ERROR 才算需要人处理。WARNING（比如 AI 复核不可用）只是提示。"""
+    return any(str(item.get("severity") or "").upper() == "ERROR" for item in issues)
+
+
 def parse_fixed_value(text: str) -> Optional[str]:
     """从引用原文里提取固定值。
 
@@ -917,12 +922,15 @@ def _record_code_set_validation(
             id=str(uuid.uuid4()),
             code_set_id=row.id,
             validator_kind="AI_REVIEW",
-            status="NEEDS_REVIEW" if issues else "PASSED",
+            status="NEEDS_REVIEW" if _has_error_issues(issues) else "PASSED",
             issues_json=issues,
             trace_json=trace,
         )
     )
-    row.status = "NEEDS_REVIEW" if program_issues or issues else "AI_SELF_VALIDATED"
+    # AI 复核不可用时 issues 里塞的是 WARNING 级的 AI_REVIEW_UNAVAILABLE——
+    # 那是服务没跑成，不是数据有问题。整表标红成「需要核对」会让 100 张
+    # 本来没问题的码表挂在那里没人该看。只有 ERROR 级的真问题才拦。
+    row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) or _has_error_issues(issues) else "AI_SELF_VALIDATED"
 
 
 def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: bool = True) -> List[str]:
