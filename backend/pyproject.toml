@@ -31,6 +31,9 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+  "smoke: real-link smoke test requiring real GLM + Oracle (skipped unless RUN_REAL_SMOKE=1)",
+]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

@@ -7,7 +7,7 @@ from app.config import Settings, get_settings
 from app.generic_domain import bind_generators, bind_rules, bind_schema
 from app.generic_oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
 from app.generic_ai import LlmTimeoutError
-from app.generic_workflow import _call_validated, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
+from app.generic_workflow import _call_validated, _create_run, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
 from app.production_service import build_production_bundle
 from app.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.rules import RuleValidationError
@@ -325,3 +325,23 @@ def test_call_validated_validation_error_carries_structured_context():
     assert ctx["error_kind"] == "validation"
     assert ctx["stage"] == "rule_binder"
     assert ctx["field"] == "POSTCODE"
+
+
+def test_create_run_marks_run_running(organization_spec):
+    session = make_session()
+    spec_id = str(uuid.uuid4())
+    session.add(
+        SpecificationModel(
+            id=spec_id,
+            version="SAFE_1.3",
+            table_code="CONFIRMED_SNAPSHOT",
+            source_name=organization_spec.source_name,
+            source_sha256=organization_spec.source_sha256,
+            content_json={"table_name": "confirmed", "selection_confirmed": True, "tables": [organization_spec.model_dump()]},
+        )
+    )
+    session.commit()
+
+    run = _create_run(session, spec_id, Settings())
+    assert run.status == "RUNNING"
+    assert run.current_node == "bind_rules"

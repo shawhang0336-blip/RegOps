@@ -1,4 +1,5 @@
 import hashlib
+import threading
 import uuid
 from typing import Any, Dict, List
 
@@ -12,7 +13,8 @@ from ..code_service import generation_blockers
 from ..config import get_settings
 from ..db import SessionLocal
 from ..domain import canonical_json
-from ..generic_workflow import start_generic_run
+from ..events import append_event
+from ..generic_workflow import _create_run, _execute_run
 from ..metadata_service import metadata_to_spec
 from ..models import RunModel, SpecificationModel
 from ..production_service import build_production_bundle
@@ -63,12 +65,39 @@ def download_production_bundle(run_id: str):
         )
 
 
-@router.post("/runs", status_code=201)
+def _spawn_background_run(run_id: str, settings, generation_budget) -> None:
+    def _run():
+        try:
+            with SessionLocal() as session:
+                run = session.get(RunModel, run_id)
+                if run and run.status == "RUNNING":
+                    _execute_run(session, run, settings, generation_budget=generation_budget)
+        except Exception as exc:
+            with SessionLocal() as session:
+                run = session.get(RunModel, run_id)
+                if run:
+                    append_event(
+                        session,
+                        run,
+                        "RUN_FAILED",
+                        "background_executor",
+                        {
+                            "node": "background_executor",
+                            "result": {"error": f"{type(exc).__name__}: {exc}"},
+                        },
+                    )
+                    session.commit()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@router.post("/runs", status_code=202)
 def create_generation(request: GenerationRequest) -> Dict[str, Any]:
     if request.provider != "live":
         raise HTTPException(status_code=422, detail="Production generation requires provider=live")
     if not request.table_ids:
         raise HTTPException(status_code=422, detail="Select at least one published table")
+    settings = get_settings()
     with SessionLocal() as session:
         tables = [session.get(TableMetadataModel, table_id) for table_id in request.table_ids]
         if any(not table for table in tables):
@@ -102,12 +131,15 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
         )
         session.add(snapshot)
         session.flush()
-        run = start_generic_run(
-            session,
-            snapshot.id,
-            get_settings(),
-            generation_budget=get_budget(session),
-        )
-        from ..main import run_view
+        run = _create_run(session, snapshot.id, settings)
+        budget = get_budget(session)
+        session.commit()
+        run_id = run.id
 
+    _spawn_background_run(run_id, settings, budget)
+
+    from ..main import run_view
+
+    with SessionLocal() as session:
+        run = session.get(RunModel, run_id)
         return run_view(session, run)

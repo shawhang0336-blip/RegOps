@@ -21,7 +21,7 @@ from .business import BusinessDatabaseError, ReadOnlyBusinessDatabase
 from .catalog import parse_document_catalog
 from .config import get_settings
 from .db import SessionLocal, init_db
-from .events import fold_events
+from .events import append_event, fold_events
 from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
 from .models import EventModel, RuleModel, RunModel, SpecificationModel
 from .oracle_sandbox import OracleSandbox
@@ -29,9 +29,29 @@ from .spec_parser import SpecParseError
 from .errors import WorkflowError
 
 
+def _mark_interrupted_runs():
+    with SessionLocal() as session:
+        rows = (
+            session.query(RunModel)
+            .filter(RunModel.status.in_(["RUNNING", "AUDITING", "READY_TO_AUDIT"]))
+            .all()
+        )
+        for run in rows:
+            append_event(
+                session,
+                run,
+                "RUN_FAILED",
+                "startup",
+                {"node": "startup", "result": {"error": "Run interrupted by process restart"}},
+            )
+        if rows:
+            session.commit()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _mark_interrupted_runs()
     yield
 
 

@@ -302,6 +302,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                 payload = {
                     **spec_payload(spec),
                     "fields": [field.model_dump()],
+                    "field_names": [item.name for item in spec.fields],
                     "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
                     "existing_rule_keys": [rule.rule_key for rule in field_rules],
                     **_code_set_context(field_code_sets, spec.table_code, field.name),
@@ -309,7 +310,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                 rules, trace = _call_validated(
                     llm,
                     "assign_rules",
-                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。",
+                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。",
                     payload,
                     lambda args: bind_rules(spec, args.get("rules", [])),
                 )
@@ -794,9 +795,8 @@ def _latest_payload(session: Session, run_id: str, kind: str) -> Dict[str, Any]:
     return event.payload_json
 
 
-def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
-    specs = _specs(session, spec_id)
-    llm = llm or RealDesignLlm(settings)
+def _create_run(session: Session, spec_id: str, settings: Settings) -> RunModel:
+    _specs(session, spec_id)  # 校验 spec 存在且已确认；非法则抛 WorkflowError
     run = RunModel(id=str(uuid.uuid4()), spec_id=spec_id, status="NEW", current_node="created")
     session.add(run)
     session.flush()
@@ -808,6 +808,12 @@ def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=No
         "table_confirmation",
         {"spec_id": spec_id, "provider": "REAL_GLM", "confirmation": specification.content_json.get("confirmation")},
     )
+    return run
+
+
+def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
+    specs = _specs(session, run.spec_id)
+    llm = llm or RealDesignLlm(settings)
     current_stage = "created"
     try:
         current_stage = "generation_planner"
@@ -855,6 +861,12 @@ def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=No
         return run
     session.commit()
     return continue_generic_run(session, run, settings, llm)
+
+
+def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
+    """同步入口：创建 run 并执行到第一个 gate。测试与内部调用使用。"""
+    run = _create_run(session, spec_id, settings)
+    return _execute_run(session, run, settings, llm, generation_budget)
 
 
 def approve_generic_rules(
