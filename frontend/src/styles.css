@@ -297,30 +297,128 @@
   min-width: 0;
 }
 
-.current-file-select {
-  flex: 1 1 260px;
-  max-width: 560px;
+.file-picker {
+  position: relative;
+  flex: 1 1 300px;
+  max-width: 520px;
   min-width: 0;
-  padding: 3px 8px;
-  border: 1px solid transparent;
+}
+
+.file-picker-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.file-picker-trigger:hover:not(:disabled) {
+  border-color: var(--muted-light);
+  background: var(--surface-hover);
+}
+
+.file-picker-trigger.open {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px var(--blue-light);
+}
+
+.file-picker-trigger:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.file-picker-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.file-picker-caret {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--muted);
+  transition: transform 0.18s ease;
+}
+
+.file-picker-trigger.open .file-picker-caret {
+  transform: rotate(180deg);
+}
+
+.file-picker-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.file-picker-option {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--ink);
-  font-size: 15px;
-  font-weight: 650;
+  text-align: left;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.current-file-select:hover:not(:disabled) {
-  border-color: var(--line);
-  background: var(--surface-subtle);
+.file-picker-option:hover {
+  background: var(--surface-hover);
 }
 
-.current-file-select:focus {
-  border-color: var(--blue);
-  background: var(--surface);
-  outline: none;
+.file-picker-option.selected {
+  background: var(--blue-light);
+}
+
+.file-picker-option.selected::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 9px;
+  bottom: 9px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--blue);
+}
+
+.file-picker-option-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.file-picker-option-meta {
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .current-file-meta {

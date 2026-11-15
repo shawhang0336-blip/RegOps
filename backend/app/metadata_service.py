@@ -2,7 +2,7 @@ import hashlib
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -54,6 +54,39 @@ def _source_declares_type(raw_context: str) -> bool:
     return any(hint in text for hint in TYPE_DECLARATION_HINTS)
 
 
+def _field_declares_length(raw_context: str, field_en: str) -> Optional[bool]:
+    """判断原文对该字段是否给出了明确的长度。
+
+    True = 写了"数值型，13.8"这类完整声明；False = 只写了"数值型"没给长度；
+    None = 原文里找不到该字段的类型声明。
+    """
+    if not field_en:
+        return None
+    type_pattern = r"(定长字符型|变长字符型|字符型|数值型|日期型|整数型|长整数型|时间型)"
+    lines = (raw_context or "").split("\n")
+    found_type = False
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith(field_en):
+            continue
+        if re.search(type_pattern + r"\s*[，,]\s*\d+", stripped):
+            return True
+        if re.search(type_pattern, stripped):
+            found_type = True
+            # 长度可能被折到下一行，但下一行必须是纯续行（不是新字段）才算
+            nxt = lines[index + 1] if index + 1 < len(lines) else ""
+            if nxt and not re.match(r"^\s*[A-Z][A-Z0-9_]{2,}\s", nxt) and re.search(
+                r"^\s*[，,]?\s*\d{1,3}(\.\d+)?", nxt
+            ):
+                return True
+    return False if found_type else None
+
+
+def _is_length_related(code: str) -> bool:
+    upper = (code or "").upper()
+    return any(key in upper for key in ("LENGTH", "PRECISION", "DECIMAL"))
+
+
 def _is_type_related(code: str) -> bool:
     upper = (code or "").upper()
     return any(upper.startswith(prefix) for prefix in TYPE_RELATED_PREFIXES)
@@ -84,6 +117,8 @@ def enforce_issue_evidence(
         if severity == "ERROR" and downgrade_unverified:
             if not declares and _is_type_related(code):
                 reason = "来源原文未声明数据类型或长度，该判断属推断"
+            elif _is_length_related(code) and _field_declares_length(raw_context, str(item.get("field_en") or "")) is False:
+                reason = "来源原文只写了类型、未给出长度，长度判断属推断"
             elif evidence and evidence.upper() not in {"NO_SOURCE", "无", "N/A"}:
                 compact_evidence = re.sub(r"\s+", "", evidence)
                 if compact_evidence and compact_evidence not in compact_source:

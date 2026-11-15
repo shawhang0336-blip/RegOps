@@ -240,3 +240,27 @@ def test_table_needs_review_only_for_errors():
 
     assert table_needs_review([{"severity": "WARNING"}, {"severity": "INFO"}]) is False
     assert table_needs_review([{"severity": "WARNING"}, {"severity": "ERROR"}]) is True
+
+
+def test_field_declares_length_distinguishes_missing_length():
+    from app.metadata_service import _field_declares_length
+
+    raw = (
+        "CGYN             是否有反担保人   数值型         必填项，1-是，0-否。\n"
+        "ANNINRATE  年利率  数值型，13.8  必填项\n"
+    )
+    assert _field_declares_length(raw, "CGYN") is False      # 只写了数值型，没给长度
+    assert _field_declares_length(raw, "ANNINRATE") is True  # 数值型，13.8
+    assert _field_declares_length(raw, "NOT_THERE") is None
+
+
+def test_enforce_issue_evidence_downgrades_length_claim_without_declared_length():
+    from app.metadata_service import enforce_issue_evidence
+
+    raw = "CGYN  是否有反担保人  数值型  必填项，1-是，0-否。\n"
+    issues = [
+        {"severity": "ERROR", "code": "TYPE_LENGTH_MISMATCH", "field_en": "CGYN", "message": "22.2 与 0/1 标识不符"},
+    ]
+    result = enforce_issue_evidence(issues, raw)
+    assert result[0]["severity"] == "WARNING"
+    assert "未给出长度" in result[0]["message"]
