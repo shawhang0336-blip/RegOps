@@ -418,10 +418,12 @@ export default function MetadataPage({ embedded = false }) {
     }
     const target = readiness?.summary?.ready_all || 0
     if (target <= 0) {
-      setError('当前没有三项都就绪的表，先处理下方列出的卡点。')
+      setError('当前没有可出包的表，先处理下方列出的卡点。')
       return
     }
-    if (!window.confirm(`将发布 ${target} 张「DDL / 规则 / 码值」都就绪的表，发布后内容不可直接修改。继续？`)) {
+    const naCodes = readiness?.summary?.not_applicable?.code_sets || 0
+    const naNote = naCodes ? `（其中 ${naCodes} 张没有码值引用，不涉及码值项）` : ''
+    if (!window.confirm(`将发布 ${target} 张所有适用项都就绪的表${naNote}，发布后内容不可直接修改。继续？`)) {
       return
     }
     setBusy(true)
@@ -504,7 +506,10 @@ export default function MetadataPage({ embedded = false }) {
                 <strong>可出包 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
                 <span className="muted-text">
                   DDL 就绪 {readiness.summary.ready.ddl} · 规则原料齐 {readiness.summary.ready.rule_materials} · 码值就绪{' '}
-                  {readiness.summary.ready.code_sets} · 校验原文覆盖 {readiness.summary.check_text_coverage}%
+                  {readiness.summary.ready.code_sets}
+                  {readiness.summary.not_applicable?.code_sets > 0 &&
+                    `（另 ${readiness.summary.not_applicable.code_sets} 张无码值引用，不涉及）`}
+                  {' · '}校验原文覆盖 {readiness.summary.check_text_coverage}%
                 </span>
               </div>
               <button
@@ -514,9 +519,10 @@ export default function MetadataPage({ embedded = false }) {
                 onClick={publishReadyTables}
                 title="只发布 DDL 能落地、码值能灌库、规则原料齐备的表"
               >
-                批量发布三项齐备的表
+                批量发布可出包的表
               </button>
-              {readiness.summary.ready.code_sets < readiness.summary.ready.ddl && (
+              {readiness.summary.ready.code_sets + (readiness.summary.not_applicable?.code_sets || 0) <
+                readiness.summary.ready.ddl && (
                 <p className="readiness-hint">
                   卡口在码值：能建表 {readiness.summary.ready.ddl} 张、能灌码值只有 {readiness.summary.ready.code_sets} 张，
                   通常是引用的码表还没发布——阶段 2 的规则装配遇到未发布码表会直接报错，码值也进不了产出包。
@@ -549,17 +555,22 @@ export default function MetadataPage({ embedded = false }) {
                       {['ddl', 'rule_materials', 'code_sets'].map((key) => {
                         const section = readinessById[table.id][key]
                         const label = key === 'ddl' ? 'DDL' : key === 'rule_materials' ? '规则原料' : '码值'
+                        // applicable=false：这张表根本没有这一项（例如没有码值引用的报表），
+                        // 显示成「✓」会被误读成「验过了」
+                        const na = section.applicable === false
                         return (
                           <span
                             key={key}
-                            className={`ready-chip ${section.ready ? 'ok' : 'bad'}`}
+                            className={`ready-chip ${na ? 'na' : section.ready ? 'ok' : 'bad'}`}
                             title={
-                              section.ready
-                                ? `${label} 可以生成`
-                                : section.blockers.map((item) => item.message).join('；')
+                              na
+                                ? `${label} 不适用：这张表没有引用任何码表`
+                                : section.ready
+                                  ? `${label} 可以生成`
+                                  : section.blockers.map((item) => item.message).join('；')
                             }
                           >
-                            {label} {section.ready ? '✓' : `✕${section.blockers.length}`}
+                            {label} {na ? '—' : section.ready ? '✓' : `✕${section.blockers.length}`}
                           </span>
                         )
                       })}

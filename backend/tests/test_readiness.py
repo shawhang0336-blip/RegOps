@@ -223,3 +223,47 @@ def test_evaluate_document_scopes_by_document():
     payload = evaluate_document(session, document_id)
     assert payload["summary"]["table_count"] == 1
     assert payload["tables"][0]["table_code"] == "T1"
+
+
+def test_table_without_code_reference_marks_code_sets_not_applicable():
+    """报表字段和码值没有必然联系。
+
+    备注、金额、日期这类字段本来就不该有码值引用。这种表的「码值」项是
+    「不适用」——既不是齐也不是缺。以前它被算作 ready=True，界面上打一个 ✓，
+    读起来像「验过了」，于是 30 张「三项齐」里混进了 5 张根本没有码值项的表。
+    """
+    session = make_session()
+    table = make_table(session, fields=[{"en": "REMARK", "length": 256, "check": "非必填项"}])
+    result = evaluate_table(session, table)
+    assert result["code_sets"]["applicable"] is False
+    # 不适用不阻断推进
+    assert result["code_sets"]["ready"] is True
+
+
+def test_table_with_code_reference_marks_code_sets_applicable():
+    session = make_session()
+    table = make_table(
+        session,
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="PUBLISHED",
+    )
+    result = evaluate_table(session, table)
+    assert result["code_sets"]["applicable"] is True
+    assert result["code_sets"]["ready"] is True
+
+
+def test_summary_separates_not_applicable_from_ready():
+    session = make_session()
+    make_table(session, table_code="NOCODE", fields=[{"en": "REMARK", "length": 256}])
+    make_table(
+        session,
+        table_code="WITHCODE",
+        fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表"}],
+        code_set_status="PUBLISHED",
+    )
+    summary = summarize([evaluate_table(session, table) for table in session.query(TableMetadataModel).all()])
+    assert summary["not_applicable"]["code_sets"] == 1
+    assert summary["ready"]["code_sets"] == 1
+    # 两张都能推进阶段 2，但只有一张是真的三项都适用且都就绪
+    assert summary["ready_all"] == 2
+    assert summary["ready_all_full"] == 1

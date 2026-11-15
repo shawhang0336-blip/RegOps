@@ -225,17 +225,21 @@ export default function GenerationPage() {
                         <div className="readiness-row">
                           {ARTIFACTS.map((artifact) => {
                             const section = item[artifact.key]
+                            // 没有码值引用的报表没有「码值」这项，不能渲染成 ✓
+                            const na = section.applicable === false
                             return (
                               <span
                                 key={artifact.key}
-                                className={`ready-chip ${section.ready ? 'ok' : 'bad'}`}
+                                className={`ready-chip ${na ? 'na' : section.ready ? 'ok' : 'bad'}`}
                                 title={
-                                  section.ready
-                                    ? `${artifact.label} 可以生成（${artifact.hint}）`
-                                    : section.blockers.map((b) => b.message).join('；')
+                                  na
+                                    ? `${artifact.label} 不适用：这张表没有引用任何码表`
+                                    : section.ready
+                                      ? `${artifact.label} 可以生成（${artifact.hint}）`
+                                      : section.blockers.map((b) => b.message).join('；')
                                 }
                               >
-                                {artifact.label} {section.ready ? '✓' : `✕${section.blockers.length}`}
+                                {artifact.label} {na ? '—' : section.ready ? '✓' : `✕${section.blockers.length}`}
                               </span>
                             )
                           })}

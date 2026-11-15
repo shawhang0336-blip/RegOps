@@ -1523,6 +1523,15 @@
   color: var(--red);
 }
 
+/* 不适用：不是通过也不是缺失，用虚线边框区别于两种实心状态 */
+.ready-chip.na {
+  border-style: dashed;
+  border-color: var(--line);
+  background: transparent;
+  color: var(--muted);
+  opacity: 0.75;
+}
+
 .warn-ack {
   display: flex;
   gap: 8px;

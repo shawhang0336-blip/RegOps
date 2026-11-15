@@ -184,8 +184,13 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
             _issue("WARNING", "TYPE_INFERRED", f"{inferred} 个字段的类型在原文里没有依据，是推断出来的")
         )
 
-    def pack(items: List[Dict[str, Any]], warnings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def pack(items: List[Dict[str, Any]], warnings: List[Dict[str, Any]], applicable: bool = True) -> Dict[str, Any]:
         return {
+            # applicable=False 表示这张表根本没有这一项交付物。
+            # 报表字段和码值没有必然联系：备注、金额、日期都不该有码值引用。
+            # 这种「不适用」不能被渲染成「通过」——它既不是齐也不是缺，
+            # 混进统计口径会让人以为验过了。
+            "applicable": applicable,
             "ready": not any(item["severity"] == "ERROR" for item in items),
             "blockers": [item for item in items if item["severity"] == "ERROR"],
             "warnings": warnings,
@@ -207,30 +212,60 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
         ),
         "ddl": pack(ddl, ddl_warnings),
         "rule_materials": pack(materials, [item for item in materials if item["severity"] != "ERROR"]),
-        "code_sets": pack(codes, [item for item in codes if item["severity"] != "ERROR"]),
+        # 只有引用了码表的表才有「码值」这项交付物
+        "code_sets": pack(
+            codes,
+            [item for item in codes if item["severity"] != "ERROR"],
+            applicable=bool(refs),
+        ),
     }
 
 
 def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """汇总：每项交付物各有多少张表可用，以及卡点排行。"""
+    """汇总：每项交付物各有多少张表可用，以及卡点排行。
+
+    口径要说清楚：「不适用」不等于「就绪」。
+    例如一张没有码值引用的报表，code_sets 这一项对它不成立，
+    它不该被算进「码值就绪」，也不该阻止它推进阶段 2。
+    """
     total_fields = sum(item["field_count"] for item in results)
     missing_check = sum(item["fields_without_check_text"] for item in results)
     counter: Dict[str, Dict[str, int]] = {artifact: {} for artifact in ARTIFACTS}
     ready = {artifact: 0 for artifact in ARTIFACTS}
+    not_applicable = {artifact: 0 for artifact in ARTIFACTS}
     for item in results:
         for artifact in ARTIFACTS:
             section = item[artifact]
+            if not section.get("applicable", True):
+                not_applicable[artifact] += 1
+                continue
             if section["ready"]:
                 ready[artifact] += 1
             for blocker in section["blockers"]:
                 counter[artifact][blocker["code"]] = counter[artifact].get(blocker["code"], 0) + 1
+
+    def passing(item) -> bool:
+        """所有适用的项都就绪；不适用的项不参与判定。"""
+        return all(
+            item[artifact]["ready"] if item[artifact].get("applicable", True) else True
+            for artifact in ARTIFACTS
+        )
+
     return {
         "table_count": len(results),
         "field_count": total_fields,
         "fields_without_check_text": missing_check,
         "check_text_coverage": round(100 * (total_fields - missing_check) / total_fields, 1) if total_fields else 0.0,
         "ready": ready,
-        "ready_all": sum(1 for item in results if all(item[artifact]["ready"] for artifact in ARTIFACTS)),
+        "not_applicable": not_applicable,
+        # 可推进阶段 2 的表数（含「某项不适用」的表）
+        "ready_all": sum(1 for item in results if passing(item)),
+        # 三项都实际适用、且都就绪的表数——这才是字面意义的「三项齐」
+        "ready_all_full": sum(
+            1
+            for item in results
+            if passing(item) and all(item[artifact].get("applicable", True) for artifact in ARTIFACTS)
+        ),
         "blocker_codes": {
             artifact: sorted(codes.items(), key=lambda pair: pair[1], reverse=True)
             for artifact, codes in counter.items()
