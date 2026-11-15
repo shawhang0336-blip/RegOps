@@ -9,10 +9,25 @@ def quote_identifier(name: str, dialect: str = "mysql") -> str:
     return f'"{name}"' if dialect == "oracle" else f"`{name}`"
 
 
+def _blank_fold(field: str, dialect: str) -> str:
+    """把制表/换行折成空格再 TRIM。
+
+    只 TRIM 空格会把纯 "\\t" 当成有值：Oracle 的 TRIM 默认只去空格，
+    于是「必填」在遇到空白填充的脏数据时漏判。必填的语义是「去掉空白后仍有内容」。
+    """
+    chars = ("CHR(9)", "CHR(10)", "CHR(13)") if dialect == "oracle" else ("CHAR(9)", "CHAR(10)", "CHAR(13)")
+    folded = field
+    for char in chars:
+        folded = f"REPLACE({folded}, {char}, ' ')"
+    return f"TRIM({folded})"
+
+
 def missing_text(field: str, dialect: str) -> str:
+    folded = _blank_fold(field, dialect)
     if dialect == "oracle":
-        return f"({field} IS NULL OR TRIM({field}) IS NULL)"
-    return f"({field} IS NULL OR TRIM({field}) = '')"
+        # Oracle 里空串即 NULL，折叠后 TRIM 为 '' 会变成 NULL
+        return f"({field} IS NULL OR {folded} IS NULL)"
+    return f"({field} IS NULL OR {folded} = '')"
 
 
 def compile_where(

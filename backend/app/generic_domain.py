@@ -140,4 +140,13 @@ def bind_audit_cases(
             raise RuleValidationError("Audit override is outside the field whitelist")
         if any(rule_key not in active_rule_keys for rule_key in case.expected_rule_keys):
             raise RuleValidationError("Audit expectation references an inactive rule")
+        if "GOLDEN" in case.case_id.upper():
+            # 黄金用例是零命中基线，期望必须为空，由审计侧强制
+            case.expected_rule_keys = []
+        elif not case.expected_rule_keys:
+            # 变异用例必须声明「这条用例要打死哪条规则」，否则它测不出任何东西，
+            # 只是把 AI 的漏覆盖伪装成通过
+            raise RuleValidationError(
+                f"变异用例 {case.case_id} 必须声明至少一条 expected_rule_keys，否则无法判断它验证了什么"
+            )
     return cases

@@ -20,6 +20,21 @@ def test_oracle_required_handles_empty_string_as_null(organization_spec):
     assert "= ''" not in sql
 
 
+def test_required_treats_tab_and_newline_as_missing(organization_spec):
+    """纯制表符填充的「必填」字段要判为缺失。
+
+    Oracle 的 TRIM 只去空格，'\t' 会被当成有值；线上变异用例就是给了 "\t"，
+    必填规则没报，看起来像规则失效，其实是规则弱了。
+    """
+    rule = next(rule for rule in build_explicit_rules(organization_spec) if rule.operator == "REQUIRED")
+    sql, _ = compile_rule_query(rule, "oracle")
+    for char in ("CHR(9)", "CHR(10)", "CHR(13)"):
+        assert char in sql
+    mysql_sql, _ = compile_rule_query(rule, "mysql")
+    for char in ("CHAR(9)", "CHAR(10)", "CHAR(13)"):
+        assert char in mysql_sql
+
+
 def test_identifier_validation():
     try:
         quote_identifier("SAFE_TABLE; DROP TABLE USERS")

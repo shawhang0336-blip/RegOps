@@ -1,5 +1,6 @@
 import copy
-from typing import Any, Dict, List
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 
@@ -8,6 +9,83 @@ from .compiler import compile_rule_query, quote_identifier
 from .domain import RuleDefinition, SpecDocument
 from .generic_domain import AuditCaseBinding, GeneratorBinding, SchemaBinding, materialize_golden_record
 from .oracle_sandbox import physical_table_name
+
+
+def _fit_text(value: Any, length: int) -> Any:
+    text_value = str(value)
+    if length and len(text_value) > length:
+        return text_value[:length]
+    return text_value
+
+
+def _fit_number(value: Any, length: int, decimals: int) -> Any:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return value
+    scale = max(int(decimals or 0), 0)
+    quantum = Decimal(1).scaleb(-scale)
+    number = number.quantize(quantum, rounding=ROUND_DOWN)
+    integer_digits = max(int(length or 38) - scale, 1)
+    limit = Decimal(10) ** integer_digits - quantum
+    if number > limit:
+        number = limit
+    if number < -limit:
+        number = -limit
+    return number
+
+
+def fit_record_values(
+    spec: SpecDocument,
+    schema_lengths: Optional[Dict[str, int]],
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """把记录值裁到字段长度/精度以内。
+
+    阶段 1 给了字段长度，阶段 2 让 AI 设计变异用例时不一定遵守：实测出现过
+    REMARK 给 257 字符、字段是 VARCHAR(256)，插库直接 ORA-12899，整次审计失败。
+    入库前按元数据裁一刀，宁可截断也不让整批挂掉。
+
+    注意：这个函数只用于「进生产同构表（严格列宽）」的黄金记录。
+    审计用例的变异值进的是 VARCHAR2(4000) 的沙箱宽表，绝不能裁——
+    一旦裁到声明长度，LENGTH / LENGTH_MAX 规则就永远没有超长值可测，
+    整类长度规则会集体变成永不触发的死规则（实测 8/14 个失败就是这么来的）。
+    """
+    fitted = dict(record)
+    for field in spec.fields:
+        if field.name not in fitted:
+            continue
+        value = fitted[field.name]
+        if value is None:
+            continue
+        schema_length = (schema_lengths or {}).get(field.name)
+        length = min(field.length or 0, schema_length) if schema_length else (field.length or 0)
+        if (field.data_type or "").upper() == "NUMBER":
+            fitted[field.name] = _fit_number(value, length or 38, field.decimal_places or 0)
+        else:
+            fitted[field.name] = _fit_text(value, length)
+    return fitted
+
+
+# 沙箱表（变异用例落地的表）所有列都是 VARCHAR2(4000)，只有这一个物理上限
+SANDBOX_TEXT_LIMIT = 4000
+
+
+def fit_sandbox_values(spec: SpecDocument, record: Dict[str, Any]) -> Dict[str, Any]:
+    """变异用例进沙箱宽表：只做 4000 上限保护，不按元数据声明长度裁剪。
+
+    长度类规则（LENGTH / LENGTH_MAX）要的就是「超长值」，裁掉等于把规则测成死规则。
+    """
+    fitted = dict(record)
+    for field in spec.fields:
+        if field.name not in fitted:
+            continue
+        value = fitted[field.name]
+        if not isinstance(value, str):
+            continue
+        if len(value) > SANDBOX_TEXT_LIMIT:
+            fitted[field.name] = value[:SANDBOX_TEXT_LIMIT]
+    return fitted
 
 
 def compile_ai_schema_oracle_ddl(
@@ -137,7 +215,7 @@ class GenericOracleExecutor:
                 record = copy.deepcopy(golden_records[spec.table_code])
                 record.update(case.overrides)
                 record["record_id"] = case.case_id
-                records[spec.table_code].append(record)
+                records[spec.table_code].append(fit_sandbox_values(spec, record))
         hits = {
             spec.table_code: {case.case_id: [] for case in audit_cases[spec.table_code]} for spec in specs
         }
@@ -182,11 +260,15 @@ class GenericOracleExecutor:
                             if golden_generators and spec.table_code in golden_generators
                             else golden_records[spec.table_code]
                         )
-                        golden = {
-                            **golden_records[spec.table_code],
-                            **generated,
-                            "record_id": f"GOLDEN_{index + 1}",
-                        }
+                        golden = fit_record_values(
+                            spec,
+                            {item.field: item.length for item in schemas[spec.table_code]},
+                            {
+                                **golden_records[spec.table_code],
+                                **generated,
+                                "record_id": f"GOLDEN_{index + 1}",
+                            },
+                        )
                         connection.execute(target_insert, dict(zip(parameters, [golden.get(name) for name in names])))
                     if not prepared_assets:
                         connection.execute(text(compile_sandbox_oracle_ddl(table, spec)))
@@ -206,27 +288,48 @@ class GenericOracleExecutor:
         results = []
         false_positives = 0
         false_negatives = 0
+        co_triggered_total = 0
+        hit_rules = set()
         for spec in specs:
             for case in audit_cases[spec.table_code]:
-                expected = set(case.expected_rule_keys)
+                is_golden = "GOLDEN" in case.case_id.upper()
+                # 黄金用例是「零命中」基线：AI 写的期望一律无效，命中任何规则都是误报
+                expected = set() if is_golden else set(case.expected_rule_keys)
                 actual = set(hits[spec.table_code][case.case_id])
+                hit_rules.update(actual)
                 missing = sorted(expected - actual)
-                unexpected = sorted(actual - expected)
+                extra = sorted(actual - expected)
+                # 非黄金用例是「定向变异」：同一个变异值同时踩中多条规则（例如置空同时违反
+                # 必填和枚举）是必然的，不算缺陷。AI 手写的期望全集从来写不全，用它判失败
+                # 只会把好规则判成坏规则。
+                unexpected = extra if is_golden else []
+                co_triggered = [] if is_golden else extra
                 false_negatives += len(missing)
                 false_positives += len(unexpected)
+                co_triggered_total += len(co_triggered)
                 results.append(
                     {
                         "table_code": spec.table_code,
                         "case_id": case.case_id,
+                        "case_kind": "GOLDEN" if is_golden else "MUTATION",
                         "expected_rules": sorted(expected),
                         "actual_rules": sorted(actual),
                         "missing_rules": missing,
                         "unexpected_rules": unexpected,
+                        "co_triggered_rules": co_triggered,
                         "passed": not missing and not unexpected,
                     }
                 )
+        uncovered = sorted({rule.rule_key for rule in rules} - hit_rules)
+        coverage_rate = (
+            round((len(rules) - len(uncovered)) / len(rules), 4) if rules else 1.0
+        )
         return {
             "all_passed": false_positives == 0 and false_negatives == 0,
+            "coverage_complete": not uncovered,
+            "coverage_rate": coverage_rate,
+            "uncovered_rules": uncovered,
+            "co_triggered_count": co_triggered_total,
             "backend": "ORACLE",
             "table_count": len(specs),
             "case_count": len(results),

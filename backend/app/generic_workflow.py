@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -133,42 +134,99 @@ def _error_details(exc: BaseException, fallback_stage: str) -> Dict[str, Any]:
     }
 
 
-def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None):
+# 瞬时错误（网络/超时/模型不调工具）的重试预算。线上 8 次失败里 6 次属于这类，
+# 给 4 次机会 + 退避能把「一次抖动毁掉整批」的概率压到很低。
+_TRANSIENT_ATTEMPTS = 4
+# 参数校验失败的重试预算：把拒绝原因回喂给模型，通常第二次就能改对
+_VALIDATION_ATTEMPTS = 3
+_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+_NO_TOOL_CALL_HINT = (
+    "上一次没有返回工具调用。必须通过工具返回结构化参数，禁止输出自然语言或 SQL；"
+    "字段名、规则参数必须严格取自输入。"
+)
+
+
+def _backoff_wait(steps, attempt: int) -> None:
+    index = min(max(attempt - 1, 0), len(steps) - 1)
+    delay = steps[index] if steps else 0
+    if delay:
+        time.sleep(delay)
+
+
+def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None, backoff=None):
+    """带退避的模型调用。
+
+    原来只重试 2 次、HTTP 错误直接抛、超时只给 1 次机会。线上 8 次失败里有 6 次是
+    这类瞬时错误（"The read operation timed out" / "Model returned no tool call"），
+    一次网络抖动就整批 FAILED，代价太大。现在按错误性质分开退避：
+
+    - 网络/超时：重试 4 次，超时窗口逐次放宽，不回喂 feedback（模型侧可能压根没收到）；
+    - 模型没调工具：重试 4 次，给一句更硬的指令（这是行为问题，不是网络问题）；
+    - 参数校验不过：重试 3 次，把拒绝原因回喂给模型。
+    """
     feedback = None
     rejection = None
+    last_kind = "validation"
+    last_error = ""
     retried_after_timeout = False
-    for _ in range(2):
+    transient_used = 0
+    validation_used = 0
+    wait_steps = _BACKOFF_SECONDS if backoff is None else backoff
+
+    for attempt in range(1, _TRANSIENT_ATTEMPTS + _VALIDATION_ATTEMPTS + 1):
+        # 超时过就放宽窗口，避免同一个请求反复被同一个超时掐掉
+        attempt_timeout = timeout
+        if timeout and transient_used:
+            attempt_timeout = int(min(timeout * (1 + 0.5 * transient_used), timeout * 2))
         try:
-            if timeout is None:
+            if attempt_timeout is None:
                 arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
             else:
-                arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=timeout)
+                arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
             result = validator(arguments)
             if rejection:
                 trace["previous_rejection"] = rejection
             if retried_after_timeout:
                 trace["retried_after_timeout"] = True
+            if attempt > 1:
+                trace["attempts"] = attempt
             return result, trace
         except LlmTimeoutError as exc:
-            if retried_after_timeout:
-                raise WorkflowError(
-                    f"{tool_name} model call timed out after retry: {type(exc).__name__}",
-                    context=_fail_context(tool_name, payload, "timeout", retried=True),
-                ) from exc
+            transient_used += 1
             retried_after_timeout = True
-            continue
-        except (httpx.HTTPError, RuntimeError) as exc:
-            raise WorkflowError(
-                f"{tool_name} model call failed without retry: {type(exc).__name__}: {exc}",
-                context=_fail_context(tool_name, payload, "model_error"),
-            ) from exc
+            last_kind, last_error = "timeout", str(exc)
+            if transient_used >= _TRANSIENT_ATTEMPTS:
+                break
+            _backoff_wait(wait_steps, transient_used)
+        except (httpx.HTTPError, TimeoutError, ConnectionError) as exc:
+            transient_used += 1
+            last_kind, last_error = "transport", f"{type(exc).__name__}: {exc}"
+            if transient_used >= _TRANSIENT_ATTEMPTS:
+                break
+            _backoff_wait(wait_steps, transient_used)
+        except RuntimeError as exc:
+            # 模型没返回工具调用：给一句更硬的指令再来一次，而不是直接判死
+            transient_used += 1
+            last_kind, last_error = "model_no_tool_call", str(exc)
+            feedback = _NO_TOOL_CALL_HINT
+            if transient_used >= _TRANSIENT_ATTEMPTS:
+                break
+            _backoff_wait(wait_steps, transient_used)
         except (RuleValidationError, ValueError, KeyError, TypeError) as exc:
+            validation_used += 1
             rejection = str(exc)
             feedback = rejection
-    raise WorkflowError(
-        f"{tool_name} failed deterministic validation twice: {rejection}",
-        context=_fail_context(tool_name, payload, "validation"),
-    )
+            last_kind, last_error = "validation", rejection
+            if validation_used >= _VALIDATION_ATTEMPTS:
+                break
+
+    if last_kind == "timeout":
+        message = f"{tool_name} model call timed out after retry ({transient_used} 次): {last_error}"
+    elif last_kind == "validation":
+        message = f"{tool_name} 连续 {validation_used} 次未通过参数校验：{last_error}"
+    else:
+        message = f"{tool_name} 连续 {transient_used} 次没有拿到可用返回（{last_kind}）：{last_error}"
+    raise WorkflowError(message, context=_fail_context(tool_name, payload, last_kind, retried=transient_used > 1))
 
 
 def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocument], worker) -> List[Any]:
@@ -293,9 +351,29 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
     def worker(spec):
         bound_rules = []
         batch_traces = []
+        gaps: List[Dict[str, Any]] = []
         fields = spec.fields
 
         def bind_field(field):
+            try:
+                return _bind_one_field(field)
+            except WorkflowError as exc:
+                # 单个字段绑不出规则不该毁掉整张表：记账、跳过，让人在规则确认环节补
+                gaps.append(
+                    {
+                        "field": field.name,
+                        "error": str(exc),
+                        "context": getattr(exc, "context", {}) or {},
+                    }
+                )
+                return [], {
+                    "tool_name": "assign_rules",
+                    "skipped": True,
+                    "field": field.name,
+                    "error": str(exc),
+                }
+
+        def _bind_one_field(field):
             field_rules = []
             traces = []
             for _ in range(3):
@@ -337,16 +415,40 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
             if key_counts[rule.rule_key] > 1:
                 rule.rule_key = f"{rule.rule_key}_{key_counts[rule.rule_key]}"
                 rule.rule_hash = calculate_rule_hash(rule, spec.source_sha256)
+        if not bound_rules and gaps:
+            raise WorkflowError(
+                f"{spec.table_code} 的 {len(gaps)} 个字段全部未能绑定规则，"
+                f"首个失败：{gaps[0]['error']}",
+                context={"stage": "rule_binder", "table_code": spec.table_code, "field": gaps[0]["field"]},
+            )
         return bound_rules, {
             "provider": "GLM",
-            "model": batch_traces[0]["model"] if batch_traces else "unknown",
+            "model": (batch_traces[0].get("model") or "unknown") if batch_traces else "unknown",
             "tool_name": "assign_rules",
             "batch_count": len(batch_traces),
             "batches": batch_traces,
+            "gaps": gaps,
             "arguments": {"rules": [rule.model_dump() for rule in bound_rules]},
         }
 
     results = _fanout(session, run, "rule_binder", specs, worker)
+    gaps_by_table = {
+        spec.table_code: trace["gaps"]
+        for spec, (_, trace) in zip(specs, results)
+        if trace.get("gaps")
+    }
+    if gaps_by_table:
+        append_event(
+            session,
+            run,
+            "RULE_BIND_GAPS",
+            "rule_binder",
+            {
+                "total": sum(len(items) for items in gaps_by_table.values()),
+                "tables": gaps_by_table,
+                "note": "这些字段没有绑定到规则（模型调用失败或多次校验不过），需要在规则确认环节人工补充",
+            },
+        )
     for spec, (rules, _) in zip(specs, results):
         for rule in rules:
             _upsert_rule(session, run, rule, "APPROVED" if rule.source == "DOC_EXPLICIT" else "PENDING")
@@ -574,6 +676,82 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
     return golden_records
 
 
+def _required_backfill_candidates(specs, rules) -> List[tuple]:
+    """找出「原文句首写必填、但规则集里没有 REQUIRED」的字段。
+
+    只认句首的「必填」：「非必填项，当…时必填」和「条件必填」都不是无条件必填，
+    误补一条 REQUIRED 会把合法的空值判成违规，比漏补伤害更大。
+    """
+    covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "REQUIRED"}
+    candidates = []
+    for spec in specs:
+        for field in spec.fields:
+            if (spec.table_code, field.name) in covered:
+                continue
+            if not (field.check_text or "").strip().startswith("必填"):
+                continue
+            candidates.append((spec, field))
+    return candidates
+
+
+def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]:
+    """按字典原文机械补齐必填规则。
+
+    必填是最不需要推理的一条：原文写「必填项」就是必填。但 AI 会漏——
+    实测 SAFE_6_7_1_2 的 BASERE（担保责任余额）校验原文是
+    「必填项，0<=担保责任余额<=保函金额。」，元数据 required=True，
+    planner 也明说「BASERE 必填」，最后规则集里一条 BASERE 规则都没有。
+    这种漏项不该靠 AI 的注意力，靠原文前缀就能判，所以在这里确定性补齐，
+    并留一条 RULE_BACKFILL 事件说明是补的不是 AI 生成的。
+    """
+    added: List[RuleDefinition] = []
+    for spec, field in _required_backfill_candidates(specs, rules):
+        text = (field.check_text or "").strip()
+        rule_key = f"{spec.table_code}_{field.name}_REQUIRED"
+        try:
+            bound = bind_rules(
+                spec,
+                [
+                    {
+                        "field": field.name,
+                        "operator": "REQUIRED",
+                        "params": {},
+                        "rule_key": rule_key,
+                        "evidence_kind": "DICTIONARY",
+                        "rationale": f"数据字典校验原文以「必填」开头：{text[:80]}（由元数据机械补齐，非 AI 生成）",
+                    }
+                ],
+            )
+        except (RuleValidationError, WorkflowError) as exc:
+            append_event(
+                session,
+                run,
+                "RULE_BACKFILL_GAP",
+                "rule_backfill",
+                {"table_code": spec.table_code, "field": field.name, "error": str(exc)},
+            )
+            continue
+        _upsert_rule(session, run, bound[0], "APPROVED")
+        added.append(bound[0])
+    if added:
+        session.flush()
+        append_event(
+            session,
+            run,
+            "RULE_BACKFILL",
+            "rule_backfill",
+            {
+                "total": len(added),
+                "rules": [
+                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
+                    for rule in added
+                ],
+                "note": "原文句首为「必填」但 AI 未生成对应 REQUIRED 规则，已确定性补齐",
+            },
+        )
+    return rules + added
+
+
 def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None):
     _, field_code_sets = load_published_code_sets(session, specs)
 
@@ -581,7 +759,25 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
         table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
         active_keys = {rule.rule_key for rule in table_rules}
 
+        gaps: List[Dict[str, Any]] = []
+
         def bind_cases(target_rule=None):
+            try:
+                return _bind_one_case(target_rule)
+            except WorkflowError as exc:
+                label = target_rule.rule_key if target_rule else "GOLDEN"
+                gaps.append({"target": label, "error": str(exc)})
+                if target_rule is None:
+                    # 黄金用例是整表基线，缺了就没法判"无违规"这一侧
+                    raise
+                return [], {
+                    "tool_name": "assign_audit_cases",
+                    "skipped": True,
+                    "target": label,
+                    "error": str(exc),
+                }
+
+        def _bind_one_case(target_rule=None):
             payload = {
                 "table": spec_payload(spec),
                 "golden_record": golden_records[spec.table_code],
@@ -595,9 +791,13 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 },
             }
             instruction = (
-                "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例，expected_rule_keys 精确列出全部预期命中；ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
+                "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例。"
+                "expected_rule_keys 至少要包含 target_rule 自身（这条用例必须打死它）；"
+                "同一变异值顺带触发的其它规则不必全部列出，也不要把它们当成额外义务。"
+                "变异值必须是真正违规的取值（例如置空用 null、超长要真的超过声明长度），"
+                "用空格或制表符冒充空值不算违规。ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
                 if target_rule
-                else "设计一个无覆盖的黄金合规审计用例，expected_rule_keys 应为空。"
+                else "设计一个无覆盖的黄金合规审计用例，expected_rule_keys 必须为空（黄金用例要求零命中）。"
             )
             return _call_validated(
                 llm,
@@ -622,14 +822,32 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 case_items.append(case)
         return case_items, {
             "provider": "GLM",
-            "model": traces[0]["model"],
+            "model": traces[0].get("model") if traces else "unknown",
             "tool_name": "assign_audit_cases",
             "batch_count": len(traces),
             "batches": traces,
+            "gaps": gaps,
             "arguments": {"cases": [case.model_dump() for case in case_items]},
         }
 
     results = _fanout(session, run, "audit_case_binder", specs, worker)
+    audit_gaps = {
+        spec.table_code: trace["gaps"]
+        for spec, (_, trace) in zip(specs, results)
+        if trace.get("gaps")
+    }
+    if audit_gaps:
+        append_event(
+            session,
+            run,
+            "AUDIT_CASE_GAPS",
+            "audit_case_binder",
+            {
+                "total": sum(len(items) for items in audit_gaps.values()),
+                "tables": audit_gaps,
+                "note": "这些规则没有生成对应的变异用例，审计覆盖会不完整",
+            },
+        )
     cases = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     for spec in specs:
         session.add(
@@ -689,12 +907,11 @@ def _dedupe_approved_rules(session: Session, run: RunModel) -> int:
 
 def _rebind_failed_rules(session, run, specs, llm, report) -> int:
     changed_count = _dedupe_approved_rules(session, run)
+    # 只修「该命中却没命中」的规则。黄金用例上的误报（unexpected_rules）不进自动修正：
+    # 让 AI 去「调到不报」等于允许它把规则改弱以通过测试，那条规则就废了，
+    # 而且原文证据还挂着，事后完全看不出来。误报交给人判断。
     failed_keys = sorted(
-        {
-            rule_key
-            for case in report["cases"]
-            for rule_key in case["missing_rules"] + case["unexpected_rules"]
-        }
+        {rule_key for case in report["cases"] for rule_key in case["missing_rules"]}
     )
     if not failed_keys:
         return 0
@@ -707,11 +924,7 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
     for row in rows:
         spec = next(item for item in specs if item.table_code == row.table_code)
         current = RuleDefinition.model_validate(row.definition_json)
-        failed_cases = [
-            case
-            for case in report["cases"]
-            if row.rule_key in case["missing_rules"] or row.rule_key in case["unexpected_rules"]
-        ]
+        failed_cases = [case for case in report["cases"] if row.rule_key in case["missing_rules"]]
         payload = {
             **spec_payload(spec),
             "fields": [next(field for field in spec.fields if field.name == current.field).model_dump()],
@@ -725,17 +938,36 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
                 raise RuleValidationError("A failed rule must be revised into exactly one rule")
             if revised[0].rule_hash == current.rule_hash:
                 raise RuleValidationError("The revised rule is identical to the failed version")
+            if revised[0].operator != current.operator:
+                # 同 key 换 operator 等于把一条有原文证据的规则偷偷换成另一条：
+                # 实测出现过 WABACHANDATE_REQUIRED 被改成 REGEXP，必填检查就此消失，
+                # 而 rule_key 和证据页码还留着，事后无法从审计报告看出被替换过。
+                raise RuleValidationError(
+                    f"修正不能更换 operator（当前 {current.operator}）。"
+                    f"若原文还要求 {revised[0].operator}，那是另一条规则，"
+                    "请保持当前 operator 只调整 params。"
+                )
             revised[0].rule_key = current.rule_key
             revised[0].rule_hash = calculate_rule_hash(revised[0], spec.source_sha256)
             return revised[0]
 
-        revised, trace = _call_validated(
-            llm,
-            "assign_rules",
-            "根据失败记录修正当前规则赋值。最大长度用 LENGTH_MAX，精确长度用 LENGTH；只返回修正后的一条规则。",
-            payload,
-            validate_revision,
-        )
+        try:
+            revised, trace = _call_validated(
+                llm,
+                "assign_rules",
+                "根据失败记录修正当前规则赋值。最大长度用 LENGTH_MAX，精确长度用 LENGTH；只返回修正后的一条规则。",
+                payload,
+                validate_revision,
+            )
+        except WorkflowError as exc:
+            append_event(
+                session,
+                run,
+                "RULE_REBIND_GAP",
+                "rule_binder",
+                {"table_code": spec.table_code, "rule_key": current.rule_key, "error": str(exc)},
+            )
+            continue
         append_event(
             session,
             run,
@@ -955,6 +1187,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     plans = plan_event.payload_json["tables"] if plan_event else {}
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
+    rules = _backfill_required_rules(session, run, specs, rules)
     prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
     golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans)
     session.commit()
@@ -990,6 +1223,18 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
         prepared_assets=prepared_assets,
     )
     blobs = LocalBlobStore(settings.blob_dir)
+    if report.get("uncovered_rules"):
+        append_event(
+            session,
+            run,
+            "RULE_COVERAGE_GAP",
+            "oracle_executor",
+            {
+                "coverage_rate": report.get("coverage_rate"),
+                "uncovered_rules": report["uncovered_rules"],
+                "note": "这些规则没有任何变异用例命中过，等于没被验证；审计通过不代表它们对",
+            },
+        )
     ddl_uri = blobs.put(
         "\n\n".join(compile_ai_schema_mysql_ddl(spec.table_code, typed_schemas[spec.table_code]) for spec in specs).encode()
     )

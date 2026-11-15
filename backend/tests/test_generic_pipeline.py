@@ -282,13 +282,46 @@ def test_call_validated_retries_once_after_timeout():
     assert "previous_rejection" not in trace
 
 
-def test_call_validated_fails_after_two_timeouts():
+def test_call_validated_gives_up_after_transient_budget():
+    inst = {}
+
     class AlwaysTimeout:
+        calls = 0
+
         def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            inst["calls"] = inst.get("calls", 0) + 1
+            inst["timeouts"] = inst.get("timeouts", []) + [timeout]
             raise LlmTimeoutError("ReadTimeout")
 
     with pytest.raises(WorkflowError, match="timed out after retry"):
-        _call_validated(AlwaysTimeout(), "assign_rules", "instr", {}, lambda args: args)
+        _call_validated(AlwaysTimeout(), "assign_rules", "instr", {}, lambda args: args, backoff=(0, 0, 0))
+
+    # 瞬时错误给 4 次机会，且超时窗口逐次放宽，不是同一个窗口反复被掐
+    assert inst["calls"] == 4
+    assert inst["timeouts"] == [None, None, None, None] or inst["timeouts"][-1] > inst["timeouts"][0]
+
+
+def test_call_validated_retries_when_model_returns_no_tool_call():
+    """模型只回文字不调工具时，带一句更硬的提示重试，而不是直接判死。"""
+
+    class TextOnlyThenOk:
+        def __init__(self):
+            self.calls = 0
+            self.feedback = []
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            self.calls += 1
+            self.feedback.append(feedback)
+            if self.calls == 1:
+                raise RuntimeError("Model returned no tool call: {...}")
+            return {"ok": True}, {"provider": "test"}
+
+    llm = TextOnlyThenOk()
+    result, trace = _call_validated(llm, "assign_rules", "instr", {}, lambda args: args, backoff=(0, 0, 0))
+    assert result == {"ok": True}
+    assert llm.calls == 2
+    assert llm.feedback[1] and "工具调用" in llm.feedback[1]
+    assert trace["attempts"] == 2
 
 
 def test_call_validated_timeout_error_carries_structured_context():
@@ -298,7 +331,7 @@ def test_call_validated_timeout_error_carries_structured_context():
 
     payload = {"table_code": "SAFE_6_1_ORGANIZATION", "fields": [{"name": "POSTCODE"}]}
     with pytest.raises(WorkflowError) as error:
-        _call_validated(AlwaysTimeout(), "assign_rules", "instr", payload, lambda args: args)
+        _call_validated(AlwaysTimeout(), "assign_rules", "instr", payload, lambda args: args, backoff=(0, 0, 0))
 
     ctx = error.value.context
     assert ctx["error_kind"] == "timeout"
