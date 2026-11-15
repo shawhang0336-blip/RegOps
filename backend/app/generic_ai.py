@@ -317,10 +317,13 @@ class RealDesignLlm:
                 {"role": "user", "content": prompt},
             ],
             "tools": [{"type": "function", "function": {"name": tool_name, "description": instruction, "parameters": schema}}],
-            "tool_choice": {"type": "function", "function": {"name": tool_name}},
             "temperature": 0,
             "max_tokens": 8192,
         }
+        if self.settings.llm_tool_choice == "forced":
+            request_json["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
+        else:
+            request_json["tool_choice"] = "auto"
         if self.settings.llm_thinking:
             request_json["thinking"] = {"type": self.settings.llm_thinking}
         try:

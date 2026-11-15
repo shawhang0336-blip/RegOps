@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # LLM 单次工具调用超时（秒）。实测单字段约 11~70s，个别复杂字段（含条件规则）可达 120s，
     # 默认 120s 覆盖波动；超过此值视为真实失败并报错（不做确定性降级）。
     llm_timeout: int = 120
+    # tool_choice 模式：auto = 模型自决（deepseek thinking 模型只支持 auto）；
+    # forced = 强制调用指定工具（GLM 支持，可提升小任务稳定性）。
+    llm_tool_choice: str = "auto"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")

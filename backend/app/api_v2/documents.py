@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
-from ..code_service import extract_parallel_for_blocks
+from ..code_service import auto_link_all_references, extract_code_sets_for_block, extract_parallel_for_blocks
 from ..config import get_settings
 from ..db import SessionLocal
 from ..extractors import extract_document
@@ -42,6 +42,32 @@ def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
     }
 
 
+def _auto_extract_code_sets(document_id: str, settings) -> int:
+    """切块后自动把 CODE_SET 块的标准码表入库（纯程序，不做 AI 复核），避免码表块被漏提。"""
+    with SessionLocal() as session:
+        block_ids = [
+            block_id
+            for (block_id,) in session.query(RawBlockModel.id)
+            .filter(
+                RawBlockModel.document_id == document_id,
+                RawBlockModel.block_type.in_(["CODE_SET", "CODE_SET_CANDIDATE"]),
+            )
+            .order_by(RawBlockModel.ordinal)
+            .all()
+        ]
+    created = 0
+    for block_id in block_ids:
+        try:
+            created += len(extract_code_sets_for_block(block_id, settings, auto_link=False, review_with_ai=False))
+        except Exception:
+            continue
+    if block_ids:
+        with SessionLocal() as session:
+            auto_link_all_references(session)
+            session.commit()
+    return created
+
+
 def store_initial_blocks(document_id: str) -> SourceDocumentModel:
     with SessionLocal() as session:
         document = session.get(SourceDocumentModel, document_id)
@@ -49,6 +75,7 @@ def store_initial_blocks(document_id: str) -> SourceDocumentModel:
             raise HTTPException(status_code=404, detail="Document not found")
         existing_blocks = session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).count()
         if existing_blocks:
+            _auto_extract_code_sets(document_id, get_settings())
             return document
         settings = get_settings()
         source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
@@ -66,6 +93,7 @@ def store_initial_blocks(document_id: str) -> SourceDocumentModel:
         for block in blocks:
             session.add(RawBlockModel(id=str(uuid.uuid4()), document_id=document.id, **block))
         session.commit()
+        _auto_extract_code_sets(document_id, get_settings())
         return document
 
 

@@ -184,8 +184,8 @@ def ensure_field_reference(
         if not code_set:
             code_set = CodeSetModel(
                 id=str(uuid.uuid4()),
-                code=code,
-                name=text,
+                code=code[:96],
+                name=text[:255],
                 definition=f"由字段 {field.field_en} 的校验引用自动建立",
                 source_type="DOCUMENT_REFERENCE",
                 status="DRAFT",
@@ -395,6 +395,7 @@ def _record_code_set_validation(
     block: RawBlockModel,
     settings: Settings,
     content_changed: bool,
+    review_with_ai: bool = True,
 ) -> None:
     program_issues = validate_code_set_draft(draft)
     session.add(
@@ -408,6 +409,9 @@ def _record_code_set_validation(
         )
     )
     if row.status == "PUBLISHED":
+        return
+    if not review_with_ai:
+        row.status = "NEEDS_REVIEW" if program_issues else "PROGRAM_VALIDATED"
         return
 
     llm = None
@@ -459,7 +463,7 @@ def _record_code_set_validation(
     row.status = "NEEDS_REVIEW" if program_issues or issues else "AI_SELF_VALIDATED"
 
 
-def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> List[str]:
+def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: bool = True) -> List[str]:
     """Extract standalone CodeSets or inline field enum CodeSets from a RawBlockModel (Track B)."""
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
@@ -482,7 +486,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                     values=valid_vals,
                 )
                 row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
-                _record_code_set_validation(session, row, draft, block, settings, changed)
+                _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
                 created_ids.append(row.id)
 
         # Case 2: Block has inline_code_sets (from table fields in Chapter 6 or Statistical System Section 四)
@@ -508,7 +512,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                     "page": inline_cs.get("page", ""),
                 },
             )
-            _record_code_set_validation(session, row, draft, block, settings, changed)
+            _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
             created_ids.append(row.id)
 
         # Case 3: Unstructured block routed as CODE_SET without pre-extracted values -> regex + AI fallback
@@ -546,7 +550,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                 )
             if draft.values:
                 row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
-                _record_code_set_validation(session, row, draft, block, settings, changed)
+                _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
                 created_ids.append(row.id)
 
         if auto_link:
