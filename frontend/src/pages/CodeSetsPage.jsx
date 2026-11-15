@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
@@ -7,6 +7,7 @@ import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeveri
 
 export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   const [params] = useSearchParams()
+  const navigate = useNavigate()
 
   const [sets, setSets] = useState([])
   const [unresolved, setUnresolved] = useState([])
@@ -195,6 +196,18 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     }
   }
 
+  // 点「码值待补」跳到那张报表、定位到具体字段。
+  // 直接切到占位码表是没用的——那是一张空表，用户看着不知道要改哪里。
+  function openReferencingField(item) {
+    if (!item.table_id) return
+    const next = new URLSearchParams()
+    next.set('view', 'fields')
+    if (params.get('document_id')) next.set('document_id', params.get('document_id'))
+    next.set('table', item.table_id)
+    next.set('field', item.field_id)
+    navigate(`/documents?${next.toString()}`)
+  }
+
   async function importExcel(event) {
     const file = event.target.files?.[0]
     event.target.value = ''
@@ -308,10 +321,17 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                 key={item.id}
                 type="button"
                 className="unresolved-chip"
-                onClick={() => select(item.code_set_id)}
+                title={
+                  item.table_code
+                    ? `${item.table_code} · ${item.field_en}（${item.field_cn}）的码值引用：${item.reference_text}`
+                    : undefined
+                }
+                onClick={() => openReferencingField(item)}
               >
                 <strong>{item.reference_text}</strong>
-                <span className="muted-text">去补充 →</span>
+                <span className="muted-text">
+                  {item.table_code ? `${item.table_code} · ${item.field_en} →` : '去补充 →'}
+                </span>
               </button>
             ))}
           </div>

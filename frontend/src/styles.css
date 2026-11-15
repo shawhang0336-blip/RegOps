@@ -1533,8 +1533,7 @@
 }
 
 /* 提示文案里的跳转链接 */
-.link-button {
-  margin-left: 6px;
+.link-button {  margin-left: 6px;
   padding: 0;
   border: none;
   background: none;
@@ -1600,4 +1599,10 @@
 .warn-ack input {
   margin-top: 2px;
   accent-color: var(--amber);
+}
+
+/* 从「码值待补」跳过来时，把命中的那一行标出来 */
+.field-row-highlight {
+  background: var(--amber-light);
+  box-shadow: inset 3px 0 0 var(--amber);
 }

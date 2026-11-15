@@ -50,6 +50,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
   const [unresolvedRefs, setUnresolvedRefs] = useState([])
   const [codeSets, setCodeSets] = useState([])
   const [editingFieldId, setEditingFieldId] = useState(null)
+  const [highlightFieldId, setHighlightFieldId] = useState(null)
   const [editReason, setEditReason] = useState('人工复核修正元数据')
   const [newField, setNewField] = useState(emptyField)
   const [showAdd, setShowAdd] = useState(false)
@@ -97,11 +98,23 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     load().catch((err) => setError(err.message))
   }, [params.get('document_id')])
 
+  useEffect(() => {
+    if (!highlightFieldId) return
+    const row = document.getElementById(`field-row-${highlightFieldId}`)
+    if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }, [highlightFieldId, detail?.id])
+
   async function select(id, resetTab = false) {
     const data = await v2(`/metadata/tables/${id}`)
     setDetail(data)
     setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
     setEditingFieldId(null)
+    // 从「码值待补」跳过来时会带上 field，把那一行标出来并滚到视野里，
+    // 否则用户落到一张几十个字段的表上，不知道要看哪一个
+    const requestedField = params.get('field')
+    setHighlightFieldId(
+      requestedField && (data.fields || []).some((field) => field.id === requestedField) ? requestedField : null
+    )
     if (resetTab) setTab('fields')
   }
 
@@ -995,7 +1008,13 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                           return (
                             <tr
                               key={field.id}
-                              className={isEditing ? 'field-row-active' : ''}
+                              id={`field-row-${field.id}`}
+                              className={[
+                                isEditing ? 'field-row-active' : '',
+                                highlightFieldId === field.id ? 'field-row-highlight' : '',
+                              ]
+                                .filter(Boolean)
+                                .join(' ')}
                             >
                               <td>
                                 <strong>{field.field_cn}</strong>

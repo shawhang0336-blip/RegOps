@@ -191,24 +191,36 @@ async def upload_code_set_document(
 
 @router.get("/references/unresolved")
 def unresolved_references(document_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """字段说"取值见 XXX 码表"但没解析到码表。
+
+    这里必须带上所属报表和字段——只给码表 id 的话，前端点进去只会落到一张
+    空占位码表上，用户看到的是一张没有码值的表，完全不知道要改哪里。
+    真正要动手的地方是那个字段的引用，不是码表。
+    """
     with SessionLocal() as session:
-        query = session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.status == "UNRESOLVED")
+        query = (
+            session.query(FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+            .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+            .filter(FieldCodeReferenceModel.status == "UNRESOLVED")
+        )
         if document_id:
-            query = (
-                query.join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-                .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
-                .filter(TableMetadataModel.document_id == document_id)
-            )
+            query = query.filter(TableMetadataModel.document_id == document_id)
         rows = query.all()
         return [
             {
-                "id": row.id,
-                "field_id": row.field_id,
-                "code_set_id": row.code_set_id,
-                "reference_text": row.reference_text,
-                "status": row.status,
+                "id": reference.id,
+                "field_id": reference.field_id,
+                "code_set_id": reference.code_set_id,
+                "reference_text": reference.reference_text,
+                "status": reference.status,
+                "table_id": table.id,
+                "table_code": table.table_code,
+                "table_name": table.table_name,
+                "field_en": field.field_en,
+                "field_cn": field.field_cn,
             }
-            for row in rows
+            for reference, field, table in rows
         ]
 
 
