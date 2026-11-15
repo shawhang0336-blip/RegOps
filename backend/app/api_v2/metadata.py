@@ -93,15 +93,26 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
         # 否则用户只看到一个红色的"需要核对"，无法判断到底有几处、要不要动手。
         stats: Dict[str, Dict[str, Any]] = {}
         for validation in session.query(MetadataValidationModel).all():
-            entry = stats.setdefault(validation.table_id, {"issue_count": 0, "fields": set(), "codes": {}})
+            entry = stats.setdefault(
+                validation.table_id,
+                {"issue_count": 0, "blocking": 0, "advisory": 0, "fields": set(), "codes": {}},
+            )
             for issue in validation.issues_json or []:
+                severity = str(issue.get("severity") or "WARNING").upper()
+                if severity == "INFO":
+                    continue  # 已修正/说明类条目不再计入待处理
                 entry["issue_count"] += 1
+                if severity == "ERROR":
+                    entry["blocking"] += 1
+                else:
+                    entry["advisory"] += 1
                 code = str(issue.get("code") or "").strip()
                 if code:
                     entry["codes"][code] = entry["codes"].get(code, 0) + 1
-                field_en = str(issue.get("field_en") or "").strip()
-                if field_en:
-                    entry["fields"].add(field_en)
+                if severity == "ERROR":
+                    field_en = str(issue.get("field_en") or "").strip()
+                    if field_en:
+                        entry["fields"].add(field_en)
         result = []
         for row in rows:
             field_count = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == row.id).count()
@@ -116,6 +127,8 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
                     **table_summary(row),
                     "field_count": field_count,
                     "review_issue_count": entry.get("issue_count", 0),
+                    "review_blocking_count": entry.get("blocking", 0),
+                    "review_advisory_count": entry.get("advisory", 0),
                     "review_field_count": len(entry.get("fields") or set()),
                     "review_top_codes": [code for code, _ in top_codes],
                 }

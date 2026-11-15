@@ -262,30 +262,100 @@
 
 .current-file-bar {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 18px;
   margin: -6px 0 18px;
-  padding: 12px 15px;
+  padding: 14px 18px;
   border: 1px solid var(--line);
+  border-left: 3px solid var(--blue);
   border-radius: var(--radius-md);
   background: var(--surface);
+  box-shadow: var(--shadow-sm);
 }
 
-.current-file-bar > label {
+.current-file-main {
+  display: grid;
+  gap: 3px;
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.current-file-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+.current-file-heading {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
   min-width: 0;
-  flex: 1;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
 }
 
-.current-file-bar select {
-  width: min(620px, 100%);
+.current-file-select {
+  flex: 1 1 260px;
+  max-width: 560px;
   min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.current-file-select:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--surface-subtle);
+}
+
+.current-file-select:focus {
+  border-color: var(--blue);
+  background: var(--surface);
+  outline: none;
+}
+
+.current-file-meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.current-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.button.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.button.ghost:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.danger-text {
+  color: var(--red) !important;
+}
+
+.button.danger-text:hover:not(:disabled) {
+  border-color: var(--red-border);
+  background: var(--red-light);
+  color: var(--red) !important;
 }
 
 .asset-workspace-tabs {

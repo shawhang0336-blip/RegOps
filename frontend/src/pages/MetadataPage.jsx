@@ -307,13 +307,18 @@ export default function MetadataPage({ embedded = false }) {
     return { text, label: text, status: 'DRAFT', codeSetId: null }
   }
 
-  const totalIssues = (detail?.validations || []).reduce(
-    (acc, v) => acc + (Array.isArray(v.issues) ? groupValidationIssues(v.issues).length : 0),
-    0
+  const detailIssues = (detail?.validations || []).flatMap((v) =>
+    Array.isArray(v.issues) ? groupValidationIssues(v.issues) : []
   )
+  const blockingIssues = detailIssues.filter((issue) => String(issue.severity || '').toUpperCase() === 'ERROR')
+  const advisoryIssues = detailIssues.filter((issue) => {
+    const severity = String(issue.severity || '').toUpperCase()
+    return severity === 'WARNING' || severity === 'INFO'
+  })
+  const totalIssues = blockingIssues.length + advisoryIssues.length
 
   const visibleTables = onlyIssues
-    ? tables.filter((table) => (table.review_issue_count || 0) > 0)
+    ? tables.filter((table) => (table.review_blocking_count || 0) > 0)
     : tables
 
   const pageActions = detail && (
@@ -379,12 +384,15 @@ export default function MetadataPage({ embedded = false }) {
                     当前 v{table.current_version}
                     {table.published_version ? ` · 已发布 v${table.published_version}` : ' · 尚未发布'}
                   </em>
-                  {table.review_issue_count > 0 && (
+                  {(table.review_blocking_count || 0) > 0 ? (
                     <em className="danger-text">
-                      {table.review_issue_count} 项待复核
-                      {table.review_field_count > 0 ? ` · 涉及 ${table.review_field_count} 个字段` : ''}
+                      {table.review_blocking_count} 项需要处理
+                      {(table.review_field_count || 0) > 0 ? ` · 涉及 ${table.review_field_count} 个字段` : ''}
+                      {(table.review_advisory_count || 0) > 0 ? `（另有 ${table.review_advisory_count} 条提示）` : ''}
                     </em>
-                  )}
+                  ) : (table.review_advisory_count || 0) > 0 ? (
+                    <em className="muted-text">{table.review_advisory_count} 条提示，不影响使用</em>
+                  ) : null}
                 </button>
               ))}
             </div>
@@ -503,8 +511,12 @@ export default function MetadataPage({ embedded = false }) {
 
               {totalIssues > 0 && tab === 'fields' && (
                 <div className="review-guide">
-                  <span>这张表有 {totalIssues} 项需要核对，请先查看具体问题。</span>
-                  <button type="button" className="button secondary sm" onClick={() => setTab('validation')}>查看待核对问题</button>
+                  <span>
+                    {blockingIssues.length > 0
+                      ? `这张表有 ${blockingIssues.length} 项需要处理${advisoryIssues.length ? `，另有 ${advisoryIssues.length} 条提示` : ''}。`
+                      : `这张表有 ${advisoryIssues.length} 条提示，没有阻断项，可以直接发布。`}
+                  </span>
+                  <button type="button" className="button secondary sm" onClick={() => setTab('validation')}>查看核对明细</button>
                 </div>
               )}
 
@@ -522,8 +534,12 @@ export default function MetadataPage({ embedded = false }) {
                   onClick={() => setTab('validation')}
                 >
                   待处理问题
-                  <StatusBadge tone={totalIssues > 0 ? 'amber' : 'green'}>
-                    {totalIssues > 0 ? `${totalIssues} 项提示` : '通过'}
+                  <StatusBadge tone={blockingIssues.length > 0 ? 'red' : totalIssues > 0 ? 'amber' : 'green'}>
+                    {blockingIssues.length > 0
+                      ? `${blockingIssues.length} 待处理`
+                      : totalIssues > 0
+                        ? `${totalIssues} 提示`
+                        : '通过'}
                   </StatusBadge>
                 </button>
                 <button

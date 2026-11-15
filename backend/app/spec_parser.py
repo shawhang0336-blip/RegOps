@@ -392,6 +392,31 @@ def _parse_non_xml_dictionary(dictionary_text: str, evidence_page: str, parse_wa
     return fields
 
 
+def _find_field_anchor(compact: str, compact_lower: str, candidate: str, start: int) -> int:
+    """在去空白文本里定位字段定义的起点，跳过"公式引用"造成的假命中。
+
+    数据字典的校验列常出现 `A0116=A0117+A0118+A0119+A0120+A0121` 这种公式，
+    按字符串首次出现定位会把 A0117 的起点落到公式里，导致该字段的类型/长度解析失败、
+    校验原文退化成 "+"。真正的字段起点两侧不会紧邻运算符。
+    """
+    # 公式里字段名两侧常是运算符或连接词（A0130x和A0131x、A0117+A0118）
+    formula_neighbors = "+-=—<>≤≥（(【[、，,和及与加减乘除"
+    pos = max(0, start)
+    while True:
+        index = compact_lower.find(candidate, pos)
+        if index < 0:
+            return -1
+        after = compact[index + len(candidate) : index + len(candidate) + 1]
+        before = compact[index - 1 : index] if index > 0 else ""
+        if after and after in formula_neighbors:
+            pos = index + 1
+            continue
+        if before and before in "=+—<>≤≥和及与加减乘除":
+            pos = index + 1
+            continue
+        return index
+
+
 def _parse_fields_flexible(
     format_text: str,
     dictionary_text: str,
@@ -443,7 +468,7 @@ def _parse_fields_flexible(
             if prefix_len < min(6, len(name)):
                 continue
             cand = target_lower[:prefix_len]
-            idx = compact_lower.find(cand, cursor)
+            idx = _find_field_anchor(compact, compact_lower, cand, cursor)
             if idx >= 0:
                 found_idx = idx
                 found_len = prefix_len
@@ -455,7 +480,7 @@ def _parse_fields_flexible(
                 if prefix_len < min(5, len(name)):
                     continue
                 cand = target_lower[:prefix_len]
-                idx = compact_lower.find(cand)
+                idx = _find_field_anchor(compact, compact_lower, cand, 0)
                 if idx >= 0:
                     found_idx = idx
                     found_len = prefix_len

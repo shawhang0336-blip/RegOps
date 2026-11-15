@@ -469,16 +469,35 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
           <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onFileInputChange} />
         </label>
         <section className="current-file-bar">
-          <label>
-            <span>当前文件</span>
-            <select value={detail?.id || ''} disabled={busy || !documents.length} onChange={(event) => selectDocument(event.target.value)}>
-              {documents.map((doc) => <option value={doc.id} key={doc.id}>{doc.file_name}</option>)}
-            </select>
-          </label>
-          <div className="actions">
+          <div className="current-file-main">
+            <span className="current-file-eyebrow">当前文件</span>
+            <div className="current-file-heading">
+              <select
+                className="current-file-select"
+                value={detail?.id || ''}
+                disabled={busy || !documents.length}
+                onChange={(event) => selectDocument(event.target.value)}
+              >
+                {documents.map((doc) => <option value={doc.id} key={doc.id}>{doc.file_name}</option>)}
+              </select>
+              {detail && <StatusBadge status={detail.status} />}
+            </div>
+            <p className="current-file-meta">
+              {(() => {
+                const current = documents.find((doc) => doc.id === detail?.id)
+                if (!current) return '还没有可用的文件，先在上方选择或拖入一份规范。'
+                return [
+                  String(current.file_type || '').toUpperCase(),
+                  `${current.block_count ?? 0} 个内容块`,
+                  current.created_at ? `${formatTime(current.created_at)} 上传` : '',
+                ].filter(Boolean).join(' · ')
+              })()}
+            </p>
+          </div>
+          <div className="current-file-actions">
             {detail?.status === 'OVERVIEW_FAILED' && <button type="button" className="button primary" disabled={busy} onClick={prepareDocument}>重新检查并解析</button>}
             {detail && detail.status !== 'OVERVIEW_FAILED' && <button type="button" className="button secondary" disabled={busy} onClick={parseCurrentDocument}>解析当前文件</button>}
-            {detail && <button type="button" className="button secondary danger-text" disabled={busy} onClick={deleteDocument}>删除文件</button>}
+            {detail && <button type="button" className="button ghost danger-text" disabled={busy} onClick={deleteDocument}>删除文件</button>}
           </div>
         </section>
         <ImportProgressPanel progress={importProgress} onClose={() => setImportProgress(null)} />

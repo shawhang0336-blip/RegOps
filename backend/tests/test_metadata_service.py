@@ -189,3 +189,54 @@ def test_failed_assignment_skips_second_llm_review(monkeypatch):
     assert len([issue for issue in program.issues_json if issue["code"] == "LOW_CONFIDENCE"]) == 1
     assert review.issues_json[0]["code"] == "AI_REVIEW_UNAVAILABLE"
     assert review.issues_json[0]["severity"] == "WARNING"
+
+
+def test_enforce_issue_evidence_downgrades_type_claims_without_source():
+    from app.metadata_service import enforce_issue_evidence
+
+    # 来源没有类型声明：类型类 ERROR 属于推断，必须降级
+    raw = "指对应月度末，境外被投资机构合并资产负债表中的“资产总额”。"
+    issues = [
+        {"severity": "ERROR", "code": "TYPE_MISMATCH", "field_en": "A0117", "message": "应为 NUMBER(22,2)"},
+        {"severity": "ERROR", "code": "MISSING_FIELD", "field_en": "A0119", "message": "原文有该字段但未录入"},
+    ]
+    result = enforce_issue_evidence(issues, raw)
+    assert result[0]["severity"] == "WARNING"
+    assert result[0]["code"].startswith("UNVERIFIED_")
+    assert "未声明数据类型" in result[0]["message"]
+    # 非类型类问题不受影响
+    assert result[1]["severity"] == "ERROR"
+
+
+def test_enforce_issue_evidence_keeps_claim_when_source_declares_type():
+    from app.metadata_service import enforce_issue_evidence
+
+    raw = "A0117   实收资本   数值型，22.2   必填项。"
+    issues = [{"severity": "ERROR", "code": "TYPE_MISMATCH", "field_en": "A0117", "message": "当前是 VARCHAR(128)"}]
+    result = enforce_issue_evidence(issues, raw)
+    assert result[0]["severity"] == "ERROR"
+
+
+def test_enforce_issue_evidence_downgrades_unfindable_quote():
+    from app.metadata_service import enforce_issue_evidence
+
+    raw = "A0117   实收资本   数值型，22.2   必填项。"
+    issues = [
+        {
+            "severity": "ERROR",
+            "code": "TYPE_LENGTH_MISMATCH",
+            "field_en": "A0117",
+            "message": "长度不符",
+            "evidence": "原文要求字段长度为 999 位",
+        }
+    ]
+    result = enforce_issue_evidence(issues, raw)
+    assert result[0]["severity"] == "WARNING"
+    assert "未在来源中找到" in result[0]["message"]
+
+
+def test_table_needs_review_only_for_errors():
+    from app.metadata_service import table_needs_review
+
+    assert table_needs_review([{"severity": "WARNING"}, {"severity": "INFO"}]) is False
+    assert table_needs_review([{"severity": "WARNING"}, {"severity": "ERROR"}]) is True

@@ -173,12 +173,20 @@ TOOL_SCHEMAS = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "severity": {"type": "string", "enum": ["ERROR", "WARNING", "INFO"]},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["ERROR", "WARNING", "INFO"],
+                            "description": "只有来源原文明确写出该要求时才可用 ERROR；凭业务常识推断的一律用 WARNING。",
+                        },
                         "code": {"type": "string"},
                         "field_en": {"type": "string"},
                         "message": {"type": "string"},
+                        "evidence": {
+                            "type": "string",
+                            "description": "支持这条判断的来源原文片段（逐字摘录）。原文没有相关内容时填 NO_SOURCE。",
+                        },
                     },
-                    "required": ["severity", "code", "field_en", "message"],
+                    "required": ["severity", "code", "field_en", "message", "evidence"],
                 },
             }
         },

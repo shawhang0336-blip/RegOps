@@ -24,6 +24,85 @@ from .spec_parser import _parse_type_from_entry, extract_code_reference_from_tex
 
 METADATA_BATCH_SIZE = 10
 
+# 来源原文里出现这些字样，才说明这份文档真的声明了数据类型/长度
+TYPE_DECLARATION_HINTS = (
+    "类型（长度）",
+    "字符型",
+    "数值型",
+    "整数型",
+    "日期型",
+    "定长",
+    "变长",
+    "数据格式",
+)
+
+# 与类型/长度相关的问题码前缀；原文没有类型声明时，这类 ERROR 只能算推断
+TYPE_RELATED_PREFIXES = (
+    "TYPE_",
+    "TYPE",
+    "LENGTH",
+    "VALUE_TYPE",
+    "PRECISION",
+    "DECIMAL",
+    "UNVERIFIED_LENGTH",
+    "UNDOCUMENTED_LENGTH",
+)
+
+
+def _source_declares_type(raw_context: str) -> bool:
+    text = raw_context or ""
+    return any(hint in text for hint in TYPE_DECLARATION_HINTS)
+
+
+def _is_type_related(code: str) -> bool:
+    upper = (code or "").upper()
+    return any(upper.startswith(prefix) for prefix in TYPE_RELATED_PREFIXES)
+
+
+def enforce_issue_evidence(
+    issues: List[Dict[str, Any]],
+    raw_context: str,
+    *,
+    downgrade_unverified: bool = True,
+) -> List[Dict[str, Any]]:
+    """把"没有原文依据的 ERROR"降级成提示。
+
+    复核模型很容易把业务常识当成原文要求（例如依据"金额项"推断 NUMBER(22,2)）。
+    来源文档如果没有声明过类型/长度，这类判断就不该阻断整张表；同理，模型给出的
+    evidence 片段如果在原文里找不到，也不该算数。
+    """
+    declares = _source_declares_type(raw_context)
+    compact_source = re.sub(r"\s+", "", raw_context or "")
+    result: List[Dict[str, Any]] = []
+    for issue in issues:
+        item = dict(issue)
+        code = str(item.get("code") or "AI_REVIEW")
+        severity = str(item.get("severity") or "WARNING").upper()
+        message = str(item.get("message") or "")
+        evidence = str(item.get("evidence") or "").strip()
+        reason = ""
+        if severity == "ERROR" and downgrade_unverified:
+            if not declares and _is_type_related(code):
+                reason = "来源原文未声明数据类型或长度，该判断属推断"
+            elif evidence and evidence.upper() not in {"NO_SOURCE", "无", "N/A"}:
+                compact_evidence = re.sub(r"\s+", "", evidence)
+                if compact_evidence and compact_evidence not in compact_source:
+                    reason = "所引原文片段未在来源中找到"
+        if reason:
+            severity = "WARNING"
+            code = f"UNVERIFIED_{code}"[:64]
+            message = f"{message}（{reason}，已降级为提示）"
+        item["severity"] = severity
+        item["code"] = code
+        item["message"] = message
+        result.append(item)
+    return result
+
+
+def table_needs_review(issues: List[Dict[str, Any]]) -> bool:
+    """只有 ERROR 才让整张表进入待复核；WARNING 是提示，保留在详情里但不阻断。"""
+    return any(str(item.get("severity") or "").upper() == "ERROR" for item in issues)
+
 
 def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
     return {
@@ -388,7 +467,15 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
             try:
                 args, review_trace = llm.assign(
                     "review_metadata",
-                    "独立复核整表字段元数据，仅输出存在遗漏、类型长度错配、无依据必填或虚构码值的问题列表（无问题则返回空数组）。",
+                    (
+                        "独立复核整表字段元数据，只依据 raw_context 判断，仅输出存在遗漏、类型长度错配、"
+                        "无依据必填或虚构码值的问题。硬性要求："
+                        "①每条问题必须给出 evidence，逐字摘录 raw_context 中支持该判断的原文；"
+                        "②raw_context 没有声明数据类型/长度时，不得判定类型或长度错配为 ERROR，"
+                        "只能报 WARNING 并把 evidence 填 NO_SOURCE；"
+                        "③不要用业务常识（如\"金额项应为数值型\"）替代原文声明，此类推断不得报 ERROR；"
+                        "④没有问题就返回空数组。"
+                    ),
                     {
                         "source_locator": block.source_locator,
                         "table": {"table_code": draft.table_code, "table_name": draft.table_name},
@@ -419,6 +506,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         else:
             review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "checked_fields": len(draft.fields)}
 
+        issues = enforce_issue_evidence(issues, block.raw_content)
         session.add(
             MetadataValidationModel(
                 id=str(uuid.uuid4()),
@@ -441,9 +529,10 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                 reason="Independent batch metadata review",
             )
         )
+        # 只有确实违反原文的 ERROR 才让整表进待复核；提示类问题保留在详情里，不再整表标红
         table.status = (
             "NEEDS_REVIEW"
-            if any(item.get("severity") in {"ERROR", "WARNING"} for item in program_issues + issues)
+            if table_needs_review(program_issues + issues)
             else "AI_SELF_VALIDATED"
         )
         if auto_link:
