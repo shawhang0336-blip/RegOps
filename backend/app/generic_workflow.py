@@ -1325,6 +1325,8 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
     summary = (run.result_json or {}).get("audit_summary", {})
     if not summary.get("all_passed"):
         raise WorkflowError("Test results can only be confirmed after all Oracle checks pass")
+    if summary.get("coverage_complete") is False:
+        raise WorkflowError("Test results cannot be confirmed while validation rules remain uncovered")
     report_uri = run.result_json.get("audit_report_blob", "")
     object_hash = hashlib.sha256(f"{run.id}:{report_uri}".encode()).hexdigest()
     session.add(

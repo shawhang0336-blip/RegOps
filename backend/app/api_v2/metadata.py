@@ -101,13 +101,22 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
         # 和就绪度汇总共用同一套「每张表只留最新版本」的规则，
         # 否则用户会看到「汇总 151 张、列表 150 张」
         rows = latest_table_rows(session, document_id=document_id, status=status)
+        table_ids = [row.id for row in rows]
         # 表级状态是"任意一条告警就整表待复核"，列表里必须把问题落到条数和字段上，
         # 否则用户只看到一个红色的"需要核对"，无法判断到底有几处、要不要动手。
         stats: Dict[str, Dict[str, Any]] = {}
         # 每次重新提取都会追加一轮校验记录，历史轮次的问题不能继续算在"待处理"里，
         # 否则修好之后列表仍然显示旧问题，用户看到的永远是过时状态。
         latest_by_kind: Dict[tuple, Any] = {}
-        for validation in session.query(MetadataValidationModel).order_by(MetadataValidationModel.created_at).all():
+        validations = (
+            session.query(MetadataValidationModel)
+            .filter(MetadataValidationModel.table_id.in_(table_ids))
+            .order_by(MetadataValidationModel.created_at)
+            .all()
+            if table_ids
+            else []
+        )
+        for validation in validations:
             latest_by_kind[(validation.table_id, validation.validator_kind)] = validation
         for (table_id, _kind), validation in latest_by_kind.items():
             entry = stats.setdefault(
@@ -131,9 +140,18 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
                     if field_en:
                         entry["fields"].add(field_en)
         basis_stats: Dict[str, Dict[str, int]] = {}
-        for field in session.query(FieldMetadataModel).all():
-            entry = basis_stats.setdefault(field.table_id, {"source": 0, "inferred": 0, "manual": 0})
-            basis = (field.type_basis or "UNKNOWN").upper()
+        field_counts: Dict[str, int] = {}
+        field_rows = (
+            session.query(FieldMetadataModel.table_id, FieldMetadataModel.type_basis)
+            .filter(FieldMetadataModel.table_id.in_(table_ids))
+            .all()
+            if table_ids
+            else []
+        )
+        for table_id, type_basis in field_rows:
+            field_counts[table_id] = field_counts.get(table_id, 0) + 1
+            entry = basis_stats.setdefault(table_id, {"source": 0, "inferred": 0, "manual": 0})
+            basis = (type_basis or "UNKNOWN").upper()
             if basis == "SOURCE":
                 entry["source"] += 1
             elif basis == "INFERRED":
@@ -142,7 +160,7 @@ def list_tables(status: Optional[str] = None, document_id: Optional[str] = None)
                 entry["manual"] += 1
         result = []
         for row in rows:
-            field_count = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == row.id).count()
+            field_count = field_counts.get(row.id, 0)
             basis = basis_stats.get(row.id, {"source": 0, "inferred": 0, "manual": 0})
             entry = stats.get(row.id) or {}
             top_codes = sorted(

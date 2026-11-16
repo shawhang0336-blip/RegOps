@@ -29,6 +29,8 @@ def evaluate_code_set(
     session: Session,
     row: CodeSetModel,
     table_id: Optional[str] = None,
+    values_override: Optional[List[CodeValueModel]] = None,
+    refs_override: Optional[List] = None,
 ) -> Dict[str, Any]:
     """检查一张码表能不能用。
 
@@ -38,22 +40,28 @@ def evaluate_code_set(
     传了只看这张表自己的字段——否则每张引用过它的表都会背上别人的问题，
     用户点进去发现自己的字段根本不超长。
     """
-    total_values = (
-        session.query(CodeValueModel)
-        .filter(CodeValueModel.code_set_id == row.id)
-        .order_by(CodeValueModel.sort_order, CodeValueModel.value)
-        .all()
-    )
+    if values_override is None:
+        total_values = (
+            session.query(CodeValueModel)
+            .filter(CodeValueModel.code_set_id == row.id)
+            .order_by(CodeValueModel.sort_order, CodeValueModel.value)
+            .all()
+        )
+    else:
+        total_values = values_override
     total_value_count = len(total_values)
     values = [value for value in total_values if value.enabled]
-    refs_query = (
-        session.query(FieldCodeReferenceModel, FieldMetadataModel)
-        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-        .filter(FieldCodeReferenceModel.code_set_id == row.id)
-    )
-    if table_id:
-        refs_query = refs_query.filter(FieldMetadataModel.table_id == table_id)
-    refs = refs_query.all()
+    if refs_override is None:
+        refs_query = (
+            session.query(FieldCodeReferenceModel, FieldMetadataModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+            .filter(FieldCodeReferenceModel.code_set_id == row.id)
+        )
+        if table_id:
+            refs_query = refs_query.filter(FieldMetadataModel.table_id == table_id)
+        refs = refs_query.all()
+    else:
+        refs = refs_override
     blockers: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
 
@@ -169,7 +177,35 @@ def evaluate_code_sets(
         ids = document_code_set_ids(session, document_id)
         query = query.filter(CodeSetModel.id.in_(ids))
     rows = query.order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
-    results = [evaluate_code_set(session, row) for row in rows]
+    row_ids = [row.id for row in rows]
+    values = (
+        session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(row_ids)).all()
+        if row_ids
+        else []
+    )
+    refs = (
+        session.query(FieldCodeReferenceModel, FieldMetadataModel)
+        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+        .filter(FieldCodeReferenceModel.code_set_id.in_(row_ids))
+        .all()
+        if row_ids
+        else []
+    )
+    values_by_set: Dict[str, List[CodeValueModel]] = {}
+    for value in values:
+        values_by_set.setdefault(value.code_set_id, []).append(value)
+    refs_by_set: Dict[str, List] = {}
+    for ref, field in refs:
+        refs_by_set.setdefault(ref.code_set_id, []).append((ref, field))
+    results = [
+        evaluate_code_set(
+            session,
+            row,
+            values_override=values_by_set.get(row.id, []),
+            refs_override=refs_by_set.get(row.id, []),
+        )
+        for row in rows
+    ]
     # 和列表接口用同一套可见性规则，否则就会出现「汇总 96 张、列表 86 张」这种对不上
     results = [item for item in results if not is_reference_placeholder(item)]
     if referenced_only:

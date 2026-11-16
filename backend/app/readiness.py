@@ -49,32 +49,45 @@ def _issue(severity: str, code: str, message: str, field_en: str = "", **extra: 
     return {"severity": severity, "code": code, "message": message, "field_en": field_en, **extra}
 
 
-def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
+def evaluate_table(
+    session: Session,
+    table: TableMetadataModel,
+    context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """评估一张表的交付物：能建表 / 能灌码值 / 规则原料是否齐备。"""
-    fields = (
-        session.query(FieldMetadataModel)
-        .filter(FieldMetadataModel.table_id == table.id)
-        .order_by(FieldMetadataModel.sort_order)
-        .all()
-    )
-    refs = (
-        session.query(FieldCodeReferenceModel)
-        .filter(FieldCodeReferenceModel.field_id.in_([field.id for field in fields]))
-        .all()
-        if fields
-        else []
-    )
-    refs_by_field: Dict[str, List[FieldCodeReferenceModel]] = {}
-    for ref in refs:
-        refs_by_field.setdefault(ref.field_id, []).append(ref)
-    code_sets: Dict[str, CodeSetModel] = {}
-    if refs:
-        code_sets = {
-            row.id: row
-            for row in session.query(CodeSetModel)
-            .filter(CodeSetModel.id.in_({ref.code_set_id for ref in refs}))
+    if context is None:
+        fields = (
+            session.query(FieldMetadataModel)
+            .filter(FieldMetadataModel.table_id == table.id)
+            .order_by(FieldMetadataModel.sort_order)
             .all()
-        }
+        )
+        refs = (
+            session.query(FieldCodeReferenceModel)
+            .filter(FieldCodeReferenceModel.field_id.in_([field.id for field in fields]))
+            .all()
+            if fields
+            else []
+        )
+        refs_by_field: Dict[str, List[FieldCodeReferenceModel]] = {}
+        for ref in refs:
+            refs_by_field.setdefault(ref.field_id, []).append(ref)
+        code_sets = (
+            {
+                row.id: row
+                for row in session.query(CodeSetModel)
+                .filter(CodeSetModel.id.in_({ref.code_set_id for ref in refs}))
+                .all()
+            }
+            if refs
+            else {}
+        )
+    else:
+        fields = context["fields_by_table"].get(table.id, [])
+        refs_by_field = context["refs_by_field"]
+        refs = [ref for field in fields for ref in refs_by_field.get(field.id, [])]
+        referenced_ids = {ref.code_set_id for ref in refs}
+        code_sets = {code_set_id: context["code_sets"][code_set_id] for code_set_id in referenced_ids if code_set_id in context["code_sets"]}
 
     ddl: List[Dict[str, Any]] = []
     materials: List[Dict[str, Any]] = []
@@ -166,7 +179,21 @@ def evaluate_table(session: Session, table: TableMetadataModel) -> Dict[str, Any
         # 按这张表的视角检查：码值超长是相对引用字段长度说的，
         # 不带 table_id 会把别的表短字段的超长问题算到这张表头上，
         # 用户看到 ✕ 点进码表页却找不到要改什么。
-        verdict = evaluate_code_set(session, code_set, table_id=table.id)
+        context_values = context["values_by_set"].get(code_set.id, []) if context else None
+        context_refs = None
+        if context:
+            context_refs = [
+                (ref, field)
+                for ref, field in context["refs_with_field_by_set"].get(code_set.id, [])
+                if field.table_id == table.id
+            ]
+        verdict = evaluate_code_set(
+            session,
+            code_set,
+            table_id=table.id,
+            values_override=context_values,
+            refs_override=context_refs,
+        )
         if is_reference_placeholder(verdict):
             # 占位不是码表，用户没法补；引用它的字段上面已经按 UNRESOLVED 报过了
             continue
@@ -349,5 +376,60 @@ def latest_table_rows(
 
 def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:
     tables = latest_table_rows(session, document_id=document_id)
-    results = [evaluate_table(session, table) for table in tables]
+    if not tables:
+        return {"summary": summarize([]), "tables": []}
+    table_ids = [table.id for table in tables]
+    fields = (
+        session.query(FieldMetadataModel)
+        .filter(FieldMetadataModel.table_id.in_(table_ids))
+        .order_by(FieldMetadataModel.sort_order)
+        .all()
+    )
+    field_ids = [field.id for field in fields]
+    refs = (
+        session.query(FieldCodeReferenceModel)
+        .filter(FieldCodeReferenceModel.field_id.in_(field_ids))
+        .all()
+        if field_ids
+        else []
+    )
+    code_set_ids = {ref.code_set_id for ref in refs}
+    code_sets = (
+        session.query(CodeSetModel).filter(CodeSetModel.id.in_(code_set_ids)).all()
+        if code_set_ids
+        else []
+    )
+    values = (
+        session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(code_set_ids)).all()
+        if code_set_ids
+        else []
+    )
+    refs_with_field = (
+        session.query(FieldCodeReferenceModel, FieldMetadataModel)
+        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+        .filter(FieldCodeReferenceModel.code_set_id.in_(code_set_ids))
+        .all()
+        if code_set_ids
+        else []
+    )
+    fields_by_table: Dict[str, List[FieldMetadataModel]] = {}
+    for field in fields:
+        fields_by_table.setdefault(field.table_id, []).append(field)
+    refs_by_field: Dict[str, List[FieldCodeReferenceModel]] = {}
+    for ref in refs:
+        refs_by_field.setdefault(ref.field_id, []).append(ref)
+    values_by_set: Dict[str, List[CodeValueModel]] = {}
+    for value in values:
+        values_by_set.setdefault(value.code_set_id, []).append(value)
+    refs_with_field_by_set: Dict[str, List] = {}
+    for ref, field in refs_with_field:
+        refs_with_field_by_set.setdefault(ref.code_set_id, []).append((ref, field))
+    context = {
+        "fields_by_table": fields_by_table,
+        "refs_by_field": refs_by_field,
+        "code_sets": {row.id: row for row in code_sets},
+        "values_by_set": values_by_set,
+        "refs_with_field_by_set": refs_with_field_by_set,
+    }
+    results = [evaluate_table(session, table, context=context) for table in tables]
     return {"summary": summarize(results), "tables": results}

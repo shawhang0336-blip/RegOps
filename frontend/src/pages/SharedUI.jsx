@@ -10,6 +10,8 @@ export const STATUS_META = {
   OVERVIEW_REVIEWED: { label: '结构检查完成', tone: 'green' },
   OVERVIEW_NEEDS_REVIEW: { label: '结构需要确认', tone: 'amber' },
   OVERVIEW_FAILED: { label: '结构检查未完成', tone: 'red' },
+  STRUCTURE_REVIEWED: { label: '结构检查完成', tone: 'green' },
+  UPLOADED: { label: '等待结构检查', tone: 'amber' },
   BLOCK_EXTRACTION_FAILED: { label: '初步切块未完成', tone: 'red' },
   EXTRACTING: { label: '正在提取', tone: 'blue' },
   EXTRACTED: { label: '提取完成', tone: 'green' },

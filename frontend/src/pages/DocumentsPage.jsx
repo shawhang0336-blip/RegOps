@@ -266,6 +266,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   const [mappingOptions, setMappingOptions] = useState([])
   const [blockFilter, setBlockFilter] = useState('all')
   const [dragging, setDragging] = useState(false)
+  const [showUpload, setShowUpload] = useState(false)
   const [importProgress, setImportProgress] = useState(() => {
     try {
       return JSON.parse(window.localStorage.getItem('regops-import-progress') || 'null')
@@ -322,6 +323,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   async function selectDocument(id) {
     const doc = await v2(`/documents/${id}`)
     setDetail(doc)
+    setShowUpload(false)
     if (onSelectDocument) onSelectDocument(doc.id)
     const eligibleIds = (doc.blocks || []).filter((b) => b.eligible !== false && !b.superseded).map((b) => b.id)
     setSelected(eligibleIds)
@@ -417,6 +419,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
       setError(friendlyError(err.message))
     } finally {
       setBusy(false)
+      setShowUpload(false)
     }
   }
 
@@ -655,50 +658,52 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     return (
       <>
         <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
-        <label
-          className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
-          onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={onDrop}
-        >
-          <div className="upload-dropzone-text">
-            <strong>选择或拖入规范文件，上传后自动解析</strong>
-            <span>支持 PDF、Word、Excel；完成后直接在下方核对报表字段和码表</span>
-          </div>
-          <span className="button primary">{busy ? '正在自动解析...' : '选择文件并解析'}</span>
-          <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onFileInputChange} />
-        </label>
-        <section className="current-file-bar">
-          <div className="current-file-main">
-            <span className="current-file-eyebrow">当前文件</span>
-            <div className="current-file-heading">
-              <CurrentFilePicker
-                documents={documents}
-                currentId={detail?.id}
-                busy={busy}
-                onSelect={selectDocument}
-              />
-              {detail && <StatusBadge status={detail.status} />}
+        {(!detail || showUpload) && (
+          <label
+            className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
+            onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={onDrop}
+          >
+            <div className="upload-dropzone-text">
+              <strong>选择或拖入规范文件，上传后自动解析</strong>
+              <span>支持 PDF、Word、Excel；完成后直接在下方核对报表字段和码表</span>
             </div>
-            <p className="current-file-meta">
-              {(() => {
-                const current = documents.find((doc) => doc.id === detail?.id)
-                if (!current) return '还没有可用的文件，先在上方选择或拖入一份规范。'
-                return [
-                  String(current.file_type || '').toUpperCase(),
-                  `${current.block_count ?? 0} 个内容块`,
-                  current.created_at ? `${formatTime(current.created_at)} 上传` : '',
-                ].filter(Boolean).join(' · ')
-              })()}
-            </p>
-          </div>
-          <div className="current-file-actions">
-            {detail?.status === 'OVERVIEW_FAILED' && <button type="button" className="button primary" disabled={busy} onClick={prepareDocument}>重新检查并解析</button>}
-            {detail && detail.status !== 'OVERVIEW_FAILED' && <button type="button" className="button secondary" disabled={busy} onClick={parseCurrentDocument}>解析当前文件</button>}
-            {detail && <button type="button" className="button ghost danger-text" disabled={busy} onClick={deleteDocument}>删除文件</button>}
-          </div>
-        </section>
-        <ImportProgressPanel progress={importProgress} onClose={() => setImportProgress(null)} />
+            <span className="button primary">{busy ? '正在自动解析...' : '选择文件并解析'}</span>
+            <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onFileInputChange} />
+          </label>
+        )}
+        {detail && (
+          <section className="current-file-bar compact">
+            <div className="current-file-main">
+              <span className="current-file-eyebrow">当前文件</span>
+              <div className="current-file-heading">
+                <CurrentFilePicker documents={documents} currentId={detail.id} busy={busy} onSelect={selectDocument} />
+                <StatusBadge status={detail.status} />
+              </div>
+              <p className="current-file-meta">
+                {(() => {
+                  const current = documents.find((doc) => doc.id === detail.id)
+                  if (!current) return '文件已加载'
+                  return [
+                    String(current.file_type || '').toUpperCase(),
+                    `${current.block_count ?? 0} 个内容块`,
+                    current.created_at ? `${formatTime(current.created_at)} 上传` : '',
+                  ].filter(Boolean).join(' · ')
+                })()}
+              </p>
+            </div>
+            <div className="current-file-actions">
+              {detail.status === 'OVERVIEW_FAILED' && <button type="button" className="button primary sm" disabled={busy} onClick={prepareDocument}>重新检查并解析</button>}
+              {detail.status !== 'OVERVIEW_FAILED' && <button type="button" className="button secondary sm" disabled={busy} onClick={parseCurrentDocument}>重新解析</button>}
+              <button type="button" className="button secondary sm" disabled={busy} onClick={() => setShowUpload(!showUpload)}>
+                {showUpload ? '收起导入' : '导入新文件'}
+              </button>
+              <button type="button" className="button ghost danger-text sm" disabled={busy} onClick={deleteDocument}>删除文件</button>
+            </div>
+          </section>
+        )}
+        <ImportProgressPanel progress={importProgress?.status === 'DONE' && !showUpload ? null : importProgress} onClose={() => setImportProgress(null)} />
       </>
     )
   }

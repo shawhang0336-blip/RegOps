@@ -76,6 +76,27 @@ def compile_code_set_oracle_merge(code_set: Dict[str, Any], table: str) -> str:
     return ";\n".join(statements)
 
 
+def compile_code_set_oracle_insert(code_set: Dict[str, Any], table: str) -> str:
+    """Oracle INSERT ALL：用于首次初始化，重复部署请使用 MERGE 版本。"""
+    quoted = quote_identifier(table, "oracle")
+    columns = '("CODE_VALUE", "LABEL_CN", "LABEL_EN", "DEFINITION", "SORT_ORDER", "ENABLED")'
+    statements = []
+    for value in code_set["values"]:
+        items = (
+            value["value"],
+            value["label_cn"],
+            value.get("label_en") or "",
+            value.get("definition") or "",
+            int(value.get("sort_order", 0)),
+            1 if value.get("enabled", True) else 0,
+        )
+        values = ", ".join(_sql_literal(item) for item in items)
+        statements.append(f"  INTO {quoted} {columns} VALUES ({values})")
+    if not statements:
+        return ""
+    return "INSERT ALL\n" + "\n".join(statements) + "\nSELECT 1 FROM DUAL"
+
+
 def load_published_code_sets(
     session: Session,
     specs: List[SpecDocument],

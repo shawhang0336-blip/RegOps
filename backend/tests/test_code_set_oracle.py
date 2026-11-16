@@ -5,6 +5,7 @@ import pytest
 from app.asset_models import CodeSetModel, CodeValueModel
 from app.code_set_oracle import (
     compile_code_set_oracle_ddl,
+    compile_code_set_oracle_insert,
     compile_code_set_oracle_merge,
     load_published_code_sets,
     stable_code_set_table,
@@ -79,6 +80,21 @@ def test_oracle_code_set_ddl_and_merge_are_stable_and_idempotent():
     assert "MERGE INTO" in sql
     assert "WHEN MATCHED THEN UPDATE" in sql
     assert "'CHN' AS CODE_VALUE" in sql
+
+
+def test_oracle_code_set_insert_all_supports_initial_batch_load():
+    table = stable_code_set_table("COUNTRY")
+    code_set = {
+        "values": [
+            {"value": "CHN", "label_cn": "中国", "label_en": "China", "sort_order": 0, "enabled": True},
+            {"value": "USA", "label_cn": "美国", "definition": "O'Brien", "sort_order": 1, "enabled": False},
+        ]
+    }
+    sql = compile_code_set_oracle_insert(code_set, table)
+    assert sql.startswith("INSERT ALL")
+    assert sql.count("  INTO ") == 2
+    assert "'O''Brien'" in sql
+    assert sql.endswith("SELECT 1 FROM DUAL")
 
 
 def test_published_code_set_drives_rules_and_generators():

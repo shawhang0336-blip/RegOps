@@ -62,14 +62,96 @@ def _latest_run_for_table(session: Session, table_code: str) -> Optional[RunMode
     return session.get(RunModel, row[0])
 
 
+def _rules_payload(session: Session, table: TableMetadataModel, run: RunModel) -> List[Dict[str, Any]]:
+    """一张表在某次 run 里的规则列表，带编译后的 SQL；明细和总览共用它。"""
+    rows = (
+        session.query(RuleModel)
+        .filter(RuleModel.run_id == run.id, RuleModel.table_code == table.table_code)
+        .order_by(RuleModel.created_at, RuleModel.rule_key)
+        .all()
+    )
+    physical = {table.table_code: table.table_code}
+    rules: List[Dict[str, Any]] = []
+    for row in rows:
+        definition = RuleDefinition.model_validate(row.definition_json)
+        try:
+            sql, _ = compile_where(definition, "oracle", physical)
+        except Exception:
+            sql = None
+        rules.append(
+            {
+                "row_id": row.row_id,
+                "rule_hash": row.rule_hash,
+                "rule_key": definition.rule_key,
+                "field": definition.field,
+                "operator": definition.operator,
+                "operator_label": _OPERATOR_LABELS.get(definition.operator, definition.operator),
+                "params": definition.params,
+                "source": definition.source,
+                "status": row.status,
+                "rationale": definition.rationale,
+                "evidence": definition.evidence.model_dump() if definition.evidence else None,
+                "sql": sql,
+            }
+        )
+    return rules
+
+
+@router.get("/rules")
+def all_table_rules() -> Dict[str, Any]:
+    """所有已生成表的规则总览：按表分组，每组带最近一次 run 的状态。
+
+    第二步的校验规则视图按「做了哪些表」组织，不暴露批次概念；
+    每张表的规则来自它最近一次产出规则的 run。
+    """
+    with SessionLocal() as session:
+        tables = session.query(TableMetadataModel).order_by(TableMetadataModel.table_code).all()
+        items: List[Dict[str, Any]] = []
+        for table in tables:
+            run = _latest_run_for_table(session, table.table_code)
+            if not run:
+                continue
+            rules = _rules_payload(session, table, run)
+            result = run.result_json or {}
+            items.append(
+                {
+                    "table": {
+                        "id": table.id,
+                        "table_code": table.table_code,
+                        "table_name": table.table_name,
+                        "status": table.status,
+                    },
+                    "run": {
+                        "id": run.id,
+                        "status": run.status,
+                        "created_at": run.created_at.isoformat() if run.created_at else None,
+                    },
+                    "rules": rules,
+                    "active_count": sum(1 for rule in rules if rule["status"] != "SUPERSEDED"),
+                    "pending_count": sum(1 for rule in rules if rule["status"] == "PENDING"),
+                    "superseded_count": sum(1 for rule in rules if rule["status"] == "SUPERSEDED"),
+                    "precheck": result.get("oracle_precheck"),
+                }
+            )
+        # 最近有产出的表排前面，同批次的表按表代码稳定排序
+        items.sort(key=lambda item: (item["run"]["created_at"] or "", item["table"]["table_code"]), reverse=True)
+        return {"tables": items}
+
+
 @router.get("")
 def artifacts_status() -> Dict[str, Any]:
     """每张表最近一次生成的状态，用于列表显示（未生成/生成中/已验证/失败）。"""
     with SessionLocal() as session:
         latest: Dict[str, str] = {}
+        rule_counts: Dict[str, Dict[str, int]] = {}
         for row in session.query(RuleModel).order_by(RuleModel.created_at.desc()).all():
             if row.table_code not in latest:
                 latest[row.table_code] = row.run_id
+            # SUPERSEDED 是被去重替换掉的重复规则，不算有效规则数
+            if row.status == "SUPERSEDED":
+                continue
+            by_table = rule_counts.setdefault(row.run_id, {})
+            by_table[row.table_code] = by_table.get(row.table_code, 0) + 1
         run_ids = set(latest.values())
         runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
         tables = session.query(TableMetadataModel).all()
@@ -84,7 +166,8 @@ def artifacts_status() -> Dict[str, Any]:
         for table in tables:
             run_id = latest.get(table.table_code)
             run = runs.get(run_id)
-            summary = (run.result_json or {}).get("audit_summary") if run else {}
+            run_result = (run.result_json or {}) if run else {}
+            summary = run_result.get("audit_summary") or {}
             result.append(
                 {
                     "id": table.id,
@@ -99,6 +182,11 @@ def artifacts_status() -> Dict[str, Any]:
                     "run_status": run.status if run else None,
                     "all_passed": summary.get("all_passed") if summary else None,
                     "created_at": run.created_at.isoformat() if run and run.created_at else None,
+                    # 清单直接展示产物状态，避免前端逐表请求详情后才能统计。
+                    "ddl_generated": bool(run_result.get("ddl_blob") or run_result.get("oracle_ddl_blob")),
+                    "rule_count": rule_counts.get(run_id, {}).get(table.table_code, 0) if run_id else 0,
+                    "code_set_count": len(summary.get("code_set_record_counts") or {}),
+                    "audit_case_count": summary.get("case_count"),
                 }
             )
         return {"tables": result}
@@ -188,6 +276,7 @@ def table_artifacts(table_id: str) -> Dict[str, Any]:
             "rule_groups": {},
             "ddl": None,
             "code_sets": [],
+            "precheck": None,
             "audit": None,
         }
         if not run:
@@ -201,37 +290,10 @@ def table_artifacts(table_id: str) -> Dict[str, Any]:
         }
 
         # 规则：核心产物，按算子分组，每条带原文依据和编译后的 SQL
-        rows = (
-            session.query(RuleModel)
-            .filter(RuleModel.run_id == run.id, RuleModel.table_code == table.table_code)
-            .order_by(RuleModel.created_at, RuleModel.rule_key)
-            .all()
-        )
+        rules = _rules_payload(session, table, run)
         groups: Dict[str, int] = {}
-        rules: List[Dict[str, Any]] = []
-        physical = {table.table_code: table.table_code}
-        for row in rows:
-            definition = RuleDefinition.model_validate(row.definition_json)
-            try:
-                sql, _ = compile_where(definition, "oracle", physical)
-            except Exception:
-                sql = None
-            groups[definition.operator] = groups.get(definition.operator, 0) + 1
-            rules.append(
-                {
-                    "row_id": row.row_id,
-                    "rule_key": definition.rule_key,
-                    "field": definition.field,
-                    "operator": definition.operator,
-                    "operator_label": _OPERATOR_LABELS.get(definition.operator, definition.operator),
-                    "params": definition.params,
-                    "source": definition.source,
-                    "status": row.status,
-                    "rationale": definition.rationale,
-                    "evidence": definition.evidence.model_dump() if definition.evidence else None,
-                    "sql": sql,
-                }
-            )
+        for rule in rules:
+            groups[rule["operator"]] = groups.get(rule["operator"], 0) + 1
         payload["rules"] = rules
         payload["rule_groups"] = groups
 
@@ -263,6 +325,7 @@ def table_artifacts(table_id: str) -> Dict[str, Any]:
                 }
             )
 
+        payload["precheck"] = result.get("oracle_precheck")
         # 验证结果
         if summary:
             payload["audit"] = {

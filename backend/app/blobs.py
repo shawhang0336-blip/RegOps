@@ -22,3 +22,9 @@ class LocalBlobStore:
         if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
             raise ValueError("Invalid blob URI")
         return (self.root / digest[:2] / digest).read_bytes()
+
+    def delete(self, uri: str) -> None:
+        digest = uri.removeprefix("blob://")
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("Invalid blob URI")
+        (self.root / digest[:2] / digest).unlink(missing_ok=True)

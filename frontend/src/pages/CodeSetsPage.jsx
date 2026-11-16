@@ -5,7 +5,7 @@ import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeverity } from './SharedUI.jsx'
 
-export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
+export default function CodeSetsPage({ embedded = false, onDocumentChange, onSummaryChange, statusFilter, onStatusFilterChange }) {
   const [params] = useSearchParams()
   const navigate = useNavigate()
 
@@ -16,6 +16,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   const [newValue, setNewValue] = useState({ value: '', label_cn: '', label_en: '' })
   const [filterText, setFilterText] = useState('')
   const [setSearch, setSetSearch] = useState('')
+  const [localStatusFilter, setLocalStatusFilter] = useState('all')
+  const activeStatusFilter = statusFilter ?? localStatusFilter
+  const changeStatusFilter = onStatusFilterChange || setLocalStatusFilter
   const [includeInline, setIncludeInline] = useState(true)
   const [dragging, setDragging] = useState(false)
   const [readiness, setReadiness] = useState(null)
@@ -29,6 +32,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     if (embedded && !documentId) {
       setSets([])
       setDetail(null)
+      onSummaryChange?.(null)
       return
     }
     // 不带 referenced_only：汇总数要和下面的列表张数对得上，
@@ -42,6 +46,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     setSets(setList)
     setUnresolved(unresolvedList)
     setReadiness(readinessPayload)
+    onSummaryChange?.(readinessPayload?.summary || null)
 
     const paramSetId = params.get('set')
     const paramName = params.get('name')
@@ -235,6 +240,18 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
     (readiness?.code_sets || []).map((item) => [item.code_set_id, item])
   )
   const verdictOf = (id) => readinessById[id]
+  const statusOf = (set) => {
+    if (!set) return { key: 'pending', label: '未评估', tone: 'neutral' }
+    if (set.status === 'EXTERNAL') return { key: 'external', label: '外部规范引用', tone: 'blue' }
+    const verdict = verdictOf(set.id)
+    if (!verdict) return { key: 'pending', label: '评估中', tone: 'neutral' }
+    const problems = verdict.blockers || []
+    if (problems.length) return { key: 'blocked', label: `需补 ${problems.length} 项`, tone: 'red' }
+    if ((verdict.warnings || []).some((item) => item.code === 'NOT_REFERENCED')) {
+      return { key: 'unreferenced', label: '无关联引用', tone: 'neutral' }
+    }
+    return { key: 'ready', label: '齐备', tone: 'green' }
+  }
 
   // 码值超长要在列表里指出来——只说「需补 1 项」，用户对着 257 个码值找不到哪个有问题
   const problemValueSet = new Set()
@@ -247,6 +264,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
   }
 
   const filteredSets = sets.filter((s) => {
+    if (activeStatusFilter !== 'all' && statusOf(s).key !== activeStatusFilter) return false
     if (!setSearch.trim()) return true
     const q = setSearch.toLowerCase()
     return (
@@ -276,25 +294,28 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
-      <div
-        className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={onDrop}
-      >
-        <div className="upload-dropzone-text">
-          <strong>上传码值文件，系统会自动识别并关联字段</strong>
-          <span>支持 PDF、Word、Excel；也可以上传完整规范，只提取其中的码值表</span>
+      <details className="code-import-panel" open={!sets.length}>
+        <summary>导入码值文件 <span>支持 PDF、Word、Excel，自动识别并关联字段</span></summary>
+        <div
+          className={`upload-dropzone ${dragging ? 'dragging' : ''}`}
+          onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={onDrop}
+        >
+          <div className="upload-dropzone-text">
+            <strong>上传码值文件，系统会自动识别并关联字段</strong>
+            <span>也可以上传完整规范，只提取其中的码值表</span>
+          </div>
+          <label className="button primary">
+            {busy ? '正在识别...' : '选择码值文件'}
+            <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onDocInputChange} />
+          </label>
         </div>
-        <label className="button primary">
-          {busy ? '正在识别...' : '选择码值文件'}
-          <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onDocInputChange} />
+        <label className="inline-option code-upload-option">
+          <input type="checkbox" checked={includeInline} onChange={(e) => setIncludeInline(e.target.checked)} />
+          同时提取字段说明中列出的取值
         </label>
-      </div>
-      <label className="inline-option code-upload-option">
-        <input type="checkbox" checked={includeInline} onChange={(e) => setIncludeInline(e.target.checked)} />
-        同时提取字段说明中列出的取值
-      </label>
+      </details>
 
       {readiness && (
         <div className="readiness-summary">
@@ -359,13 +380,20 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
             <StatusBadge tone="neutral">{sets.length}</StatusBadge>
           </div>
 
-          <div style={{ marginBottom: 10 }}>
+          <div className="code-set-filters">
             <input
               type="search"
               placeholder="检索码值表名称或代码..."
               value={setSearch}
               onChange={(e) => setSetSearch(e.target.value)}
             />
+            <select aria-label="码表状态" value={activeStatusFilter} onChange={(e) => changeStatusFilter(e.target.value)}>
+              <option value="all">全部状态</option>
+              <option value="ready">齐备</option>
+              <option value="blocked">需补</option>
+              <option value="external">外部规范引用</option>
+              <option value="unreferenced">无关联引用</option>
+            </select>
           </div>
 
           {filteredSets.length > 0 ? (
@@ -398,14 +426,8 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                   <div className="list-row-top">
                     <strong>{set.name}</strong>
                     {(() => {
-                      const verdict = verdictOf(set.id)
-                      const problems = verdict?.blockers || []
-                      if (!verdict) return <StatusBadge tone="neutral">未评估</StatusBadge>
-                      return problems.length ? (
-                        <StatusBadge tone="red">需补 {problems.length} 项</StatusBadge>
-                      ) : (
-                        <StatusBadge tone="green">齐备</StatusBadge>
-                      )
+                      const status = statusOf(set)
+                      return <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
                     })()}
                   </div>
                   <span>
@@ -420,7 +442,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
               ))}
             </div>
           ) : (
-            <div className="empty">当前文件没有已识别的码表，可点击上方“解析当前文件”，或上传码值文件。</div>
+            <div className="empty">{setSearch || activeStatusFilter !== 'all' ? '没有符合当前条件的码表。' : '当前文件没有已识别的码表，可展开上方“导入码值文件”补充。'}</div>
           )}
 
           <details className="inline-form" open={!sets.length}>
@@ -455,12 +477,8 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                     <h2>{detail.name}</h2>
                     <code>{detail.code}</code>
                     {(() => {
-                      const problems = verdictOf(detail.id)?.blockers || []
-                      return problems.length ? (
-                        <StatusBadge tone="red">需补 {problems.length} 项</StatusBadge>
-                      ) : (
-                        <StatusBadge tone="green">齐备</StatusBadge>
-                      )
+                      const status = statusOf(detail)
+                      return <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
                     })()}
                     <StatusBadge status={detail.source_type}>
                       {detail.source_type === 'MANUAL' ? '人工维护' : '文档识别'}
@@ -512,26 +530,29 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange }) {
                 </details>
               )}
 
-              <div className="add-value-form">
-                <input
-                  placeholder="码值编码 *（例：USD / 100）"
-                  value={newValue.value}
-                  onChange={(e) => setNewValue({ ...newValue, value: e.target.value })}
-                />
-                <input
-                  placeholder="中文含义 *（例：美元）"
-                  value={newValue.label_cn}
-                  onChange={(e) => setNewValue({ ...newValue, label_cn: e.target.value })}
-                />
-                <input
-                  placeholder="英文含义（选填，例：US Dollar）"
-                  value={newValue.label_en}
-                  onChange={(e) => setNewValue({ ...newValue, label_en: e.target.value })}
-                />
-                <button type="button" className="button primary" disabled={busy} onClick={addValue}>
-                  + 添加码值项
-                </button>
-              </div>
+              <details className="inline-add-panel" open={!detail.values?.length}>
+                <summary>+ 添加单个码值</summary>
+                <div className="add-value-form">
+                  <input
+                    placeholder="码值编码 *（例：USD / 100）"
+                    value={newValue.value}
+                    onChange={(e) => setNewValue({ ...newValue, value: e.target.value })}
+                  />
+                  <input
+                    placeholder="中文含义 *（例：美元）"
+                    value={newValue.label_cn}
+                    onChange={(e) => setNewValue({ ...newValue, label_cn: e.target.value })}
+                  />
+                  <input
+                    placeholder="英文含义（选填，例：US Dollar）"
+                    value={newValue.label_en}
+                    onChange={(e) => setNewValue({ ...newValue, label_en: e.target.value })}
+                  />
+                  <button type="button" className="button primary" disabled={busy} onClick={addValue}>
+                    确认添加
+                  </button>
+                </div>
+              </details>
 
               {filteredValues.length > 0 ? (
                 <div className="table-wrap">

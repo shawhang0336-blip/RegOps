@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .asset_models import ArtifactModel
 from .blobs import LocalBlobStore
-from .code_set_oracle import compile_code_set_oracle_ddl, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
+from .code_set_oracle import compile_code_set_oracle_ddl, compile_code_set_oracle_insert, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
 from .domain import RuleDefinition, canonical_json
 from .generic_domain import SchemaBinding
 from .generic_workflow import _latest_payload, _specs
@@ -21,6 +21,8 @@ from .errors import WorkflowError
 def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> Tuple[str, bytes]:
     if run.status != "COMPLETED" or not run.result_json or not run.result_json.get("audit_summary", {}).get("all_passed"):
         raise WorkflowError("Production export requires a completed, fully passed Oracle audit")
+    if run.result_json.get("audit_summary", {}).get("coverage_complete") is False:
+        raise WorkflowError("Production export is blocked by uncovered validation rules")
     pending = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "PENDING").count()
     if pending:
         raise WorkflowError("Production export is blocked by unapproved rules")
@@ -37,14 +39,17 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
     if code_sets and "code_set_versions" not in run.result_json["audit_summary"]:
         raise WorkflowError("This run predates code set auditing; rerun the Oracle audit before production export")
     code_set_tables = {item["code"]: stable_code_set_table(item["code"]) for item in code_sets}
-    oracle_code_sets = []
+    oracle_code_set_ddl = []
+    oracle_code_set_insert = []
+    oracle_code_set_merge = []
     for code_set in code_sets:
         table = code_set_tables[code_set["code"]]
-        data_sql = compile_code_set_oracle_merge(code_set, table)
-        oracle_code_sets.append(
-            f"-- {code_set['code']} | {code_set['name']} | audited version {code_set['version']}\n"
-            f"{compile_code_set_oracle_ddl(table)};\n{data_sql}" + (";" if data_sql else "")
-        )
+        comment = f"-- {code_set['code']} | {code_set['name']} | audited version {code_set['version']}\n"
+        oracle_code_set_ddl.append(comment + compile_code_set_oracle_ddl(table) + ";")
+        insert_sql = compile_code_set_oracle_insert(code_set, table)
+        merge_sql = compile_code_set_oracle_merge(code_set, table)
+        oracle_code_set_insert.append(comment + insert_sql + (";" if insert_sql else ""))
+        oracle_code_set_merge.append(comment + merge_sql + (";" if merge_sql else ""))
     oracle_ddl = "\n\n".join(compile_production_oracle_ddl(spec.table_code, schemas[spec.table_code]) + ";" for spec in specs)
     mysql_ddl = "\n\n".join(compile_production_mysql_ddl(spec.table_code, schemas[spec.table_code]) + ";" for spec in specs)
     oracle_rules = []
@@ -86,17 +91,20 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
         "deployment_order": [
             "Backup target schemas",
             "Review manifest.json and rules.json",
-            "Run oracle/01_create_tables.sql or mysql/01_create_tables.sql as appropriate",
-            "Run oracle/02_code_sets.sql to create and merge the audited code set versions",
-            "Run oracle/03_validation_rules.sql in report mode",
+            "Run oracle/01_report_tables.sql or mysql/01_report_tables.sql as appropriate",
+            "Run oracle/02_code_set_tables.sql",
+            "Run oracle/03_code_values_insert.sql for initial deployment, or oracle/04_code_values_merge.sql for repeatable updates",
+            "Run oracle/05_validation_rules.sql in report mode",
         ],
     }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("oracle/01_create_tables.sql", oracle_ddl + "\n")
-        archive.writestr("oracle/02_code_sets.sql", "\n\n".join(oracle_code_sets) + "\n")
-        archive.writestr("oracle/03_validation_rules.sql", "\n\n".join(oracle_rules) + "\n")
-        archive.writestr("mysql/01_create_tables.sql", mysql_ddl + "\n")
+        archive.writestr("oracle/01_report_tables.sql", oracle_ddl + "\n")
+        archive.writestr("oracle/02_code_set_tables.sql", "\n\n".join(oracle_code_set_ddl) + "\n")
+        archive.writestr("oracle/03_code_values_insert.sql", "\n\n".join(oracle_code_set_insert) + "\n")
+        archive.writestr("oracle/04_code_values_merge.sql", "\n\n".join(oracle_code_set_merge) + "\n")
+        archive.writestr("oracle/05_validation_rules.sql", "\n\n".join(oracle_rules) + "\n")
+        archive.writestr("mysql/01_report_tables.sql", mysql_ddl + "\n")
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         archive.writestr("rules.json", canonical_json([rule.model_dump() for rule in rules]))
     content = buffer.getvalue()

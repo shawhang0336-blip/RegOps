@@ -40,7 +40,18 @@ function typeBasisMeta(basis) {
   return TYPE_BASIS_META[String(basis || 'UNKNOWN').toUpperCase()] || TYPE_BASIS_META.UNKNOWN
 }
 
-export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
+function tableGate(table, item) {
+  if (!item) return { key: 'pending', label: '评估中', tone: 'blue', reason: '正在评估生成条件' }
+  let reason = ''
+  if (table.status === 'NEEDS_REVIEW') reason = `${table.review_blocking_count || 1} 项字段问题需要处理`
+  else if (!item.ddl?.ready) reason = item.ddl?.blockers?.[0]?.message || '表结构暂不能生成'
+  else if (!item.rule_materials?.ready) reason = item.rule_materials?.blockers?.[0]?.message || '校验信息不完整'
+  else if ((item.code_sets?.defects || []).length) reason = item.code_sets.defects[0]?.message || '关联码表需要补充'
+  if (reason) return { key: 'blocked', label: '需处理', tone: 'red', reason }
+  return { key: 'ready', label: '可生成', tone: 'green', reason: '' }
+}
+
+export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadinessChange, reportFilter, onReportFilterChange }) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
 
@@ -56,8 +67,12 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
   const [showAdd, setShowAdd] = useState(false)
   const [tab, setTab] = useState(params.get('tab') || 'fields')
   const [fieldSearch, setFieldSearch] = useState('')
+  const [tableSearch, setTableSearch] = useState('')
   const [onlyIssues, setOnlyIssues] = useState(false)
   const [onlyInferred, setOnlyInferred] = useState(false)
+  const [localReportFilter, setLocalReportFilter] = useState('all')
+  const activeReportFilter = reportFilter ?? localReportFilter
+  const changeReportFilter = onReportFilterChange || setLocalReportFilter
   const [showTypeImport, setShowTypeImport] = useState(false)
   const [typeImportFile, setTypeImportFile] = useState(null)
   const [typeImportResult, setTypeImportResult] = useState(null)
@@ -72,6 +87,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     if (embedded && !documentId) {
       setTables([])
       setDetail(null)
+      onReadinessChange?.(null)
       return
     }
     const [tableList, unresolvedList, codeSetList, readinessPayload] = await Promise.all([
@@ -84,6 +100,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     setUnresolvedRefs(unresolvedList)
     setCodeSets(codeSetList)
     setReadiness(readinessPayload)
+    onReadinessChange?.(readinessPayload)
 
     const requestedId = params.get('table')
     const currentId = detail?.id
@@ -234,6 +251,8 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
   // Keyboard shortcuts for field inspector drawer: Ctrl+S save, Esc close, Alt+Up/Down switch field
   useEffect(() => {
     if (!activeField || tab !== 'fields') return undefined
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
 
     function onKeyDown(e) {
       if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
@@ -261,7 +280,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     }
 
     window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
   }, [activeField, tab, isPublished, busy, filteredFields, saveField])
 
   async function removeField(field) {
@@ -415,22 +437,18 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
     { source: 0, inferred: 0, manual: 0, unknown: 0 }
   )
 
+  const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
   const visibleTables = tables
     .filter((table) => (onlyIssues ? (table.review_blocking_count || 0) > 0 : true))
     .filter((table) => (onlyInferred ? (table.type_inferred_count || 0) > 0 : true))
+    .filter((table) => activeReportFilter === 'all' || tableGate(table, readinessById[table.id]).key === activeReportFilter)
+    .filter((table) => {
+      const q = tableSearch.trim().toLowerCase()
+      return !q || (table.table_name || '').toLowerCase().includes(q) || (table.table_code || '').toLowerCase().includes(q)
+    })
 
   const inferredTableCount = tables.filter((table) => (table.type_inferred_count || 0) > 0).length
   const allInferredTableCount = tables.filter((table) => table.type_all_inferred).length
-
-  const readinessById = Object.fromEntries((readiness?.tables || []).map((item) => [item.table_id, item]))
-  // 卡点按「多少张表」分类，比按维度列数字直观：用户关心的是几张能用、几张卡在哪
-  const tablesAll = readiness?.tables || []
-  const codeDefectCount = tablesAll.filter(
-    (item) => item.code_sets?.applicable && (item.code_sets.defects || []).length > 0
-  ).length
-  const ddlBlockCount = tablesAll.filter((item) => !item.ddl?.ready).length
-  const ruleBlockCount = tablesAll.filter((item) => !item.rule_materials?.ready).length
-
   const pageActions = detail && (
     <>
       {/* 没有「发布」这一步了——去第 2 步选表就会定稿。表本身随时可改。 */}
@@ -438,7 +456,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
         {showTypeImport ? '收起批量导入' : '批量导入类型修正'}
       </button>
       <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
-      <button type="button" className="button primary" onClick={() => navigate(`/generation?table=${detail.id}`)}>前往生成 →</button>
+      <button type="button" className="button secondary" onClick={() => navigate(`/generation?table=${detail.id}`)}>在第二步查看</button>
     </>
   )
 
@@ -468,47 +486,28 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
             <StatusBadge tone="neutral">{tables.length}</StatusBadge>
           </div>
 
-          <div className="list-filters">
+          <div className="list-filters report-list-filters">
+            <input type="search" placeholder="搜索报表名称或代码..." value={tableSearch} onChange={(e) => setTableSearch(e.target.value)} />
+            <select aria-label="报表生成状态" value={activeReportFilter} onChange={(e) => changeReportFilter(e.target.value)}>
+              <option value="all">全部报表</option>
+              <option value="ready">只看可生成</option>
+              <option value="blocked">只看需处理</option>
+            </select>
             <label className="inline-option">
               <input type="checkbox" checked={onlyIssues} onChange={(e) => setOnlyIssues(e.target.checked)} />
-              只看有待复核项的报表
+              只看字段复核问题
             </label>
             <label className="inline-option">
               <input type="checkbox" checked={onlyInferred} onChange={(e) => setOnlyInferred(e.target.checked)} />
-              只看类型需要确认的报表
+              只看类型需确认
               {allInferredTableCount > 0 && <span className="muted-text">（{allInferredTableCount} 张整表推断）</span>}
             </label>
           </div>
-
-
-          {readiness && (
-            <div className="readiness-summary">
-              <div className="readiness-summary-main">
-                <strong>可直接生成 {readiness.summary.ready_all} / {readiness.summary.table_count} 张</strong>
-                <span className="muted-text">
-                  {[
-                    ddlBlockCount > 0 && `DDL 卡 ${ddlBlockCount}`,
-                    codeDefectCount > 0 && `码值要补 ${codeDefectCount}`,
-                    ruleBlockCount > 0 && `规则原料缺 ${ruleBlockCount}`,
-                  ].filter(Boolean).join(' · ') || '没有卡点'}
-                  {readiness.summary.not_applicable?.code_sets > 0 &&
-                    ` · 另 ${readiness.summary.not_applicable.code_sets} 张没有码值引用，不涉及`}
-                  {' · '}校验原文覆盖 {readiness.summary.check_text_coverage}%
-                </span>
-              </div>
-              <p className="readiness-hint">
-                不用在这里点发布：去第 2 步选表，能用的会直接定稿并生成，不能用会告诉你缺什么。
-                {onOpenCodeSets && codeDefectCount > 0 && (
-                  <button type="button" className="link-button" onClick={onOpenCodeSets}>
-                    去补码值 →
-                  </button>
-                )}
-              </p>
-            </div>
-          )}
           {visibleTables.length > 0 ? (
             <div className="list-stack">
-              {visibleTables.map((table) => (
+              {visibleTables.map((table) => {
+                const gate = tableGate(table, readinessById[table.id])
+                return (
                 <div
                   key={table.id}
                   role="button"
@@ -535,97 +534,34 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   </button>
                   <div className="list-row-top">
                     <strong>{table.table_name}</strong>
-                    {/* 「已发布 / 自动检查完成」是流程状态机，发布已自动化，显示出来只会
-                        让人以为还有手续没走。真正要看的三个 chip 在下面。 */}
-                    {table.status === 'NEEDS_REVIEW' && <StatusBadge tone="red">待处理</StatusBadge>}
+                    <StatusBadge tone={gate.tone}>{gate.label}</StatusBadge>
                   </div>
                   <span>
                     <code>{table.table_code}</code> · {table.field_count} 个字段
                   </span>
-                  {readinessById[table.id] && (
-                    <div className="readiness-row">
-                      {['ddl', 'rule_materials', 'code_sets'].map((key) => {
-                        const section = readinessById[table.id][key]
-                        const label = key === 'ddl' ? 'DDL' : key === 'rule_materials' ? '规则原料' : '码值'
-                        // 码值只看「有没有需要人补的东西」：发布是自动的，
-                        // 「待发布」不占状态位，否则用户还要为一个不用他管的动作操心
-                        const defects = section.defects || []
-                        const problems = key === 'code_sets' ? defects : section.blockers || []
-                        // 这张表根本没有这一项（例如没有码值引用的报表）
-                        const na = section.applicable === false
-                        // 码值有问题时能直接跳到那张码表，不然用户看着 ✕ 不知道去哪补
-                        const jumpTo = key === 'code_sets' && problems.length && problems[0].code_set_id
-                        return (
-                          <span
-                            key={key}
-                            role={jumpTo ? 'button' : undefined}
-                            tabIndex={jumpTo ? 0 : undefined}
-                            className={`ready-chip ${na ? 'na' : problems.length ? 'bad' : 'ok'} ${jumpTo ? 'jumpable' : ''}`}
-                            onClick={
-                              jumpTo
-                                ? (event) => {
-                                    event.stopPropagation()
-                                    openCodeSet(problems[0].code_set_id)
-                                  }
-                                : undefined
-                            }
-                            onKeyDown={
-                              jumpTo
-                                ? (event) => {
-                                    if (event.key === 'Enter' || event.key === ' ') {
-                                      event.preventDefault()
-                                      event.stopPropagation()
-                                      openCodeSet(problems[0].code_set_id)
-                                    }
-                                  }
-                                : undefined
-                            }
-                            title={
-                              na
-                                ? `${label} 不适用：这张表没有引用任何码表`
-                                : problems.length
-                                  ? problems.map((item) => item.message).join('；') +
-                                    (jumpTo ? '\n（点击打开这张码表）' : '')
-                                  : key === 'code_sets'
-                                    ? '码值齐备，不需要补充；码表会在发布时自动发出'
-                                    : `${label} 可以生成`
-                            }
-                          >
-                            {label} {na ? '—' : problems.length ? `✕${problems.length}` : '✓'}
-                          </span>
-                        )
-                      })}
-                    </div>
-                  )}
-                  <div className="type-basis-line">
-                    <span className="basis-pill basis-source">{table.type_source_count || 0} 原文有依据</span>
-                    <span className={`basis-pill basis-inferred ${table.type_inferred_count ? 'warn' : ''}`}>
-                      {table.type_inferred_count || 0} 推断
-                    </span>
-                    {(table.type_manual_count || 0) > 0 && (
-                      <span className="basis-pill basis-manual">{table.type_manual_count} 人工</span>
-                    )}
-                    {table.type_all_inferred && <span className="basis-pill basis-inferred warn">整表类型均无原文依据</span>}
-                  </div>
-                  {(table.review_blocking_count || 0) > 0 ? (
-                    <em className="danger-text">
-                      {table.review_blocking_count} 项需要处理
-                      {(table.review_field_count || 0) > 0 ? ` · 涉及 ${table.review_field_count} 个字段` : ''}
-                      {(table.review_advisory_count || 0) > 0 ? `（另有 ${table.review_advisory_count} 条提示）` : ''}
-                    </em>
+                  {gate.reason ? (
+                    <em className="danger-text" title={gate.reason}>{gate.reason}</em>
                   ) : (table.review_advisory_count || 0) > 0 ? (
                     <em className="muted-text">{table.review_advisory_count} 条提示，不影响使用</em>
-                  ) : null}
+                  ) : (
+                    <em className="muted-text">结构、校验信息和关联码表均可用</em>
+                  )}
+                  {(table.type_inferred_count || 0) > 0 && (
+                    <span className="report-type-hint">{table.type_inferred_count} 个字段类型需确认{table.type_all_inferred ? ' · 整表推断' : ''}</span>
+                  )}
                 </div>
-              ))}
+                )
+              })}
             </div>
           ) : (
             <div className="empty">
-              {onlyIssues
-                ? '当前没有带待复核项的报表。'
-                : onlyInferred
-                  ? '当前没有带推断类型的报表。'
-                  : '当前文件还没有字段结果，可点击上方“解析当前文件”；新文件上传后会自动解析。'}
+              {tableSearch || activeReportFilter !== 'all'
+                ? '没有符合当前搜索和状态条件的报表。'
+                : onlyIssues
+                  ? '当前没有带待复核项的报表。'
+                  : onlyInferred
+                    ? '当前没有带推断类型的报表。'
+                    : '当前文件还没有字段结果，可点击上方“重新解析”；新文件上传后会自动解析。'}
             </div>
           )}
         </div>
@@ -638,7 +574,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   <div className="actions">
                     <h2>{detail.table_name}</h2>
                     <code>{detail.table_code}</code>
-                    {(detail.review_blocking_count || 0) > 0 && <StatusBadge tone="red">待处理</StatusBadge>}
+                    {(() => {
+                      const gate = tableGate(detail, readinessById[detail.id])
+                      return <StatusBadge tone={gate.tone}>{gate.label}</StatusBadge>
+                    })()}
                   </div>
                   <p>{detail.table_definition || '暂无表级业务说明'} · 版本 v{detail.current_version}</p>
                   <div className="type-basis-line">
@@ -660,6 +599,34 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                   />
                 </div>
               </div>
+
+              {readinessById[detail.id] && (
+                <div className="detail-readiness-grid" aria-label="当前报表生成条件">
+                  {['ddl', 'rule_materials', 'code_sets'].map((key) => {
+                    const section = readinessById[detail.id][key]
+                    const label = key === 'ddl' ? '表结构' : key === 'rule_materials' ? '校验信息' : '关联码表'
+                    const na = section.applicable === false
+                    const problems = key === 'code_sets' ? section.defects || [] : section.blockers || []
+                    const firstProblem = problems[0]
+                    return (
+                      <div key={key} className={`detail-readiness-item ${na ? 'na' : problems.length ? 'bad' : 'ok'}`}>
+                        <span>{label}</span>
+                        <strong>{na ? '不涉及' : problems.length ? `需处理 ${problems.length} 项` : '可用'}</strong>
+                        {firstProblem && <small title={firstProblem.message}>{firstProblem.message}</small>}
+                        {key === 'code_sets' && firstProblem && (
+                          <button
+                            type="button"
+                            className="button-link"
+                            onClick={() => firstProblem.code_set_id ? openCodeSet(firstProblem.code_set_id) : onOpenCodeSets?.()}
+                          >
+                            去处理码表
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
 
               {showTypeImport && !isPublished && (
                 <div className="type-import-panel">
@@ -851,7 +818,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                 </button>
                 <button
                   type="button"
-                  className={tab === 'revisions' ? 'active' : ''}
+                  className={`metadata-secondary-tab ${tab === 'revisions' ? 'active' : ''}`}
                   onClick={() => setTab('revisions')}
                 >
                   变更记录 ({detail.revisions.length})
@@ -861,8 +828,9 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
               {tab === 'fields' && (
                 <>
                   {activeField && (
-                    <div className="field-editor-drawer">
-                      <div className="panel-heading">
+                    <div className="field-editor-drawer-backdrop" onClick={() => setEditingFieldId(null)}>
+                    <aside className="field-editor-drawer" role="dialog" aria-modal="true" aria-label={`编辑字段 ${activeField.field_en}`} onClick={(event) => event.stopPropagation()}>
+                      <div className="panel-heading field-editor-header">
                         <div>
                           <h2>
                             查看或修改字段：{activeField.field_cn} (<code>{activeField.field_en}</code>)
@@ -871,7 +839,29 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                             修改后请点击保存；字段原文和自动识别依据可在下方查看。
                           </p>
                         </div>
-                        <div className="actions">
+                        <div className="actions field-editor-actions">
+                          <button
+                            type="button"
+                            className="button secondary sm"
+                            disabled={filteredFields.findIndex((field) => field.id === activeField.id) <= 0}
+                            onClick={() => {
+                              const index = filteredFields.findIndex((field) => field.id === activeField.id)
+                              if (index > 0) setEditingFieldId(filteredFields[index - 1].id)
+                            }}
+                          >
+                            上一个字段
+                          </button>
+                          <button
+                            type="button"
+                            className="button secondary sm"
+                            disabled={filteredFields.findIndex((field) => field.id === activeField.id) === filteredFields.length - 1}
+                            onClick={() => {
+                              const index = filteredFields.findIndex((field) => field.id === activeField.id)
+                              if (index < filteredFields.length - 1) setEditingFieldId(filteredFields[index + 1].id)
+                            }}
+                          >
+                            下一个字段
+                          </button>
                           {!isPublished && (
                             <>
                               <input
@@ -902,7 +892,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                             className="button secondary sm"
                             onClick={() => setEditingFieldId(null)}
                           >
-                            收起
+                            关闭
                           </button>
                         </div>
                       </div>
@@ -965,6 +955,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets }) {
                         <summary>查看自动识别初值与原文依据</summary>
                         <EvidenceCard field={activeField} />
                       </details>
+                    </aside>
                     </div>
                   )}
 

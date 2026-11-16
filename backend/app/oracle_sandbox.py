@@ -22,3 +22,17 @@ class OracleSandbox:
                 return [dict(row) for row in result.mappings().all()]
         finally:
             self.engine.dispose()
+
+    def drop_tables(self, tables: List[str]) -> List[str]:
+        """清理批次专属沙箱表；单表失败不影响其他表，也不触碰生产表。"""
+        errors: List[str] = []
+        try:
+            with self.engine.begin() as connection:
+                for table in sorted(set(item for item in tables if item)):
+                    try:
+                        connection.execute(text(f"DROP TABLE {quote_identifier(table, 'oracle')} PURGE"))
+                    except Exception as exc:
+                        errors.append(f"{table}: {type(exc).__name__}")
+        finally:
+            self.engine.dispose()
+        return errors

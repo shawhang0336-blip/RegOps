@@ -11,6 +11,7 @@ from ..asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel,
 from ..code_set_readiness import evaluate_code_sets, evaluate_code_set, is_reference_placeholder
 from ..code_service import (
     auto_link_all_references,
+    code_set_summaries,
     code_set_summary,
     document_code_set_ids,
     document_code_set_ordinals,
@@ -106,9 +107,10 @@ def list_code_sets(document_id: Optional[str] = None, include_placeholders: bool
             return (ordinal is None, ordinal if ordinal is not None else 0, row.code)
 
         rows.sort(key=sort_key)
+        summaries = {item["id"]: item for item in code_set_summaries(session, rows)}
         result = []
         for row in rows:
-            summary = code_set_summary(session, row)
+            summary = summaries[row.id]
             # 默认隐藏"引用占位"（0 值的 DOCUMENT_REFERENCE），它们只是匹配失败的产物，不是可维护的码表
             if not include_placeholders and is_reference_placeholder(summary):
                 continue

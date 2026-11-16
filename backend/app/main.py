@@ -25,6 +25,13 @@ from .identity import OPERATOR_PLACEHOLDER
 from .db import SessionLocal, init_db
 from .events import append_event, fold_events
 from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
+from .asset_models import (
+    ArtifactModel,
+    AuditCaseDefinitionModel,
+    GenerationPlanModel,
+    GeneratorDefinitionModel,
+    SchemaDefinitionModel,
+)
 from .models import EventModel, RuleModel, RunModel, SpecificationModel
 from .oracle_sandbox import OracleSandbox
 from .spec_parser import SpecParseError
@@ -150,15 +157,31 @@ def rule_view(row: RuleModel) -> Dict:
     }
 
 
+def _run_tables(session: Session, run: RunModel) -> List[Dict]:
+    spec = session.get(SpecificationModel, run.spec_id)
+    content = (spec.content_json or {}) if spec else {}
+    tables = content.get("tables") or ([content] if content else [])
+    return [
+        {"table_code": item.get("table_code"), "table_name": item.get("table_name")}
+        for item in tables
+        if item.get("table_code")
+    ]
+
+
 def run_view(session: Session, run: RunModel, include_events: bool = True) -> Dict:
     rules = session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
     events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
+    tables = _run_tables(session, run)
     result = {
         "id": run.id,
         "spec_id": run.spec_id,
         "status": run.status,
         "current_node": run.current_node,
         "attempt": run.attempt,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+        "tables": tables,
+        "table_count": len(tables),
         "result": run.result_json,
         "rules": [rule_view(rule) for rule in sorted(rules, key=lambda item: item.rule_key)],
     }
@@ -337,6 +360,91 @@ def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
     return [run_view(session, run, include_events=False) for run in runs]
 
 
+ACTIVE_RUN_STATUSES = {"RUNNING", "AUDITING", "READY_TO_AUDIT"}
+
+
+def _history_cleanup_plan(session: Session):
+    """每组报表保留最新批次和最近一次通过验证的批次，运行中批次永不清理。"""
+    runs = session.query(RunModel).order_by(RunModel.created_at.desc()).all()
+    groups: Dict[tuple, List[RunModel]] = {}
+    for run in runs:
+        key = tuple(sorted(item["table_code"] for item in _run_tables(session, run))) or (run.spec_id,)
+        groups.setdefault(key, []).append(run)
+    keep = set()
+    for group in groups.values():
+        ordered = sorted(group, key=lambda item: item.created_at or datetime.min, reverse=True)
+        keep.add(ordered[0].id)
+        completed = next((item for item in ordered if item.status == "COMPLETED"), None)
+        if completed:
+            keep.add(completed.id)
+        keep.update(item.id for item in ordered if item.status in ACTIVE_RUN_STATUSES)
+    deletes = [run for run in runs if run.id not in keep]
+    return runs, deletes
+
+
+@app.get("/api/runs/history/cleanup-preview")
+def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
+    runs, deletes = _history_cleanup_plan(session)
+    return {
+        "total": len(runs),
+        "keep_count": len(runs) - len(deletes),
+        "delete_count": len(deletes),
+        "runs": [
+            {
+                "id": run.id,
+                "status": run.status,
+                "created_at": run.created_at.isoformat() if run.created_at else None,
+                "tables": _run_tables(session, run),
+            }
+            for run in deletes
+        ],
+    }
+
+
+def _delete_run_rows(session: Session, run: RunModel):
+    result = run.result_json or {}
+    oracle_tables = set()
+    for key in ("oracle_tables", "oracle_target_tables", "oracle_code_set_tables"):
+        oracle_tables.update((result.get(key) or {}).values())
+    blob_uris = {row.blob_uri for row in session.query(ArtifactModel).filter(ArtifactModel.run_id == run.id).all()}
+    for model in (RuleModel, EventModel, ArtifactModel, GenerationPlanModel, GeneratorDefinitionModel, SchemaDefinitionModel, AuditCaseDefinitionModel):
+        session.query(model).filter(model.run_id == run.id).delete(synchronize_session=False)
+    session.delete(run)
+    return blob_uris, oracle_tables
+
+
+def _finish_run_deletion(session: Session, blob_uris: set, oracle_tables: set) -> List[str]:
+    session.flush()
+    remaining_uris = {row[0] for row in session.query(ArtifactModel.blob_uri).distinct().all()}
+    store = LocalBlobStore(settings.blob_dir)
+    for uri in blob_uris - remaining_uris:
+        try:
+            store.delete(uri)
+        except ValueError:
+            pass
+    session.commit()
+    if not oracle_tables or not settings.oracle_sandbox_url:
+        return []
+    try:
+        return OracleSandbox(settings.oracle_sandbox_url).drop_tables(sorted(oracle_tables))
+    except Exception as exc:
+        return [f"沙箱表清理失败：{type(exc).__name__}"]
+
+
+@app.post("/api/runs/history/cleanup")
+def history_cleanup(session: Session = Depends(db_session)) -> Dict:
+    _, deletes = _history_cleanup_plan(session)
+    deleted_ids = [run.id for run in deletes]
+    blob_uris = set()
+    oracle_tables = set()
+    for run in deletes:
+        run_blobs, run_tables = _delete_run_rows(session, run)
+        blob_uris.update(run_blobs)
+        oracle_tables.update(run_tables)
+    warnings = _finish_run_deletion(session, blob_uris, oracle_tables)
+    return {"deleted_count": len(deleted_ids), "deleted_ids": deleted_ids, "sandbox_cleanup": warnings}
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
@@ -348,6 +456,160 @@ def get_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     if (replayed.status, replayed.current_node, replayed.result_json) != (run.status, run.current_node, run.result_json):
         raise HTTPException(status_code=500, detail="Event projection does not match the stored run projection")
     return run_view(session, run)
+
+
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status in ACTIVE_RUN_STATUSES:
+        raise HTTPException(status_code=409, detail="Running validation batches cannot be deleted")
+    blob_uris, oracle_tables = _delete_run_rows(session, run)
+    warnings = _finish_run_deletion(session, blob_uris, oracle_tables)
+    return {"deleted_id": run_id, "sandbox_cleanup": warnings}
+
+
+def _latest_event_tables(events: List[EventModel], kind: str) -> Dict:
+    tables: Dict = {}
+    for event in events:
+        if event.kind == kind:
+            tables = (event.payload_json or {}).get("tables") or {}
+    return tables
+
+
+@app.get("/api/runs/{run_id}/validation-detail")
+def validation_detail(run_id: str, session: Session = Depends(db_session)) -> Dict:
+    """把 AI 数据定义和 Oracle 审计报告整理成可浏览、可逐规则核对的结果。"""
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run.result_json or {}
+    report: Dict = {}
+    report_uri = result.get("audit_report_blob")
+    if report_uri:
+        try:
+            report = json.loads(LocalBlobStore(settings.blob_dir).get(report_uri).decode("utf-8"))
+        except (ValueError, FileNotFoundError, json.JSONDecodeError):
+            report = {}
+
+    events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
+    generators = _latest_event_tables(events, "GENERATORS_ASSIGNED")
+    plans = _latest_event_tables(events, "GENERATION_PLANNED")
+    case_definitions = _latest_event_tables(events, "AUDIT_CASES_ASSIGNED")
+    case_definition_map = {
+        (table_code, item.get("case_id")): item
+        for table_code, items in case_definitions.items()
+        for item in items
+    }
+
+    approved = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
+    rule_map: Dict = {}
+    for row in approved:
+        definition = row.definition_json or {}
+        item = {
+            "rule_hash": row.rule_hash,
+            "rule_key": row.rule_key,
+            "table_code": row.table_code,
+            "field": definition.get("field"),
+            "operator": definition.get("operator"),
+            "params": definition.get("params") or {},
+            "source": row.source,
+            "status": row.status,
+            "rationale": definition.get("rationale") or "",
+            "expected_case_ids": [],
+            "hit_case_ids": [],
+            "missing_case_ids": [],
+            "unexpected_case_ids": [],
+            "co_triggered_case_ids": [],
+        }
+        rule_map[(row.table_code, row.rule_key)] = item
+
+    cases = []
+    for raw in report.get("cases") or []:
+        table_code = raw.get("table_code")
+        case_id = raw.get("case_id")
+        definition = case_definition_map.get((table_code, case_id), {})
+        case = {
+            **raw,
+            "case_kind": raw.get("case_kind") or ("GOLDEN" if "GOLDEN" in str(case_id).upper() else "MUTATION"),
+            "overrides": definition.get("overrides") or {},
+            "expected_rule_keys": definition.get("expected_rule_keys") or raw.get("expected_rules") or [],
+        }
+        cases.append(case)
+        for key in case.get("expected_rules") or []:
+            rule = rule_map.get((table_code, key))
+            if rule:
+                rule["expected_case_ids"].append(case_id)
+        for key in case.get("actual_rules") or []:
+            rule = rule_map.get((table_code, key))
+            if rule:
+                rule["hit_case_ids"].append(case_id)
+        for key in case.get("missing_rules") or []:
+            rule = rule_map.get((table_code, key))
+            if rule:
+                rule["missing_case_ids"].append(case_id)
+        for key in case.get("unexpected_rules") or []:
+            rule = rule_map.get((table_code, key))
+            if rule:
+                rule["unexpected_case_ids"].append(case_id)
+        for key in case.get("co_triggered_rules") or []:
+            rule = rule_map.get((table_code, key))
+            if rule:
+                rule["co_triggered_case_ids"].append(case_id)
+
+    rules = []
+    for rule in rule_map.values():
+        covered = bool(rule["hit_case_ids"])
+        failed = bool(rule["missing_case_ids"] or rule["unexpected_case_ids"])
+        rules.append({
+            **rule,
+            "covered": covered,
+            "has_target_case": bool(rule["expected_case_ids"]),
+            "effective": covered and not failed,
+            "result": "FAILED" if failed else "EFFECTIVE" if covered else "UNCOVERED",
+        })
+    rules.sort(key=lambda item: (item["table_code"], item["field"] or "", item["rule_key"]))
+
+    spec = session.get(SpecificationModel, run.spec_id)
+    spec_content = (spec.content_json or {}) if spec else {}
+    spec_tables = spec_content.get("tables") or ([spec_content] if spec_content else [])
+    table_names = {item.get("table_code"): item.get("table_name") for item in spec_tables}
+    table_codes = sorted(set(result.get("oracle_tables") or {}) | set(generators) | set(table_names))
+    test_data = []
+    for table_code in table_codes:
+        generator = generators.get(table_code) or {}
+        plan = plans.get(table_code) or generator.get("generation_plan") or {}
+        audit_count = sum(1 for case in cases if case.get("table_code") == table_code)
+        test_data.append({
+            "table_code": table_code,
+            "table_name": table_names.get(table_code) or table_code,
+            "generation_mode": "AI_FIELD_ASSIGNMENT",
+            "generator_count": len(generator.get("generators") or []),
+            "golden_record": generator.get("golden_record") or {},
+            "golden_count": int(plan.get("golden_count") or 1),
+            "audit_count": audit_count,
+            "generation_plan": plan,
+            "audit_preview_url": f"/api/runs/{run.id}/oracle-preview?table_code={table_code}&dataset=audit&limit=100" if (result.get("oracle_tables") or {}).get(table_code) else None,
+            "golden_preview_url": f"/api/runs/{run.id}/oracle-preview?table_code={table_code}&dataset=golden&limit=100" if (result.get("oracle_target_tables") or {}).get(table_code) else None,
+        })
+
+    active_hashes = set(result.get("active_rule_hashes") or [])
+    approved_hashes = {row.rule_hash for row in approved}
+    summary = {key: value for key, value in report.items() if key != "cases"}
+    if not summary:
+        summary = result.get("audit_summary") or {}
+    return {
+        "run_id": run.id,
+        "status": run.status,
+        "ai_generated": bool(generators),
+        "audit_stale": bool(active_hashes and active_hashes != approved_hashes),
+        "summary": summary,
+        "rules": rules,
+        "cases": cases,
+        "test_data": test_data,
+        "coverage_statement": report.get("coverage_statement") or "结果仅对本次透明展示的 AI 审计参数负责，不代表监管语义完备。",
+    }
 
 
 @app.post("/api/runs/{run_id}/approvals")
@@ -435,12 +697,14 @@ def oracle_preview(
     run_id: str,
     table_code: str = Query(min_length=1),
     limit: int = Query(default=20, ge=1, le=100),
+    dataset: str = Query(default="audit", pattern="^(audit|golden)$"),
     session: Session = Depends(db_session),
 ) -> List[Dict]:
     run = session.get(RunModel, run_id)
-    if not run or not run.result_json or not run.result_json.get("oracle_tables"):
+    result_key = "oracle_target_tables" if dataset == "golden" else "oracle_tables"
+    if not run or not run.result_json or not run.result_json.get(result_key):
         raise HTTPException(status_code=404, detail="Oracle run artifacts not found")
-    physical_table = run.result_json["oracle_tables"].get(table_code)
+    physical_table = run.result_json[result_key].get(table_code)
     if not physical_table:
         raise HTTPException(status_code=404, detail="Table is outside this run")
     try:

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from .asset_models import (
@@ -222,13 +223,16 @@ def validate_code_set_draft(draft: CodeSetDraft) -> List[Dict[str, Any]]:
     return issues
 
 
-def code_set_summary(session: Session, row: CodeSetModel) -> Dict[str, Any]:
-    value_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).count()
-    enabled_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id, CodeValueModel.enabled.is_(True)).count()
-    unresolved = session.query(FieldCodeReferenceModel).filter(
-        FieldCodeReferenceModel.code_set_id == row.id,
-        FieldCodeReferenceModel.status == "UNRESOLVED",
-    ).count()
+def code_set_summary(session: Session, row: CodeSetModel, metrics: Optional[Tuple[int, int, int]] = None) -> Dict[str, Any]:
+    if metrics is None:
+        value_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).count()
+        enabled_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id, CodeValueModel.enabled.is_(True)).count()
+        unresolved = session.query(FieldCodeReferenceModel).filter(
+            FieldCodeReferenceModel.code_set_id == row.id,
+            FieldCodeReferenceModel.status == "UNRESOLVED",
+        ).count()
+    else:
+        value_count, enabled_count, unresolved = metrics
     return {
         "id": row.id,
         "code": row.code,
@@ -247,6 +251,49 @@ def code_set_summary(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     }
 
 
+def code_set_summaries(session: Session, rows: List[CodeSetModel]) -> List[Dict[str, Any]]:
+    """列表页批量统计码值数和未决引用，避免每张码表执行三条 COUNT。"""
+    if not rows:
+        return []
+    ids = [row.id for row in rows]
+    value_rows = (
+        session.query(
+            CodeValueModel.code_set_id,
+            func.count(CodeValueModel.id),
+            func.sum(case((CodeValueModel.enabled.is_(True), 1), else_=0)),
+        )
+        .filter(CodeValueModel.code_set_id.in_(ids))
+        .group_by(CodeValueModel.code_set_id)
+        .all()
+    )
+    value_metrics = {
+        code_set_id: (int(total or 0), int(enabled or 0))
+        for code_set_id, total, enabled in value_rows
+    }
+    unresolved_rows = (
+        session.query(FieldCodeReferenceModel.code_set_id, func.count(FieldCodeReferenceModel.id))
+        .filter(
+            FieldCodeReferenceModel.code_set_id.in_(ids),
+            FieldCodeReferenceModel.status == "UNRESOLVED",
+        )
+        .group_by(FieldCodeReferenceModel.code_set_id)
+        .all()
+    )
+    unresolved_metrics = {code_set_id: int(total or 0) for code_set_id, total in unresolved_rows}
+    return [
+        code_set_summary(
+            session,
+            row,
+            (
+                value_metrics.get(row.id, (0, 0))[0],
+                value_metrics.get(row.id, (0, 0))[1],
+                unresolved_metrics.get(row.id, 0),
+            ),
+        )
+        for row in rows
+    ]
+
+
 def document_code_set_ids(session: Session, document_id: str) -> set:
     block_ids = {
         row.id for row in session.query(RawBlockModel.id).filter(RawBlockModel.document_id == document_id).all()
@@ -260,9 +307,12 @@ def document_code_set_ids(session: Session, document_id: str) -> set:
         .all()
     }
     sourced_ids = {
-        value.code_set_id
-        for value in session.query(CodeValueModel).all()
-        if value.source_locator.get("block_id") in block_ids
+        code_set_id
+        for code_set_id, source_locator in session.query(
+            CodeValueModel.code_set_id,
+            CodeValueModel.source_locator,
+        ).all()
+        if (source_locator or {}).get("block_id") in block_ids
     }
     return referenced_ids | sourced_ids
 
@@ -284,13 +334,18 @@ def document_code_set_ordinals(session: Session, document_id: str, code_set_ids:
         .all()
     }
     located: set = set()
-    for value in session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(code_set_ids)).all():
-        block_id = (value.source_locator or {}).get("block_id")
+    value_rows = (
+        session.query(CodeValueModel.code_set_id, CodeValueModel.source_locator)
+        .filter(CodeValueModel.code_set_id.in_(code_set_ids))
+        .all()
+    )
+    for code_set_id, source_locator in value_rows:
+        block_id = (source_locator or {}).get("block_id")
         if block_id in block_ordinal:
-            located.add(value.code_set_id)
+            located.add(code_set_id)
             candidate = block_ordinal[block_id] * 1000
-            if candidate < ordinals.get(value.code_set_id, candidate + 1):
-                ordinals[value.code_set_id] = candidate
+            if candidate < ordinals.get(code_set_id, candidate + 1):
+                ordinals[code_set_id] = candidate
     rows = (
         session.query(
             FieldCodeReferenceModel.code_set_id,
