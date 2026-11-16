@@ -50,6 +50,8 @@ class RuleDefinition(BaseModel):
         "LENGTH_MAX",
         "REGEXP",
         "FOREIGN_KEY",
+        "NUM_RANGE",
+        "FIELD_COMPARE",
     ]
     params: Dict[str, Any] = Field(default_factory=dict)
     source: Literal["DOC_EXPLICIT", "AI_EXPANDED"]
@@ -73,6 +75,8 @@ LLM_OPERATORS = (
     "LENGTH_MAX",
     "REGEXP",
     "FOREIGN_KEY",
+    "NUM_RANGE",
+    "FIELD_COMPARE",
 )
 
 

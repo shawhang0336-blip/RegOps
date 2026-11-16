@@ -8,6 +8,9 @@ __pycache__/
 backend/var/
 frontend/node_modules/
 frontend/dist/
+# 根目录下的 sqlite 兜底库是误启动产物，真实配置走 .env 的 MySQL
+/dq_agent.db
+/dq_agent.db-*
 外汇业务数据采集规范_1.4版_公开资料/*.pdf
 *.log
 .workbuddy/

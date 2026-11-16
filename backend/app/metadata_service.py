@@ -27,7 +27,7 @@ from .spec_parser import (
     lookup_term_definition,
 )
 
-METADATA_BATCH_SIZE = 10
+METADATA_BATCH_SIZE = 3  # 疑难字段小批次：单次 AI 调用少字段，超时损失可控
 
 # 来源原文里出现这些字样，才说明这份文档真的声明了数据类型/长度
 TYPE_DECLARATION_HINTS = (
@@ -417,6 +417,35 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
     return table
 
 
+def _field_needs_ai(raw_field: Dict[str, Any]) -> bool:
+    """判断字段是否需要 AI 补全：要素齐全的结构化字段走确定性提取即可。
+
+    疑难信号：缺英文名/中文名、类型缺失或无法识别、行解析带类型告警。
+    """
+    if "name" in raw_field:
+        if not str(raw_field.get("name") or "").strip():
+            return True
+        if not str(raw_field.get("content") or "").strip():
+            return True
+        if str(raw_field.get("data_type", "")).upper() not in ("VARCHAR", "NUMBER"):
+            return True
+        if not raw_field.get("length"):
+            return True
+        return False
+    if "row" in raw_field:
+        row = [str(cell or "").strip() for cell in raw_field["row"]]
+        field_cn = row[0] if row else ""
+        check_text = row[2] if len(row) > 2 else ""
+        # 英文名缺失时确定性路径只能编造哈希名，交给 AI 从上下文推断
+        if len(row) < 2 or not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1] or ""):
+            return True
+        _, data_type, _length, _dec, _, type_warnings = _parse_type_from_entry(check_text, field_cn)
+        if type_warnings or not data_type:
+            return True
+        return False
+    return True
+
+
 def _deterministic_field_draft(
     raw_field: Dict[str, Any],
     terms_text: str,
@@ -531,10 +560,21 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         except Exception:
             llm = None
 
-        # Chunk raw_fields into batches (up to 10 fields per LLM call instead of 1 call per field)
-        chunks = [raw_fields[i : i + METADATA_BATCH_SIZE] for i in range(0, len(raw_fields), METADATA_BATCH_SIZE)]
+        # 确定性提取先行：spec_parser 已结构化、字段要素齐全的字段毫秒级落库，
+        # 只有缺类型/缺英文名/有解析告警的疑难字段才小批次调 AI，避免整批 120s 白等超时。
+        indexed_fields = list(enumerate(raw_fields))
+        clean_items = [item for item in indexed_fields if not _field_needs_ai(item[1])]
+        suspect_items = [item for item in indexed_fields if _field_needs_ai(item[1])]
+        clean_drafts = {
+            index: _deterministic_field_draft(raw_field, terms_text, block.source_locator)
+            for index, raw_field in clean_items
+        }
 
-        def bind_chunk(chunk: List[Dict[str, Any]]):
+        # 疑难字段小批次调 AI，失败的批次退回确定性提取
+        chunks = [suspect_items[i : i + METADATA_BATCH_SIZE] for i in range(0, len(suspect_items), METADATA_BATCH_SIZE)]
+
+        def bind_chunk(chunk_items):
+            chunk = [raw_field for _, raw_field in chunk_items]
             if llm is not None:
                 payload = {
                     "source_locator": block.source_locator,
@@ -583,18 +623,25 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
             }
 
         with ThreadPoolExecutor(max_workers=min(2, len(chunks))) as executor:
-            chunk_results = list(executor.map(bind_chunk, chunks))
+            chunk_results = list(executor.map(bind_chunk, chunks)) if chunks else []
 
-        all_fields: List[MetadataFieldDraft] = []
+        # 按原始字段顺序合并：确定性结果 + AI/兜底结果
+        field_by_index: Dict[int, MetadataFieldDraft] = dict(clean_drafts)
         table_definition = ""
         batch_traces = []
-        for fields_part, t_def, tr in chunk_results:
-            all_fields.extend(fields_part)
+        if clean_drafts:
+            batch_traces.append({"strategy": "DETERMINISTIC_FIRST", "field_count": len(clean_drafts)})
+        for chunk_items, (fields_part, t_def, tr) in zip(chunks, chunk_results):
+            for (index, _), draft_field in zip(chunk_items, fields_part):
+                field_by_index[index] = draft_field
             if t_def and not table_definition:
                 table_definition = t_def
             batch_traces.append(tr)
+        all_fields: List[MetadataFieldDraft] = [field_by_index[index] for index in range(len(raw_fields))]
 
-        assignment_fallback = bool(batch_traces) and all(trace.get("fallback_from") for trace in batch_traces)
+        # 只有真调过 AI 赋值的批次才值得再做一次 AI 复核；全确定性提取走交叉核验即可
+        ai_assignment_used = any(not str(trace.get("strategy", "")).startswith("DETERMINISTIC") for trace in batch_traces)
+        assignment_fallback = bool(suspect_items) and not ai_assignment_used
         draft = MetadataTableDraft(
             table_code=fallback_code,
             table_name=fallback_name,
@@ -633,7 +680,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
 
         # Differential Review Stage (using review_metadata tool or deterministic cross-check)
         issues: List[Dict[str, Any]] = []
-        if llm is not None and not assignment_fallback:
+        if llm is not None and ai_assignment_used:
             try:
                 args, review_trace = llm.assign(
                     "review_metadata",

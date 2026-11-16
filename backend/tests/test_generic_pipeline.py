@@ -134,7 +134,7 @@ def test_generic_run_records_ai_tool_calls_before_human_gate(organization_spec, 
         )
     )
     session.commit()
-    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None):
+    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
         physical = {spec.table_code: f"STAGING_{attempt}" for spec in specs}
         return {"attempt": attempt, "physical_tables": physical, "target_tables": {code: f"TARGET_{attempt}" for code in physical}, "code_set_tables": {}, "code_set_versions": {}, "code_set_record_counts": {}, "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])}}
     monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
@@ -202,7 +202,7 @@ def test_assets_precede_rule_approval_and_export_follows_test_confirmation(organ
     session.commit()
     calls = []
 
-    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None):
+    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
         calls.append("PREPARE")
         physical = {spec.table_code: f"STAGING_{attempt}" for spec in specs}
         return {

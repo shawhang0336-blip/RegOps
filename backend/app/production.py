@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .compiler import compile_where, quote_identifier
 from .domain import RuleDefinition
@@ -22,8 +22,12 @@ def compile_production_mysql_ddl(table: str, schema: List[SchemaBinding]) -> str
     return f"CREATE TABLE {quote_identifier(table)} (\n  " + ",\n  ".join(columns) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
 
-def compile_production_rule_query(rule: RuleDefinition, dialect: str = "oracle") -> str:
-    where, params = compile_where(rule, dialect)
+def compile_production_rule_query(
+    rule: RuleDefinition,
+    dialect: str = "oracle",
+    code_set_bindings: Optional[Dict[Any, Dict[str, Any]]] = None,
+) -> str:
+    where, params = compile_where(rule, dialect, code_set_bindings=code_set_bindings)
     alias = "t" if dialect == "oracle" else "AS t"
     sql = (
         f"SELECT :compiled_rule_key AS rule_key, t.* "

@@ -84,6 +84,8 @@ export default function ArtifactsPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [preflight, setPreflight] = useState(null)
+  const [reauditBusy, setReauditBusy] = useState(false)
   const [statusFilter, setStatusFilter] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
   const [docFilter, setDocFilter] = useState('all')
@@ -271,7 +273,7 @@ export default function ArtifactsPage() {
     })
   }
 
-  async function generate(tableIds) {
+  async function generate(tableIds, options = {}) {
     const ids = tableIds || selected
     if (!ids.length) {
       setError('请先勾选要生成的报表。')
@@ -282,14 +284,36 @@ export default function ArtifactsPage() {
     try {
       const run = await v2('/generation/runs', {
         method: 'POST',
-        body: JSON.stringify({ table_ids: ids, provider: 'live' }),
+        body: JSON.stringify({ table_ids: ids, provider: 'live', accept_warnings: Boolean(options.acceptWarnings) }),
       })
+      setPreflight(null)
       setNotice('已启动生成，正在跳转执行中心。')
       navigate(`/runs?run=${run.id}`)
     } catch (err) {
-      setError(err.message)
+      // 软告警（外部码表引用、非必填项无校验原文等）需要人工确认后重发
+      if (err.status === 409 && err.detail && typeof err.detail === 'object' && err.detail.requires_ack) {
+        setPreflight({ tableIds: ids, detail: err.detail })
+      } else {
+        setError(err.message)
+      }
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function reaudit() {
+    if (!detail?.run) return
+    setReauditBusy(true)
+    setError('')
+    try {
+      await api(`/api/runs/${detail.run.id}/reaudit`, { method: 'POST' })
+      setNotice('已发起重新验证：规则保持不动（含手工修改），只重跑 AI 造数与 Oracle 验证。')
+      select(currentId, { background: true })
+      refreshOverview()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setReauditBusy(false)
     }
   }
 
@@ -315,6 +339,33 @@ export default function ArtifactsPage() {
         }
       />
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
+
+      {preflight && (
+        <div className="action-callout preflight-callout">
+          <div>
+            <strong>继续生成前请确认以下风险</strong>
+            <p>{preflight.detail.message}</p>
+            <ul>
+              {(preflight.detail.tables || []).map((item) => (
+                <li key={item.table_code}>
+                  <code>{item.table_code}</code>：{(item.blockers || []).map((blocker) => blocker.message).join('；')}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="actions">
+            <button type="button" className="button secondary sm" onClick={() => setPreflight(null)}>返回处理</button>
+            <button
+              type="button"
+              className="button primary sm"
+              disabled={busy}
+              onClick={() => generate(preflight.tableIds, { acceptWarnings: true })}
+            >
+              确认已知风险并继续生成
+            </button>
+          </div>
+        </div>
+      )}
 
       <nav className="tab-bar workspace-main-tabs" aria-label="规则工作台视图" role="tablist">
         <button
@@ -523,11 +574,26 @@ export default function ArtifactsPage() {
                   >
                     {refreshing ? '刷新中...' : '刷新规则'}
                   </button>
+                  {detail.run && !runActive && (
+                    <button
+                      type="button"
+                      className="button secondary sm"
+                      disabled={reauditBusy}
+                      title="保留当前规则（含手工修改与审批结论），只重跑 AI 造数与 Oracle 沙箱验证"
+                      onClick={reaudit}
+                    >
+                      {reauditBusy ? '已提交...' : '重新验证（保留规则）'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="button secondary sm"
                     disabled={busy || currentSelectable !== true}
-                    title={currentSelectable === false ? currentBlockReason : ''}
+                    title={currentSelectable === false
+                      ? currentBlockReason
+                      : detail.run
+                        ? '从头重新生成：AI 会重新绑定规则，抽屉里手工改过的参数会被覆盖'
+                        : ''}
                     onClick={() => generate([detail.table.id])}
                   >
                     {detail.run ? '重新生成并验证' : '生成这张表'}
@@ -700,7 +766,7 @@ function ArtifactDetail({ detail, view, onClose }) {
   )
 }
 
-const RULE_ORDER = ['REQUIRED', 'ENUM', 'COND_REQUIRED', 'LENGTH', 'LENGTH_MAX', 'REGEXP', 'NOT_IN', 'FOREIGN_KEY']
+const RULE_ORDER = ['REQUIRED', 'ENUM', 'COND_REQUIRED', 'LENGTH', 'LENGTH_MAX', 'REGEXP', 'NOT_IN', 'NUM_RANGE', 'FIELD_COMPARE', 'FOREIGN_KEY']
 
 function sortRules(rows) {
   return [...rows].sort(
@@ -1241,7 +1307,7 @@ function RuleDrawer({ rule, index, total, onPrevious, onNext, onClose, onSaved, 
               onCancel={() => setEditing(false)}
               onSaved={() => {
                 setEditing(false)
-                onNotice?.(`已保存「${rule.rule_key}」的参数，请重新生成并验证当前报表。`)
+                onNotice?.(`已保存「${rule.rule_key}」的参数。点页面右上「重新验证（保留规则）」用新参数重跑测试，规则不会被重新生成。`)
                 onSaved?.()
               }}
             />
@@ -1335,6 +1401,51 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
         </label>
       )}
 
+      {operator === 'NUM_RANGE' && (
+        <>
+          <label>
+            <span>下限（留空表示不限）</span>
+            <input type="number" value={params.min ?? ''} onChange={(e) => set('min', e.target.value === '' ? null : Number(e.target.value))} />
+          </label>
+          <label>
+            <span>上限（留空表示不限）</span>
+            <input type="number" value={params.max ?? ''} onChange={(e) => set('max', e.target.value === '' ? null : Number(e.target.value))} />
+          </label>
+          <label>
+            <span>边界</span>
+            <select
+              value={`${params.min_inclusive === false ? 'ex' : 'in'}-${params.max_inclusive === false ? 'ex' : 'in'}`}
+              onChange={(e) => {
+                const [minSide, maxSide] = e.target.value.split('-')
+                setParams({ ...params, min_inclusive: minSide === 'in', max_inclusive: maxSide === 'in' })
+              }}
+            >
+              <option value="in-in">含下限也含上限</option>
+              <option value="in-ex">含下限、不含上限</option>
+              <option value="ex-in">不含下限、含上限</option>
+              <option value="ex-ex">上下限都不含</option>
+            </select>
+          </label>
+        </>
+      )}
+
+      {operator === 'FIELD_COMPARE' && (
+        <>
+          <label><span>对比字段（右值）</span><input value={params.right_field ?? ''} onChange={(e) => set('right_field', e.target.value)} placeholder="例：起息日字段名" /></label>
+          <label>
+            <span>必须成立的关系</span>
+            <select value={params.operator ?? 'GE'} onChange={(e) => set('operator', e.target.value)}>
+              <option value="LT">小于（&lt;）</option>
+              <option value="LE">小于等于（≤）</option>
+              <option value="GT">大于（&gt;）</option>
+              <option value="GE">大于等于（≥）</option>
+              <option value="EQ">等于（=）</option>
+              <option value="NE">不等于（≠）</option>
+            </select>
+          </label>
+        </>
+      )}
+
       {operator === 'COND_REQUIRED' && (
         <>
           <label><span>条件字段</span><input value={params.if_field ?? ''} onChange={(e) => set('if_field', e.target.value)} /></label>
@@ -1371,7 +1482,7 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
         <button type="button" className="button primary sm" disabled={busy || operator === 'REQUIRED'} onClick={save}>{busy ? '保存中...' : '保存参数'}</button>
         <button type="button" className="button secondary sm" onClick={onCancel}>取消</button>
       </div>
-      <p className="muted-text">保存后不会自动重跑验证，请使用当前报表的“重新生成并验证”确认改动。</p>
+      <p className="muted-text">保存后不会自动重跑验证，请用页面上的「重新验证（保留规则）」确认改动；“重新生成并验证”会让 AI 重新绑定规则并覆盖这里的修改。</p>
     </div>
   )
 }

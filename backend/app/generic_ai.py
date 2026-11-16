@@ -9,7 +9,24 @@ from json_repair import repair_json
 from .config import Settings
 from .domain import LLM_OPERATORS, SpecDocument
 
-LLM_CALL_SEMAPHORE = threading.BoundedSemaphore(4)
+# LLM 并发闸门：默认值只是兜底，实际宽度由系统设置的 max_llm_concurrency 决定，
+# 生成批次启动时通过 configure_llm_concurrency 调整。
+_semaphore_lock = threading.Lock()
+_llm_semaphore = threading.BoundedSemaphore(4)
+_llm_semaphore_limit = 4
+
+
+def configure_llm_concurrency(limit: int) -> None:
+    global _llm_semaphore, _llm_semaphore_limit
+    limit = max(1, int(limit))
+    with _semaphore_lock:
+        if limit != _llm_semaphore_limit:
+            _llm_semaphore_limit = limit
+            _llm_semaphore = threading.BoundedSemaphore(limit)
+
+
+def llm_call_semaphore() -> threading.BoundedSemaphore:
+    return _llm_semaphore
 
 
 class LlmTimeoutError(RuntimeError):
@@ -339,7 +356,7 @@ class RealDesignLlm:
         if self.settings.llm_thinking:
             request_json["thinking"] = {"type": self.settings.llm_thinking}
         try:
-            with LLM_CALL_SEMAPHORE:
+            with llm_call_semaphore():
                 response = httpx.post(
                     f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},

@@ -158,6 +158,23 @@ def load_published_code_sets(
     return list(code_sets.values()), field_bindings
 
 
+def code_set_compile_bindings(
+    field_bindings: Dict[Tuple[str, str], Dict[str, Any]],
+    table_by_code: Dict[str, str],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """把 (表, 字段) → 已发布码表 的绑定编译成 compiler 可用的值域映射。
+
+    只有拿到物理表名的码表才会进入映射；ENUM 规则取值与启用码值一致时，
+    compiler 会改用 NOT EXISTS 子查询而不是展开 IN 列表。
+    """
+    bindings: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for key, binding in field_bindings.items():
+        table = table_by_code.get(binding["code"])
+        if table:
+            bindings[key] = {"table": table, "values": [item["value"] for item in binding["values"]]}
+    return bindings
+
+
 def validate_code_set_usage(
     rules: List[RuleDefinition],
     golden_generators: Dict[str, List[GeneratorBinding]],

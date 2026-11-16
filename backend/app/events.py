@@ -23,6 +23,10 @@ def apply(run: RunModel, kind: str, payload: Dict[str, Any]) -> None:
     elif kind == "HUMAN_DECISIONS_RECORDED":
         run.status = "READY_TO_AUDIT" if payload.get("all_decided") else "WAITING_APPROVAL"
         run.current_node = "build_audit" if payload.get("all_decided") else "human_gate"
+    elif kind == "REAUDIT_REQUESTED":
+        # 人工改参后只重跑造数与 Oracle 验证，规则集合保持不动
+        run.status = "READY_TO_AUDIT"
+        run.current_node = "build_audit"
     elif kind == "ORACLE_ASSETS_PREPARED":
         run.result_json = payload.get("result")
     elif kind == "TEST_CONFIRMATION_REQUIRED":

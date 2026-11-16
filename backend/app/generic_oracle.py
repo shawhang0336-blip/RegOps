@@ -132,6 +132,7 @@ class GenericOracleExecutor:
         schemas: Dict[str, List[SchemaBinding]],
         code_sets: List[Dict[str, Any]] = None,
         rules: List[RuleDefinition] = None,
+        code_set_bindings: Dict[Any, Any] = None,
     ) -> Dict[str, Any]:
         physical_tables = {
             spec.table_code: physical_table_name(run_id, attempt, spec.table_code) for spec in specs
@@ -168,7 +169,7 @@ class GenericOracleExecutor:
                     connection.execute(text(compile_ai_schema_oracle_ddl(target_tables[spec.table_code], schemas[spec.table_code])))
                     connection.execute(text(compile_sandbox_oracle_ddl(physical_tables[spec.table_code], spec)))
                 for rule in rules or []:
-                    sql, params = compile_rule_query(rule, "oracle", physical_tables)
+                    sql, params = compile_rule_query(rule, "oracle", physical_tables, code_set_bindings)
                     connection.execute(text(sql), params).fetchall()
         finally:
             engine.dispose()
@@ -195,6 +196,7 @@ class GenericOracleExecutor:
         golden_generators: Dict[str, List[GeneratorBinding]] = None,
         code_sets: List[Dict[str, Any]] = None,
         prepared_assets: Dict[str, Any] = None,
+        code_set_bindings: Dict[Any, Any] = None,
     ) -> Dict[str, Any]:
         physical_tables = {
             spec.table_code: physical_table_name(run_id, attempt, spec.table_code) for spec in specs
@@ -280,7 +282,7 @@ class GenericOracleExecutor:
                     for record in records[spec.table_code]:
                         connection.execute(statement, dict(zip(parameters, [record.get(name) for name in names])))
                 for rule in rules:
-                    sql, params = compile_rule_query(rule, "oracle", physical_tables)
+                    sql, params = compile_rule_query(rule, "oracle", physical_tables, code_set_bindings)
                     for row in connection.execute(text(sql), params).fetchall():
                         hits[rule.table_code][row[1]].append(row[0])
         finally:

@@ -6,9 +6,11 @@
 """
 
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..asset_models import (
@@ -37,6 +39,8 @@ _OPERATOR_LABELS = {
     "LENGTH_MAX": "最大长度",
     "REGEXP": "格式",
     "FOREIGN_KEY": "外键",
+    "NUM_RANGE": "数值区间",
+    "FIELD_COMPARE": "跨字段比较",
 }
 
 
@@ -71,11 +75,29 @@ def _rules_payload(session: Session, table: TableMetadataModel, run: RunModel) -
         .all()
     )
     physical = {table.table_code: table.table_code}
+    # 尽力还原执行时的码表子查询形态：码表版本漂移或老批次缺上下文时回退为内联列表
+    code_set_bindings = None
+    try:
+        from ..code_set_oracle import code_set_compile_bindings, load_published_code_sets
+        from ..models import SpecificationModel
+
+        spec_model = session.get(SpecificationModel, run.spec_id)
+        specs = [
+            SpecDocument.model_validate(item)
+            for item in (spec_model.content_json or {}).get("tables") or []
+            if item.get("table_code") == table.table_code
+        ]
+        code_set_tables = ((run.result_json or {}).get("oracle_code_set_tables")) or {}
+        if specs and code_set_tables:
+            _, field_bindings = load_published_code_sets(session, specs)
+            code_set_bindings = code_set_compile_bindings(field_bindings, code_set_tables)
+    except Exception:
+        code_set_bindings = None
     rules: List[Dict[str, Any]] = []
     for row in rows:
         definition = RuleDefinition.model_validate(row.definition_json)
         try:
-            sql, _ = compile_where(definition, "oracle", physical)
+            sql, _ = compile_where(definition, "oracle", physical, code_set_bindings)
         except Exception:
             sql = None
         rules.append(
@@ -142,16 +164,28 @@ def all_table_rules() -> Dict[str, Any]:
 def artifacts_status() -> Dict[str, Any]:
     """每张表最近一次生成的状态，用于列表显示（未生成/生成中/已验证/失败）。"""
     with SessionLocal() as session:
+        # 聚合查询代替全表扫进内存：规则行会无限增长，前端又每 5 秒轮询
+        candidates = (
+            session.query(RuleModel.table_code, RuleModel.run_id, func.max(RuleModel.created_at))
+            .group_by(RuleModel.table_code, RuleModel.run_id)
+            .all()
+        )
         latest: Dict[str, str] = {}
+        newest_at: Dict[str, Any] = {}
+        for table_code, run_id, newest in candidates:
+            if table_code not in newest_at or (newest or datetime.min) > newest_at[table_code]:
+                newest_at[table_code] = newest or datetime.min
+                latest[table_code] = run_id
+        # SUPERSEDED 是被去重替换掉的重复规则，不算有效规则数
+        count_rows = (
+            session.query(RuleModel.run_id, RuleModel.table_code, func.count())
+            .filter(RuleModel.status != "SUPERSEDED")
+            .group_by(RuleModel.run_id, RuleModel.table_code)
+            .all()
+        )
         rule_counts: Dict[str, Dict[str, int]] = {}
-        for row in session.query(RuleModel).order_by(RuleModel.created_at.desc()).all():
-            if row.table_code not in latest:
-                latest[row.table_code] = row.run_id
-            # SUPERSEDED 是被去重替换掉的重复规则，不算有效规则数
-            if row.status == "SUPERSEDED":
-                continue
-            by_table = rule_counts.setdefault(row.run_id, {})
-            by_table[row.table_code] = by_table.get(row.table_code, 0) + 1
+        for run_id, table_code, count in count_rows:
+            rule_counts.setdefault(run_id, {})[table_code] = count
         run_ids = set(latest.values())
         runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
         tables = session.query(TableMetadataModel).all()

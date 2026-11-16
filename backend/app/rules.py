@@ -131,6 +131,25 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
         raise RuleValidationError("Enum values cannot be empty")
     if rule.operator in {"LENGTH", "LENGTH_MAX"} and int(rule.params.get("length", 0)) <= 0:
         raise RuleValidationError("Length must be positive")
+    if rule.operator == "NUM_RANGE":
+        min_value = rule.params.get("min")
+        max_value = rule.params.get("max")
+        if min_value is None and max_value is None:
+            raise RuleValidationError("NUM_RANGE requires at least one of min/max")
+        try:
+            min_float = float(min_value) if min_value is not None else None
+            max_float = float(max_value) if max_value is not None else None
+        except (TypeError, ValueError) as exc:
+            raise RuleValidationError("NUM_RANGE bounds must be numeric") from exc
+        if min_float is not None and max_float is not None and min_float > max_float:
+            raise RuleValidationError("NUM_RANGE min cannot exceed max")
+    if rule.operator == "FIELD_COMPARE":
+        if rule.params.get("right_field") not in fields:
+            raise RuleValidationError("Unknown comparison field")
+        if rule.params.get("right_field") == rule.field:
+            raise RuleValidationError("FIELD_COMPARE cannot compare a field with itself")
+        if rule.params.get("operator") not in {"LT", "LE", "GT", "GE", "EQ", "NE"}:
+            raise RuleValidationError("Unsupported comparison operator")
     if rule.operator == "REGEXP":
         try:
             re.compile(rule.params["pattern"])

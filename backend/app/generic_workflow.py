@@ -10,14 +10,20 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .blobs import LocalBlobStore
-from .code_set_oracle import compile_code_set_oracle_ddl, load_published_code_sets, validate_code_set_usage
+from .code_set_oracle import (
+    code_set_compile_bindings,
+    compile_code_set_oracle_ddl,
+    load_published_code_sets,
+    sandbox_code_set_table,
+    validate_code_set_usage,
+)
 from .compiler import compile_rule_query
 from .asset_models import ApprovalModel, ArtifactModel, AuditCaseDefinitionModel, GenerationPlanModel, GeneratorDefinitionModel, SchemaDefinitionModel
 from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
 from .errors import WorkflowError
 from .events import append_event
-from .generic_ai import LlmTimeoutError, RealDesignLlm, spec_payload
+from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
     bind_audit_cases,
     bind_generators,
@@ -229,7 +235,23 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
     raise WorkflowError(message, context=_fail_context(tool_name, payload, last_kind, retried=transient_used > 1))
 
 
-def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocument], worker) -> List[Any]:
+def _resolve_budget(session: Session, generation_budget=None):
+    """预算只读一次并贯通到底：max_retries 决定自愈轮数，max_llm_concurrency 决定并发宽度。"""
+    if generation_budget is None:
+        from .api_v2.settings import get_budget
+
+        generation_budget = get_budget(session)
+    concurrency = max(1, int(generation_budget.get("max_llm_concurrency", 4)))
+    configure_llm_concurrency(concurrency)
+    return generation_budget, concurrency
+
+
+def _inner_width(concurrency: int, outer_workers: int) -> int:
+    """外层扇出已占用的并发额度，剩下的才给字段级内层池，避免外层 4 × 内层 4 = 16 线程争抢。"""
+    return max(1, concurrency // max(1, outer_workers))
+
+
+def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocument], worker, max_workers: int = 4) -> List[Any]:
     append_event(
         session,
         run,
@@ -237,7 +259,7 @@ def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocumen
         stage,
         {"stage": stage, "table_codes": [spec.table_code for spec in specs]},
     )
-    with ThreadPoolExecutor(max_workers=min(4, len(specs))) as executor:
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(specs))) as executor:
         futures = [executor.submit(worker, spec) for spec in specs]
         results = [future.result() for future in futures]
     for spec, (_, trace) in zip(specs, results):
@@ -271,7 +293,7 @@ def _validate_plan(args, budget):
     return plan
 
 
-def _plan_stage(session, run, specs, llm, budget):
+def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4):
     def worker(spec):
         return _call_validated(
             llm,
@@ -281,7 +303,7 @@ def _plan_stage(session, run, specs, llm, budget):
             lambda args: _validate_plan(args, budget),
         )
 
-    results = _fanout(session, run, "generation_planner", specs, worker)
+    results = _fanout(session, run, "generation_planner", specs, worker, max_workers=concurrency)
     plans = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     append_event(
         session,
@@ -305,7 +327,7 @@ def _plan_stage(session, run, specs, llm, budget):
     return plans
 
 
-def _schema_stage(session, run, specs, llm):
+def _schema_stage(session, run, specs, llm, concurrency: int = 4):
     def worker(spec):
         return _call_validated(
             llm,
@@ -315,7 +337,7 @@ def _schema_stage(session, run, specs, llm):
             lambda args: bind_schema(spec, args.get("fields", [])),
         )
 
-    results = _fanout(session, run, "schema_mapper", specs, worker)
+    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency)
     schemas = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     for spec in specs:
         session.add(
@@ -345,8 +367,9 @@ def _schema_stage(session, run, specs, llm):
     return schemas
 
 
-def _rules_stage(session, run, specs, llm, plans=None) -> int:
+def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> int:
     _, field_code_sets = load_published_code_sets(session, specs)
+    outer_workers = max(1, min(concurrency, len(specs)))
 
     def worker(spec):
         bound_rules = []
@@ -388,7 +411,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                 rules, trace = _call_validated(
                     llm,
                     "assign_rules",
-                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。",
+                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE）。",
                     payload,
                     lambda args: bind_rules(spec, args.get("rules", [])),
                 )
@@ -404,7 +427,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
                 "arguments": {"rules": [rule.model_dump() for rule in field_rules]},
             }
 
-        with ThreadPoolExecutor(max_workers=min(4, len(fields))) as field_executor:
+        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(fields))) as field_executor:
             field_results = list(field_executor.map(bind_field, fields))
         for rules, trace in field_results:
             bound_rules.extend(rules)
@@ -431,7 +454,7 @@ def _rules_stage(session, run, specs, llm, plans=None) -> int:
             "arguments": {"rules": [rule.model_dump() for rule in bound_rules]},
         }
 
-    results = _fanout(session, run, "rule_binder", specs, worker)
+    results = _fanout(session, run, "rule_binder", specs, worker, max_workers=concurrency)
     gaps_by_table = {
         spec.table_code: trace["gaps"]
         for spec, (_, trace) in zip(specs, results)
@@ -539,9 +562,14 @@ def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
         code: [SchemaBinding.model_validate(item) for item in items]
         for code, items in schema_payload.items()
     }
-    code_sets, _ = load_published_code_sets(session, specs)
+    code_sets, field_code_sets = load_published_code_sets(session, specs)
+    # 码表子查询用沙箱表名：预检建表和规则空跑在同一批沙箱对象上执行
+    code_set_bindings = code_set_compile_bindings(
+        field_code_sets,
+        {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
+    )
     assets = GenericOracleExecutor(settings.oracle_sandbox_url).prepare_assets(
-        run.id, attempt, specs, typed_schemas, code_sets=code_sets, rules=rules
+        run.id, attempt, specs, typed_schemas, code_sets=code_sets, rules=rules, code_set_bindings=code_set_bindings
     )
     blobs = LocalBlobStore(settings.blob_dir)
     ddl_uri = blobs.put(
@@ -556,7 +584,7 @@ def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
     oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
     queries = []
     for rule in rules:
-        sql, params = compile_rule_query(rule, "oracle", assets["physical_tables"])
+        sql, params = compile_rule_query(rule, "oracle", assets["physical_tables"], code_set_bindings)
         queries.append({"rule_key": rule.rule_key, "table_code": rule.table_code, "sql": sql, "params": params})
     sql_uri = blobs.put(canonical_json({"dialect": "oracle", "queries": queries}).encode())
     result = {
@@ -586,8 +614,9 @@ def _next_asset_version(session, model, run_id, table_code) -> int:
     return int(current or 0) + 1
 
 
-def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None):
+def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None, concurrency: int = 4):
     _, field_code_sets = load_published_code_sets(session, specs)
+    outer_workers = max(1, min(concurrency, len(specs)))
 
     def worker(spec):
         rule_views = [rule.model_dump() for rule in active_rules if rule.table_code == spec.table_code]
@@ -616,7 +645,7 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 validate_one,
             )
 
-        with ThreadPoolExecutor(max_workers=min(4, len(spec.fields))) as field_executor:
+        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(spec.fields))) as field_executor:
             field_results = list(field_executor.map(bind_field, spec.fields))
         generator_items = [item for item, _ in field_results]
         generators = bind_generators(spec, generator_items)
@@ -926,8 +955,9 @@ def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefiniti
     return rules + added
 
 
-def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None):
+def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None, concurrency: int = 4):
     _, field_code_sets = load_published_code_sets(session, specs)
+    outer_workers = max(1, min(concurrency, len(specs)))
 
     def worker(spec):
         table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
@@ -983,7 +1013,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
             )
 
         targets = [None] + table_rules
-        with ThreadPoolExecutor(max_workers=min(4, len(targets))) as audit_executor:
+        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(targets))) as audit_executor:
             audit_results = list(audit_executor.map(bind_cases, targets))
         case_items = []
         case_ids = set()
@@ -1157,7 +1187,7 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
     return changed_count + revised_count
 
 
-def retry_generic_run(session: Session, run: RunModel, settings: Settings) -> RunModel:
+def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer_continuation: bool = False) -> RunModel:
     report_uri = (run.result_json or {}).get("audit_report_blob")
     if not report_uri:
         redirect = (
@@ -1188,6 +1218,8 @@ def retry_generic_run(session: Session, run: RunModel, settings: Settings) -> Ru
         session.commit()
         return run
     session.commit()
+    if defer_continuation:
+        return run
     return continue_generic_run(session, run, settings, llm)
 
 
@@ -1222,16 +1254,17 @@ def _create_run(session: Session, spec_id: str, settings: Settings) -> RunModel:
 def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
+    resolved_budget, concurrency = _resolve_budget(session, generation_budget)
     current_stage = "created"
     try:
         current_stage = "generation_planner"
-        plans = _plan_stage(session, run, specs, llm, generation_budget) if generation_budget else None
+        plans = _plan_stage(session, run, specs, llm, resolved_budget, concurrency) if generation_budget else None
         session.commit()
         current_stage = "schema_mapper"
-        _schema_stage(session, run, specs, llm)
+        _schema_stage(session, run, specs, llm, concurrency)
         session.commit()
         current_stage = "rule_binder"
-        pending_count = _rules_stage(session, run, specs, llm, plans)
+        pending_count = _rules_stage(session, run, specs, llm, plans, concurrency=concurrency)
         session.commit()
         current_stage = "oracle_asset_builder"
         schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
@@ -1268,8 +1301,7 @@ def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, 
         session.commit()
         return run
     session.commit()
-    return continue_generic_run(session, run, settings, llm)
-
+    return continue_generic_run(session, run, settings, llm, resolved_budget)
 
 def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     """同步入口：创建 run 并执行到第一个 gate。测试与内部调用使用。"""
@@ -1284,6 +1316,7 @@ def approve_generic_rules(
     decisions: Dict[str, str],
     settings: Settings,
     llm=None,
+    defer_continuation: bool = False,
 ) -> RunModel:
     if run.status != "WAITING_APPROVAL":
         raise WorkflowError("Run is not waiting for rule approval")
@@ -1316,7 +1349,11 @@ def approve_generic_rules(
         {"approver": approver, "decisions": normalized, "all_decided": all_decided},
     )
     session.commit()
-    return continue_generic_run(session, run, settings, llm) if all_decided else run
+    if not all_decided:
+        return run
+    if defer_continuation:
+        return run
+    return continue_generic_run(session, run, settings, llm)
 
 
 def confirm_generic_test_results(session: Session, run: RunModel, approver: str) -> RunModel:
@@ -1350,9 +1387,11 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
     return run
 
 
-def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None) -> RunModel:
+def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
+    resolved_budget, concurrency = _resolve_budget(session, generation_budget)
+    max_attempts = int(resolved_budget.get("max_retries", 3))
     schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
     schemas = {code: [item for item in items] for code, items in schema_payload.items()}
     cross = _latest_payload(session, run.id, "CROSS_RULES_ASSIGNED")
@@ -1369,9 +1408,9 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     rules = _backfill_length_rules(session, run, specs, rules)
     rules = _backfill_fixed_value_rules(session, run, specs, rules)
     prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
-    golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans)
+    golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans, concurrency=concurrency)
     session.commit()
-    audit_cases = _audit_stage(session, run, specs, llm, rules, golden_records, plans)
+    audit_cases = _audit_stage(session, run, specs, llm, rules, golden_records, plans, concurrency=concurrency)
     session.commit()
     attempt = run.attempt + 1
     append_event(session, run, "AUDIT_STARTED", "oracle_executor", {"attempt": attempt})
@@ -1389,6 +1428,10 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     }
     code_sets, field_code_sets = load_published_code_sets(session, specs)
     validate_code_set_usage(rules, golden_generators, field_code_sets)
+    code_set_bindings = code_set_compile_bindings(
+        field_code_sets,
+        {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
+    )
     report = GenericOracleExecutor(settings.oracle_sandbox_url).execute(
         run.id,
         attempt,
@@ -1401,6 +1444,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
         golden_generators,
         code_sets=code_sets,
         prepared_assets=prepared_assets,
+        code_set_bindings=code_set_bindings,
     )
     blobs = LocalBlobStore(settings.blob_dir)
     if report.get("uncovered_rules"):
@@ -1460,7 +1504,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
             )
         )
     session.flush()
-    if not report["all_passed"] and attempt < 3:
+    if not report["all_passed"] and attempt < max_attempts:
         append_event(
             session,
             run,
@@ -1475,7 +1519,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
                 append_event(session, run, "APPROVAL_REQUIRED", "human_gate", {"pending_count": pending_count})
                 session.commit()
                 return run
-            return continue_generic_run(session, run, settings, llm)
+            return continue_generic_run(session, run, settings, llm, resolved_budget)
     append_event(
         session,
         run,
@@ -1495,9 +1539,9 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     return run
 
 
-def continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None) -> RunModel:
+def continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     try:
-        return _continue_generic_run(session, run, settings, llm)
+        return _continue_generic_run(session, run, settings, llm, generation_budget)
     except Exception as exc:
         fallback_stage = run.current_node or "oracle_executor"
         append_event(

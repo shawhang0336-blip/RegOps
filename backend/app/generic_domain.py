@@ -167,7 +167,7 @@ def materialize_golden_record(spec: SpecDocument, bindings: List[GeneratorBindin
 
 
 # 只在单个字段上判定的算子：要打死它们，变异必须落在那个字段上
-SELF_FIELD_OPERATORS = {"REQUIRED", "ENUM", "NOT_IN", "LENGTH", "LENGTH_MAX", "REGEXP"}
+SELF_FIELD_OPERATORS = {"REQUIRED", "ENUM", "NOT_IN", "LENGTH", "LENGTH_MAX", "REGEXP", "NUM_RANGE"}
 
 
 def _is_blank(value: Any) -> bool:
@@ -205,6 +205,24 @@ def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any
             return re.search(pattern, str(value)) is None
         except re.error:
             return None
+    if operator == "NUM_RANGE":
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            number = float(str(value).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+        min_value = params.get("min")
+        max_value = params.get("max")
+        if min_value is not None:
+            bound = float(min_value)
+            if number < bound or (not params.get("min_inclusive", True) and number == bound):
+                return True
+        if max_value is not None:
+            bound = float(max_value)
+            if number > bound or (not params.get("max_inclusive", True) and number == bound):
+                return True
+        return False
     return None
 
 

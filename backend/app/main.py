@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -24,7 +25,14 @@ from .config import get_settings
 from .identity import OPERATOR_PLACEHOLDER
 from .db import SessionLocal, init_db
 from .events import append_event, fold_events
-from .generic_workflow import approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
+from .generic_workflow import (
+    _pending_rules,
+    approve_generic_rules,
+    confirm_generic_test_results,
+    continue_generic_run,
+    retry_generic_run,
+    start_generic_run,
+)
 from .asset_models import (
     ArtifactModel,
     AuditCaseDefinitionModel,
@@ -157,10 +165,8 @@ def rule_view(row: RuleModel) -> Dict:
     }
 
 
-def _run_tables(session: Session, run: RunModel) -> List[Dict]:
-    spec = session.get(SpecificationModel, run.spec_id)
-    content = (spec.content_json or {}) if spec else {}
-    tables = content.get("tables") or ([content] if content else [])
+def _run_tables_from_content(content: Dict) -> List[Dict]:
+    tables = (content or {}).get("tables") or ([content] if content else [])
     return [
         {"table_code": item.get("table_code"), "table_name": item.get("table_name")}
         for item in tables
@@ -168,10 +174,20 @@ def _run_tables(session: Session, run: RunModel) -> List[Dict]:
     ]
 
 
-def run_view(session: Session, run: RunModel, include_events: bool = True) -> Dict:
-    rules = session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
-    events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
-    tables = _run_tables(session, run)
+def _run_tables(session: Session, run: RunModel) -> List[Dict]:
+    spec = session.get(SpecificationModel, run.spec_id)
+    return _run_tables_from_content((spec.content_json or {}) if spec else {})
+
+
+def run_view(
+    session: Session,
+    run: RunModel,
+    include_events: bool = True,
+    prefetched_rules: Optional[List[RuleModel]] = None,
+    prefetched_tables: Optional[List[Dict]] = None,
+) -> Dict:
+    rules = prefetched_rules if prefetched_rules is not None else session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
+    tables = prefetched_tables if prefetched_tables is not None else _run_tables(session, run)
     result = {
         "id": run.id,
         "spec_id": run.spec_id,
@@ -186,6 +202,7 @@ def run_view(session: Session, run: RunModel, include_events: bool = True) -> Di
         "rules": [rule_view(rule) for rule in sorted(rules, key=lambda item: item.rule_key)],
     }
     if include_events:
+        events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
         result["events"] = [
             {
                 "seq": event.seq,
@@ -357,7 +374,30 @@ def create_run(request: RunRequest, session: Session = Depends(db_session)) -> D
 @app.get("/api/runs")
 def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
     runs = session.query(RunModel).order_by(RunModel.created_at.desc()).limit(50).all()
-    return [run_view(session, run, include_events=False) for run in runs]
+    if not runs:
+        return []
+    # 批量预取：规则与 spec 各一次 IN 查询，避免 50 个批次 × 3 次循环查询
+    run_ids = [run.id for run in runs]
+    spec_ids = {run.spec_id for run in runs}
+    rules_by_run: Dict[str, List[RuleModel]] = {}
+    for rule in session.query(RuleModel).filter(RuleModel.run_id.in_(run_ids)).all():
+        rules_by_run.setdefault(rule.run_id, []).append(rule)
+    spec_by_id = {
+        row.id: row
+        for row in session.query(SpecificationModel).filter(SpecificationModel.id.in_(spec_ids)).all()
+    }
+    return [
+        run_view(
+            session,
+            run,
+            include_events=False,
+            prefetched_rules=rules_by_run.get(run.id, []),
+            prefetched_tables=_run_tables_from_content(
+                (spec_by_id[run.spec_id].content_json or {}) if run.spec_id in spec_by_id else {}
+            ),
+        )
+        for run in runs
+    ]
 
 
 ACTIVE_RUN_STATUSES = {"RUNNING", "AUDITING", "READY_TO_AUDIT"}
@@ -612,6 +652,35 @@ def validation_detail(run_id: str, session: Session = Depends(db_session)) -> Di
     }
 
 
+def _spawn_run_continuation(run_id: str) -> None:
+    """在后台线程里继续跑造数 + Oracle 验证，让审批/重试/重审接口立即返回。
+
+    continue_generic_run 内部自己兜底异常并落 RUN_FAILED 事件，
+    这里只需要保证线程崩了也有痕迹。
+    """
+
+    def _run():
+        try:
+            with SessionLocal() as session:
+                run = session.get(RunModel, run_id)
+                if run and run.status in {"READY_TO_AUDIT", "RUNNING"}:
+                    continue_generic_run(session, run, settings)
+        except Exception:
+            with SessionLocal() as session:
+                run = session.get(RunModel, run_id)
+                if run and run.status in {"READY_TO_AUDIT", "RUNNING"}:
+                    append_event(
+                        session,
+                        run,
+                        "RUN_FAILED",
+                        "background_executor",
+                        {"node": "background_executor", "result": {"error": "后台续跑线程异常退出"}},
+                    )
+                    session.commit()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 @app.post("/api/runs/{run_id}/approvals")
 def approve_run(run_id: str, request: ApprovalRequest, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
@@ -624,10 +693,13 @@ def approve_run(run_id: str, request: ApprovalRequest, session: Session = Depend
             request.approver.strip(),
             {decision.rule_hash: decision.decision for decision in request.decisions},
             settings,
+            defer_continuation=True,
         )
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if run.status == "READY_TO_AUDIT":
+        _spawn_run_continuation(run.id)
     return run_view(session, run)
 
 
@@ -652,10 +724,55 @@ def retry_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     if run.status != "FAILED":
         raise HTTPException(status_code=409, detail="Only failed runs can be retried")
     try:
-        run = retry_generic_run(session, run, settings)
+        run = retry_generic_run(session, run, settings, defer_continuation=True)
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if run.status == "RUNNING":
+        _spawn_run_continuation(run.id)
+    return run_view(session, run)
+
+
+@app.post("/api/runs/{run_id}/reaudit")
+def reaudit_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
+    """人工改参后的轻量重审：规则集合保持不动，只重跑造数与 Oracle 沙箱验证。
+
+    与「重新生成」的区别：不开新 run、不调 AI 重新绑规则，
+    PATCH 过的参数和人工审批结论全部保留。
+    """
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status in ACTIVE_RUN_STATUSES:
+        raise HTTPException(status_code=409, detail="批次正在执行中，请等当前验证结束后再发起重审")
+    pending = _pending_rules(session, run.id)
+    if pending:
+        raise HTTPException(status_code=409, detail=f"还有 {len(pending)} 条规则待确认，请先在第二步处理完再重审")
+    approved = (
+        session.query(RuleModel)
+        .filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED")
+        .count()
+    )
+    if not approved:
+        raise HTTPException(status_code=409, detail="这个批次没有已批准的规则可验证")
+    # 老批次可能没走到过造数阶段，缺少续跑所需的生成上下文
+    for required_kind in ("SCHEMA_ASSIGNED", "GENERATORS_ASSIGNED"):
+        exists = (
+            session.query(EventModel)
+            .filter(EventModel.run_id == run.id, EventModel.kind == required_kind)
+            .first()
+        )
+        if not exists:
+            raise HTTPException(status_code=409, detail="该批次缺少生成上下文（未完成过规则绑定），请改用“重新生成并验证”")
+    append_event(
+        session,
+        run,
+        "REAUDIT_REQUESTED",
+        "build_audit",
+        {"reason": "保留规则与人工修改，仅重跑 AI 造数与 Oracle 沙箱验证"},
+    )
+    session.commit()
+    _spawn_run_continuation(run.id)
     return run_view(session, run)
 
 

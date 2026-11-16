@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .asset_models import ArtifactModel
 from .blobs import LocalBlobStore
-from .code_set_oracle import compile_code_set_oracle_ddl, compile_code_set_oracle_insert, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
+from .code_set_oracle import code_set_compile_bindings, compile_code_set_oracle_ddl, compile_code_set_oracle_insert, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
 from .domain import RuleDefinition, canonical_json
 from .generic_domain import SchemaBinding
 from .generic_workflow import _latest_payload, _specs
@@ -35,10 +35,11 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
     expected_versions = run.result_json["audit_summary"].get("code_set_versions", {})
-    code_sets, _ = load_published_code_sets(session, specs, expected_versions=expected_versions)
+    code_sets, field_code_sets = load_published_code_sets(session, specs, expected_versions=expected_versions)
     if code_sets and "code_set_versions" not in run.result_json["audit_summary"]:
         raise WorkflowError("This run predates code set auditing; rerun the Oracle audit before production export")
     code_set_tables = {item["code"]: stable_code_set_table(item["code"]) for item in code_sets}
+    rule_bindings = code_set_compile_bindings(field_code_sets, code_set_tables)
     oracle_code_set_ddl = []
     oracle_code_set_insert = []
     oracle_code_set_merge = []
@@ -57,7 +58,7 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
         oracle_rules.append(
             f"-- {rule.rule_key} | {rule.source} | {rule.rule_hash}\n"
             f"-- {rule.rationale}\n"
-            f"{compile_production_rule_query(rule, 'oracle')};"
+            f"{compile_production_rule_query(rule, 'oracle', code_set_bindings=rule_bindings)};"
         )
     manifest = {
         "bundle_type": "PRODUCTION_DEPLOYMENT",
