@@ -76,7 +76,12 @@ def fit_sandbox_values(spec: SpecDocument, record: Dict[str, Any]) -> Dict[str, 
     """变异用例进沙箱宽表：只做 4000 上限保护，不按元数据声明长度裁剪。
 
     长度类规则（LENGTH / LENGTH_MAX）要的就是「超长值」，裁掉等于把规则测成死规则。
+    数值列顺手去千分位逗号：校验阶段允许 "1,000.00" 这种写法（见 _as_number），
+    但 Oracle NUMBER 列不认逗号，直接插会 ORA-01722。
     """
+    numeric_fields = {
+        field.name for field in spec.fields if (field.data_type or "").upper() == "NUMBER"
+    }
     fitted = dict(record)
     for field in spec.fields:
         if field.name not in fitted:
@@ -84,6 +89,14 @@ def fit_sandbox_values(spec: SpecDocument, record: Dict[str, Any]) -> Dict[str, 
         value = fitted[field.name]
         if not isinstance(value, str):
             continue
+        if field.name in numeric_fields and "," in value:
+            cleaned = value.replace(",", "")
+            try:
+                float(cleaned)
+                fitted[field.name] = cleaned
+                continue
+            except ValueError:
+                pass  # 非数字保留原样：绑定阶段已拦截，真漏过来就让 Oracle 大声报错
         if len(value) > SANDBOX_TEXT_LIMIT:
             fitted[field.name] = value[:SANDBOX_TEXT_LIMIT]
     return fitted

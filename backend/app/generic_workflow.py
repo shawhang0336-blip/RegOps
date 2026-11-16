@@ -25,6 +25,8 @@ from .errors import WorkflowError
 from .events import append_event
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
+    GeneratorBinding,
+    _validate_generator_item,
     bind_audit_cases,
     bind_generators,
     bind_rules,
@@ -635,6 +637,11 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 items = args.get("generators", [])
                 if len(items) != 1 or items[0].get("field") != field.name:
                     raise RuleValidationError("Generator response must contain exactly the requested field")
+                # 当场做单字段校验（数值字段被塞 "N/A" 之类），让 _call_validated 立刻退避重绑，
+                # 而不是等整表字段并发跑完才在 bind_generators 里失败
+                binding = GeneratorBinding.model_validate(items[0])
+                _validate_generator_item(field, binding)
+                items[0]["params"] = binding.params
                 return items[0]
 
             return _call_validated(

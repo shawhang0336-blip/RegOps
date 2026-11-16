@@ -105,17 +105,62 @@ def _as_number(value: Any) -> Any:
     实测出现过 SEQUENCE 的 start/step 都写成 "1000.00" / "100.00"，
     于是 index=1 时 `"1000.00" + 1 * "100.00"` 走成了字符串拼接，
     生成出 "1000.00100.00"，插 NUMBER 列直接 ORA-01722 整次审计失败。
+    千分位逗号（"1,000.00"）视为合法数字，入库前由 fit_sandbox_values 清洗。
     """
     if isinstance(value, bool):
         raise ValueError("布尔值不是数字")
     if isinstance(value, (int, float)):
         return value
-    text = str(value).strip()
+    text = str(value).strip().replace(",", "")
     if re.fullmatch(r"[+-]?\d+", text):
         return int(text)
     if re.fullmatch(r"[+-]?\d+\.\d+", text):
         return float(text)
     raise ValueError(f"不是数字：{value!r}")
+
+
+def _validate_generator_item(field, item: "GeneratorBinding") -> None:
+    """单字段生成器校验：bind_generators 整表校验与 _data_stage 单字段回调共用。
+
+    数值字段只验不改：FIXED/ENUM 的值保持原始字符串形态（码表白名单按字符串比对，
+    Oracle 插入 NUMBER 列时会隐式转换），改写为 int/float 反而会打破下游比对。
+    """
+    if item.generator == "FIXED" and "value" not in item.params:
+        raise RuleValidationError(f"{item.field} FIXED generator requires a value")
+    if item.generator == "ENUM" and not item.params.get("values"):
+        raise RuleValidationError(f"{item.field} ENUM generator requires values")
+    if item.generator == "SEQUENCE":
+        if "start" not in item.params:
+            raise RuleValidationError(f"{item.field} SEQUENCE generator requires start")
+        for key in ("start", "step"):
+            if key not in item.params:
+                continue
+            try:
+                item.params[key] = _as_number(item.params[key])
+            except ValueError as exc:
+                raise RuleValidationError(
+                    f"{item.field} SEQUENCE 的 {key} 必须是数字（不能是带单位的文本）：{exc}"
+                ) from exc
+        for key in ("padding", "width"):
+            if key in item.params and item.params[key] is not None:
+                try:
+                    item.params[key] = int(item.params[key])
+                except (TypeError, ValueError) as exc:
+                    raise RuleValidationError(f"{item.field} SEQUENCE 的 {key} 必须是整数") from exc
+    if (getattr(field, "data_type", "") or "").upper() != "NUMBER":
+        return
+    try:
+        if item.generator == "FIXED":
+            _as_number(item.params["value"])
+        elif item.generator == "ENUM":
+            for value in item.params["values"]:
+                _as_number(value)
+        elif item.generator == "SEQUENCE" and str(item.params.get("prefix") or ""):
+            raise ValueError("prefix 会拼出非数字文本")
+    except ValueError as exc:
+        raise RuleValidationError(
+            f"{item.field} 是数值字段，生成器产出必须能解析成数字（否则 NUMBER 列入不了库）：{exc}"
+        ) from exc
 
 
 def bind_generators(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[GeneratorBinding]:
@@ -124,28 +169,7 @@ def bind_generators(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[Gen
     if {item.field for item in bindings} != set(expected) or len(bindings) != len(expected):
         raise RuleValidationError("Generator assignment must cover every whitelisted field exactly once")
     for item in bindings:
-        if item.generator == "FIXED" and "value" not in item.params:
-            raise RuleValidationError(f"{item.field} FIXED generator requires a value")
-        if item.generator == "ENUM" and not item.params.get("values"):
-            raise RuleValidationError(f"{item.field} ENUM generator requires values")
-        if item.generator == "SEQUENCE":
-            if "start" not in item.params:
-                raise RuleValidationError(f"{item.field} SEQUENCE generator requires start")
-            for key in ("start", "step"):
-                if key not in item.params:
-                    continue
-                try:
-                    item.params[key] = _as_number(item.params[key])
-                except ValueError as exc:
-                    raise RuleValidationError(
-                        f"{item.field} SEQUENCE 的 {key} 必须是数字（不能是带单位的文本）：{exc}"
-                    ) from exc
-            for key in ("padding", "width"):
-                if key in item.params and item.params[key] is not None:
-                    try:
-                        item.params[key] = int(item.params[key])
-                    except (TypeError, ValueError) as exc:
-                        raise RuleValidationError(f"{item.field} SEQUENCE 的 {key} 必须是整数") from exc
+        _validate_generator_item(expected[item.field], item)
     return bindings
 
 
