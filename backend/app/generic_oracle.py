@@ -67,7 +67,8 @@ def fit_record_values(
     return fitted
 
 
-# 沙箱表（变异用例落地的表）所有列都是 VARCHAR2(4000)，只有这一个物理上限
+# 沙箱表（变异用例落地的表）字符列是 VARCHAR2(4000)，只有这一个物理上限；
+# 数值列是裸 NUMBER（38 位），保证数值比较语义与生产一致
 SANDBOX_TEXT_LIMIT = 4000
 
 
@@ -103,8 +104,20 @@ def compile_ai_schema_oracle_ddl(
 
 
 def compile_sandbox_oracle_ddl(table: str, spec: SpecDocument) -> str:
+    """沙箱表：字符字段 VARCHAR2(4000) 放开长度，数值字段用原生 NUMBER。
+
+    数值字段必须建成裸 NUMBER（不带精度，支持 38 位任意小数）：
+    VARCHAR2 上 FIELD_COMPARE/NUM_RANGE 会退化成字符串字典序比较
+    （'90' > '100' 在字典序下成立），黄金样本必误报、数值变异必漏报。
+    代价：非数字变异值会在插入时被 Oracle 拒绝——这类用例在绑定阶段
+    （bind_audit_cases）就会被拦下，轮到入库的都是数值形态。
+    """
     columns = ['"record_id" VARCHAR2(64 CHAR) PRIMARY KEY']
-    columns.extend(f"{quote_identifier(field.name, 'oracle')} VARCHAR2(4000 CHAR) NULL" for field in spec.fields)
+    for field in spec.fields:
+        if (field.data_type or "").upper() == "NUMBER":
+            columns.append(f"{quote_identifier(field.name, 'oracle')} NUMBER NULL")
+        else:
+            columns.append(f"{quote_identifier(field.name, 'oracle')} VARCHAR2(4000 CHAR) NULL")
     return f"CREATE TABLE {quote_identifier(table, 'oracle')} (\n  " + ",\n  ".join(columns) + "\n)"
 
 

@@ -755,8 +755,9 @@ def reaudit_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     )
     if not approved:
         raise HTTPException(status_code=409, detail="这个批次没有已批准的规则可验证")
-    # 老批次可能没走到过造数阶段，缺少续跑所需的生成上下文
-    for required_kind in ("SCHEMA_ASSIGNED", "GENERATORS_ASSIGNED"):
+    # 续跑只需要表结构和跨表规则上下文：GENERATORS_ASSIGNED 由 _data_stage 在续跑内部自己生成，
+    # 不能拿它当前置条件，否则「刚批完规则还没造过数」的批次会被误判为缺上下文
+    for required_kind in ("SCHEMA_ASSIGNED", "CROSS_RULES_ASSIGNED"):
         exists = (
             session.query(EventModel)
             .filter(EventModel.run_id == run.id, EventModel.kind == required_kind)

@@ -226,15 +226,49 @@ def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any
     return None
 
 
+_COMPARE_RELATIONS = {
+    "LT": lambda left, right: left < right,
+    "LE": lambda left, right: left <= right,
+    "GT": lambda left, right: left > right,
+    "GE": lambda left, right: left >= right,
+    "EQ": lambda left, right: left == right,
+    "NE": lambda left, right: left != right,
+}
+
+
+def violates_field_compare(operator: str, left: Any, right: Any) -> Optional[bool]:
+    """预判两列取值是否打破 field OP right_field 的断言。
+
+    能转数值就按数值比（与生产 NUMBER 列一致），转不了按字符串序
+    （与沙箱/生产字符列的字典序比较一致）。任一侧缺失或关系未知返回 None。
+    """
+    relation = _COMPARE_RELATIONS.get(operator)
+    if relation is None or left is None or right is None:
+        return None
+    try:
+        left_value = float(str(left).replace(",", ""))
+        right_value = float(str(right).replace(",", ""))
+    except (TypeError, ValueError):
+        left_value, right_value = str(left), str(right)
+    try:
+        return not relation(left_value, right_value)
+    except TypeError:
+        return None
+
+
 def bind_audit_cases(
     spec: SpecDocument,
     items: List[Dict[str, Any]],
     active_rule_keys: set,
     rule_index: Optional[Dict[str, tuple]] = None,
+    golden_record: Optional[Dict[str, Any]] = None,
 ) -> List[AuditCaseBinding]:
     cases = [AuditCaseBinding.model_validate(item) for item in items]
     if not cases:
         raise RuleValidationError("At least one audit case is required")
+    numeric_fields = {
+        field.name for field in spec.fields if (field.data_type or "").upper() == "NUMBER"
+    }
     case_ids = set()
     for case in cases:
 
@@ -243,6 +277,16 @@ def bind_audit_cases(
         case_ids.add(case.case_id)
         if any(field not in field_map(spec) for field in case.overrides):
             raise RuleValidationError("Audit override is outside the field whitelist")
+        # 沙箱数值列是原生 NUMBER：塞非数字会在入库时 ORA-01722 挂掉整批，绑定阶段就拦下
+        for override_field, override_value in case.overrides.items():
+            if override_field in numeric_fields and override_value is not None:
+                try:
+                    float(str(override_value).replace(",", ""))
+                except (TypeError, ValueError) as exc:
+                    raise RuleValidationError(
+                        f"用例 {case.case_id} 把数值字段 {override_field} 变异成非数字 {override_value!r}，"
+                        "沙箱数值列无法入库。数值字段的违规请用越界数值（如 0、负数、超大数）。"
+                    ) from exc
         if any(rule_key not in active_rule_keys for rule_key in case.expected_rule_keys):
             raise RuleValidationError("Audit expectation references an inactive rule")
         if "GOLDEN" in case.case_id.upper():
@@ -277,4 +321,21 @@ def bind_audit_cases(
                         f"（{operator} {params}），但取值 {case.overrides[field]!r} 并不违规，"
                         "这条用例跑到 Oracle 也不会命中，白白消耗一轮审计。请给出真正越界或缺失的值。"
                     )
+            if operator == "FIELD_COMPARE":
+                right_field = params.get("right_field")
+                if field not in case.overrides and right_field not in case.overrides:
+                    raise RuleValidationError(
+                        f"用例 {case.case_id} 期望命中 {rule_key}（{field} 与 {right_field} 的跨字段比较），"
+                        f"但 overrides 既没有改 {field} 也没有改 {right_field}，两列都继承黄金值，测不到任何东西。"
+                    )
+                if golden_record is not None:
+                    left = case.overrides.get(field, golden_record.get(field))
+                    right = case.overrides.get(right_field, golden_record.get(right_field))
+                    verdict = violates_field_compare(params.get("operator"), left, right)
+                    if verdict is False:
+                        raise RuleValidationError(
+                            f"用例 {case.case_id} 声称会触发 {rule_key}（{operator} {params}），"
+                            f"但变异后的 {field}={left!r} 与 {right_field}={right!r} 仍满足比较关系，"
+                            "跑到 Oracle 也不会命中。请给出真正打破关系的取值。"
+                        )
     return cases

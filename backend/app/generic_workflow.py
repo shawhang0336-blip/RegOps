@@ -1009,7 +1009,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 "assign_audit_cases",
                 instruction,
                 payload,
-                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index),
+                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index, golden_record=golden_records.get(spec.table_code)),
             )
 
         targets = [None] + table_rules
@@ -1161,7 +1161,9 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
                 llm,
                 "assign_rules",
                 "根据失败记录修正当前规则赋值。长度一律用 LENGTH_MAX（列宽是上限）；"
-                "要卡「必须正好 N 位」请用 REGEXP 写死格式；只返回修正后的一条规则。",
+                "要卡「必须正好 N 位」请用 REGEXP 写死格式；数值上下限用 NUM_RANGE（min/max/min_inclusive/max_inclusive）；"
+                "跨字段比较用 FIELD_COMPARE（right_field 取自输入字段列表，operator:LT|LE|GT|GE|EQ|NE）；"
+                "只返回修正后的一条规则。",
                 payload,
                 validate_revision,
             )
@@ -1387,11 +1389,14 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
     return run
 
 
-def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
+def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base: Optional[int] = None) -> RunModel:
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
     resolved_budget, concurrency = _resolve_budget(session, generation_budget)
     max_attempts = int(resolved_budget.get("max_retries", 3))
+    # 自愈窗口按本轮续跑的起始 attempt 算：reaudit/重试时 run.attempt 可能已是 3+，
+    # 用绝对值比较（attempt < max_attempts）会让重审直接失去自愈机会
+    first_attempt = attempt_base or (run.attempt + 1)
     schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
     schemas = {code: [item for item in items] for code, items in schema_payload.items()}
     cross = _latest_payload(session, run.id, "CROSS_RULES_ASSIGNED")
@@ -1504,7 +1509,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
             )
         )
     session.flush()
-    if not report["all_passed"] and attempt < max_attempts:
+    if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
         append_event(
             session,
             run,
@@ -1519,7 +1524,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
                 append_event(session, run, "APPROVAL_REQUIRED", "human_gate", {"pending_count": pending_count})
                 session.commit()
                 return run
-            return continue_generic_run(session, run, settings, llm, resolved_budget)
+            return continue_generic_run(session, run, settings, llm, resolved_budget, first_attempt)
     append_event(
         session,
         run,
@@ -1539,9 +1544,9 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     return run
 
 
-def continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
+def continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base: Optional[int] = None) -> RunModel:
     try:
-        return _continue_generic_run(session, run, settings, llm, generation_budget)
+        return _continue_generic_run(session, run, settings, llm, generation_budget, attempt_base)
     except Exception as exc:
         fallback_stage = run.current_node or "oracle_executor"
         append_event(
