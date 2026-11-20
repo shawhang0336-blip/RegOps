@@ -10,8 +10,8 @@
 
 from typing import Any, Dict, List, Optional
 
-from ..domain import LLM_OPERATORS
-from ..kernel.bus import Bus, global_bus
+from app.engine.domain import LLM_OPERATORS
+from app.kernel.bus import Bus, global_bus
 
 # 字段名参数：模型在这些槽位上填错/编造会导致规则、生成器或表结构绑定到不存在的列
 _FIELD_ARG_KEYS = (

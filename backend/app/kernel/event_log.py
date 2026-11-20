@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session
 
-from ..models import EventModel, RunModel
+from app.infra.models import EventModel, RunModel
 from .bus import global_bus
 
 GENESIS_HASH = "0" * 64

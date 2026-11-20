@@ -2,8 +2,8 @@ import uuid
 
 import pytest
 
-from app.asset_models import CodeSetModel, CodeValueModel
-from app.code_set_oracle import (
+from app.infra.asset_models import CodeSetModel, CodeValueModel
+from app.assets.code_sets.oracle import (
     compile_code_set_oracle_ddl,
     compile_code_set_oracle_insert,
     compile_code_set_oracle_merge,
@@ -11,11 +11,11 @@ from app.code_set_oracle import (
     stable_code_set_table,
     validate_code_set_usage,
 )
-from app.domain import RuleDefinition
-from app.generic_domain import GeneratorBinding
-from app.generic_workflow import _code_set_context
-from app.metadata_service import metadata_to_spec, publish_table
-from app.errors import WorkflowError
+from app.engine.domain import RuleDefinition
+from app.engine.binding import GeneratorBinding
+from app.engine.workflow import _code_set_context
+from app.assets.metadata_service import metadata_to_spec, publish_table
+from app.infra.errors import WorkflowError
 from .test_metadata_service import make_metadata
 from .helpers import make_session
 

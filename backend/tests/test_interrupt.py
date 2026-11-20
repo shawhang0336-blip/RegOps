@@ -9,16 +9,10 @@ import uuid
 
 import pytest
 
-from app.events import (
-    append_event,
-    interrupt_payload,
-    latest_interrupt,
-    matching_answer,
-    pending_interrupt,
-    project,
-)
-from app.models import EventModel, RunModel
-from app.errors import WorkflowError
+from app.kernel.event_log import append_event, latest_interrupt, matching_answer
+from app.policy.regops_plan import interrupt_payload, pending_interrupt, project
+from app.infra.models import EventModel, RunModel
+from app.infra.errors import WorkflowError
 from .helpers import make_session
 
 

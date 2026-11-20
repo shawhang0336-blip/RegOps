@@ -8,8 +8,8 @@
 
 import pytest
 
-from app.generic_domain import bind_audit_cases
-from app.generic_domain import RuleValidationError
+from app.engine.binding import bind_audit_cases
+from app.engine.binding import RuleValidationError
 
 
 def _case(case_id, overrides, expected):

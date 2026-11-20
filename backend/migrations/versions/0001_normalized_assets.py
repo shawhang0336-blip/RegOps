@@ -6,8 +6,8 @@ Revises:
 
 from alembic import op
 
-from app.db import Base
-from app import asset_models, models
+from app.infra.db import Base
+from app.infra import asset_models, models
 
 revision = "0001_normalized_assets"
 down_revision = None

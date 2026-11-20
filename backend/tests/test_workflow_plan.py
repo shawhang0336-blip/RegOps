@@ -6,19 +6,17 @@ Run 的 current_node 必须落在 Plan 节点集里；跳转目标同样受 Plan
 
 import pytest
 
-from app.workflow import (
+from app.policy.regops_plan import (
     DEFAULT_PLAN,
-    WorkflowPlan,
-    PlanEdge,
-    PlanNode,
     approval_target,
     audit_passed_target,
     decided_target,
     is_gate,
     self_heal_target,
 )
-from app.events import append_event
-from app.models import RunModel
+from app.kernel.plan import WorkflowPlan, PlanEdge, PlanNode
+from app.kernel.event_log import append_event
+from app.infra.models import RunModel
 from .helpers import make_session
 
 
@@ -87,7 +85,8 @@ def test_render_mermaid_contains_all_nodes_and_edges():
 
 def test_go_redirect_rejects_node_outside_plan():
     """GO_REDIRECT 的目标必须是 Plan 里的合法节点。"""
-    from app.events import _apply, RunState
+    from app.policy.regops_plan import _apply
+    from app.kernel.event_log import RunState
 
     with pytest.raises(ValueError, match="不在 Plan 中"):
         _apply(RunState(), "GO_REDIRECT", {"target": "ghost_node"})

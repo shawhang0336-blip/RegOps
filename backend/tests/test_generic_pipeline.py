@@ -2,17 +2,25 @@ import uuid
 
 import pytest
 
-from app.catalog import parse_document_catalog
-from app.config import Settings, get_settings
-from app.generic_domain import bind_generators, bind_rules, bind_schema
-from app.generic_oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
-from app.generic_ai import LlmTimeoutError
-from app.events import project
-from app.generic_workflow import _call_validated, _create_run, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
-from app.production_service import build_production_bundle
-from app.models import EventModel, RuleModel, RunModel, SpecificationModel
-from app.rules import RuleValidationError
-from app.errors import WorkflowError
+from app.ingestion.catalog import parse_document_catalog
+from app.infra.config import Settings, get_settings
+from app.engine.binding import bind_generators, bind_rules, bind_schema
+from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
+from app.engine.llm import LlmTimeoutError
+from app.policy.regops_plan import project
+from app.engine.workflow import (
+    _call_validated,
+    _create_run,
+    _dedupe_approved_rules,
+    approve_generic_rules,
+    confirm_generic_test_results,
+    retry_generic_run,
+    start_generic_run,
+)
+from app.delivery.production_service import build_production_bundle
+from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.engine.rules import RuleValidationError
+from app.infra.errors import WorkflowError
 from .helpers import make_session
 
 

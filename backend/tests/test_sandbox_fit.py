@@ -6,8 +6,8 @@
 误报为「规则该命中却没命中」。
 """
 
-from app.domain import FieldSpec, SpecDocument
-from app.generic_oracle import SANDBOX_TEXT_LIMIT, fit_sandbox_values
+from app.engine.domain import FieldSpec, SpecDocument
+from app.engine.oracle import SANDBOX_TEXT_LIMIT, fit_sandbox_values
 
 SPEC = SpecDocument(
     version="TEST",

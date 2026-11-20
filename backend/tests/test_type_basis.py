@@ -1,17 +1,13 @@
 import uuid
 
-from app.asset_models import (
+from app.infra.asset_models import (
     FieldMetadataModel,
     MetadataRevisionModel,
     RawBlockModel,
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.metadata_service import (
-    apply_field_type_import,
-    type_basis_for,
-    update_field,
-)
+from app.assets.metadata_service import apply_field_type_import, type_basis_for, update_field
 from .helpers import make_session
 
 DECLARED_CONTEXT = """字段 内容 类型（长度） 校验

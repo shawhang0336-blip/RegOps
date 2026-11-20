@@ -14,12 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.asset_models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
-from app.catalog import parse_document_catalog
-from app.config import get_settings
-from app.db import SessionLocal
-from app.metadata_service import extract_metadata_for_block
-from app.spec_quality import inspect_block
+from app.infra.asset_models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from app.ingestion.catalog import parse_document_catalog
+from app.infra.config import get_settings
+from app.infra.db import SessionLocal
+from app.assets.metadata_service import extract_metadata_for_block
+from app.ingestion.spec_quality import inspect_block
 
 TARGET_TABLES = ("SAFE_6_7_5_3", "SAFE_6_9_2")
 

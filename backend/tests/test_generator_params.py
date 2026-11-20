@@ -10,9 +10,9 @@
 
 import pytest
 
-from app.domain import FieldSpec, SpecDocument
-from app.generic_domain import bind_generators, materialize_golden_record
-from app.rules import RuleValidationError
+from app.engine.domain import FieldSpec, SpecDocument
+from app.engine.binding import bind_generators, materialize_golden_record
+from app.engine.rules import RuleValidationError
 
 SPEC = SpecDocument(
     version="TEST",

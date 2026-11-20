@@ -1,7 +1,7 @@
 import pytest
 
-from app.config import get_settings
-from app.spec_parser import parse_safe_13_organization_spec, parse_safe_chapter6_slice
+from app.infra.config import get_settings
+from app.ingestion.spec_parser import parse_safe_13_organization_spec, parse_safe_chapter6_slice
 
 
 @pytest.fixture(scope="session")

@@ -8,11 +8,14 @@
 5. 身份信息随事件落账，可追溯。
 """
 
-from app.context import Identity, RunContext, build_context
-from app.events import append_event, project
-from app.models import EventModel, RunModel
-from app.scheduler import Outcome, Scheduler
-from app.workflow import DEFAULT_PLAN, PlanEdge, PlanNode, WorkflowPlan
+from app.kernel.channel import Identity, RunContext
+from app.policy.regops_channels import build_context
+from app.kernel.event_log import append_event
+from app.policy.regops_plan import project
+from app.infra.models import EventModel, RunModel
+from app.kernel.scheduler import Outcome, Scheduler
+from app.policy.regops_plan import DEFAULT_PLAN
+from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan
 from .helpers import make_session
 import uuid
 

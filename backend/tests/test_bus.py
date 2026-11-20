@@ -4,19 +4,18 @@
 原因回喂模型；这不是写在 prompt 里的软约束。
 """
 
-from app.bus import (
-    Bus,
+from app.kernel.bus import Bus, global_bus
+from app.policy.regops_bus import (
     code_set_values_adjudicator,
     cross_table_adjudicator,
     default_bus,
     field_whitelist_adjudicator,
-    global_bus,
     operator_whitelist_adjudicator,
     structure_block_adjudicator,
 )
-from app.generic_workflow import _call_validated
-from app.generic_ai import LlmTimeoutError
-from app.errors import WorkflowError
+from app.engine.workflow import _call_validated
+from app.engine.llm import LlmTimeoutError
+from app.infra.errors import WorkflowError
 
 
 def test_field_whitelist_adjudicator_blocks_hallucination():
@@ -219,7 +218,7 @@ def test_bus_full_lifecycle_fire_subscribe_isolation_and_global_bubbling():
     assert len(parent.history(run_id="r1")) == 2
 
     # 验证阶段一 import_progress 亦通过 global_bus 广播 document.progress
-    from app.import_progress import finish, forget, start, update
+    from app.ingestion.import_progress import finish, forget, start, update
 
     doc_events = []
     handler = lambda ev: doc_events.append(ev)

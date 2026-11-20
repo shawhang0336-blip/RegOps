@@ -1,7 +1,7 @@
 import uuid
 
-from app.asset_models import RawBlockModel, TableMetadataModel
-from app.segment_service import _split_segments, analyze_block_segments, merge_metadata_tables
+from app.infra.asset_models import RawBlockModel, TableMetadataModel
+from app.ingestion.segment_service import _split_segments, analyze_block_segments, merge_metadata_tables
 from .test_metadata_service import make_metadata
 from .helpers import make_session
 
@@ -19,7 +19,7 @@ class SegmentFixtureLlm:
 
 
 def make_parent(session):
-    document = __import__('app.asset_models', fromlist=['SourceDocumentModel']).SourceDocumentModel(
+    document = __import__('app.infra.asset_models', fromlist=['SourceDocumentModel']).SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="sample.pdf", file_type="pdf", sha256=uuid.uuid4().hex,
         blob_uri="blob://sample", spec_version="TEST", status="UPLOADED", block_count=1,
     )
@@ -35,9 +35,9 @@ def make_parent(session):
 
 def test_block_segments_are_hierarchical_and_keep_parent_evidence(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.segment_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.segment_service.SessionLocal", lambda: session)
     parent = make_parent(session)
-    ids = analyze_block_segments(parent.id, __import__('app.config', fromlist=['Settings']).Settings(), SegmentFixtureLlm())
+    ids = analyze_block_segments(parent.id, __import__('app.infra.config', fromlist=['Settings']).Settings(), SegmentFixtureLlm())
     assert len(ids) == 4
     parent = session.get(RawBlockModel, parent.id)
     assert parent.content_json["superseded"] is True

@@ -3,9 +3,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.config import Settings
-from app.asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
-from app.structure_service import _apply_plan, _validate_plan, latest_document_architecture
+from app.infra.config import Settings
+from app.infra.asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
+from app.ingestion.structure_service import _apply_plan, _validate_plan, latest_document_architecture
 from .helpers import make_session
 
 
@@ -69,9 +69,9 @@ def test_structure_plan_rejects_uncovered_source_block():
         _validate_plan({"blocks": [{"source_block_ids": [first.id], "role": "IGNORE"}]}, [first, second])
 import uuid
 
-from app.asset_models import RawBlockModel, SourceDocumentModel
-from app.structure_service import analyze_document_structure
-import app.structure_service as structure_service
+from app.infra.asset_models import RawBlockModel, SourceDocumentModel
+from app.ingestion.structure_service import analyze_document_structure
+import app.ingestion.structure_service as structure_service
 from .helpers import make_session
 
 
@@ -126,11 +126,11 @@ def make_document(session, eligible):
 
 def test_ambiguous_structure_uses_single_short_llm_call(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document, _ = make_document(session, eligible=False)
     llm = SingleCallLlm()
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: llm)
-    architecture_id = analyze_document_structure(document.id, __import__('app.config', fromlist=['Settings']).Settings())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
+    architecture_id = analyze_document_structure(document.id, __import__('app.infra.config', fromlist=['Settings']).Settings())
     assert llm.calls == [structure_service.STRUCTURE_PLAN_TIMEOUT]
     assert architecture_id
     document = session.get(SourceDocumentModel, document.id)
@@ -139,15 +139,15 @@ def test_ambiguous_structure_uses_single_short_llm_call(monkeypatch):
 
 def test_structured_block_skips_llm_architecture_call(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document, _ = make_document(session, eligible=True)
 
     class NoCallLlm:
         def assign(self, *args, **kwargs):
             raise AssertionError("Structured block should not call LLM")
 
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: NoCallLlm())
-    architecture_id = analyze_document_structure(document.id, __import__('app.config', fromlist=['Settings']).Settings())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: NoCallLlm())
+    architecture_id = analyze_document_structure(document.id, __import__('app.infra.config', fromlist=['Settings']).Settings())
     assert architecture_id
 
 
@@ -263,7 +263,7 @@ class _CountingLlm:
 
 def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document = SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="only.xlsx", file_type="xlsx", sha256=uuid.uuid4().hex,
         blob_uri="blob://only", spec_version="TEST", status="UPLOADED", block_count=1,
@@ -273,7 +273,7 @@ def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
     _block_with_spec(session, document, 0, "SAFE_6_1", ["CUSTNAME"])
 
     llm = _CountingLlm()
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: llm)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
     structure_service.analyze_document_structure(document.id, Settings())
 
     # 自适模式下，已完成结构化解析、又没有任何告警的单块章节不需要再问 AI
@@ -282,7 +282,7 @@ def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
 
 def test_all_scope_sends_every_block_to_ai(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document = SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="only.xlsx", file_type="xlsx", sha256=uuid.uuid4().hex,
         blob_uri="blob://only", spec_version="TEST", status="UPLOADED", block_count=1,
@@ -311,7 +311,7 @@ def test_all_scope_sends_every_block_to_ai(monkeypatch):
                 "global_warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: PassingLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: PassingLlm())
     structure_service.analyze_document_structure(document.id, Settings(structure_ai_scope="all"))
 
     candidates = calls["payload"]["candidate_blocks"]

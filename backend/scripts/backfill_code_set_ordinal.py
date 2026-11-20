@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.asset_models import (  # noqa: E402
+from app.infra.asset_models import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,
@@ -19,7 +19,7 @@ from app.asset_models import (  # noqa: E402
     RawBlockModel,
     TableMetadataModel,
 )
-from app.db import SessionLocal  # noqa: E402
+from app.infra.db import SessionLocal  # noqa: E402
 
 
 def main(apply: bool = True) -> None:

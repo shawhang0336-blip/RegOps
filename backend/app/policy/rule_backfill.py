@@ -8,10 +8,10 @@
 
 from typing import Callable, List, Optional
 
-from ..domain import RuleDefinition, calculate_rule_hash
-from ..errors import WorkflowError
-from ..generic_domain import bind_rules
-from ..rules import RuleValidationError
+from app.engine.domain import RuleDefinition, calculate_rule_hash
+from app.infra.errors import WorkflowError
+from app.engine.binding import bind_rules
+from app.engine.rules import RuleValidationError
 
 
 def _required_backfill_candidates(specs, rules) -> List[tuple]:
@@ -188,7 +188,7 @@ def _backfill_length_rules(
 
 def _fixed_value_candidates(specs, rules) -> List[tuple]:
     """找出「原文明确要求本项固定填某个值」的字段。"""
-    from ..code_service import is_conditional_phrase, parse_fixed_value
+    from app.assets.code_sets.service import is_conditional_phrase, parse_fixed_value
 
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
     candidates = []

@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from ..kernel.event_log import (
+from app.kernel.event_log import (
     RunState,
     fold_with,
     make_interrupt_payload,
@@ -18,8 +18,8 @@ from ..kernel.event_log import (
     project_with,
     register_default_reducer,
 )
-from ..kernel.plan import PlanEdge, PlanNode, WorkflowPlan
-from ..models import EventModel, RunModel
+from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan
+from app.infra.models import EventModel, RunModel
 
 # 条件标签语义（执行器按此查边）：
 #   always                 无条件后继

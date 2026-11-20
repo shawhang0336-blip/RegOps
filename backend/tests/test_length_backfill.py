@@ -10,8 +10,8 @@ LENGTH 已从模型算子白名单移除（列宽是上限，不是定长），�
 「字符型，28」只能推出「最多 28 位」，这是机械结论，不该由模型决定要不要生成。
 """
 
-from app.domain import FieldSpec, SpecDocument
-from app.generic_workflow import _length_backfill_candidates
+from app.engine.domain import FieldSpec, SpecDocument
+from app.engine.workflow import _length_backfill_candidates
 
 
 def _field(name, length, data_type="VARCHAR"):

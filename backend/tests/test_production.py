@@ -2,13 +2,18 @@ import uuid
 
 import pytest
 
-from app.generic_domain import bind_schema
-from app.events import append_event
-from app.models import RunModel
-from app.production import compile_production_mysql_ddl, compile_production_oracle_ddl, compile_production_rule_query, inline_sql_literals
-from app.production_service import build_production_bundle
-from app.rules import build_explicit_rules
-from app.errors import WorkflowError
+from app.engine.binding import bind_schema
+from app.kernel.event_log import append_event
+from app.infra.models import RunModel
+from app.delivery.production import (
+    compile_production_mysql_ddl,
+    compile_production_oracle_ddl,
+    compile_production_rule_query,
+    inline_sql_literals,
+)
+from app.delivery.production_service import build_production_bundle
+from app.engine.rules import build_explicit_rules
+from app.infra.errors import WorkflowError
 from .helpers import make_session
 
 

@@ -21,12 +21,12 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import app.asset_models  # noqa: F401  确保所有 ORM 模型注册到 Base.metadata
-from app.events import project
-from app.config import Settings
-from app.db import Base
-from app.generic_workflow import approve_generic_rules, confirm_generic_test_results, start_generic_run
-from app.models import RuleModel, SpecificationModel
+import app.infra.asset_models
+from app.policy.regops_plan import project
+from app.infra.config import Settings
+from app.infra.db import Base
+from app.engine.workflow import approve_generic_rules, confirm_generic_test_results, start_generic_run
+from app.infra.models import RuleModel, SpecificationModel
 
 pytestmark = pytest.mark.smoke
 

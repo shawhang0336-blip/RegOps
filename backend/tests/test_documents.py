@@ -6,9 +6,16 @@ import pytest
 from fastapi import HTTPException
 from openpyxl import Workbook
 
-from app.api_v2 import code_sets, documents, metadata
-from app.asset_models import CodeSetModel, CodeValueModel, DocumentArchitectureModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
-from app.config import Settings
+from app.api.v2 import code_sets, documents, metadata
+from app.infra.asset_models import (
+    CodeSetModel,
+    CodeValueModel,
+    DocumentArchitectureModel,
+    RawBlockModel,
+    SourceDocumentModel,
+    TableMetadataModel,
+)
+from app.infra.config import Settings
 from .helpers import make_session
 
 
@@ -80,9 +87,9 @@ def test_uploading_deleted_document_rebuilds_blocks(monkeypatch, tmp_path):
                 "warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
-    monkeypatch.setattr("app.structure_service.extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
+    monkeypatch.setattr("app.ingestion.structure_service.extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
 
     reimported = documents.ingest_uploaded_file("sample.xlsx", content)
 
@@ -121,7 +128,7 @@ def extracted_block():
 def configure_upload(session, monkeypatch, tmp_path):
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     monkeypatch.setattr(documents, "get_settings", lambda: Settings(blob_dir=str(tmp_path)))
-    monkeypatch.setattr("app.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
 
 
 def test_document_overview_runs_before_initial_chunking(monkeypatch, tmp_path):
@@ -142,7 +149,7 @@ def test_document_overview_runs_before_initial_chunking(monkeypatch, tmp_path):
                 "warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", lambda path, file_type: (calls.append("INITIAL_CHUNK") or ("TEST", [extracted_block()])))
 
     document = documents.ingest_uploaded_file("sample.xlsx", xlsx_content())
@@ -175,7 +182,7 @@ def test_failed_overview_blocks_chunking_and_can_retry(monkeypatch, tmp_path):
         assert not should_fail, "Initial chunking must not run after a failed overview"
         return "TEST", [extracted_block()]
 
-    monkeypatch.setattr("app.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", extract)
 
     document = documents.ingest_uploaded_file("sample.xlsx", xlsx_content())

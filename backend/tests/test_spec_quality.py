@@ -1,4 +1,4 @@
-from app.spec_quality import inspect_block, inspect_spec
+from app.ingestion.spec_quality import inspect_block, inspect_spec
 
 
 def _spec(fields):

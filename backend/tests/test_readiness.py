@@ -1,6 +1,6 @@
 import uuid
 
-from app.asset_models import (
+from app.infra.asset_models import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,
@@ -9,8 +9,8 @@ from app.asset_models import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.metadata_service import publish_table
-from app.readiness import evaluate_document, evaluate_table, split_preflight_issues, summarize
+from app.assets.metadata_service import publish_table
+from app.assets.readiness import evaluate_document, evaluate_table, split_preflight_issues, summarize
 from .helpers import make_session
 
 
@@ -210,7 +210,7 @@ def test_publish_records_readiness_and_auto_publishes_code_sets():
     )
     publish_table(session, table, "tester", 1)
     assert table.status == "PUBLISHED"
-    from app.asset_models import CodeSetModel, MetadataRevisionModel
+    from app.infra.asset_models import CodeSetModel, MetadataRevisionModel
 
     revision = (
         session.query(MetadataRevisionModel)
@@ -235,7 +235,7 @@ def test_publish_records_code_sets_that_still_need_work():
         fields=[{"en": "CURRENCY", "length": 3, "code_ref": "币种代码表", "required": True}],
         code_set_status="AI_SELF_VALIDATED",
     )
-    from app.asset_models import CodeValueModel, MetadataRevisionModel
+    from app.infra.asset_models import CodeValueModel, MetadataRevisionModel
 
     session.query(CodeValueModel).delete()
     session.commit()
@@ -310,7 +310,7 @@ def test_empty_code_set_is_a_hard_blocker_not_confirmable():
     所以不能给它「确认风险继续」的逃生口——确认了照样 WorkflowError，
     只是让人白点一次。自动发布也发不出去（检查不通过），必须人去补。
     """
-    from app.asset_models import CodeValueModel
+    from app.infra.asset_models import CodeValueModel
 
     session = make_session()
     table = make_table(
@@ -341,7 +341,7 @@ def test_auto_publish_takes_over_the_manual_publish_step():
     几百张码表挨个确认本来就确认不过来，而没发的话阶段 2 的
     load_published_code_sets 直接抛错退出。
     """
-    from app.code_set_readiness import auto_publish_referenced_code_sets
+    from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
 
     session = make_session()
     table = make_table(
@@ -364,8 +364,8 @@ def test_auto_publish_takes_over_the_manual_publish_step():
 
 def test_auto_publish_refuses_empty_code_set():
     """空码表不能自动发出去——那正是需要人补数据的情况。"""
-    from app.asset_models import CodeValueModel
-    from app.code_set_readiness import auto_publish_referenced_code_sets
+    from app.infra.asset_models import CodeValueModel
+    from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
 
     session = make_session()
     table = make_table(

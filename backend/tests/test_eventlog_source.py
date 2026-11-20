@@ -8,8 +8,9 @@
 
 import uuid
 
-from app.events import append_event, fold, project, verify_chain
-from app.models import EventModel, RunModel
+from app.kernel.event_log import append_event, verify_chain
+from app.policy.regops_plan import fold, project
+from app.infra.models import EventModel, RunModel
 from .helpers import make_session
 
 

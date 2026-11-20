@@ -12,20 +12,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from .api_v2 import artifacts as artifacts_v2
-from .api_v2 import code_sets as code_sets_v2
-from .api_v2 import documents as documents_v2
-from .api_v2 import generation as generation_v2
-from .api_v2 import metadata as metadata_v2
-from .api_v2 import settings as settings_v2
-from .blobs import LocalBlobStore
-from .business import BusinessDatabaseError, ReadOnlyBusinessDatabase
-from .catalog import parse_document_catalog
-from .config import get_settings
-from .identity import OPERATOR_PLACEHOLDER
-from .db import SessionLocal, init_db
-from .events import append_event, project, project_many, verify_chain
-from .generic_workflow import (
+from app.api.v2 import artifacts as artifacts_v2
+from app.api.v2 import code_sets as code_sets_v2
+from app.api.v2 import documents as documents_v2
+from app.api.v2 import generation as generation_v2
+from app.api.v2 import metadata as metadata_v2
+from app.api.v2 import settings as settings_v2
+from app.kernel.blob_store import LocalBlobStore
+from app.delivery.business_db import BusinessDatabaseError, ReadOnlyBusinessDatabase
+from app.ingestion.catalog import parse_document_catalog
+from app.infra.config import get_settings
+from app.infra.identity import OPERATOR_PLACEHOLDER
+from app.infra.db import SessionLocal, init_db
+from app.kernel.event_log import append_event, verify_chain
+from app.policy.regops_plan import project, project_many
+from app.engine.workflow import (
     _pending_rules,
     approve_generic_rules,
     confirm_generic_test_results,
@@ -33,17 +34,17 @@ from .generic_workflow import (
     retry_generic_run,
     start_generic_run,
 )
-from .asset_models import (
+from app.infra.asset_models import (
     ArtifactModel,
     AuditCaseDefinitionModel,
     GenerationPlanModel,
     GeneratorDefinitionModel,
     SchemaDefinitionModel,
 )
-from .models import EventModel, RuleModel, RunModel, SpecificationModel
-from .oracle_sandbox import OracleSandbox
-from .spec_parser import SpecParseError
-from .errors import WorkflowError
+from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.engine.oracle import OracleSandbox
+from app.ingestion.spec_parser import SpecParseError
+from app.infra.errors import WorkflowError
 
 
 def _mark_interrupted_runs():
@@ -514,7 +515,7 @@ def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
 
 
 def _latest_event_tables(events: List[EventModel], kind: str) -> Dict:
-    from .context import resolve_event_tables
+    from app.kernel.channel import resolve_event_tables
 
     blob_store = LocalBlobStore(settings.blob_dir)
     tables: Dict = {}
@@ -801,7 +802,7 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
 @app.get("/api/runs/{run_id}/bus-events")
 def run_bus_events(run_id: str, topic: Optional[str] = Query(default=None)) -> Dict:
     """查看某个 Run 在全生命周期 Bus 上广播的实时事件流。"""
-    from .bus import global_bus
+    from app.kernel.bus import global_bus
 
     events = global_bus().history(topic=topic, run_id=run_id)
     return {"run_id": run_id, "count": len(events), "events": events}

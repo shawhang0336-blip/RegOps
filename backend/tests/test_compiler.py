@@ -1,5 +1,5 @@
-from app.compiler import compile_mysql_ddl, compile_rule_query, quote_identifier
-from app.rules import build_explicit_rules
+from app.engine.compiler import compile_mysql_ddl, compile_rule_query, quote_identifier
+from app.engine.rules import build_explicit_rules
 
 
 def test_mysql_artifacts_use_whitelisted_identifiers_and_parameters(organization_spec):

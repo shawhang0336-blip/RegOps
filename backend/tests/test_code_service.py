@@ -3,12 +3,30 @@ from openpyxl import Workbook
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.asset_models import CodeSetModel, CodeSetValidationModel, CodeValueModel, FieldCodeReferenceModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
-from app.db import Base
-from app.code_service import CodeSetDraft, _upsert_code_set_draft, auto_link_all_references, extract_code_sets_for_block, extract_parallel_for_blocks, generation_blockers, normalize_code_set_name, parse_inline_enum, refresh_reference_status
-from app.config import Settings
-from app.extractors import extract_xlsx
-from app.metadata_service import publish_table
+from app.infra.asset_models import (
+    CodeSetModel,
+    CodeSetValidationModel,
+    CodeValueModel,
+    FieldCodeReferenceModel,
+    RawBlockModel,
+    SourceDocumentModel,
+    TableMetadataModel,
+)
+from app.infra.db import Base
+from app.assets.code_sets.service import (
+    CodeSetDraft,
+    _upsert_code_set_draft,
+    auto_link_all_references,
+    extract_code_sets_for_block,
+    extract_parallel_for_blocks,
+    generation_blockers,
+    normalize_code_set_name,
+    parse_inline_enum,
+    refresh_reference_status,
+)
+from app.infra.config import Settings
+from app.ingestion.extractors import extract_xlsx
+from app.assets.metadata_service import publish_table
 from .test_metadata_service import make_metadata
 from .helpers import make_session
 
@@ -49,8 +67,8 @@ def test_parallel_extraction_extracts_metadata_and_code_sets_and_autolinks(monke
     engine = create_engine(f"sqlite:///{tmp_path / 'parallel.db'}")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    monkeypatch.setattr("app.code_service.SessionLocal", session_factory)
-    monkeypatch.setattr("app.metadata_service.SessionLocal", session_factory)
+    monkeypatch.setattr("app.assets.code_sets.service.SessionLocal", session_factory)
+    monkeypatch.setattr("app.assets.metadata_service.SessionLocal", session_factory)
     session = session_factory()
 
     # Create a multi-sheet XLSX with one field table sheet and one code set sheet
@@ -148,7 +166,7 @@ def test_substring_code_set_name_does_not_auto_bind():
 
 def test_code_set_ai_review_runs_once_for_unchanged_content(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.code_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.assets.code_sets.service.SessionLocal", lambda: session)
 
     class FakeReviewLlm:
         calls = 0
@@ -159,7 +177,7 @@ def test_code_set_ai_review_runs_once_for_unchanged_content(monkeypatch):
             return {"issues": []}, {"provider": "FIXTURE", "tool_name": tool_name}
 
     reviewer = FakeReviewLlm()
-    monkeypatch.setattr("app.code_service.RealDesignLlm", lambda settings: reviewer)
+    monkeypatch.setattr("app.assets.code_sets.service.RealDesignLlm", lambda settings: reviewer)
     document = SourceDocumentModel(
         id=str(uuid.uuid4()),
         file_name="codes.xlsx",

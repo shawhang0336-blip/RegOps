@@ -1,7 +1,7 @@
 import pytest
 
-from app.domain import Evidence, RuleDefinition, calculate_rule_hash
-from app.rules import RuleValidationError, build_explicit_rules, validate_rule
+from app.engine.domain import Evidence, RuleDefinition, calculate_rule_hash
+from app.engine.rules import RuleValidationError, build_explicit_rules, validate_rule
 
 
 def test_real_pdf_yields_field_whitelist_and_evidence(organization_spec):
