@@ -101,25 +101,40 @@ class Scheduler:
                 # 该节点没有 body（如由外部事件推进的 gate / terminal 节点）→ 停下
                 break
             ctx.current_node = node
+            if hasattr(ctx.bus, "fire"):
+                ctx.bus.fire("node.enter", {"run_id": ctx.run.id, "node": node, "attempt": ctx.state.attempt})
             outcome = body(None, ctx)
             # 屏障：先落 Bus 拦截事件与节点事件，再写 Channel，再折叠 state，最后应用 goto
             bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
             for rej in bus_rejections:
-                append_event(ctx.session, ctx.run, "BUS_REJECTED", node, rej)
+                append_event(ctx.session, ctx.run, "BUS_REJECTED", node, rej, bus=ctx.bus)
             for kind, ev_node, payload in outcome.events:
-                append_event(ctx.session, ctx.run, kind, ev_node, payload)
+                append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
             ctx.session.flush()
             for key, value in outcome.shared.items():
                 ctx.put(key, value)
             ctx.refresh_state()
+            if hasattr(ctx.bus, "fire"):
+                ctx.bus.fire(
+                    "node.exit",
+                    {
+                        "run_id": ctx.run.id,
+                        "node": node,
+                        "when": outcome.when,
+                        "goto": outcome.goto,
+                        "status": ctx.state.status,
+                    },
+                )
             executed.append(StepResult(node, outcome))
             if outcome.goto:
                 if outcome.goto not in {item.name for item in self.plan.nodes}:
                     raise ValueError(f"goto 目标不在 Plan 中：{outcome.goto}")
                 goto_payload = {"target": outcome.goto, "reason": "scheduler goto", **outcome.control}
-                append_event(ctx.session, ctx.run, "GO_REDIRECT", node, goto_payload)
+                append_event(ctx.session, ctx.run, "GO_REDIRECT", node, goto_payload, bus=ctx.bus)
                 ctx.session.flush()
                 ctx.refresh_state()
+                if hasattr(ctx.bus, "fire"):
+                    ctx.bus.fire("node.redirect", {"run_id": ctx.run.id, "from": node, **goto_payload})
                 # goto 是"重新执行目标节点"，不是"执行目标的后继"
                 target = outcome.goto
                 cursor = outcome.goto
@@ -128,7 +143,12 @@ class Scheduler:
                 last_when = outcome.when
             # 只在终态停；WAITING_* 由 _next 在 gate 处返回 None 实现中断
             if ctx.state.status in {"COMPLETED", "FAILED"}:
+                if hasattr(ctx.bus, "fire"):
+                    topic = "run.completed" if ctx.state.status == "COMPLETED" else "run.failed"
+                    ctx.bus.fire(topic, {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
                 ctx.session.commit()
                 return executed
+        if hasattr(ctx.bus, "fire") and ctx.state.status.startswith("WAITING_"):
+            ctx.bus.fire("run.interrupted", {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
         ctx.session.commit()
         return executed

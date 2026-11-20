@@ -1,49 +1,148 @@
-"""Bus：AI 工具调用的统一门禁层。
+"""Bus：ProdAgent 全生命周期事件总线（事前门禁裁决 check/adjudicate + 事后广播 fire/subscribe）。
 
-模型只负责填工具参数，参数在执行前先过 Bus 的前置裁决（adjudicator）。
-裁决器返回拒绝原因即物理拦截，原因回喂给模型重试，并记录到 trace 与 EventLog（BUS_REJECTED）。
-这把 ProdAgent「机制在内、策略在外」的 Bus 裁决落到了实际执行链路上：
-白名单约束不再只写在 prompt 里，而是代码里的一道硬门。
-
-设计要点：
-- Bus 不认识具体算子实现，裁决器按 tool_name 与 payload 契约运行，新增规则只加裁决器；
-- 裁决是纯函数（args + payload -> 拒绝原因或 None），无 DB 副作用；
-- 拦截记录线程安全地暂存，既回写 trace，又在 Scheduler 屏障处统一落 BUS_REJECTED 事件。
+一体两面设计（对标李号双 limenagent/prodagent）：
+1. 事前门禁裁决（check / adjudicate）：
+   模型或节点准备执行动作前先过 Bus 征询；任一裁决器返回拒绝原因即物理拦截，
+   原因回喂给模型重试，同时触发 `tool.rejected` 广播并在屏障处落 `BUS_REJECTED` 事件。
+2. 全生命周期事后广播（fire / subscribe）：
+   覆盖 Run 启停与中断（`run.*`）、节点进出与跳转（`node.*`）、BSP 并发波次（`wave.*`）、
+   工具调用前后（`tool.*`）、事件账本追加（`event.appended`）以及文档解析进度（`document.progress`）。
+   旁观订阅者（Observer）异常被严格隔离，绝不影响主流程状态机推进。
 """
 
 import threading
+import time
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
 from .domain import LLM_OPERATORS
 
 Adjudicator = Callable[[str, Dict[str, Any], Dict[str, Any]], Optional[str]]
+Subscriber = Callable[[Dict[str, Any]], None]
+
+LIFECYCLE_TOPICS = (
+    "run.created",
+    "run.resumed",
+    "run.interrupted",
+    "run.completed",
+    "run.failed",
+    "node.enter",
+    "node.exit",
+    "node.redirect",
+    "node.error",
+    "wave.fanout",
+    "wave.barrier",
+    "tool.before",
+    "tool.after",
+    "tool.rejected",
+    "event.appended",
+    "document.progress",
+)
+
+MAX_BUS_HISTORY = 2000
 
 
 class Bus:
-    """工具调用总线：前置裁决 + 旁观记录 + 线程安全拦截缓冲。"""
+    """全生命周期总线：事前门禁裁决（adjudicate/check）+ 事后主题广播（fire/subscribe）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, parent: Optional["Bus"] = None) -> None:
         self._adjudicators: List[Adjudicator] = []
-        self._observers: List[Callable[[Dict[str, Any]], None]] = []
+        self._observers: List[Subscriber] = []
+        self._subscribers: Dict[str, List[Subscriber]] = defaultdict(list)
         self._rejections: List[Dict[str, Any]] = []
+        self._history: List[Dict[str, Any]] = []
+        self._seq: int = 0
+        self._parent: Optional["Bus"] = parent
         self._lock = threading.Lock()
 
     def add_adjudicator(self, fn: Adjudicator) -> "Bus":
-        self._adjudicators.append(fn)
+        with self._lock:
+            self._adjudicators.append(fn)
         return self
 
-    def add_observer(self, fn: Callable[[Dict[str, Any]], None]) -> "Bus":
-        self._observers.append(fn)
+    def add_observer(self, fn: Subscriber) -> "Bus":
+        """注册门禁拦截旁观者（兼容旧接口；等价于订阅 tool.rejected）。"""
+        with self._lock:
+            self._observers.append(fn)
         return self
+
+    def subscribe(self, topic: str, fn: Subscriber) -> "Bus":
+        """订阅特定生命周期主题（如 'node.enter'、'tool.rejected'、'event.appended'）或 '*' 通配全部主题。"""
+        with self._lock:
+            self._subscribers[topic].append(fn)
+        return self
+
+    def unsubscribe(self, topic: str, fn: Subscriber) -> "Bus":
+        with self._lock:
+            handlers = self._subscribers.get(topic, [])
+            if fn in handlers:
+                handlers.remove(fn)
+        return self
+
+    def fire(self, topic: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """向外广播一条生命周期事件。旁观者抛出的任何异常均被吞掉隔离，绝不阻断主流程。"""
+        with self._lock:
+            self._seq += 1
+            envelope: Dict[str, Any] = {
+                "seq": self._seq,
+                "topic": topic,
+                "timestamp": time.time(),
+                **(payload or {}),
+            }
+            self._history.append(envelope)
+            if len(self._history) > MAX_BUS_HISTORY:
+                del self._history[:-MAX_BUS_HISTORY]
+            topic_handlers = list(self._subscribers.get(topic, []))
+            wildcard_handlers = list(self._subscribers.get("*", []))
+            parent = self._parent
+
+        for handler in topic_handlers + wildcard_handlers:
+            try:
+                handler(envelope)
+            except Exception:
+                # 旁观者只看不拦：任何订阅者异常不得影响主流程
+                pass
+
+        if parent is not None:
+            parent._forward(envelope)
+        return envelope
+
+    def _forward(self, envelope: Dict[str, Any]) -> None:
+        """子 Bus（如单次 Run 的 ctx.bus）向全局 Bus 冒泡广播。"""
+        topic = envelope.get("topic", "")
+        with self._lock:
+            self._seq += 1
+            forwarded = {**envelope, "global_seq": self._seq}
+            self._history.append(forwarded)
+            if len(self._history) > MAX_BUS_HISTORY:
+                del self._history[:-MAX_BUS_HISTORY]
+            topic_handlers = list(self._subscribers.get(topic, []))
+            wildcard_handlers = list(self._subscribers.get("*", []))
+        for handler in topic_handlers + wildcard_handlers:
+            try:
+                handler(forwarded)
+            except Exception:
+                pass
 
     def adjudicate(self, tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
-        """逐个跑裁决器，第一个拒绝原因立即返回；全部通过返回 None。"""
-        for fn in self._adjudicators:
+        """事前门禁裁决：先发 tool.before 广播，再逐个跑裁决器；拒绝时发 tool.rejected 广播并返回原因。"""
+        table_code = payload.get("table_code") or (payload.get("table") or {}).get("table_code")
+        fields = payload.get("fields") or []
+        field_name = fields[0].get("name") if len(fields) == 1 and isinstance(fields[0], dict) else None
+
+        before_meta: Dict[str, Any] = {"tool": tool_name, "args": args}
+        if table_code:
+            before_meta["table_code"] = table_code
+        if field_name:
+            before_meta["field"] = field_name
+        self.fire("tool.before", before_meta)
+
+        with self._lock:
+            adjudicators = list(self._adjudicators)
+
+        for fn in adjudicators:
             reason = fn(tool_name, args, payload)
             if reason:
-                table_code = payload.get("table_code") or (payload.get("table") or {}).get("table_code")
-                fields = payload.get("fields") or []
-                field_name = fields[0].get("name") if len(fields) == 1 and isinstance(fields[0], dict) else None
                 record: Dict[str, Any] = {
                     "tool": tool_name,
                     "adjudicator": getattr(fn, "__name__", "anonymous"),
@@ -57,10 +156,17 @@ class Bus:
                 with self._lock:
                     self._rejections.append(record)
                     observers = list(self._observers)
+                self.fire("tool.rejected", record)
                 for observer in observers:
-                    observer(record)
+                    try:
+                        observer(record)
+                    except Exception:
+                        pass
                 return reason
         return None
+
+    # ProdAgent 标准别名：check 等同于 adjudicate
+    check = adjudicate
 
     def drain_rejections(self) -> List[Dict[str, Any]]:
         """取出并清空已累积的 Bus 拦截记录，供 Scheduler 屏障处统一落 BUS_REJECTED 事件。"""
@@ -68,6 +174,20 @@ class Bus:
             items = list(self._rejections)
             self._rejections.clear()
             return items
+
+    def history(self, topic: Optional[str] = None, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """查询已广播的生命周期事件流（可按 topic 或 run_id 过滤）。"""
+        with self._lock:
+            items = list(self._history)
+        if topic is not None:
+            items = [item for item in items if item.get("topic") == topic]
+        if run_id is not None:
+            items = [item for item in items if item.get("run_id") == run_id]
+        return items
+
+    def clear_history(self) -> None:
+        with self._lock:
+            self._history.clear()
 
 
 # 字段名参数：模型在这些槽位上填错/编造会导致规则、生成器或表结构绑定到不存在的列
@@ -231,10 +351,25 @@ def structure_block_adjudicator(
     return None
 
 
-def default_bus() -> Bus:
-    """默认门禁组合：字段白名单 + 跨表引用 + 算子白名单 + 码表值域 + 结构块白名单。"""
+_GLOBAL_BUS = (
+    Bus()
+    .add_adjudicator(field_whitelist_adjudicator)
+    .add_adjudicator(cross_table_adjudicator)
+    .add_adjudicator(operator_whitelist_adjudicator)
+    .add_adjudicator(code_set_values_adjudicator)
+    .add_adjudicator(structure_block_adjudicator)
+)
+
+
+def global_bus() -> Bus:
+    """进程级全局 Bus：汇聚所有 Run 子总线的生命周期广播与文档解析进度广播。"""
+    return _GLOBAL_BUS
+
+
+def default_bus(parent: Optional[Bus] = _GLOBAL_BUS) -> Bus:
+    """单次 Run 的默认总线：搭载五大确定性门禁，并将生命周期广播冒泡至 global_bus。"""
     return (
-        Bus()
+        Bus(parent=parent)
         .add_adjudicator(field_whitelist_adjudicator)
         .add_adjudicator(cross_table_adjudicator)
         .add_adjudicator(operator_whitelist_adjudicator)

@@ -798,6 +798,15 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     }
 
 
+@app.get("/api/runs/{run_id}/bus-events")
+def run_bus_events(run_id: str, topic: Optional[str] = Query(default=None)) -> Dict:
+    """查看某个 Run 在全生命周期 Bus 上广播的实时事件流。"""
+    from .bus import global_bus
+
+    events = global_bus().history(topic=topic, run_id=run_id)
+    return {"run_id": run_id, "count": len(events), "events": events}
+
+
 @app.get("/api/blobs/{digest}")
 def get_blob(digest: str) -> Dict:
     try:

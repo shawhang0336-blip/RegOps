@@ -374,8 +374,9 @@ def append_event(
     kind: str,
     node: str,
     payload: Dict[str, Any],
+    bus: Any = None,
 ) -> EventModel:
-    """追加一条不可变事件。这是 Run 状态变化的唯一入口。"""
+    """追加一条不可变事件，并通过 Bus 广播 event.appended 生命周期信号。"""
     previous = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id)
@@ -404,6 +405,27 @@ def append_event(
     run.updated_at = datetime.utcnow()
     session.flush()
     _state_cache(session).pop(run.id, None)
+
+    active_bus = bus
+    if active_bus is None:
+        from .bus import global_bus
+
+        active_bus = global_bus()
+    if hasattr(active_bus, "fire"):
+        active_bus.fire(
+            "event.appended",
+            {
+                "run_id": run.id,
+                "seq": event.seq,
+                "kind": kind,
+                "node": node,
+                "event_hash": event.event_hash,
+            },
+        )
+        if kind == "RUN_CREATED":
+            active_bus.fire("run.created", {"run_id": run.id, "spec_id": run.spec_id, "node": node})
+        elif kind in {"RUN_RESUMED", "REAUDIT_REQUESTED"}:
+            active_bus.fire("run.resumed", {"run_id": run.id, "kind": kind, "node": node})
     return event
 
 

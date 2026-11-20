@@ -10,6 +10,7 @@ from app.bus import (
     cross_table_adjudicator,
     default_bus,
     field_whitelist_adjudicator,
+    global_bus,
     operator_whitelist_adjudicator,
     structure_block_adjudicator,
 )
@@ -164,3 +165,73 @@ def test_operator_and_code_set_and_structure_adjudicators():
         {"blocks": [{"source_block_ids": ["b1"]}]},
         {"candidate_blocks": [{"id": "b1"}]},
     ) is None
+
+
+def test_bus_full_lifecycle_fire_subscribe_isolation_and_global_bubbling():
+    """验证 Bus 全生命周期广播：
+    1. 精确主题订阅与 '*' 通配订阅；
+    2. 旁观者抛异常时被严格隔离，绝不影响主流程；
+    3. tool.before / tool.rejected / tool.after 全生命周期信号；
+    4. 子 Bus 向 global_bus 冒泡，以及 document.progress 进度广播。
+    """
+    parent = Bus()
+    child = default_bus(parent=parent)
+
+    seen_topics = []
+    parent_topics = []
+
+    def bad_subscriber(_ev):
+        raise RuntimeError("broken observer should never crash workflow")
+
+    child.subscribe("*", bad_subscriber)
+    child.subscribe("*", lambda ev: seen_topics.append(ev["topic"]))
+    parent.subscribe("*", lambda ev: parent_topics.append(ev["topic"]))
+
+    class Llm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if feedback is None:
+                return {"rules": [{"field": "FAKE_FIELD"}]}, {"provider": "TEST"}
+            return {"rules": [{"field": "CUSTCODE"}]}, {"provider": "TEST"}
+
+    child.fire("node.enter", {"run_id": "r1", "node": "rule_binder"})
+    result, _ = _call_validated(
+        Llm(),
+        "assign_rules",
+        "instr",
+        {"field_names": ["CUSTCODE"], "table_code": "SAFE_6_1"},
+        lambda args: args,
+        backoff=(0, 0, 0),
+        bus=child,
+    )
+    child.fire("node.exit", {"run_id": "r1", "node": "rule_binder", "status": "RUNNING"})
+
+    assert result["rules"][0]["field"] == "CUSTCODE"
+    assert seen_topics == [
+        "node.enter",
+        "tool.before",
+        "tool.rejected",
+        "tool.before",
+        "tool.after",
+        "node.exit",
+    ]
+    assert parent_topics == seen_topics
+    assert len(child.history(topic="tool.rejected")) == 1
+    assert len(parent.history(run_id="r1")) == 2
+
+    # 验证阶段一 import_progress 亦通过 global_bus 广播 document.progress
+    from app.import_progress import finish, forget, start, update
+
+    doc_events = []
+    handler = lambda ev: doc_events.append(ev)
+    global_bus().subscribe("document.progress", handler)
+    try:
+        start("doc-bus-test", "spec.pdf")
+        update("doc-bus-test", stage=2, detail="结构体检中", log="开始体检")
+        finish("doc-bus-test", status="DONE", detail="完成")
+    finally:
+        global_bus().unsubscribe("document.progress", handler)
+        forget("doc-bus-test")
+
+    assert len(doc_events) == 3
+    assert [e["stage"] for e in doc_events] == [1, 2, 4]
+    assert doc_events[-1]["status"] == "DONE"

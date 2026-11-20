@@ -10,7 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .blobs import LocalBlobStore
-from .bus import default_bus
+from .bus import default_bus, global_bus
 from .context import Identity, RunContext, build_context
 from .scheduler import Outcome, Scheduler
 from .code_set_oracle import (
@@ -237,6 +237,15 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
                 trace["retried_after_timeout"] = True
             if attempt > 1:
                 trace["attempts"] = attempt
+            if hasattr(bus, "fire"):
+                bus.fire(
+                    "tool.after",
+                    {
+                        "tool": tool_name,
+                        "attempts": attempt,
+                        "table_code": payload.get("table_code") or (payload.get("table") or {}).get("table_code"),
+                    },
+                )
             return result, trace
         except LlmTimeoutError as exc:
             transient_used += 1
@@ -300,18 +309,25 @@ def _fanout(
     worker,
     max_workers: int = 4,
     events: Optional[List[tuple]] = None,
+    bus: Any = None,
 ) -> List[Any]:
+    table_codes = [spec.table_code for spec in specs]
+    active_bus = bus if bus is not None else global_bus()
+    if hasattr(active_bus, "fire"):
+        active_bus.fire("wave.fanout", {"run_id": run.id, "stage": stage, "table_codes": table_codes, "wave_size": len(specs)})
     _emit(
         events,
         session,
         run,
         "BSP_FANOUT",
         stage,
-        {"stage": stage, "table_codes": [spec.table_code for spec in specs]},
+        {"stage": stage, "table_codes": table_codes},
     )
     with ThreadPoolExecutor(max_workers=min(max_workers, len(specs))) as executor:
         futures = [executor.submit(worker, spec) for spec in specs]
         results = [future.result() for future in futures]
+    if hasattr(active_bus, "fire"):
+        active_bus.fire("wave.barrier", {"run_id": run.id, "stage": stage, "table_codes": table_codes, "merged_count": len(results)})
     for spec, (_, trace) in zip(specs, results):
         _emit(
             events,
@@ -355,7 +371,7 @@ def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4, bus=None
             bus=bus,
         )
 
-    results = _fanout(session, run, "generation_planner", specs, worker, max_workers=concurrency, events=events)
+    results = _fanout(session, run, "generation_planner", specs, worker, max_workers=concurrency, events=events, bus=bus)
     plans = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     _emit(
         events,
@@ -398,7 +414,7 @@ def _schema_stage(session, run, specs, llm, concurrency: int = 4, bus=None, even
             bus=bus,
         )
 
-    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency, events=events)
+    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency, events=events, bus=bus)
     schemas = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     for spec in specs:
         session.add(
@@ -522,7 +538,7 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
             "arguments": {"rules": [rule.model_dump() for rule in bound_rules]},
         }
 
-    results = _fanout(session, run, "rule_binder", specs, worker, max_workers=concurrency, events=events)
+    results = _fanout(session, run, "rule_binder", specs, worker, max_workers=concurrency, events=events, bus=bus)
     gaps_by_table = {
         spec.table_code: trace["gaps"]
         for spec, (_, trace) in zip(specs, results)
@@ -744,7 +760,7 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
             "arguments": {"generators": generator_items},
         }
 
-    results = _fanout(session, run, "data_generator_binder", specs, worker, max_workers=concurrency, events=events)
+    results = _fanout(session, run, "data_generator_binder", specs, worker, max_workers=concurrency, events=events, bus=bus)
     generators = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     golden_records = {
         spec.table_code: materialize_golden_record(spec, generators[spec.table_code]) for spec in specs
@@ -1108,7 +1124,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
             "arguments": {"cases": [case.model_dump() for case in case_items]},
         }
 
-    results = _fanout(session, run, "audit_case_binder", specs, worker, max_workers=concurrency, events=events)
+    results = _fanout(session, run, "audit_case_binder", specs, worker, max_workers=concurrency, events=events, bus=bus)
     audit_gaps = {
         spec.table_code: trace["gaps"]
         for spec, (_, trace) in zip(specs, results)
@@ -1548,8 +1564,10 @@ def drive(session: Session, run: RunModel, settings: Settings, llm=None, generat
         scheduler.drive(ctx)
     except Exception as exc:
         failed_node = ctx.current_node or ctx.state.current_node or "created"
+        if hasattr(ctx.bus, "fire"):
+            ctx.bus.fire("node.error", {"run_id": run.id, "node": failed_node, "error": f"{type(exc).__name__}: {exc}"})
         for rej in (ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []):
-            append_event(session, run, "BUS_REJECTED", failed_node, rej)
+            append_event(session, run, "BUS_REJECTED", failed_node, rej, bus=ctx.bus)
         append_event(
             session, run, "RUN_FAILED", failed_node,
             {
@@ -1561,7 +1579,10 @@ def drive(session: Session, run: RunModel, settings: Settings, llm=None, generat
                     "error_details": _error_details(exc, failed_node),
                 },
             },
+            bus=ctx.bus,
         )
+        if hasattr(ctx.bus, "fire"):
+            ctx.bus.fire("run.failed", {"run_id": run.id, "node": failed_node, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"})
         session.commit()
     return run
 
@@ -1673,6 +1694,7 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
         answer_payload["interrupt_seq"] = interrupt.seq
         answer_payload["answer_fingerprint"] = fingerprint
     append_event(session, run, "TEST_RESULTS_CONFIRMED", "test_confirmation", answer_payload)
+    global_bus().fire("run.completed", {"run_id": run.id, "node": "export", "status": "COMPLETED"})
     session.commit()
     return run
 

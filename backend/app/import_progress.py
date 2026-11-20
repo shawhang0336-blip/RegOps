@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from .bus import global_bus
+
 _LOCK = threading.Lock()
 _STATE: Dict[str, Dict[str, Any]] = {}
 
@@ -39,6 +41,16 @@ def start(document_id: str, file_name: str, *, auto_parse: bool = False) -> None
             "updated_at": _now(),
             "auto_parse": auto_parse,
         }
+    global_bus().fire(
+        "document.progress",
+        {
+            "document_id": document_id,
+            "file_name": file_name,
+            "stage": 1,
+            "status": "WORKING",
+            "detail": "正在校验文件格式与指纹",
+        },
+    )
 
 
 def ensure(document_id: str, file_name: str = "") -> None:
@@ -77,6 +89,15 @@ def update(
             logs.append({"at": _now(), "text": log, "stage": state["stage"]})
             del logs[:-MAX_LOGS]
         state["updated_at"] = _now()
+        snapshot_event = {
+            "document_id": document_id,
+            "file_name": state.get("file_name", ""),
+            "stage": state["stage"],
+            "status": state["status"],
+            "detail": state["detail"],
+            "log": log,
+        }
+    global_bus().fire("document.progress", snapshot_event)
 
 
 def finish(document_id: str, *, status: str = "DONE", detail: Optional[str] = None) -> None:
