@@ -1,30 +1,18 @@
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
-
-from app.engine.domain import LLM_OPERATORS, Evidence, RuleDefinition, SpecDocument, calculate_rule_hash
+from app.infra.domain import (
+    LLM_OPERATORS,
+    AuditCaseBinding,
+    Evidence,
+    GeneratorBinding,
+    RuleDefinition,
+    SchemaBinding,
+    SpecDocument,
+    calculate_rule_hash,
+    field_map,
+)
 from app.engine.rules import RuleValidationError, validate_rule
-from app.ingestion.spec_parser import field_map
-
-
-class SchemaBinding(BaseModel):
-    field: str
-    storage_type: Literal["TEXT", "NUMBER"]
-    length: int = Field(gt=0)
-    decimal_places: int = Field(default=0, ge=0)
-
-
-class GeneratorBinding(BaseModel):
-    field: str
-    generator: Literal["FIXED", "ENUM", "SEQUENCE"]
-    params: Dict[str, Any]
-
-
-class AuditCaseBinding(BaseModel):
-    case_id: str
-    overrides: Dict[str, Any] = Field(default_factory=dict)
-    expected_rule_keys: List[str] = Field(default_factory=list)
 
 
 def bind_schema(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[SchemaBinding]:

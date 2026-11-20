@@ -15,7 +15,7 @@ from app.infra.asset_models import (
 )
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.engine.llm import RealDesignLlm
+from app.infra.llm import RealDesignLlm
 
 
 def _split_segments(raw_content: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:

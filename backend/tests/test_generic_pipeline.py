@@ -6,7 +6,7 @@ from app.ingestion.catalog import parse_document_catalog
 from app.infra.config import Settings, get_settings
 from app.engine.binding import bind_generators, bind_rules, bind_schema
 from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
-from app.engine.llm import LlmTimeoutError
+from app.infra.llm import LlmTimeoutError
 from app.policy.regops_plan import project
 from app.engine.workflow import (
     _call_validated,

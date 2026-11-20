@@ -1,12 +1,7 @@
 from typing import Any, Dict, Optional, Tuple
 
-from app.engine.domain import RuleDefinition, SpecDocument
-
-
-def quote_identifier(name: str, dialect: str = "mysql") -> str:
-    if not name.replace("_", "").isalnum() or not name.isascii():
-        raise ValueError(f"Unsafe SQL identifier: {name}")
-    return f'"{name}"' if dialect == "oracle" else f"`{name}`"
+from app.infra.domain import RuleDefinition, SpecDocument
+from app.infra.sql import quote_identifier
 
 
 def _blank_fold(field: str, dialect: str) -> str:

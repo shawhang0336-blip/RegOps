@@ -7,13 +7,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.api.v2.settings import get_budget
 from app.infra.asset_models import GenerationPlanModel, TableMetadataModel
 from app.assets.code_sets.service import generation_blockers
 from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
-from app.engine.domain import canonical_json
+from app.infra.domain import canonical_json
+from app.infra.settings_store import get_budget
 from app.kernel.event_log import append_event
 from app.policy.regops_plan import project
 from app.engine.workflow import _create_run, drive

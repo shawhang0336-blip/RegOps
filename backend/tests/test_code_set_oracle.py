@@ -11,7 +11,7 @@ from app.assets.code_sets.oracle import (
     stable_code_set_table,
     validate_code_set_usage,
 )
-from app.engine.domain import RuleDefinition
+from app.infra.domain import RuleDefinition
 from app.engine.binding import GeneratorBinding
 from app.engine.workflow import _code_set_context
 from app.assets.metadata_service import metadata_to_spec, publish_table

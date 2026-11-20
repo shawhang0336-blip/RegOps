@@ -7,7 +7,7 @@ import httpx
 from json_repair import repair_json
 
 from app.infra.config import Settings
-from app.engine.domain import LLM_OPERATORS, SpecDocument
+from app.infra.domain import LLM_OPERATORS, SpecDocument
 
 # LLM 并发闸门：默认值只是兜底，实际宽度由系统设置的 max_llm_concurrency 决定，
 # 生成批次启动时通过 configure_llm_concurrency 调整。

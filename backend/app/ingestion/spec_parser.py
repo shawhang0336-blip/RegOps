@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.engine.domain import FieldSpec, SpecDocument
+from app.infra.domain import FieldSpec, SpecDocument
 
 
 class SpecParseError(ValueError):
@@ -779,7 +779,3 @@ def parse_safe_13_organization_spec(pdf_path: str) -> SpecDocument:
     raw = path.read_bytes()
     text = _extract_pdf_text(path)
     return _parse_location(text, SECTIONS[0], path.name, hashlib.sha256(raw).hexdigest())
-
-
-def field_map(spec: SpecDocument) -> Dict[str, FieldSpec]:
-    return {field.name: field for field in spec.fields}

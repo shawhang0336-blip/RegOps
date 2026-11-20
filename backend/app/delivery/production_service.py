@@ -17,7 +17,7 @@ from app.assets.code_sets.oracle import (
     load_published_code_sets,
     stable_code_set_table,
 )
-from app.engine.domain import RuleDefinition, canonical_json
+from app.infra.domain import RuleDefinition, canonical_json
 from app.policy.regops_plan import project
 from app.engine.binding import SchemaBinding
 from app.engine.workflow import _latest_payload, _specs

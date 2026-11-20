@@ -10,8 +10,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import Session
 
 from app.infra.config import Settings
-from app.engine.domain import RuleDefinition
-from app.engine.binding import AuditCaseBinding
+from app.infra.domain import AuditCaseBinding, RuleDefinition
 from app.kernel.blob_store import LocalBlobStore
 from app.kernel.channel import ChannelSpec, Identity, RunContext, last_value, merge_dict, resolve_event_tables
 from app.infra.models import EventModel, RuleModel, RunModel

@@ -14,7 +14,7 @@ from app.policy.regops_bus import (
     structure_block_adjudicator,
 )
 from app.engine.workflow import _call_validated
-from app.engine.llm import LlmTimeoutError
+from app.infra.llm import LlmTimeoutError
 from app.infra.errors import WorkflowError
 
 

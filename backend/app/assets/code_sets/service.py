@@ -52,7 +52,7 @@ from app.assets.code_sets.parser import (
     parse_inline_enum,
     validate_code_set_draft,
 )
-from app.engine.llm import RealDesignLlm
+from app.infra.llm import RealDesignLlm
 from app.infra.asset_models import (
     CodeSetModel,
     CodeSetValidationModel,

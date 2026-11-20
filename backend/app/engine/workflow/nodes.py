@@ -18,7 +18,7 @@ from app.assets.code_sets.oracle import (
 )
 from app.engine.binding import GeneratorBinding, SchemaBinding
 from app.engine.compiler import compile_rule_query
-from app.engine.domain import RuleDefinition, canonical_json
+from app.infra.domain import RuleDefinition, canonical_json
 from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
 from app.engine.workflow.runtime import _latest_payload, _pending_rules
 from app.engine.workflow.stages import (

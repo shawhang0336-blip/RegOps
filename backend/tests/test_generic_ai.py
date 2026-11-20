@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from app.infra.config import Settings
-from app.engine.llm import LlmTimeoutError, RealDesignLlm
+from app.infra.llm import LlmTimeoutError, RealDesignLlm
 
 
 def _ok_response():
@@ -39,7 +39,7 @@ def test_default_omits_thinking_and_records_call_timing(monkeypatch):
         captured["timeout"] = timeout
         return _ok_response()
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.httpx.post", post)
     _, trace = RealDesignLlm(Settings(llm_api_key="offline-test")).assign(
         "assign_generation_plan", "test", {}, timeout=12
     )
@@ -57,7 +57,7 @@ def test_configured_thinking_is_sent(monkeypatch):
         captured["json"] = json
         return _ok_response()
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.httpx.post", post)
     RealDesignLlm(Settings(llm_api_key="offline-test", llm_thinking="low")).assign(
         "assign_generation_plan", "test", {}, timeout=12
     )
@@ -72,7 +72,7 @@ def test_assign_defaults_to_configured_timeout(monkeypatch):
         captured["timeout"] = timeout
         return _ok_response()
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.httpx.post", post)
     RealDesignLlm(Settings(llm_api_key="offline-test", llm_timeout=77)).assign(
         "assign_generation_plan", "test", {}
     )
@@ -84,7 +84,7 @@ def test_timeout_raises_llm_timeout_error(monkeypatch):
     def post(url, headers, json, timeout):
         raise httpx.ReadTimeout("read timeout")
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.httpx.post", post)
     with pytest.raises(LlmTimeoutError):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
@@ -101,7 +101,7 @@ def test_missing_tool_call_records_response_diagnostics(monkeypatch):
                 "usage": {"prompt_tokens": 100, "completion_tokens": 0},
             }
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: Response())
     with pytest.raises(RuntimeError) as error:
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
@@ -119,6 +119,6 @@ def test_http_error_includes_model_error_code(monkeypatch):
         def json(self):
             return {"error": {"code": "1210", "message": "thinking setting rejected"}}
 
-    monkeypatch.setattr("app.engine.llm.httpx.post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: Response())
     with pytest.raises(RuntimeError, match="1210"):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})

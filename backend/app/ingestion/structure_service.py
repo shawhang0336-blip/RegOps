@@ -10,7 +10,7 @@ from app.infra.asset_models import DocumentArchitectureModel, RawBlockModel, Sou
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.ingestion.extractors import extract_document, survey_document
-from app.engine.llm import RealDesignLlm
+from app.infra.llm import RealDesignLlm
 
 
 def _spec_digest(spec: Dict[str, Any]) -> Dict[str, Any]:

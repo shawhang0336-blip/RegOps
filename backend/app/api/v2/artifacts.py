@@ -19,7 +19,7 @@ from app.policy.regops_plan import project
 from app.engine.compiler import compile_where
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
-from app.engine.domain import RuleDefinition, SpecDocument, calculate_rule_hash
+from app.infra.domain import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.infra.identity import OPERATOR_PLACEHOLDER
 from app.infra.models import RuleModel, RunModel, SpecificationModel
 from app.engine.rules import RuleValidationError, validate_rule

@@ -8,7 +8,7 @@
 
 from typing import Callable, List, Optional
 
-from app.engine.domain import RuleDefinition, calculate_rule_hash
+from app.infra.domain import RuleDefinition, calculate_rule_hash
 from app.infra.errors import WorkflowError
 from app.engine.binding import bind_rules
 from app.engine.rules import RuleValidationError

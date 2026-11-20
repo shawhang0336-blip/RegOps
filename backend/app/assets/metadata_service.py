@@ -52,7 +52,7 @@ from app.assets.metadata_views import (
     table_summary,
     type_basis_for,
 )
-from app.engine.llm import RealDesignLlm
+from app.infra.llm import RealDesignLlm
 from app.infra.asset_models import (
     FieldCodeReferenceModel,
     FieldMetadataModel,

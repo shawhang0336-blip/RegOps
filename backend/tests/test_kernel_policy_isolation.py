@@ -39,6 +39,20 @@ ALLOWED_ROOT_ENTRIES = {
     "api",
 }
 
+# 严格单向八层拓扑序：任意跨层 import 必须满足 LAYER_RANK[target] < LAYER_RANK[source]，
+# 彻底杜绝反向依赖（如 engine -> api）与横向循环依赖（如 policy <-> engine、assets <-> engine）。
+LAYER_RANK = {
+    "infra": 0,
+    "kernel": 1,
+    "policy": 2,
+    "ingestion": 3,
+    "assets": 4,
+    "engine": 5,
+    "delivery": 6,
+    "api": 7,
+    "main": 8,
+}
+
 
 def test_kernel_has_zero_domain_or_policy_imports():
     """AST 静态检查：app/kernel/*.py 严禁 import 任何业务层或策略层模块。"""
@@ -138,3 +152,45 @@ def test_app_root_directory_stays_clean_and_layered():
     actual = {p.name for p in app_dir.iterdir() if p.name != "__pycache__"}
     assert actual == ALLOWED_ROOT_ENTRIES
     assert policy.DEFAULT_PLAN.validate() == []
+
+
+def test_all_backend_layers_form_strict_dag():
+    """AST 全局架构红线：所有跨层依赖必须严格从高层指向低层，零倒挂、零循环依赖。"""
+    app_dir = Path(kernel.__file__).resolve().parent.parent
+    violations = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        rel = py_file.relative_to(app_dir)
+        src_layer = rel.parts[0] if len(rel.parts) > 1 else "main"
+        if src_layer not in LAYER_RANK:
+            continue
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and node.level > 0:
+                    # 解析相对导入的目标包，防止用 `from ..xxx` 绕过架构红线
+                    pkg_parts = list(("app",) + rel.parts[:-1])
+                    if node.level <= len(pkg_parts):
+                        base = pkg_parts[: len(pkg_parts) - node.level + 1]
+                        if node.module:
+                            base = base + node.module.split(".")
+                        modules = [".".join(base)]
+                elif node.module:
+                    modules = [node.module]
+            for mod in modules:
+                if not mod.startswith("app."):
+                    continue
+                parts = mod.split(".")
+                dst_layer = parts[1] if len(parts) > 1 else "main"
+                if dst_layer == src_layer or dst_layer not in LAYER_RANK:
+                    continue
+                if LAYER_RANK[dst_layer] >= LAYER_RANK[src_layer]:
+                    violations.append(
+                        f"{rel} ({src_layer}={LAYER_RANK[src_layer]}) -> "
+                        f"{mod} ({dst_layer}={LAYER_RANK[dst_layer]})"
+                    )
+
+    assert violations == [], "检测到违反严格单向分层 DAG 的越界依赖：\n" + "\n".join(violations)

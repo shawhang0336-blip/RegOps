@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infra.db import Base
@@ -60,10 +60,3 @@ class EventModel(Base):
     prev_hash: Mapped[str] = mapped_column(String(64))
     event_hash: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class SettingModel(Base):
-    __tablename__ = "settings"
-
-    key: Mapped[str] = mapped_column(String(96), primary_key=True)
-    value: Mapped[str] = mapped_column(Text)

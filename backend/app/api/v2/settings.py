@@ -4,21 +4,17 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from app.infra.asset_models import SystemSettingModel
-from app.infra.config import Settings, get_settings
+from app.infra.config import get_settings
 from app.infra.db import SessionLocal
-from app.engine.llm import RealDesignLlm
+from app.infra.llm import RealDesignLlm
+from app.infra.settings_store import DEFAULT_BUDGET, get_budget
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
-DEFAULT_BUDGET = {
-    "max_rules_per_table": 50,
-    "max_cases_per_table": 1000,
-    "max_retries": 3,
-    "max_llm_concurrency": 4,
-}
+EDITABLE_SETTINGS = {"execution_budget"}
+READONLY_ENV_SETTINGS = {"mysql", "oracle", "llm"}
 
 
 class SettingRequest(BaseModel):
@@ -26,16 +22,14 @@ class SettingRequest(BaseModel):
     secret_reference: Optional[str] = None
 
 
-def get_budget(session: Session) -> Dict[str, int]:
-    row = session.get(SystemSettingModel, "execution_budget")
-    return {**DEFAULT_BUDGET, **(row.value_json if row else {})}
-
-
 @router.get("")
 def settings_view() -> Dict[str, Any]:
     settings = get_settings()
     with SessionLocal() as session:
-        stored = {row.key: {"value": row.value_json, "secret_reference": row.secret_reference} for row in session.query(SystemSettingModel).all()}
+        stored = {
+            row.key: {"value": row.value_json, "secret_reference": row.secret_reference}
+            for row in session.query(SystemSettingModel).all()
+        }
         budget = get_budget(session)
     return {
         "mysql": {"configured": bool(settings.database_url), "driver": settings.database_url.split(":", 1)[0]},
@@ -52,7 +46,12 @@ def settings_view() -> Dict[str, Any]:
 
 @router.put("/{key}")
 def save_setting(key: str, request: SettingRequest) -> Dict[str, Any]:
-    if key not in {"execution_budget", "mysql", "oracle", "llm"}:
+    if key in READONLY_ENV_SETTINGS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Setting '{key}' is managed via .env and cannot be modified through the API",
+        )
+    if key not in EDITABLE_SETTINGS:
         raise HTTPException(status_code=404, detail="Unknown setting")
     with SessionLocal() as session:
         row = session.get(SystemSettingModel, key)
@@ -80,9 +79,11 @@ def test_connection(kind: str) -> Dict[str, Any]:
             from sqlalchemy import create_engine
 
             engine = create_engine(settings.oracle_sandbox_url)
-            with engine.connect() as connection:
-                row = connection.execute(text("SELECT USER, SYS_CONTEXT('USERENV','CON_NAME') FROM dual")).one()
-            engine.dispose()
+            try:
+                with engine.connect() as connection:
+                    row = connection.execute(text("SELECT USER, SYS_CONTEXT('USERENV','CON_NAME') FROM dual")).one()
+            finally:
+                engine.dispose()
             return {"kind": kind, "ok": True, "user": row[0], "container": row[1]}
         if kind == "llm":
             if not settings.llm_api_key:
@@ -100,6 +101,8 @@ def test_connection(kind: str) -> Dict[str, Any]:
                 "model": trace.get("model"),
                 "elapsed_seconds": trace.get("elapsed_seconds"),
             }
+    except HTTPException:
+        raise
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM connection failed: {type(exc).__name__}") from exc
     except Exception as exc:

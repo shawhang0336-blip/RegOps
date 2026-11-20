@@ -1,3 +1,8 @@
+"""跨层共享领域值对象与确定性契约（FieldSpec / SpecDocument / RuleDefinition / Binding 模型）。
+
+作为基础设施层纯契约模块，严禁依赖任何上层业务模块，保证所有业务层与策略层单向依赖本模块。
+"""
+
 import hashlib
 import json
 from typing import Any, Dict, List, Literal, Optional
@@ -80,11 +85,34 @@ LLM_OPERATORS = (
 )
 
 
+class SchemaBinding(BaseModel):
+    field: str
+    storage_type: Literal["TEXT", "NUMBER"]
+    length: int = Field(gt=0)
+    decimal_places: int = Field(default=0, ge=0)
+
+
+class GeneratorBinding(BaseModel):
+    field: str
+    generator: Literal["FIXED", "ENUM", "SEQUENCE"]
+    params: Dict[str, Any]
+
+
+class AuditCaseBinding(BaseModel):
+    case_id: str
+    overrides: Dict[str, Any] = Field(default_factory=dict)
+    expected_rule_keys: List[str] = Field(default_factory=list)
+
+
 class AuditCase(BaseModel):
     case_id: str
     record: Dict[str, Any]
     expected_rules: List[str]
     expanded_expectations: Dict[str, List[str]] = Field(default_factory=dict)
+
+
+def field_map(spec: SpecDocument) -> Dict[str, FieldSpec]:
+    return {field.name: field for field in spec.fields}
 
 
 def canonical_json(value: Any) -> str:

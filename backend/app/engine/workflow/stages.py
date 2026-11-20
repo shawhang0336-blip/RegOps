@@ -33,8 +33,8 @@ from app.engine.binding import (
     materialize_golden_record,
 )
 from app.engine.compiler import compile_rule_query
-from app.engine.domain import RuleDefinition, calculate_rule_hash, canonical_json
-from app.engine.llm import spec_payload
+from app.infra.domain import RuleDefinition, calculate_rule_hash, canonical_json
+from app.infra.llm import spec_payload
 from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
 from app.engine.rules import RuleValidationError
 from app.engine.workflow.runtime import (
@@ -57,7 +57,7 @@ from app.infra.errors import WorkflowError
 from app.infra.models import EventModel, RuleModel, RunModel
 from app.kernel.blob_store import LocalBlobStore
 from app.policy.regops_plan import project
-from app.policy.rule_backfill import (
+from app.engine.rule_backfill import (
     _backfill_fixed_value_rules as _policy_backfill_fixed_value_rules,
     _backfill_length_rules as _policy_backfill_length_rules,
     _backfill_required_rules as _policy_backfill_required_rules,

@@ -1,8 +1,7 @@
 import re
 from typing import Any, Dict, Iterable, List
 
-from app.engine.domain import Evidence, RuleDefinition, SpecDocument, calculate_rule_hash
-from app.ingestion.spec_parser import field_map
+from app.infra.domain import Evidence, RuleDefinition, SpecDocument, calculate_rule_hash, field_map
 
 
 class RuleValidationError(ValueError):

@@ -12,10 +12,9 @@ from app.infra.asset_models import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.engine.compiler import quote_identifier
-from app.engine.domain import RuleDefinition, SpecDocument
-from app.engine.binding import GeneratorBinding
+from app.infra.domain import GeneratorBinding, RuleDefinition, SpecDocument
 from app.infra.errors import WorkflowError
+from app.infra.sql import quote_identifier
 
 
 def stable_code_set_table(code: str) -> str:

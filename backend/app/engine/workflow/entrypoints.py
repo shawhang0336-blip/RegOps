@@ -15,8 +15,8 @@ from typing import Dict, Optional
 
 from sqlalchemy.orm import Session
 
-from app.engine.domain import canonical_json
-from app.engine.llm import RealDesignLlm
+from app.infra.domain import canonical_json
+from app.infra.llm import RealDesignLlm
 from app.engine.workflow.nodes import _back_bodies, _front_bodies
 from app.engine.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
 from app.infra.asset_models import ApprovalModel

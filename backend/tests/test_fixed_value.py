@@ -47,7 +47,7 @@ def test_empty_and_none_are_safe():
 
 
 def _spec(fields):
-    from app.engine.domain import SpecDocument
+    from app.infra.domain import SpecDocument
 
     return SpecDocument(
         version="TEST",
@@ -67,7 +67,7 @@ def test_unconditional_fixed_value_becomes_a_rule_candidate():
 
     原来它被当成码表引用，在码值页堆出一张空占位表等人去补——根本没有码表可补。
     """
-    from app.engine.domain import FieldSpec
+    from app.infra.domain import FieldSpec
     from app.engine.workflow import _fixed_value_candidates
 
     spec = _spec(
@@ -87,7 +87,7 @@ def test_unconditional_fixed_value_becomes_a_rule_candidate():
 
 def test_conditional_fixed_value_is_not_a_rule_candidate():
     """E0901 那种「如为个人主体，填写为个人」，不能卡成必须等于 个人。"""
-    from app.engine.domain import FieldSpec
+    from app.infra.domain import FieldSpec
     from app.engine.workflow import _fixed_value_candidates
 
     spec = _spec(
@@ -105,7 +105,7 @@ def test_conditional_fixed_value_is_not_a_rule_candidate():
 
 
 def test_field_already_covered_by_enum_is_skipped():
-    from app.engine.domain import FieldSpec
+    from app.infra.domain import FieldSpec
     from app.engine.workflow import _fixed_value_candidates
 
     spec = _spec(

@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from app.engine.domain import FieldSpec, SpecDocument
+from app.infra.domain import FieldSpec, SpecDocument
 from app.engine.oracle import fit_record_values
 
 SPEC = SpecDocument(

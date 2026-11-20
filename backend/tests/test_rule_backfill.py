@@ -6,7 +6,7 @@
 必填不需要 AI 推理，靠原文前缀就能判，所以这里把判定抽出来做确定性补齐。
 """
 
-from app.engine.domain import FieldSpec, SpecDocument
+from app.infra.domain import FieldSpec, SpecDocument
 from app.engine.workflow import _required_backfill_candidates
 
 SPEC = SpecDocument(

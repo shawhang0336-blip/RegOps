@@ -15,11 +15,12 @@ from typing import Any, Dict, List, Optional
 import httpx
 from sqlalchemy.orm import Session
 
-from app.engine.domain import RuleDefinition, SpecDocument
-from app.engine.llm import LlmTimeoutError, configure_llm_concurrency
 from app.engine.rules import RuleValidationError
+from app.infra.domain import RuleDefinition, SpecDocument
 from app.infra.errors import WorkflowError
+from app.infra.llm import LlmTimeoutError, configure_llm_concurrency
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.settings_store import get_budget
 from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
 from app.policy.regops_bus import default_bus
@@ -270,8 +271,6 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
 def _resolve_budget(session: Session, generation_budget=None):
     """预算只读一次并贯通到底：max_retries 决定自愈轮数，max_llm_concurrency 决定并发宽度。"""
     if generation_budget is None:
-        from app.api.v2.settings import get_budget
-
         generation_budget = get_budget(session)
     concurrency = max(1, int(generation_budget.get("max_llm_concurrency", 4)))
     configure_llm_concurrency(concurrency)

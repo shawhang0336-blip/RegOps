@@ -1,10 +1,9 @@
 """RegOps 监管数据质量领域策略层（策略在外）。
 
-本包将监管报送业务策略插拔装配到 ProdAgent 微内核（app.kernel）之上：
+本包将监管报送业务策略插拔装配到 ProdAgent 微内核（app.kernel）之上，且严格仅依赖 `app.infra` 与 `app.kernel`：
 1. `regops_plan.py`：12 节点装配流水线拓扑（DEFAULT_PLAN）、人工门中断映射与事件状态折叠（_apply）；
 2. `regops_bus.py`：五大确定性事前门禁裁决器（字段/跨表/算子/码表值域/切块 ID 白名单）与 default_bus；
-3. `regops_channels.py`：16 个命名数据通道（DEFAULT_CHANNELS）与 EventLog + BlobStore 断点折叠恢复（recover_channels）；
-4. `rule_backfill.py`：必填、列宽上限（LENGTH_MAX）、固定取值的确定性元数据规则补齐策略。
+3. `regops_channels.py`：16 个命名数据通道（DEFAULT_CHANNELS）与 EventLog + BlobStore 断点折叠恢复（recover_channels）。
 """
 
 from .regops_bus import (
@@ -35,15 +34,6 @@ from .regops_plan import (
     project_many,
     self_heal_target,
 )
-from .rule_backfill import (
-    _backfill_fixed_value_rules,
-    _backfill_length_rules,
-    _backfill_required_rules,
-    _declaration_quote,
-    _fixed_value_candidates,
-    _length_backfill_candidates,
-    _required_backfill_candidates,
-)
 
 __all__ = [
     "DEFAULT_CHANNELS",
@@ -54,13 +44,6 @@ __all__ = [
     "INTERRUPT_RESUME_NODES",
     "REGOPS_ADJUDICATORS",
     "_apply",
-    "_backfill_fixed_value_rules",
-    "_backfill_length_rules",
-    "_backfill_required_rules",
-    "_declaration_quote",
-    "_fixed_value_candidates",
-    "_length_backfill_candidates",
-    "_required_backfill_candidates",
     "approval_target",
     "audit_passed_target",
     "build_context",
