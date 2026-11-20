@@ -16,6 +16,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   const { confirm } = useFeedback()
 
   const [tables, setTables] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -74,6 +75,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   }
 
   useEffect(() => {
+    setSelectedId(null)
     setDetail(null)
     setLoading(true)
     load()
@@ -89,6 +91,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
 
   async function select(id, resetTab = false) {
     const reqId = ++requestRef.current
+    setSelectedId(id)
     setDetailLoading(true)
     try {
       const data = await v2(`/metadata/tables/${id}`)
@@ -548,7 +551,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                   key={table.id}
                   role="button"
                   tabIndex={0}
-                  className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
+                  className={`list-row ${(selectedId || detail?.id) === table.id ? 'selected' : ''}`}
                   onClick={() => select(table.id, false)}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -602,7 +605,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
           )}
         </div>
 
-        <div className="panel metadata-detail">
+        <div className={`panel metadata-detail ${detailLoading && detail ? 'panel-transitioning' : ''}`}>
           {(loading || detailLoading) && !detail ? (
             <DetailSkeleton blocks={5} />
           ) : detail ? (
@@ -768,11 +771,16 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                               key={field.id}
                               id={`field-row-${field.id}`}
                               className={[
+                                'clickable-row',
                                 isEditing ? 'field-row-active' : '',
                                 highlightFieldId === field.id ? 'field-row-highlight' : '',
                               ]
                                 .filter(Boolean)
                                 .join(' ')}
+                              onClick={(event) => {
+                                if (event.target.closest('button, a, input, select, textarea')) return
+                                switchOrCloseField(isEditing ? null : field.id)
+                              }}
                             >
                               <td>
                                 <strong>{field.field_cn}</strong>
@@ -821,9 +829,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                                 <button
                                   type="button"
                                   className={`button sm ${isEditing ? 'primary' : 'secondary'}`}
-                                  onClick={() =>
-                                    setEditingFieldId(isEditing ? null : field.id)
-                                  }
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    switchOrCloseField(isEditing ? null : field.id)
+                                  }}
                                 >
                                   {isEditing ? '收起' : '查看 / 修改'}
                                 </button>

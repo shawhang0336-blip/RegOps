@@ -13,6 +13,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   const { confirm } = useFeedback()
 
   const [sets, setSets] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
   const [unresolved, setUnresolved] = useState([])
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -70,6 +71,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   }
 
   useEffect(() => {
+    setSelectedId(null)
     setDetail(null)
     setEditingValueId(null)
     setLoading(true)
@@ -80,6 +82,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
 
   async function select(id) {
     const reqId = ++requestRef.current
+    setSelectedId(id)
     setDetailLoading(true)
     setEditingValueId(null)
     try {
@@ -490,7 +493,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
                   key={set.id}
                   role="button"
                   tabIndex={0}
-                  className={`list-row ${detail?.id === set.id ? 'selected' : ''}`}
+                  className={`list-row ${(selectedId || detail?.id) === set.id ? 'selected' : ''}`}
                   onClick={() => select(set.id)}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -555,7 +558,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
           </details>
         </div>
 
-        <div className="panel">
+        <div className={`panel ${detailLoading && detail ? 'panel-transitioning' : ''}`}>
           {(loading || detailLoading) && !detail ? (
             <DetailSkeleton blocks={5} />
           ) : detail ? (

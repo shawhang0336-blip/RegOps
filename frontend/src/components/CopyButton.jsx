@@ -22,8 +22,13 @@ export default function CopyButton({ text, label = '复制', copiedLabel = '已�
   }
 
   return (
-    <button type="button" className={className} disabled={!text} onClick={handleCopy}>
-      {copied ? copiedLabel : label}
+    <button
+      type="button"
+      className={`${className} copy-btn${copied ? ' copied' : ''}`}
+      disabled={!text}
+      onClick={handleCopy}
+    >
+      {copied ? `✓ ${copiedLabel}` : label}
     </button>
   )
 }

@@ -22,7 +22,14 @@ export function RuleTable({ rows, showTable = false, decisions = {}, onDecision,
         </thead>
         <tbody>
           {rows.map((rule) => (
-            <tr key={rule.row_id} className={activeKey === rule.row_id ? 'active-rule' : ''}>
+            <tr
+              key={rule.row_id}
+              className={`clickable-row ${activeKey === rule.row_id ? 'active-rule' : ''}`}
+              onClick={(event) => {
+                if (event.target.closest('button, a, input, select, textarea')) return
+                onOpenRule(rule)
+              }}
+            >
               {showTable && (
                 <td className="rule-table-col">
                   <strong>{rule._tableName}</strong>
@@ -47,11 +54,11 @@ export function RuleTable({ rows, showTable = false, decisions = {}, onDecision,
                 <div className="rule-row-actions">
                   {canApprove?.(rule) && onDecision && (
                     <>
-                      <button type="button" className={`button sm ${decisions[rule.rule_hash] === 'APPROVED' ? 'primary' : 'secondary'}`} onClick={() => onDecision(rule.rule_hash, 'APPROVED')}>批准</button>
-                      <button type="button" className={`button sm ${decisions[rule.rule_hash] === 'REJECTED' ? 'danger' : 'secondary'}`} onClick={() => onDecision(rule.rule_hash, 'REJECTED')}>拒绝</button>
+                      <button type="button" className={`button sm ${decisions[rule.rule_hash] === 'APPROVED' ? 'primary' : 'secondary'}`} onClick={(e) => { e.stopPropagation(); onDecision(rule.rule_hash, 'APPROVED') }}>批准</button>
+                      <button type="button" className={`button sm ${decisions[rule.rule_hash] === 'REJECTED' ? 'danger' : 'secondary'}`} onClick={(e) => { e.stopPropagation(); onDecision(rule.rule_hash, 'REJECTED') }}>拒绝</button>
                     </>
                   )}
-                  <button type="button" className="button-link" onClick={() => onOpenRule(rule)}>查看 / 编辑</button>
+                  <button type="button" className="button-link" onClick={(e) => { e.stopPropagation(); onOpenRule(rule) }}>查看 / 编辑</button>
                 </div>
               </td>
             </tr>

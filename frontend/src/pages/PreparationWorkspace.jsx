@@ -126,24 +126,26 @@ export default function PreparationWorkspace() {
           {!codeSummary && codeBlockedCount > 0 && <span>{codeBlockedCount} 需补</span>}
         </button>
       </nav>
-      {view === 'fields' && (
-        <MetadataPage
-          embedded
-          onOpenCodeSets={() => openCodes('blocked')}
-          onReadinessChange={setReadiness}
-          reportFilter={reportFilter}
-          onReportFilterChange={setReportFilter}
-        />
-      )}
-      {view === 'codes' && (
-        <CodeSetsPage
-          embedded
-          onDocumentChange={changeDocument}
-          onSummaryChange={setCodeSummary}
-          statusFilter={codeFilter}
-          onStatusFilterChange={setCodeFilter}
-        />
-      )}
+      <div className="tab-panel-stage" key={view}>
+        {view === 'fields' && (
+          <MetadataPage
+            embedded
+            onOpenCodeSets={() => openCodes('blocked')}
+            onReadinessChange={setReadiness}
+            reportFilter={reportFilter}
+            onReportFilterChange={setReportFilter}
+          />
+        )}
+        {view === 'codes' && (
+          <CodeSetsPage
+            embedded
+            onDocumentChange={changeDocument}
+            onSummaryChange={setCodeSummary}
+            statusFilter={codeFilter}
+            onStatusFilterChange={setCodeFilter}
+          />
+        )}
+      </div>
     </>
   )
 }

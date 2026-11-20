@@ -475,11 +475,283 @@ button.workbench-status:hover {
   gap: 8px;
 }
 
+/* ==========================================================================
+   交互手感与动效润色（Tactile Press / 平滑入场 / 消除布局抖动与切表闪屏）
+   ========================================================================== */
+
+/* 防止抽屉/弹窗锁滚动时页面横向抖动 */
+html {
+  scrollbar-gutter: stable;
+}
+
+/* 全局统一顺滑缓动曲线与按下触感反馈 */
+.button,
+.button-link,
+.workbench-step,
+.workbench-secondary,
+.workbench-status,
+.workbench-theme-toggle,
+.tab-bar button,
+.asset-workspace-tabs button,
+.validation-tab-bar button,
+.preparation-metrics button,
+.product-status-card {
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0, 0, 1),
+    background-color 0.16s cubic-bezier(0.2, 0, 0, 1),
+    border-color 0.16s cubic-bezier(0.2, 0, 0, 1),
+    color 0.16s cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 0.18s cubic-bezier(0.2, 0, 0, 1),
+    opacity 0.16s ease;
+}
+
+.button:active:not(:disabled),
+.button-link:active:not(:disabled),
+.workbench-step:active,
+.workbench-secondary:active,
+.workbench-status:active:not(:disabled),
+.workbench-theme-toggle:active,
+.tab-bar button:active,
+.asset-workspace-tabs button:active,
+.validation-tab-bar button:active,
+.preparation-metrics button:active {
+  transform: scale(0.972);
+}
+
+.button.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(219, 0, 17, 0.24);
+}
+
+.button.primary:active:not(:disabled) {
+  transform: translateY(0) scale(0.975);
+  box-shadow: 0 1px 3px rgba(219, 0, 17, 0.2);
+}
+
+.button.secondary:hover:not(:disabled) {
+  box-shadow: 0 2px 6px rgba(28, 28, 28, 0.06);
+}
+
+.product-status-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(28, 28, 28, 0.08);
+}
+
+.product-status-card:active {
+  transform: translateY(0) scale(0.988);
+}
+
+/* 左侧列表行：消除 selected 从 3px -> 4px 引起的 1px 文字横跳，并增加触感反馈 */
+.list-row {
+  border-left-width: 3px;
+  cursor: pointer;
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0, 0, 1),
+    background-color 0.16s cubic-bezier(0.2, 0, 0, 1),
+    border-color 0.16s cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 0.18s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.list-row:hover {
+  box-shadow: 0 2px 8px rgba(28, 28, 28, 0.05);
+}
+
+.list-row:active {
+  transform: scale(0.99);
+}
+
+.list-row.selected {
+  border-left-width: 3px;
+  box-shadow: inset 1px 0 0 var(--brand), 0 3px 10px rgba(219, 0, 17, 0.09);
+}
+
+/* 可整行点击的表格行（字段表 / 规则表） */
+tbody tr {
+  transition: background-color 0.14s ease;
+}
+
+tbody tr.clickable-row {
+  cursor: pointer;
+}
+
+tbody tr.clickable-row:hover {
+  background: var(--surface-hover);
+}
+
+tbody tr.clickable-row:active {
+  background: var(--brand-light);
+}
+
+/* 切表/切批次时的无闪屏过渡（保留旧内容 + 顶部细微流光进度线） */
+.panel {
+  position: relative;
+}
+
+.panel-transitioning {
+  pointer-events: none;
+}
+
+.panel-transitioning > * {
+  opacity: 0.62;
+  transition: opacity 0.16s ease;
+}
+
+.panel-transitioning::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: linear-gradient(90deg, transparent 0%, var(--brand) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: ux-shimmer 0.9s ease-in-out infinite;
+  z-index: 4;
+}
+
+/* 路由页面 & Tab 视图轻柔和缓入场 */
+.page-stage,
+.tab-panel-stage {
+  animation: ux-stage-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes ux-stage-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 弹窗 & 确认框：遮罩淡入 + 弹框微缩放弹起 */
+.modal-backdrop {
+  animation: ux-backdrop-in 0.16s ease-out;
+}
+
+.modal-backdrop > .modal {
+  animation: ux-modal-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes ux-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ux-modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 侧边抽屉（字段编辑抽屉 / 规则详情抽屉）：遮罩模糊淡入 + 丝滑滑入 */
+.rule-drawer-backdrop,
+.field-editor-drawer-backdrop {
+  backdrop-filter: blur(2px);
+  animation: ux-backdrop-in 0.18s ease-out;
+}
+
+.rule-drawer,
+.field-editor-drawer {
+  animation: ux-drawer-in 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes ux-drawer-in {
+  from {
+    opacity: 0.4;
+    transform: translateX(36px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* 内联展开块（DDL/码表详情、时间线载荷、连通性测试结果、状态横幅）平滑显现 */
+.artifact-inline-detail,
+.trace-payload,
+.connection-result,
+.status-banner-stack,
+.action-callout {
+  animation: ux-reveal 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes ux-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* <details> 折叠区顺滑交互与展开淡入 */
+details > summary {
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+details[open] > :not(summary) {
+  animation: ux-reveal 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 一键复制成功态反馈 */
+.copy-btn.copied {
+  background: var(--green-light);
+  border-color: var(--green-border);
+  color: var(--green);
+}
+
+/* 健康探测按钮点击检测时的呼吸动画 */
+.workbench-status.status-checking .workbench-status-dot {
+  animation: ux-pulse 0.8s ease-in-out infinite;
+}
+
+/* Toast 入场微弹曲线 */
+.toast-item {
+  animation: ux-toast-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .skeleton-line,
   .skeleton-box,
   .workbench-status.status-offline .workbench-status-dot,
-  .live-stream-pill::before {
+  .workbench-status.status-checking .workbench-status-dot,
+  .live-stream-pill::before,
+  .panel-transitioning::after,
+  .page-stage,
+  .tab-panel-stage,
+  .modal-backdrop,
+  .modal-backdrop > .modal,
+  .rule-drawer-backdrop,
+  .field-editor-drawer-backdrop,
+  .rule-drawer,
+  .field-editor-drawer,
+  .artifact-inline-detail,
+  .trace-payload,
+  .connection-result,
+  .status-banner-stack,
+  .action-callout,
+  .toast-item,
+  details[open] > :not(summary) {
     animation: none;
+  }
+
+  .button:active:not(:disabled),
+  .list-row:active,
+  .product-status-card:hover,
+  .product-status-card:active {
+    transform: none;
   }
 }

@@ -43,6 +43,7 @@ export default function RunsPage() {
   const [params] = useSearchParams()
   const { confirm } = useFeedback()
   const [runs, setRuns] = useState([])
+  const [selectedRunId, setSelectedRunId] = useState(null)
   const [active, setActive] = useState(null)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -68,6 +69,7 @@ export default function RunsPage() {
 
   const select = useCallback(async (id, { silent = false } = {}) => {
     const reqId = ++requestRef.current
+    setSelectedRunId(id)
     if (!silent) setDetailLoading(true)
     try {
       const [run, detail, planList, busData, replayData] = await Promise.all([
@@ -233,6 +235,7 @@ export default function RunsPage() {
         if (list[0]) {
           await select(list[0].id)
         } else {
+          setSelectedRunId(null)
           setActive(null)
           setValidation(null)
           setPlans([])
@@ -414,7 +417,7 @@ export default function RunsPage() {
                 key={run.id}
                 role="button"
                 tabIndex={0}
-                className={`list-row batch-list-row ${active?.id === run.id ? 'selected' : ''}`}
+                className={`list-row batch-list-row ${(selectedRunId || active?.id) === run.id ? 'selected' : ''}`}
                 onClick={() => select(run.id).catch((err) => setError(err.message))}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
@@ -449,7 +452,7 @@ export default function RunsPage() {
           )}
         </div>
 
-        <div className="panel run-detail">
+        <div className={`panel run-detail ${detailLoading && active ? 'panel-transitioning' : ''}`}>
           {(loading || detailLoading) && !active ? (
             <DetailSkeleton blocks={5} />
           ) : !active ? <div className="empty">请选择一个验证批次。</div> : (

@@ -9,6 +9,7 @@ import { RevisionDiffView, StatusBadge } from './SharedUI.jsx'
 export default function VersionsPage() {
   const navigate = useNavigate()
   const [tables, setTables] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -19,6 +20,7 @@ export default function VersionsPage() {
 
   async function select(id) {
     const reqId = ++requestRef.current
+    setSelectedId(id)
     setDetailLoading(true)
     try {
       const data = await v2(`/metadata/tables/${id}`)
@@ -103,7 +105,7 @@ export default function VersionsPage() {
               {visibleTables.map((table) => (
                 <button
                   type="button"
-                  className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
+                  className={`list-row ${(selectedId || detail?.id) === table.id ? 'selected' : ''}`}
                   key={table.id}
                   onClick={() => select(table.id)}
                 >
@@ -125,7 +127,7 @@ export default function VersionsPage() {
           )}
         </div>
 
-        <div className="panel">
+        <div className={`panel ${detailLoading && detail ? 'panel-transitioning' : ''}`}>
           {detailLoading && !detail ? (
             <DetailSkeleton blocks={4} />
           ) : detail ? (
@@ -158,9 +160,7 @@ export default function VersionsPage() {
                 </div>
               </div>
 
-              {detailLoading ? (
-                <DetailSkeleton blocks={3} />
-              ) : revisions.length > 0 ? (
+              {revisions.length > 0 ? (
                 <div className="revision-list">
                   {revisions.map((item, index) => (
                     <RevisionDiffView key={index} revision={item} />

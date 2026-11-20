@@ -56,41 +56,55 @@ function ScrollToTop() {
 }
 
 function BackendHealthPill() {
-  const [health, setHealth] = useState({ state: 'checking', info: null })
+  const [health, setHealth] = useState({ state: 'checking', info: null, checkedAt: null })
+  const [probing, setProbing] = useState(false)
 
-  const check = useCallback(async () => {
+  const check = useCallback(async (manual = false) => {
+    if (manual) setProbing(true)
+    const started = Date.now()
     try {
       const data = await api('/api/health')
-      setHealth({ state: 'online', info: data })
+      if (manual) {
+        const elapsed = Date.now() - started
+        if (elapsed < 260) await new Promise((resolve) => window.setTimeout(resolve, 260 - elapsed))
+      }
+      setHealth({ state: 'online', info: data, checkedAt: new Date() })
     } catch {
-      setHealth({ state: 'offline', info: null })
+      setHealth({ state: 'offline', info: null, checkedAt: new Date() })
+    } finally {
+      if (manual) setProbing(false)
     }
   }, [])
 
   useEffect(() => {
-    check()
-    const timer = window.setInterval(check, 30000)
+    check(false)
+    const timer = window.setInterval(() => check(false), 30000)
     return () => window.clearInterval(timer)
   }, [check])
 
-  const label = health.state === 'online'
+  const effectiveState = probing ? 'checking' : health.state
+  const label = effectiveState === 'online'
     ? '已连接'
-    : health.state === 'offline'
+    : effectiveState === 'offline'
       ? '连接异常'
       : '检测中...'
 
-  const title = health.state === 'online'
-    ? `服务正常 · 数据库：${health.info?.database || 'ok'} · 模型：${health.info?.llm_provider || 'ok'}（点击重新检测）`
-    : health.state === 'offline'
+  const checkedText = health.checkedAt
+    ? ` · 检测于 ${health.checkedAt.toLocaleTimeString('zh-CN', { hour12: false })}`
+    : ''
+  const title = effectiveState === 'online'
+    ? `服务正常 · 数据库：${health.info?.database || 'ok'} · 模型：${health.info?.llm_provider || 'ok'}${checkedText}（点击重新检测）`
+    : effectiveState === 'offline'
       ? '无法连接后端服务，请确认 uvicorn 已启动（点击重试）'
       : '正在检测后端服务状态...'
 
   return (
     <button
       type="button"
-      className={`workbench-status status-${health.state}`}
+      className={`workbench-status status-${effectiveState}`}
       title={title}
-      onClick={check}
+      disabled={probing}
+      onClick={() => check(true)}
     >
       <span className="workbench-status-dot" />
       <span className="workbench-status-text">{label}</span>
@@ -153,16 +167,18 @@ function WorkbenchLayout() {
 
       <main className="main-content">
         <ErrorBoundary>
-          <Routes>
-            <Route path="/" element={<PreparationWorkspace />} />
-            <Route path="/documents" element={<PreparationWorkspace />} />
-            <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
-            <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
-            <Route path="/generation" element={<ArtifactsPage />} />
-            <Route path="/runs" element={<RunsPage />} />
-            <Route path="/versions" element={<VersionsPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-          </Routes>
+          <div className="page-stage" key={location.pathname}>
+            <Routes>
+              <Route path="/" element={<PreparationWorkspace />} />
+              <Route path="/documents" element={<PreparationWorkspace />} />
+              <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
+              <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
+              <Route path="/generation" element={<ArtifactsPage />} />
+              <Route path="/runs" element={<RunsPage />} />
+              <Route path="/versions" element={<VersionsPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+            </Routes>
+          </div>
         </ErrorBoundary>
       </main>
     </div>

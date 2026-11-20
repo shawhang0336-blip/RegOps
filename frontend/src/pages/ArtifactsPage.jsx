@@ -67,7 +67,6 @@ export default function ArtifactsPage() {
     const requestId = ++requestRef.current
     setCurrentId(id)
     if (!options.background) {
-      setDetail(null)
       setDetailLoading(true)
       setArtifactView(null)
     }
@@ -480,7 +479,7 @@ export default function ArtifactsPage() {
       )}
 
       {workspaceTab === 'rules' && (
-        <section className="panel rule-workbench-panel" role="tabpanel">
+        <section className={`panel rule-workbench-panel tab-panel-stage ${focusMode && detailLoading && detail ? 'panel-transitioning' : ''}`} role="tabpanel">
           {!focusMode ? (
             <AllRulesView
               overview={overview}
