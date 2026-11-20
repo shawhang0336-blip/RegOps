@@ -1,5 +1,9 @@
+import { useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import { api } from './api.js'
+import { FeedbackProvider } from './context/FeedbackContext.jsx'
 import { ThemeProvider, useTheme } from './context/ThemeContext.jsx'
+import ErrorBoundary from './components/ErrorBoundary.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
 import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
 import ArtifactsPage from './pages/ArtifactsPage.jsx'
@@ -43,12 +47,64 @@ function PreparationRedirect({ view }) {
   return <Navigate to={`/documents?${params.toString()}`} replace />
 }
 
+function ScrollToTop() {
+  const { pathname } = useLocation()
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'auto' })
+  }, [pathname])
+  return null
+}
+
+function BackendHealthPill() {
+  const [health, setHealth] = useState({ state: 'checking', info: null })
+
+  const check = useCallback(async () => {
+    try {
+      const data = await api('/api/health')
+      setHealth({ state: 'online', info: data })
+    } catch {
+      setHealth({ state: 'offline', info: null })
+    }
+  }, [])
+
+  useEffect(() => {
+    check()
+    const timer = window.setInterval(check, 30000)
+    return () => window.clearInterval(timer)
+  }, [check])
+
+  const label = health.state === 'online'
+    ? '已连接'
+    : health.state === 'offline'
+      ? '连接异常'
+      : '检测中...'
+
+  const title = health.state === 'online'
+    ? `服务正常 · 数据库：${health.info?.database || 'ok'} · 模型：${health.info?.llm_provider || 'ok'}（点击重新检测）`
+    : health.state === 'offline'
+      ? '无法连接后端服务，请确认 uvicorn 已启动（点击重试）'
+      : '正在检测后端服务状态...'
+
+  return (
+    <button
+      type="button"
+      className={`workbench-status status-${health.state}`}
+      title={title}
+      onClick={check}
+    >
+      <span className="workbench-status-dot" />
+      <span className="workbench-status-text">{label}</span>
+    </button>
+  )
+}
+
 function WorkbenchLayout() {
   const { theme, toggleTheme } = useTheme()
   const location = useLocation()
 
   return (
     <div className="app-shell horizontal-shell">
+      <ScrollToTop />
       <header className="workbench-header">
         <NavLink to="/documents" className="workbench-brand" aria-label="RegOps 监管报送规则生成工具">
           <span className="workbench-brand-mark"><BrandMark /></span>
@@ -84,10 +140,7 @@ function WorkbenchLayout() {
           ))}
         </nav>
 
-        <span className="workbench-status" title="数据与验证环境可用">
-          <span className="workbench-status-dot" />
-          <span className="workbench-status-text">已连接</span>
-        </span>
+        <BackendHealthPill />
         <button
           type="button"
           className="workbench-theme-toggle"
@@ -99,16 +152,18 @@ function WorkbenchLayout() {
       </header>
 
       <main className="main-content">
-        <Routes>
-          <Route path="/" element={<PreparationWorkspace />} />
-          <Route path="/documents" element={<PreparationWorkspace />} />
-          <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
-          <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
-          <Route path="/generation" element={<ArtifactsPage />} />
-          <Route path="/runs" element={<RunsPage />} />
-          <Route path="/versions" element={<VersionsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-        </Routes>
+        <ErrorBoundary>
+          <Routes>
+            <Route path="/" element={<PreparationWorkspace />} />
+            <Route path="/documents" element={<PreparationWorkspace />} />
+            <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
+            <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
+            <Route path="/generation" element={<ArtifactsPage />} />
+            <Route path="/runs" element={<RunsPage />} />
+            <Route path="/versions" element={<VersionsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+          </Routes>
+        </ErrorBoundary>
       </main>
     </div>
   )
@@ -117,9 +172,11 @@ function WorkbenchLayout() {
 export default function App() {
   return (
     <ThemeProvider>
-      <BrowserRouter>
-        <WorkbenchLayout />
-      </BrowserRouter>
+      <FeedbackProvider>
+        <BrowserRouter>
+          <WorkbenchLayout />
+        </BrowserRouter>
+      </FeedbackProvider>
     </ThemeProvider>
   )
 }

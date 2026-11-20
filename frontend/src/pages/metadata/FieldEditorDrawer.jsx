@@ -3,6 +3,7 @@ import { EvidenceCard } from '../SharedUI.jsx'
 export default function FieldEditorDrawer({
   activeField,
   filteredFields,
+  isDirty = false,
   isPublished,
   busy,
   editReason,
@@ -30,8 +31,14 @@ export default function FieldEditorDrawer({
           <div>
             <h2>
               查看或修改字段：{activeField.field_cn} (<code>{activeField.field_en}</code>)
+              {isDirty && <span className="dirty-pill">有未保存修改</span>}
             </h2>
             <p>修改后请点击保存；字段原文和自动识别依据可在下方查看。</p>
+            <div className="shortcut-hints" aria-label="快捷键提示">
+              <span><kbd>⌘/Ctrl</kbd>+<kbd>S</kbd>保存</span>
+              <span><kbd>Alt</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>切换字段</span>
+              <span><kbd>Esc</kbd>关闭抽屉</span>
+            </div>
           </div>
           <div className="actions field-editor-actions">
             <button
@@ -72,10 +79,10 @@ export default function FieldEditorDrawer({
                 <button
                   type="button"
                   className="button primary sm"
-                  disabled={busy}
+                  disabled={busy || !isDirty}
                   onClick={() => onSave(activeField)}
                 >
-                  保存修改
+                  {busy ? '保存中...' : '保存修改'}
                 </button>
               </>
             )}

@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, v2 } from '../api.js'
+import { useFeedback } from '../context/FeedbackContext.jsx'
+import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import { useEventStream } from '../hooks/useEventStream.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { DataTableModal, StatusBadge, formatTime } from './SharedUI.jsx'
+import HistoryCleanupModal from './runs/HistoryCleanupModal.jsx'
+import RunTraceTimeline from './runs/RunTraceTimeline.jsx'
 
 const RESULT_LABELS = {
   EFFECTIVE: { label: '规则有效', tone: 'green' },
@@ -37,8 +41,11 @@ function batchTables(run) {
 export default function RunsPage() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
+  const { confirm } = useFeedback()
   const [runs, setRuns] = useState([])
   const [active, setActive] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [validation, setValidation] = useState(null)
   const [plans, setPlans] = useState([])
   const [busEvents, setBusEvents] = useState([])
@@ -46,6 +53,9 @@ export default function RunsPage() {
   const [traceTab, setTraceTab] = useState('ledger')
   const [tableIdByCode, setTableIdByCode] = useState({})
   const [artifact, setArtifact] = useState(null)
+  const [runSearch, setRunSearch] = useState('')
+  const [runStatusFilter, setRunStatusFilter] = useState('ALL')
+  const [showCleanup, setShowCleanup] = useState(false)
   const [tableFilter, setTableFilter] = useState('ALL')
   const [ruleResultFilter, setRuleResultFilter] = useState('ALL')
   const [caseFilter, setCaseFilter] = useState('ALL')
@@ -54,35 +64,56 @@ export default function RunsPage() {
   const [previewBusy, setPreviewBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  const requestRef = useRef(0)
 
-  const select = useCallback(async (id) => {
-    const [run, detail, planList, busData, replayData] = await Promise.all([
-      api(`/api/runs/${id}`),
-      api(`/api/runs/${id}/validation-detail`).catch(() => null),
-      v2(`/generation/plans/${id}`).catch(() => []),
-      api(`/api/runs/${id}/bus-events`).catch(() => ({ events: [] })),
-      api(`/api/runs/${id}/replay`).catch(() => null),
-    ])
-    setActive(run)
-    setValidation(detail)
-    setPlans(planList)
-    setBusEvents(busData?.events || [])
-    setReplay(replayData)
-    setArtifact(null)
-    setTableFilter('ALL')
-    setRuleResultFilter('ALL')
-    setCaseFilter('ALL')
+  const select = useCallback(async (id, { silent = false } = {}) => {
+    const reqId = ++requestRef.current
+    if (!silent) setDetailLoading(true)
+    try {
+      const [run, detail, planList, busData, replayData] = await Promise.all([
+        api(`/api/runs/${id}`),
+        api(`/api/runs/${id}/validation-detail`).catch(() => null),
+        v2(`/generation/plans/${id}`).catch(() => []),
+        api(`/api/runs/${id}/bus-events`).catch(() => ({ events: [] })),
+        api(`/api/runs/${id}/replay`).catch(() => null),
+      ])
+      if (reqId !== requestRef.current) return
+      setActive(run)
+      setValidation(detail)
+      setPlans(planList)
+      setBusEvents(busData?.events || [])
+      setReplay(replayData)
+      if (!silent) {
+        setArtifact(null)
+        setTableFilter('ALL')
+        setRuleResultFilter('ALL')
+        setCaseFilter('ALL')
+      }
+    } finally {
+      if (reqId === requestRef.current && !silent) setDetailLoading(false)
+    }
   }, [])
 
-  const load = useCallback(async (preferredId) => {
+  const load = useCallback(async (preferredId, options = {}) => {
     const list = await api('/api/runs')
     setRuns(list)
     const target = preferredId || active?.id || params.get('run') || list[0]?.id
-    if (target) await select(target)
+    if (target) {
+      await select(target, options)
+    } else {
+      setActive(null)
+      setValidation(null)
+      setPlans([])
+      setBusEvents([])
+      setReplay(null)
+    }
   }, [active?.id, params, select])
 
   useEffect(() => {
-    load(params.get('run')).catch((err) => setError(err.message))
+    setLoading(true)
+    load(params.get('run'))
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
     v2('/artifacts').then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
@@ -90,7 +121,7 @@ export default function RunsPage() {
 
   const runIsActive = Boolean(active && ['RUNNING', 'AUDITING', 'READY_TO_AUDIT'].includes(active.status))
   const refreshActiveRun = useCallback(() => {
-    if (!busy && active?.id) load(active.id).catch(() => {})
+    if (!busy && active?.id) load(active.id, { silent: true }).catch(() => {})
   }, [active?.id, busy, load])
 
   useEventStream({
@@ -183,9 +214,13 @@ export default function RunsPage() {
   }
 
   async function deleteRun(run) {
-    const confirmed = window.confirm(
-      `删除验证批次「${batchTitle(run)}」？\n\n生成时间：${formatTime(run.created_at)}\n\n会同时删除该批次的规则、事件、临时产物和 Oracle 沙箱表，不可恢复。运行中的批次不能删除。`
-    )
+    const confirmed = await confirm({
+      title: `删除验证批次「${batchTitle(run)}」？`,
+      message: `生成时间：${formatTime(run.created_at)}`,
+      details: '会同时删除该批次的规则、事件账本、临时产物和对应的 Oracle 沙箱表，不可恢复。运行中的批次不能删除。',
+      confirmLabel: '确认删除',
+      tone: 'danger',
+    })
     if (!confirmed) return
     setBusy(true)
     setError('')
@@ -300,13 +335,43 @@ export default function RunsPage() {
             ? { tone: readyToDownload ? 'success' : 'attention', title: readyToDownload ? '验证通过，已抵达 export 终态，生产产出包可下载' : '验证完成，但仍有事项需要处理', description: readyToDownload ? '生产包包含报表与码表 DDL、码值 INSERT/MERGE 和校验 SQL。' : '请检查未覆盖规则或审计版本，再开放生产下载。' }
             : { tone: 'working', title: `Scheduler 正在驱动节点：${active.current_node || 'created'}`, description: '页面会自动刷新；生成完成后可直接浏览每张报表的测试数据。' }
 
+  const visibleRuns = useMemo(() => {
+    const q = runSearch.trim().toLowerCase()
+    return runs.filter((run) => {
+      if (runStatusFilter === 'ACTIVE' && !['NEW', 'RUNNING', 'AUDITING', 'READY_TO_AUDIT'].includes(run.status)) return false
+      if (runStatusFilter === 'WAITING' && !['WAITING_APPROVAL', 'WAITING_TEST_APPROVAL'].includes(run.status)) return false
+      if (runStatusFilter === 'COMPLETED' && run.status !== 'COMPLETED') return false
+      if (runStatusFilter === 'FAILED' && run.status !== 'FAILED') return false
+      if (!q) return true
+      return (
+        batchTitle(run).toLowerCase().includes(q) ||
+        batchTables(run).toLowerCase().includes(q) ||
+        String(run.id || '').toLowerCase().includes(q)
+      )
+    })
+  }, [runs, runSearch, runStatusFilter])
+
   return (
     <>
       <PageHeader
         eyebrow="第 3 步 · 共 3 步"
         title="AI 测试验证与下载"
         description="AI 按报表字段、业务含义和规则块生成测试数据；系统执行正常样本与定向变异验证。规则问题返回第二步修改。"
-        actions={active && <button type="button" className="button secondary" disabled={busy} onClick={() => load(active.id)}>刷新状态</button>}
+        actions={
+          <div className="actions">
+            {runIsActive && <span className="live-stream-pill">实时推送中</span>}
+            {runs.length > 1 && (
+              <button type="button" className="button secondary" disabled={busy} onClick={() => setShowCleanup(true)}>
+                清理历史批次
+              </button>
+            )}
+            {active && (
+              <button type="button" className="button secondary" disabled={busy} onClick={() => load(active.id)}>
+                刷新状态
+              </button>
+            )}
+          </div>
+        }
       />
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
@@ -325,8 +390,26 @@ export default function RunsPage() {
             <div><h2>验证批次</h2><p>共 {runs.length} 个批次，按报表和生成时间标识</p></div>
             <StatusBadge tone="neutral">{runs.length}</StatusBadge>
           </div>
+          <div className="list-filters" style={{ marginBottom: 10 }}>
+            <input
+              type="search"
+              placeholder="搜索报表名称或批次号..."
+              value={runSearch}
+              onChange={(e) => setRunSearch(e.target.value)}
+            />
+            <select aria-label="筛选批次状态" value={runStatusFilter} onChange={(e) => setRunStatusFilter(e.target.value)}>
+              <option value="ALL">全部状态</option>
+              <option value="ACTIVE">运行中</option>
+              <option value="WAITING">待人工确认</option>
+              <option value="COMPLETED">已通过</option>
+              <option value="FAILED">需处理 / 失败</option>
+            </select>
+          </div>
+          {loading ? (
+            <ListSkeleton rows={5} />
+          ) : (
           <div className="list-stack">
-            {runs.map((run) => (
+            {visibleRuns.map((run) => (
               <div
                 key={run.id}
                 role="button"
@@ -357,12 +440,19 @@ export default function RunsPage() {
                 <em>{run.rules?.length || 0} 条规则 · 第 {run.attempt} 次生成</em>
               </div>
             ))}
-            {!runs.length && <div className="empty">还没有验证批次，请先在第二步生成。</div>}
+            {!visibleRuns.length && (
+              <div className="empty">
+                {runSearch || runStatusFilter !== 'ALL' ? '没有符合筛选条件的验证批次。' : '还没有验证批次，请先在第二步生成。'}
+              </div>
+            )}
           </div>
+          )}
         </div>
 
         <div className="panel run-detail">
-          {!active ? <div className="empty">请选择一个验证批次。</div> : (
+          {(loading || detailLoading) && !active ? (
+            <DetailSkeleton blocks={5} />
+          ) : !active ? <div className="empty">请选择一个验证批次。</div> : (
             <>
               {outcome && <div className={`run-outcome ${outcome.tone}`}><strong>{outcome.title}</strong><p>{outcome.description}</p></div>}
 
@@ -564,14 +654,18 @@ export default function RunsPage() {
                 </nav>
 
                 {traceTab === 'ledger' && (
-                  <pre className="run-json">{JSON.stringify(runEvents.slice(-25), null, 2)}</pre>
+                  <RunTraceTimeline
+                    items={runEvents}
+                    mode="ledger"
+                    emptyText="当前批次尚无事件账本记录。"
+                  />
                 )}
                 {traceTab === 'bus' && (
-                  <pre className="run-json">
-                    {busEvents.length
-                      ? JSON.stringify(busEvents.slice(-30), null, 2)
-                      : '当前进程内存中暂无该历史批次的实时 Bus 广播缓存（新发起或续跑批次会实时记录 node.* / wave.* / tool.* / event.appended 信号）。'}
-                  </pre>
+                  <RunTraceTimeline
+                    items={busEvents}
+                    mode="bus"
+                    emptyText="当前进程内存中暂无该历史批次的实时 Bus 广播缓存（新发起或续跑批次会实时记录 node.* / wave.* / tool.* / event.appended 信号）。"
+                  />
                 )}
                 {traceTab === 'plan' && plans.length > 0 && (
                   <pre className="run-json">{JSON.stringify(plans, null, 2)}</pre>
@@ -582,6 +676,16 @@ export default function RunsPage() {
         </div>
       </section>
       {artifact && <DataTableModal artifact={artifact} onClose={() => setArtifact(null)} />}
+      <HistoryCleanupModal
+        open={showCleanup}
+        onClose={() => setShowCleanup(false)}
+        onCompleted={async (result) => {
+          setNotice(
+            `已清理 ${result.deleted_count} 个历史验证批次${result.sandbox_cleanup?.length ? `（${result.sandbox_cleanup.length} 张沙箱表已跳过或清理）` : ''}。`,
+          )
+          await load()
+        }}
+      />
     </>
   )
 }

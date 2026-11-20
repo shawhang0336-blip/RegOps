@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 export const STATUS_META = {
   PUBLISHED: { label: '已发布', tone: 'green' },
@@ -405,6 +405,20 @@ export function DataTableModal({ artifact, onClose }) {
   const [filter, setFilter] = useState('')
   const [rawMode, setRawMode] = useState(false)
   const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    if (!artifact) return undefined
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') onClose?.()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [artifact, onClose])
 
   if (!artifact) return null
 

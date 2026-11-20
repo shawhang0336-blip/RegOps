@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { RevisionDiffView, StatusBadge } from './SharedUI.jsx'
@@ -9,26 +10,50 @@ export default function VersionsPage() {
   const navigate = useNavigate()
   const [tables, setTables] = useState([])
   const [detail, setDetail] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [tableSearch, setTableSearch] = useState('')
   const [filterKind, setFilterKind] = useState('ALL')
   const [error, setError] = useState('')
+  const requestRef = useRef(0)
+
+  async function select(id) {
+    const reqId = ++requestRef.current
+    setDetailLoading(true)
+    try {
+      const data = await v2(`/metadata/tables/${id}`)
+      if (reqId === requestRef.current) setDetail(data)
+    } catch (err) {
+      if (reqId === requestRef.current) setError(err.message)
+    } finally {
+      if (reqId === requestRef.current) setDetailLoading(false)
+    }
+  }
 
   useEffect(() => {
+    setLoading(true)
     v2('/metadata/tables')
       .then(async (list) => {
         setTables(list)
         if (list[0]?.id) {
-          setDetail(await v2(`/metadata/tables/${list[0].id}`))
+          await select(list[0].id)
         }
       })
       .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
   }, [])
 
-  async function select(id) {
-    setDetail(await v2(`/metadata/tables/${id}`))
-  }
+  const visibleTables = tables.filter((table) => {
+    const q = tableSearch.trim().toLowerCase()
+    if (!q) return true
+    return (
+      (table.table_name || '').toLowerCase().includes(q) ||
+      (table.table_code || '').toLowerCase().includes(q)
+    )
+  })
 
   const revisions = (detail?.revisions || []).filter(
-    (item) => filterKind === 'ALL' || item.revision_kind === filterKind
+    (item) => filterKind === 'ALL' || item.revision_kind === filterKind,
   )
 
   return (
@@ -62,9 +87,20 @@ export default function VersionsPage() {
             <StatusBadge tone="neutral">{tables.length}</StatusBadge>
           </div>
 
-          {tables.length > 0 ? (
+          <div className="list-filters" style={{ marginBottom: 10 }}>
+            <input
+              type="search"
+              placeholder="搜索报表名称或代码..."
+              value={tableSearch}
+              onChange={(e) => setTableSearch(e.target.value)}
+            />
+          </div>
+
+          {loading ? (
+            <ListSkeleton rows={6} />
+          ) : visibleTables.length > 0 ? (
             <div className="list-stack">
-              {tables.map((table) => (
+              {visibleTables.map((table) => (
                 <button
                   type="button"
                   className={`list-row ${detail?.id === table.id ? 'selected' : ''}`}
@@ -83,12 +119,16 @@ export default function VersionsPage() {
               ))}
             </div>
           ) : (
-            <div className="empty">暂无元数据表版本记录。</div>
+            <div className="empty">
+              {tableSearch ? '没有匹配的报表。' : '暂无元数据表版本记录。'}
+            </div>
           )}
         </div>
 
         <div className="panel">
-          {detail ? (
+          {detailLoading && !detail ? (
+            <DetailSkeleton blocks={4} />
+          ) : detail ? (
             <>
               <div className="panel-heading">
                 <div>
@@ -118,11 +158,17 @@ export default function VersionsPage() {
                 </div>
               </div>
 
-              <div className="revision-list">
-                {revisions.map((item, index) => (
-                  <RevisionDiffView key={index} revision={item} />
-                ))}
-              </div>
+              {detailLoading ? (
+                <DetailSkeleton blocks={3} />
+              ) : revisions.length > 0 ? (
+                <div className="revision-list">
+                  {revisions.map((item, index) => (
+                    <RevisionDiffView key={index} revision={item} />
+                  ))}
+                </div>
+              ) : (
+                <div className="empty">当前筛选条件下没有变更记录。</div>
+              )}
             </>
           ) : (
             <div className="empty">请从左侧选择一张表查看版本演进与字段级差异。</div>

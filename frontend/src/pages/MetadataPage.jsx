@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { useFeedback } from '../context/FeedbackContext.jsx'
+import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { RevisionDiffView, StatusBadge, groupValidationIssues } from './SharedUI.jsx'
@@ -11,10 +13,14 @@ import { emptyField, tableGate, typeBasisMeta } from './metadata/metadataHelpers
 export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadinessChange, reportFilter, onReportFilterChange }) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
+  const { confirm } = useFeedback()
 
   const [tables, setTables] = useState([])
   const [detail, setDetail] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [baselineFields, setBaselineFields] = useState({})
+  const requestRef = useRef(0)
   const [unresolvedRefs, setUnresolvedRefs] = useState([])
   const [codeSets, setCodeSets] = useState([])
   const [editingFieldId, setEditingFieldId] = useState(null)
@@ -69,7 +75,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
 
   useEffect(() => {
     setDetail(null)
-    load().catch((err) => setError(err.message))
+    setLoading(true)
+    load()
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
   }, [params.get('document_id')])
 
   useEffect(() => {
@@ -79,17 +88,24 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   }, [highlightFieldId, detail?.id])
 
   async function select(id, resetTab = false) {
-    const data = await v2(`/metadata/tables/${id}`)
-    setDetail(data)
-    setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
-    setEditingFieldId(null)
-    // 从「码值待补」跳过来时会带上 field，把那一行标出来并滚到视野里，
-    // 否则用户落到一张几十个字段的表上，不知道要看哪一个
-    const requestedField = params.get('field')
-    setHighlightFieldId(
-      requestedField && (data.fields || []).some((field) => field.id === requestedField) ? requestedField : null
-    )
-    if (resetTab) setTab('fields')
+    const reqId = ++requestRef.current
+    setDetailLoading(true)
+    try {
+      const data = await v2(`/metadata/tables/${id}`)
+      if (reqId !== requestRef.current) return
+      setDetail(data)
+      setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
+      setEditingFieldId(null)
+      const requestedField = params.get('field')
+      setHighlightFieldId(
+        requestedField && (data.fields || []).some((field) => field.id === requestedField) ? requestedField : null,
+      )
+      if (resetTab) setTab('fields')
+    } catch (err) {
+      if (reqId === requestRef.current) setError(err.message)
+    } finally {
+      if (reqId === requestRef.current) setDetailLoading(false)
+    }
   }
 
   // 从码值缺陷直接跳到那张码表（第一步的码值表 tab），并选中它
@@ -103,17 +119,18 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     navigate(`/documents?${next.toString()}`)
   }
 
-  async function removeTable(table) {    const published = Boolean(table.published_version)
-    const warning = published
-      ? `\n\n注意：这张表已定稿（v${table.published_version}），删掉后之前生成过的运行仍能靠快照复现，但表本身会从列表里消失。`
-      : ''
-    if (
-      !window.confirm(
-        `删除报表「${table.table_name}」（${table.table_code}）？\n\n会连带删掉 ${table.field_count} 个字段和字段上的码值引用，不可恢复。${warning}`
-      )
-    ) {
-      return
-    }
+  async function removeTable(table) {
+    const published = Boolean(table.published_version)
+    const confirmed = await confirm({
+      title: `删除报表「${table.table_name}」？`,
+      message: `表代码 ${table.table_code}，将连带删除 ${table.field_count} 个字段和字段上的码值引用，操作不可恢复。`,
+      details: published
+        ? `注意：这张表已定稿（v${table.published_version}），删除后历史运行仍可依靠快照复现，但表本身会从清单移除。`
+        : '',
+      confirmLabel: '确认删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     setBusy(true)
     setError('')
     try {
@@ -190,10 +207,64 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     [detail, editReason, baselineFields]
   )
 
-  // 「已发布不可改」已经取消——编辑后状态退回草稿，下次进阶段 2 会重新自动定稿。
-  // 保留这个名字只是为了少改引用点。
   const isPublished = false
   const activeField = detail?.fields?.find((f) => f.id === editingFieldId) || null
+  const isFieldDirty = useCallback(
+    (field) => {
+      if (!field) return false
+      const base = baselineFields[field.id]
+      if (!base) return false
+      const compare = {
+        field_cn: field.field_cn,
+        field_en: field.field_en,
+        field_definition: field.field_definition,
+        check_text_raw: field.check_text_raw,
+        data_type: field.data_type,
+        length: Number(field.length),
+        decimal_places: Number(field.decimal_places),
+        required: Boolean(field.required),
+        code_reference_text: field.code_reference_text,
+        type_basis: field.type_basis,
+      }
+      return Object.entries(compare).some(([key, value]) => {
+        const before = key === 'required'
+          ? Boolean(base[key])
+          : (key === 'length' || key === 'decimal_places')
+            ? Number(base[key])
+            : base[key]
+        return value !== before && !(key === 'type_basis' && !value)
+      })
+    },
+    [baselineFields],
+  )
+  const activeFieldDirty = isFieldDirty(activeField)
+
+  const switchOrCloseField = useCallback(
+    async (nextFieldId) => {
+      if (activeField && activeField.id !== nextFieldId && isFieldDirty(activeField)) {
+        const discard = await confirm({
+          title: '放弃未保存的字段修改？',
+          message: `字段「${activeField.field_cn} (${activeField.field_en})」有尚未保存的改动。`,
+          details: '选择“放弃修改”将恢复该字段到上次保存的状态。',
+          confirmLabel: '放弃修改',
+          cancelLabel: '继续编辑',
+          tone: 'danger',
+        })
+        if (!discard) return
+        const base = baselineFields[activeField.id]
+        if (base && detail) {
+          setDetail((prev) =>
+            prev
+              ? { ...prev, fields: prev.fields.map((item) => (item.id === activeField.id ? { ...base } : item)) }
+              : prev,
+          )
+        }
+      }
+      setEditingFieldId(nextFieldId)
+    },
+    [activeField, baselineFields, confirm, detail, isFieldDirty],
+  )
+
   const filteredFields = (detail?.fields || []).filter((f) => {
     if (!fieldSearch.trim()) return true
     const q = fieldSearch.toLowerCase()
@@ -221,7 +292,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       }
       if (e.key === 'Escape') {
         e.preventDefault()
-        setEditingFieldId(null)
+        switchOrCloseField(null)
         return
       }
       if (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
@@ -232,7 +303,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
           e.key === 'ArrowDown'
             ? Math.min(filteredFields.length - 1, idx + 1)
             : Math.max(0, idx - 1)
-        setEditingFieldId(filteredFields[nextIdx]?.id || activeField.id)
+        switchOrCloseField(filteredFields[nextIdx]?.id || activeField.id)
       }
     }
 
@@ -241,10 +312,16 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       document.body.style.overflow = previousOverflow
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [activeField, tab, isPublished, busy, filteredFields, saveField])
+  }, [activeField, tab, isPublished, busy, filteredFields, saveField, switchOrCloseField])
 
   async function removeField(field) {
-    if (!window.confirm(`确认删除字段「${field.field_cn} (${field.field_en})」吗？`)) return
+    const confirmed = await confirm({
+      title: `删除字段「${field.field_cn}」？`,
+      message: `确定从当前表删除字段 ${field.field_en} 吗？删除后表版本将升为草稿。`,
+      confirmLabel: '确认删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     setBusy(true)
     setError('')
     try {
@@ -460,7 +537,9 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
               {allInferredTableCount > 0 && <span className="muted-text">（{allInferredTableCount} 张整表推断）</span>}
             </label>
           </div>
-          {visibleTables.length > 0 ? (
+          {loading ? (
+            <ListSkeleton rows={6} />
+          ) : visibleTables.length > 0 ? (
             <div className="list-stack">
               {visibleTables.map((table) => {
                 const gate = tableGate(table, readinessById[table.id])
@@ -524,7 +603,9 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
         </div>
 
         <div className="panel metadata-detail">
-          {detail ? (
+          {(loading || detailLoading) && !detail ? (
+            <DetailSkeleton blocks={5} />
+          ) : detail ? (
             <>
               <div className="panel-heading">
                 <div>
@@ -655,15 +736,16 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                   <FieldEditorDrawer
                     activeField={activeField}
                     filteredFields={filteredFields}
+                    isDirty={activeFieldDirty}
                     isPublished={isPublished}
                     busy={busy}
                     editReason={editReason}
                     onEditReasonChange={setEditReason}
-                    onSelectField={setEditingFieldId}
+                    onSelectField={switchOrCloseField}
                     onChangeProp={changeFieldProp}
                     onSave={saveField}
                     onRemove={removeField}
-                    onClose={() => setEditingFieldId(null)}
+                    onClose={() => switchOrCloseField(null)}
                   />
 
                   <div className="table-wrap">

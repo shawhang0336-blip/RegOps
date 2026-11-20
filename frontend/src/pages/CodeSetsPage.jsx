@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { useFeedback } from '../context/FeedbackContext.jsx'
+import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeverity } from './SharedUI.jsx'
@@ -8,12 +10,17 @@ import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeveri
 export default function CodeSetsPage({ embedded = false, onDocumentChange, onSummaryChange, statusFilter, onStatusFilterChange }) {
   const [params] = useSearchParams()
   const navigate = useNavigate()
+  const { confirm } = useFeedback()
 
   const [sets, setSets] = useState([])
   const [unresolved, setUnresolved] = useState([])
   const [detail, setDetail] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [newSet, setNewSet] = useState({ code: '', name: '', definition: '' })
   const [newValue, setNewValue] = useState({ value: '', label_cn: '', label_en: '' })
+  const [editingValueId, setEditingValueId] = useState(null)
+  const [editDraft, setEditDraft] = useState({ value: '', label_cn: '', label_en: '', definition: '' })
   const [filterText, setFilterText] = useState('')
   const [setSearch, setSetSearch] = useState('')
   const [localStatusFilter, setLocalStatusFilter] = useState('all')
@@ -25,6 +32,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const requestRef = useRef(0)
 
   async function load(preferredId) {
     const documentId = params.get('document_id')
@@ -63,22 +71,35 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
 
   useEffect(() => {
     setDetail(null)
-    load().catch((err) => setError(err.message))
+    setEditingValueId(null)
+    setLoading(true)
+    load()
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
   }, [params.get('document_id')])
 
   async function select(id) {
-    const data = await v2(`/code-sets/${id}`)
-    setDetail(data)
+    const reqId = ++requestRef.current
+    setDetailLoading(true)
+    setEditingValueId(null)
+    try {
+      const data = await v2(`/code-sets/${id}`)
+      if (reqId === requestRef.current) setDetail(data)
+    } catch (err) {
+      if (reqId === requestRef.current) setError(err.message)
+    } finally {
+      if (reqId === requestRef.current) setDetailLoading(false)
+    }
   }
 
   async function removeCodeSet(set) {
-    if (
-      !window.confirm(
-        `删除码表「${set.name}」（${set.code}）？\n\n会连带删掉 ${set.value_count} 项码值，不可恢复。`
-      )
-    ) {
-      return
-    }
+    const confirmed = await confirm({
+      title: `删除码表「${set.name}」？`,
+      message: `码表代码 ${set.code}，将连带删除 ${set.value_count} 项码值，不可恢复。`,
+      confirmLabel: '确认删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     setBusy(true)
     setError('')
     try {
@@ -194,6 +215,65 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
       })
       setDetail(body)
       await load(body.id)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function startEditValue(value) {
+    setEditingValueId(value.id)
+    setEditDraft({
+      value: value.value || '',
+      label_cn: value.label_cn || '',
+      label_en: value.label_en || '',
+      definition: value.definition || '',
+    })
+  }
+
+  async function saveEditValue(value) {
+    if (!editDraft.value.trim() || !editDraft.label_cn.trim()) {
+      setError('码值编码和中文含义不能为空。')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const body = await v2(`/code-sets/${detail.id}/values/${value.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          expected_version: detail.current_version,
+          reason: '人工行内编辑码值项',
+          changes: {
+            value: editDraft.value.trim(),
+            label_cn: editDraft.label_cn.trim(),
+            label_en: editDraft.label_en.trim(),
+            definition: editDraft.definition.trim(),
+          },
+        }),
+      })
+      setDetail(body)
+      setEditingValueId(null)
+      await load(body.id)
+      setNotice(`已更新码值「${editDraft.value.trim()} - ${editDraft.label_cn.trim()}」。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function relinkReferences() {
+    setBusy(true)
+    setError('')
+    try {
+      const result = await v2('/code-sets/references/relink', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      })
+      await load(detail?.id)
+      setNotice(`引用重新对齐完成：已对齐 ${result.resolved} 处（总引用 ${result.total}，剩余 ${result.unresolved} 处未决）。`)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -344,7 +424,12 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
         <div className="unresolved-banner">
           <div className="unresolved-banner-header">
             <strong>还有 {unresolved.length} 项码值需要补充</strong>
-            <StatusBadge status="UNRESOLVED">{unresolved.length} 项待处理</StatusBadge>
+            <div className="actions">
+              <button type="button" className="button secondary sm" disabled={busy} onClick={relinkReferences}>
+                {busy ? '对齐中...' : '重新对齐引用'}
+              </button>
+              <StatusBadge status="UNRESOLVED">{unresolved.length} 项待处理</StatusBadge>
+            </div>
           </div>
           <div className="unresolved-chips">
             {unresolved.map((item) => (
@@ -396,7 +481,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
             </select>
           </div>
 
-          {filteredSets.length > 0 ? (
+          {loading ? (
+            <ListSkeleton rows={6} />
+          ) : filteredSets.length > 0 ? (
             <div className="list-stack">
               {filteredSets.map((set) => (
                 <div
@@ -469,7 +556,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
         </div>
 
         <div className="panel">
-          {detail ? (
+          {(loading || detailLoading) && !detail ? (
+            <DetailSkeleton blocks={5} />
+          ) : detail ? (
             <>
               <div className="panel-heading">
                 <div>
@@ -569,22 +658,64 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredValues.map((value, idx) => (
+                      {filteredValues.map((value, idx) => {
+                        const isRowEditing = editingValueId === value.id
+                        return (
                         <tr key={value.id} className={problemValueSet.has(String(value.value)) ? 'field-row-highlight' : ''}>
                           <td className="row-index">{idx + 1}</td>
                           <td>
-                            <code>{value.value}</code>
-                            {problemValueSet.has(String(value.value)) && (
-                              <small className="danger-text" style={{ display: 'block' }}>
-                                超出引用字段 {problemValueHint.get(String(value.value))}
-                              </small>
+                            {isRowEditing ? (
+                              <input
+                                className="inline-edit-input"
+                                value={editDraft.value}
+                                onChange={(e) => setEditDraft({ ...editDraft, value: e.target.value })}
+                              />
+                            ) : (
+                              <>
+                                <code>{value.value}</code>
+                                {problemValueSet.has(String(value.value)) && (
+                                  <small className="danger-text" style={{ display: 'block' }}>
+                                    超出引用字段 {problemValueHint.get(String(value.value))}
+                                  </small>
+                                )}
+                              </>
                             )}
                           </td>
                           <td>
-                            <strong>{value.label_cn}</strong>
-                            {value.definition ? <small style={{ display: 'block' }}>{value.definition}</small> : null}
+                            {isRowEditing ? (
+                              <div className="code-edit-stack">
+                                <input
+                                  className="inline-edit-input"
+                                  placeholder="中文含义 *"
+                                  value={editDraft.label_cn}
+                                  onChange={(e) => setEditDraft({ ...editDraft, label_cn: e.target.value })}
+                                />
+                                <input
+                                  className="inline-edit-input"
+                                  placeholder="说明/备注（选填）"
+                                  value={editDraft.definition}
+                                  onChange={(e) => setEditDraft({ ...editDraft, definition: e.target.value })}
+                                />
+                              </div>
+                            ) : (
+                              <>
+                                <strong>{value.label_cn}</strong>
+                                {value.definition ? <small style={{ display: 'block' }}>{value.definition}</small> : null}
+                              </>
+                            )}
                           </td>
-                          <td>{value.label_en || '—'}</td>
+                          <td>
+                            {isRowEditing ? (
+                              <input
+                                className="inline-edit-input"
+                                placeholder="英文含义（选填）"
+                                value={editDraft.label_en}
+                                onChange={(e) => setEditDraft({ ...editDraft, label_en: e.target.value })}
+                              />
+                            ) : (
+                              value.label_en || '—'
+                            )}
+                          </td>
                           <td>
                             <StatusBadge tone={value.enabled ? 'green' : 'neutral'}>
                               {value.enabled ? '已启用' : '已停用'}
@@ -594,17 +725,31 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
                             <SourceLocatorTag locator={value.source_locator} />
                           </td>
                           <td>
-                            <button
-                              type="button"
-                              className="button secondary sm"
-                              disabled={busy}
-                              onClick={() => toggle(value)}
-                            >
-                              {value.enabled ? '停用' : '启用'}
-                            </button>
+                            <div className="actions">
+                              {isRowEditing ? (
+                                <>
+                                  <button type="button" className="button primary sm" disabled={busy} onClick={() => saveEditValue(value)}>
+                                    保存
+                                  </button>
+                                  <button type="button" className="button secondary sm" disabled={busy} onClick={() => setEditingValueId(null)}>
+                                    取消
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <button type="button" className="button secondary sm" disabled={busy} onClick={() => startEditValue(value)}>
+                                    编辑
+                                  </button>
+                                  <button type="button" className="button secondary sm" disabled={busy} onClick={() => toggle(value)}>
+                                    {value.enabled ? '停用' : '启用'}
+                                  </button>
+                                </>
+                              )}
+                            </div>
                           </td>
                         </tr>
-                      ))}
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>

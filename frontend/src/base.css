@@ -62,7 +62,7 @@ body {
   font-size: 13.5px;
   line-height: 1.55;
   color: var(--ink);
-  background: var(-- -webkit-canvas, #f7f6f5);
+  background: #f7f6f5;
 }
 
 button,

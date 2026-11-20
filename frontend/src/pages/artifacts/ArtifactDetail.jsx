@@ -1,3 +1,4 @@
+import CopyButton from '../../components/CopyButton.jsx'
 import { StatusBadge } from '../SharedUI.jsx'
 
 export function ProductStatusBar({ detail, activeView, onSelect, onShowRules }) {
@@ -94,7 +95,10 @@ export function ArtifactDetail({ detail, view, onClose }) {
     <div className="artifact-inline-detail">
       <div className="artifact-inline-heading">
         <strong>{view === 'ddl' ? 'Oracle 表结构' : view === 'codes' ? '码表迁移' : '验证结果'}</strong>
-        <button type="button" className="button-link" onClick={onClose}>收起</button>
+        <div className="actions">
+          {view === 'ddl' && detail.ddl && <CopyButton text={detail.ddl} label="复制 DDL" />}
+          <button type="button" className="button-link" onClick={onClose}>收起</button>
+        </div>
       </div>
       {view === 'ddl' && (
         detail.ddl ? <pre className="sql-pre">{detail.ddl}</pre> : <div className="empty">还没有生成表结构。</div>

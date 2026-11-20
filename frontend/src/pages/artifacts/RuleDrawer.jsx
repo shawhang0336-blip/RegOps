@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { v2 } from '../../api.js'
+import CopyButton from '../../components/CopyButton.jsx'
 import { StatusBadge } from '../SharedUI.jsx'
 import { formatValue, ruleStatusLabel } from './artifactHelpers.js'
 
@@ -218,7 +219,10 @@ export default function RuleDrawer({ rule, index, total, onPrevious, onNext, onC
 
           {rule.sql && (
             <section className="rule-drawer-section">
-              <h3>编译后的校验条件</h3>
+              <div className="section-heading-actions">
+                <h3>编译后的校验条件</h3>
+                <CopyButton text={rule.sql} label="复制 SQL" />
+              </div>
               <pre className="rule-sql">{rule.sql}</pre>
             </section>
           )}

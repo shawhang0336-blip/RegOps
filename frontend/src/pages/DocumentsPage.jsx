@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { useFeedback } from '../context/FeedbackContext.jsx'
 import { useEventStream, watchDocumentProgress } from '../hooks/useEventStream.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
@@ -15,6 +16,7 @@ import {
 
 export default function DocumentsPage({ embedded = false, importOnly = false, autoParse = false, onShowAssets, onSelectDocument }) {
   const navigate = useNavigate()
+  const { confirm } = useFeedback()
   const [documents, setDocuments] = useState([])
   const [detail, setDetail] = useState(null)
   const [selected, setSelected] = useState([])
@@ -239,9 +241,13 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
   async function deleteDocument() {
     if (!detail) return
-    const confirmed = window.confirm(
-      `确定从文件列表移除“${detail.file_name}”吗？\n\n已生成的报表、码值和运行记录都会保留；重新上传同一文件会重新检查结构并切块。`
-    )
+    const confirmed = await confirm({
+      title: `移除文件「${detail.file_name}」？`,
+      message: '将从当前文件列表中移除该规范文档。',
+      details: '已生成的报表、码值和运行记录都会保留；重新上传同一文件会重新检查结构并切块。',
+      confirmLabel: '确认移除',
+      tone: 'danger',
+    })
     if (!confirmed) return
     setBusy(true)
     setError('')
@@ -257,7 +263,13 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   }
 
   async function reextractBlocks() {
-    if (!detail || !window.confirm('重新识别会保留已核对内容，并更新当前文件的识别结果。是否继续？')) return
+    if (!detail) return
+    const confirmed = await confirm({
+      title: '重新识别文件内容？',
+      message: '重新识别会保留已核对内容，并更新当前文件的切块识别结果。',
+      confirmLabel: '继续识别',
+    })
+    if (!confirmed) return
     setBusy(true)
     try {
       await v2(`/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
