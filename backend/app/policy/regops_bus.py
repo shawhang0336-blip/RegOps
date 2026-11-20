@@ -75,11 +75,12 @@ def field_whitelist_adjudicator(
 def cross_table_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
-    """跨表引用门禁：references_table / table_code / golden_overrides 必须在已确认表集合内。"""
+    """跨表引用门禁：references_table / references_field / table_code / golden_overrides 必须在已确认表与字段白名单内。"""
     allowed = payload.get("table_codes") or payload.get("selected_table_codes")
     if not allowed:
         return None
     allowed_set = set(allowed)
+    table_fields = payload.get("table_fields") or {}
     for candidate in args.get("rules", []) or []:
         if not isinstance(candidate, dict):
             continue
@@ -88,6 +89,14 @@ def cross_table_adjudicator(
             value = candidate.get(key) or (params.get(key) if isinstance(params, dict) else None)
             if value is not None and value not in allowed_set:
                 return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {sorted(allowed_set)} 中"
+        if isinstance(params, dict) and table_fields:
+            ref_table = params.get("references_table")
+            ref_field = params.get("references_field")
+            if ref_table in table_fields and ref_field is not None and ref_field not in set(table_fields[ref_table]):
+                return (
+                    f"跨表字段幻觉拦截：references_field='{ref_field}' "
+                    f"不在目标表 {ref_table} 字段白名单 {sorted(table_fields[ref_table])} 中"
+                )
     overrides = args.get("golden_overrides")
     if isinstance(overrides, dict):
         for table_code in overrides:
@@ -118,14 +127,13 @@ def operator_whitelist_adjudicator(
 def code_set_values_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
-    """已发布码表值域门禁：当 payload 携带 published_code_set 时，ENUM 规则与生成器取值不得越界。"""
+    """已发布码表值域门禁：当 payload 携带 published_code_set 或 published_code_sets 时，ENUM 规则与生成器取值不得越界。"""
     published = payload.get("published_code_set")
-    if not isinstance(published, dict) or not published.get("values"):
-        return None
-    allowed_values = {str(v) for v in published["values"]}
-    code_name = published.get("code") or "PUBLISHED_CODE_SET"
+    published_map = payload.get("published_code_sets")
 
-    if tool_name == "assign_rules":
+    if tool_name == "assign_rules" and isinstance(published, dict) and published.get("values"):
+        allowed_values = {str(v) for v in published["values"]}
+        code_name = published.get("code") or "PUBLISHED_CODE_SET"
         for candidate in args.get("rules", []) or []:
             if not isinstance(candidate, dict) or candidate.get("operator") != "ENUM":
                 continue
@@ -140,6 +148,16 @@ def code_set_values_adjudicator(
         for candidate in args.get("generators", []) or []:
             if not isinstance(candidate, dict) or candidate.get("generator") != "ENUM":
                 continue
+            field_name = candidate.get("field")
+            target_cs = None
+            if isinstance(published_map, dict) and field_name in published_map:
+                target_cs = published_map[field_name]
+            elif isinstance(published, dict):
+                target_cs = published
+            if not isinstance(target_cs, dict) or not target_cs.get("values"):
+                continue
+            allowed_values = {str(v) for v in target_cs["values"]}
+            code_name = target_cs.get("code") or "PUBLISHED_CODE_SET"
             params = candidate.get("params")
             values = (params.get("values") if isinstance(params, dict) else None) or []
             if values:

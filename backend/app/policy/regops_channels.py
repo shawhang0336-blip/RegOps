@@ -33,6 +33,8 @@ DEFAULT_CHANNELS: Dict[str, ChannelSpec] = {
     "attempt": ChannelSpec("attempt", last_value),
     "first_attempt": ChannelSpec("first_attempt", last_value),
     "self_heal_report": ChannelSpec("self_heal_report", last_value),
+    "heal_data_report": ChannelSpec("heal_data_report", last_value),
+    "heal_cases_report": ChannelSpec("heal_cases_report", last_value),
     "approval_origin": ChannelSpec("approval_origin", last_value),
 }
 
@@ -85,6 +87,7 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
                 if isinstance(item, dict) and "golden_record" in item
             }
             shared["golden_records"] = merge_dict(shared.get("golden_records"), golden)
+            shared.pop("heal_data_report", None)
         elif kind == "AUDIT_CASES_ASSIGNED":
             tables = resolve_event_tables(payload, blob_store)
             typed_cases = {}
@@ -96,12 +99,20 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
                         pass
             if typed_cases:
                 shared["audit_cases"] = merge_dict(shared.get("audit_cases"), typed_cases)
+            shared.pop("heal_cases_report", None)
         elif kind == "GO_REDIRECT":
             shared["approval_origin"] = payload.get("origin") or "self_heal"
+            target_node = payload.get("target") or "rule_binder"
             report_uri = (payload.get("failed_result") or {}).get("audit_report_blob") or payload.get("audit_report_blob")
             if report_uri and blob_store is not None:
                 try:
-                    shared["self_heal_report"] = json.loads(blob_store.get(report_uri).decode("utf-8"))
+                    loaded_report = json.loads(blob_store.get(report_uri).decode("utf-8"))
+                    if target_node == "data_generator_binder":
+                        shared["heal_data_report"] = loaded_report
+                    elif target_node == "audit_case_binder":
+                        shared["heal_cases_report"] = loaded_report
+                    else:
+                        shared["self_heal_report"] = loaded_report
                 except Exception:
                     pass
 

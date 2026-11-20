@@ -58,6 +58,8 @@ DEFAULT_EDGES: Tuple[PlanEdge, ...] = (
     PlanEdge("data_generator_binder", "audit_case_binder", "always"),
     PlanEdge("audit_case_binder", "oracle_executor", "always"),
     PlanEdge("oracle_executor", "rule_binder", "audit_failed_self_heal"),
+    PlanEdge("oracle_executor", "data_generator_binder", "audit_failed_heal_data"),
+    PlanEdge("oracle_executor", "audit_case_binder", "audit_failed_heal_cases"),
     PlanEdge("oracle_executor", "test_confirmation", "audit_passed"),
     PlanEdge("oracle_executor", "failed", "audit_rejected"),
     PlanEdge("test_confirmation", "export", "confirmed"),
@@ -88,10 +90,26 @@ def is_gate(name: str) -> bool:
 
 
 def self_heal_target() -> str:
-    """审计失败且还有自愈预算时回到的节点。"""
+    """审计失败且需修正规则时回到的节点。"""
     target = DEFAULT_PLAN.next("oracle_executor", "audit_failed_self_heal")
     if not target:
         raise RuntimeError("Plan 缺少自愈回边")
+    return target
+
+
+def self_heal_data_target() -> str:
+    """黄金样本误报时回到造数节点修正测试数据，绝不削弱规则。"""
+    target = DEFAULT_PLAN.next("oracle_executor", "audit_failed_heal_data")
+    if not target:
+        raise RuntimeError("Plan 缺少黄金造数自愈回边")
+    return target
+
+
+def self_heal_cases_target() -> str:
+    """确定性/显性规则漏报且需重构反例时回到审计用例节点。"""
+    target = DEFAULT_PLAN.next("oracle_executor", "audit_failed_heal_cases")
+    if not target:
+        raise RuntimeError("Plan 缺少变异用例自愈回边")
     return target
 
 

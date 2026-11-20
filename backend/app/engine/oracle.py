@@ -150,7 +150,7 @@ def compile_ai_schema_oracle_ddl(
     table: str,
     schema: List[SchemaBinding],
 ) -> str:
-    columns = ['"record_id" VARCHAR2(64 CHAR) PRIMARY KEY']
+    columns = ['"record_id" VARCHAR2(128 CHAR) PRIMARY KEY']
     for field in schema:
         if field.storage_type == "NUMBER":
             data_type = f"NUMBER({field.length},{field.decimal_places})"
@@ -169,7 +169,7 @@ def compile_sandbox_oracle_ddl(table: str, spec: SpecDocument) -> str:
     代价：非数字变异值会在插入时被 Oracle 拒绝——这类用例在绑定阶段
     （bind_audit_cases）就会被拦下，轮到入库的都是数值形态。
     """
-    columns = ['"record_id" VARCHAR2(64 CHAR) PRIMARY KEY']
+    columns = ['"record_id" VARCHAR2(128 CHAR) PRIMARY KEY']
     for field in spec.fields:
         if (field.data_type or "").upper() == "NUMBER":
             columns.append(f"{quote_identifier(field.name, 'oracle')} NUMBER NULL")

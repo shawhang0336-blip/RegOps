@@ -181,7 +181,7 @@ def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
             continue
         raw = "\n".join(" | ".join(row) for row in rows)
         code_spec = _sniff_tabular_code_set(sheet.title, rows[0], rows)
-        payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "sheet": sheet.title}
+        payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "sheet": sheet.title, "table_name": sheet.title}
         if code_spec:
             payload["candidate_role"] = "CODE_SET"
             payload["code_set_spec"] = code_spec

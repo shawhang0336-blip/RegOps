@@ -82,8 +82,13 @@ def compile_where(
             key = f"if_value_{index}"
             params[key] = value
             condition_values.append(f":{key}")
-        condition_operator = "=" if rule.params["if_operator"] == "EQ" else "<>"
-        condition = f"{condition_field} {condition_operator} ({', '.join(condition_values)})"
+        is_eq = rule.params["if_operator"] == "EQ"
+        if len(condition_values) == 1:
+            condition_operator = "=" if is_eq else "<>"
+            condition = f"{condition_field} {condition_operator} {condition_values[0]}"
+        else:
+            condition_operator = "IN" if is_eq else "NOT IN"
+            condition = f"{condition_field} {condition_operator} ({', '.join(condition_values)})"
         return (
             f"({condition_field} IS NOT NULL AND {condition} "
             f"AND {missing_text(field, dialect)})",

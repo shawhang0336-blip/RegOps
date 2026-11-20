@@ -37,9 +37,10 @@ backend/app/
 │   └── scheduler.py             #    零业务硬编码调度器（屏障排空 BUS_REJECTED → 落账 → 合并 Channel → 折叠）
 │
 ├── policy/                      # 层 2：RegOps 领域策略层（仅依赖 infra + kernel，以插件方式装配到 kernel）
-│   ├── regops_plan.py           #    12 节点装配流水线拓扑（DEFAULT_PLAN）与业务事件状态折叠（_apply）
-│   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表/算子/码表/切块 ID 白名单）
-│   └── regops_channels.py       #    16 个命名数据通道与 EventLog + BlobStore 断点折叠恢复
+│   ├── regops_plan.py           #    12 节点装配流水线拓扑（DEFAULT_PLAN，含规则/造数/用例三路自愈回边）与状态折叠
+│   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）
+│   ├── regops_channels.py       #    18 个命名数据通道与 EventLog + BlobStore 断点折叠恢复
+│   └── llm_guard.py             #    跨三阶段统一受控模型调用守卫（退避重试 + Bus 门禁 + 校验回喂）
 │
 ├── ingestion/                   # 层 3：监管文档接入与结构解析（阶段一）
 │   ├── extractors.py            #    PDF / Word / Excel 原始块提取
@@ -66,13 +67,14 @@ backend/app/
 ├── engine/                      # 层 5：规则装配、造数与 Oracle 沙箱执行（阶段二）
 │   ├── rules.py                 #    单条规则校验与样本违规判定
 │   ├── compiler.py              #    规则 → Oracle / MySQL 校验 SQL 编译器
-│   ├── binding.py               #    Schema / Rule / Generator / AuditCase 确定性绑定校验
-│   ├── rule_backfill.py         #    必填 / 列宽上限（LENGTH_MAX）/ 固定值确定性规则补齐
+│   ├── binding.py               #    确定性 Schema 编译 + Rule / Generator / 黄金自洽门禁 / AuditCase 校验
+│   ├── mutations.py             #    确定性审计变异引擎（黄金基线 + 9 类非正则算子反例构造 + 正则兜底）
+│   ├── rule_backfill.py         #    前置四类确定性规则派生（必填 / 列宽上限 / 固定值 / 已发布码表 ENUM）
 │   ├── oracle.py                #    OracleSandbox 物理表管理 + GenericOracleExecutor 真跑审计
 │   └── workflow/                #    阶段二编排流水线
-│       ├── runtime.py           #      _call_validated（退避重试+Bus门禁）与 _fanout（BSP 并发扇出）
-│       ├── stages.py            #      规划 / Schema / 规则 / Oracle 资产 / 造数 / 审计用例 / 靶向重绑
-│       ├── nodes.py             #      7 个 ProdAgent NodeBody（body(input, ctx) -> Outcome）
+│       ├── runtime.py           #      _call_validated（委托 llm_guard）与 _fanout（BSP 并发扇出）
+│       ├── stages.py            #      规划 / 确定性 Schema / 前置派生+语义规则 / 资产 / 混合造数 / 确定性优先变异 / 靶向重绑
+│       ├── nodes.py             #      7 个 ProdAgent NodeBody（含误报修数据 / 漏报分流修用例或修规则的双路径自愈）
 │       └── entrypoints.py       #      drive / start / approve / confirm / retry 唯一业务入口
 │
 ├── delivery/                    # 层 6：生产交付与业务库只读校验（阶段三）

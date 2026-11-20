@@ -53,6 +53,7 @@ from app.assets.metadata_views import (
     type_basis_for,
 )
 from app.infra.llm import RealDesignLlm
+from app.policy.llm_guard import call_llm_validated
 from app.infra.asset_models import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
@@ -313,7 +314,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         if not raw_fields:
             raw_fields = [{"raw_text": block.raw_content}]
         fallback_code = source_spec.get("table_code") or block.content_json.get("table_code") or f"TABLE_{block.id.replace('-', '')[:12].upper()}"
-        fallback_name = source_spec.get("table_name") or block.content_json.get("table_name") or f"原始表格 {block.ordinal + 1}"
+        fallback_name = source_spec.get("table_name") or block.content_json.get("table_name") or block.source_locator.get("sheet") or f"原始表格 {block.ordinal + 1}"
 
         try:
             llm = RealDesignLlm(settings)
@@ -345,13 +346,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         [item.get("name") or item.get("field_en") or "" for item in chunk],
                     ),
                 }
-                try:
-                    args, trace = llm.assign(
-                        "assign_metadata",
-                        f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。",
-                        payload,
-                        timeout=120,
-                    )
+                def _validate_meta_batch(args):
                     candidate = {
                         "table_code": fallback_code,
                         "table_name": fallback_name,
@@ -359,14 +354,29 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "fields": args.get("fields", []),
                     }
                     draft = MetadataTableDraft.model_validate(candidate)
-                    if len(draft.fields) == len(chunk):
-                        require_valid_metadata(draft)
-                        _apply_source_definitions(draft.fields, chunk, terms_text)
-                        return draft.fields, draft.table_definition, trace
+                    if len(draft.fields) != len(chunk):
+                        raise ValueError(
+                            f"Field count mismatch in batch LLM response: expected {len(chunk)}, got {len(draft.fields)}"
+                        )
+                    require_valid_metadata(draft)
+                    return draft
+
+                try:
+                    draft, trace = call_llm_validated(
+                        llm,
+                        "assign_metadata",
+                        f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。",
+                        payload,
+                        _validate_meta_batch,
+                        timeout=120,
+                        backoff=(1.0,),
+                        transient_attempts=2,
+                        validation_attempts=2,
+                    )
+                    _apply_source_definitions(draft.fields, chunk, terms_text)
+                    return draft.fields, draft.table_definition, trace
                 except Exception as exc:
                     err_msg = f"{type(exc).__name__}: {exc}"
-                else:
-                    err_msg = "Field count mismatch in batch LLM response"
             else:
                 err_msg = ""
 
@@ -382,8 +392,11 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                 **({"fallback_from": err_msg} if err_msg else {}),
             }
 
-        with ThreadPoolExecutor(max_workers=min(2, len(chunks))) as executor:
-            chunk_results = list(executor.map(bind_chunk, chunks)) if chunks else []
+        if chunks:
+            with ThreadPoolExecutor(max_workers=max(1, min(2, len(chunks)))) as executor:
+                chunk_results = list(executor.map(bind_chunk, chunks))
+        else:
+            chunk_results = []
 
         # 按原始字段顺序合并：确定性结果 + AI/兜底结果
         field_by_index: Dict[int, MetadataFieldDraft] = dict(clean_drafts)
@@ -410,7 +423,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         )
         require_valid_metadata(draft)
         trace = {
-            "provider": "GLM" if llm else "DETERMINISTIC",
+            "provider": settings.llm_provider if llm else "DETERMINISTIC",
             "model": settings.llm_model if llm else "rule-engine",
             "batch_count": len(chunk_results),
             "batches": batch_traces,
@@ -442,7 +455,8 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
         issues: List[Dict[str, Any]] = []
         if llm is not None and ai_assignment_used:
             try:
-                args, review_trace = llm.assign(
+                args, review_trace = call_llm_validated(
+                    llm,
                     "review_metadata",
                     (
                         "独立复核整表字段元数据，只依据 raw_context 判断，仅输出存在遗漏、类型长度错配、"
@@ -464,6 +478,9 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         ),
                     },
                     timeout=60,
+                    backoff=(1.0,),
+                    transient_attempts=2,
+                    validation_attempts=2,
                 )
                 issues = args.get("issues", [])
             except Exception as exc:

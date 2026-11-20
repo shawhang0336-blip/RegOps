@@ -44,7 +44,7 @@ def _create_run(session: Session, spec_id: str, settings: Settings, operator: st
         "table_confirmation",
         {
             "spec_id": spec_id,
-            "provider": "REAL_GLM",
+            "provider": settings.llm_provider,
             "confirmation": specification.content_json.get("confirmation"),
             "operator": operator,
         },

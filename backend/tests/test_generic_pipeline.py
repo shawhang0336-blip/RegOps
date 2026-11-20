@@ -151,8 +151,11 @@ def test_generic_run_records_ai_tool_calls_before_human_gate(organization_spec, 
     assert project(session, run).status == "WAITING_APPROVAL"
     events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
     kinds = [event.kind for event in events]
-    assert kinds.count("AI_TOOL_ASSIGNED") == 2
+    # schema_mapper 已切换为确定性编译，不再消耗 AI 调用；进入人工门前仅 rule_binder 产生 1 次表级 AI_TOOL_ASSIGNED
+    assert kinds.count("AI_TOOL_ASSIGNED") == 1
     assert "SCHEMA_ASSIGNED" in kinds
+    assert "RULE_BACKFILL" in kinds
+    assert kinds.index("RULE_BACKFILL") < kinds.index("BSP_FANOUT")
     assert "AUDIT_STARTED" not in kinds
 
 
@@ -544,7 +547,8 @@ def test_self_heal_goto_rule_binder_only_rebinds_failed_rules_not_full_table(org
     rebind_calls = [p for p in rule_call_payloads if "current_rule" in p]
     initial_calls = [p for p in rule_call_payloads if "current_rule" not in p]
     assert len(rebind_calls) == 1
-    assert len(initial_calls) == 3  # 字段1调2次（第1条+空结束）+ 字段2调1次（空结束），自愈未新增初绑调用
+    # 确定性派生前置后，每字段单次返回全部剩余语义规则（2 个字段 = 2 次初绑调用），自愈未新增初绑调用
+    assert len(initial_calls) == 2
     kinds = [e.kind for e in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
     assert "GO_REDIRECT" in kinds
 
@@ -568,32 +572,36 @@ def test_retry_generic_run_resumes_from_last_completed_checkpoint_when_no_audit_
     )
     session.commit()
 
-    schema_calls = []
+    rule_calls = []
     fail_generators = {"should_fail": True}
 
     class FlakyGeneratorLlm(FixtureDesignLlm):
         def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
-            if tool_name == "assign_schema":
-                schema_calls.append(1)
             if tool_name == "assign_rules":
-                if payload.get("existing_rule_keys"):
-                    args = {"rules": []}
-                else:
-                    args = {
-                        "rules": [
-                            {
-                                "rule_key": "R_DOC_REQ",
-                                "field": slim_spec.fields[0].name,
-                                "operator": "REQUIRED",
-                                "params": {},
-                                "evidence_kind": "DICTIONARY",
-                                "rationale": "explicit required",
-                            }
-                        ]
-                    }
+                rule_calls.append(1)
+                args = {
+                    "rules": [
+                        {
+                            "rule_key": "R_DOC_REGEXP",
+                            "field": slim_spec.fields[0].name,
+                            "operator": "REGEXP",
+                            "params": {"pattern": "^[A-Z0-9]+$"},
+                            "evidence_kind": "DICTIONARY",
+                            "rationale": "explicit format regexp",
+                        }
+                    ]
+                }
                 return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
             if tool_name == "assign_generators" and fail_generators["should_fail"]:
                 raise RuleValidationError("simulated generator failure")
+            if tool_name == "assign_generators":
+                args = {
+                    "generators": [
+                        {"field": field["name"], "generator": "FIXED", "params": {"value": "ABC123"}}
+                        for field in payload["fields"]
+                    ]
+                }
+                return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
             return super().assign(tool_name, instruction, payload, feedback=feedback, timeout=timeout)
 
     def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
@@ -639,13 +647,14 @@ def test_retry_generic_run_resumes_from_last_completed_checkpoint_when_no_audit_
     assert failed_state.status == "FAILED"
     assert failed_state.current_node == "data_generator_binder"
     assert failed_state.resume_from_node == "oracle_asset_builder"
-    assert len(schema_calls) == 1
+    assert len(rule_calls) == 1
 
-    # 恢复正常后调用 retry_generic_run：从 oracle_asset_builder 之后断点续跑，不重跑 schema_mapper
+    # 恢复正常后调用 retry_generic_run：从 oracle_asset_builder 之后断点续跑，不重跑前半段（schema_mapper / rule_binder）
     fail_generators["should_fail"] = False
     run = retry_generic_run(session, run, settings, llm=llm)
     resumed_state = project(session, run)
     assert resumed_state.status == "WAITING_TEST_APPROVAL"
-    assert len(schema_calls) == 1  # schema_mapper 未被重复调用
+    assert len(rule_calls) == 1  # rule_binder 未被重复调用
     kinds = [e.kind for e in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
+    assert kinds.count("SCHEMA_ASSIGNED") == 1  # schema_mapper 未被重复执行
     assert "RUN_RESUMED" in kinds

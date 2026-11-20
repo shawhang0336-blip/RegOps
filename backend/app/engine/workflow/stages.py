@@ -30,7 +30,15 @@ from app.engine.binding import (
     bind_generators,
     bind_rules,
     bind_schema,
+    compile_schema_bindings,
+    find_golden_rule_violations,
     materialize_golden_record,
+    normalize_case_id,
+)
+from app.engine.mutations import (
+    build_deterministic_mutations,
+    build_golden_audit_case,
+    build_regexp_fallback_mutation,
 )
 from app.engine.compiler import compile_rule_query
 from app.infra.domain import RuleDefinition, calculate_rule_hash, canonical_json
@@ -58,14 +66,26 @@ from app.infra.models import EventModel, RuleModel, RunModel
 from app.kernel.blob_store import LocalBlobStore
 from app.policy.regops_plan import project
 from app.engine.rule_backfill import (
+    _backfill_code_set_enum_rules as _policy_backfill_code_set_enum_rules,
     _backfill_fixed_value_rules as _policy_backfill_fixed_value_rules,
     _backfill_length_rules as _policy_backfill_length_rules,
     _backfill_required_rules as _policy_backfill_required_rules,
+    _code_set_enum_backfill_candidates,
     _declaration_quote,
     _fixed_value_candidates,
     _length_backfill_candidates,
     _required_backfill_candidates,
+    derive_deterministic_rules as _policy_derive_deterministic_rules,
 )
+
+
+def _provider_name(llm, trace: Optional[Dict[str, Any]] = None) -> str:
+    if isinstance(trace, dict) and trace.get("provider"):
+        return str(trace["provider"])
+    settings = getattr(llm, "settings", None)
+    if settings is not None and getattr(settings, "llm_provider", None):
+        return str(settings.llm_provider)
+    return "unknown"
 
 
 def _validate_plan(args, budget):
@@ -132,18 +152,8 @@ def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4, bus=None
 
 
 def _schema_stage(session, run, specs, llm, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
-    def worker(spec):
-        return _call_validated(
-            llm,
-            "assign_schema",
-            "为每个白名单字段赋予物理存储类型和长度。必须逐字段全覆盖，不得改变数值字段语义。",
-            spec_payload(spec),
-            lambda args: bind_schema(spec, args.get("fields", [])),
-            bus=bus,
-        )
-
-    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency, events=events, bus=bus)
-    schemas = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
+    """确定性 Schema 映射阶段：根据已确认字段元数据直接编译物理存储类型，不消耗 AI 调用。"""
+    schemas = {spec.table_code: compile_schema_bindings(spec) for spec in specs}
     for spec in specs:
         session.add(
             SchemaDefinitionModel(
@@ -156,7 +166,10 @@ def _schema_stage(session, run, specs, llm, concurrency: int = 4, bus=None, even
         )
     session.flush()
     tables_payload = {code: [item.model_dump() for item in items] for code, items in schemas.items()}
-    event_payload: Dict[str, Any] = {"tables": tables_payload}
+    event_payload: Dict[str, Any] = {
+        "strategy": "DETERMINISTIC_SCHEMA_COMPILER",
+        "tables": tables_payload,
+    }
     if blob_store is not None:
         event_payload["tables_blob"] = blob_store.put(canonical_json(tables_payload).encode("utf-8"))
     _emit(
@@ -178,8 +191,44 @@ def _schema_stage(session, run, specs, llm, concurrency: int = 4, bus=None, even
     return tables_payload
 
 
+def _summarize_deterministic_rule(rule: RuleDefinition) -> Dict[str, Any]:
+    params = rule.params
+    if rule.operator == "ENUM" and isinstance(params.get("values"), list) and len(params["values"]) > 12:
+        params = {
+            "value_count": len(params["values"]),
+            "sample_values": params["values"][:8],
+        }
+    return {
+        "rule_key": rule.rule_key,
+        "operator": rule.operator,
+        "params": params,
+    }
+
+
 def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None):
     _, field_code_sets = load_published_code_sets(session, specs)
+    # 确定性派生先行：在调用 AI 之前先机械产出必填 / 列宽上限 / 固定值 / 已发布码表 ENUM，
+    # 让 AI 专注需要语义推理的复杂规则，且人工在第二步就能看到完整规则全集。
+    deterministic_rules = _policy_derive_deterministic_rules(
+        session,
+        run,
+        specs,
+        _upsert_rule,
+        _emit,
+        field_code_sets=field_code_sets,
+        events=events,
+    )
+    det_by_field: Dict[tuple, List[RuleDefinition]] = {}
+    det_signatures = set()
+    det_single_ops = set()
+    det_keys = set()
+    for rule in deterministic_rules:
+        det_by_field.setdefault((rule.table_code, rule.field), []).append(rule)
+        det_signatures.add((rule.table_code, rule.field, rule.operator, canonical_json(rule.params)))
+        if rule.operator in {"REQUIRED", "LENGTH_MAX"}:
+            det_single_ops.add((rule.table_code, rule.field, rule.operator))
+        det_keys.add(rule.rule_key)
+
     outer_workers = max(1, min(concurrency, len(specs)))
 
     def worker(spec):
@@ -208,59 +257,73 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
                 }
 
         def _bind_one_field(field):
-            field_rules = []
-            traces = []
-            for _ in range(3):
-                payload = {
-                    **spec_payload(spec),
-                    "fields": [field.model_dump()],
-                    "field_names": [item.name for item in spec.fields],
-                    "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
-                    "existing_rule_keys": [rule.rule_key for rule in field_rules],
-                    **_code_set_context(field_code_sets, spec.table_code, field.name),
-                }
-                rules, trace = _call_validated(
-                    llm,
-                    "assign_rules",
-                    "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE）。",
-                    payload,
-                    lambda args: bind_rules(spec, args.get("rules", [])),
-                    bus=bus,
-                )
-                traces.append(trace)
-                if not rules:
-                    break
-                field_rules.extend(rules)
-            return field_rules, {
-                "provider": "GLM",
-                "model": traces[0]["model"] if traces else "unknown",
+            field_det = det_by_field.get((spec.table_code, field.name), [])
+            payload = {
+                **spec_payload(spec),
+                "target_field": field.name,
+                "fields": [field.model_dump()],
+                "field_names": [item.name for item in spec.fields],
+                "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
+                "deterministic_rules": [_summarize_deterministic_rule(r) for r in field_det],
+                "existing_rule_keys": [],
+                **_code_set_context(field_code_sets, spec.table_code, field.name),
+            }
+            rules, trace = _call_validated(
+                llm,
+                "assign_rules",
+                f"【严格范围】本次仅处理目标字段 `{field.name}`（即 target_field），返回的每条规则的 field 必须等于 `{field.name}`，严禁为 field_names 中的其他字段生成规则（field_names 仅用于填写 if_field / right_field）。"
+                "deterministic_rules 中的必填、列宽上限、固定值和已发布码表白名单规则已由系统确定性派生并生效，严禁重复输出。"
+                "请一次返回该目标字段剩余所有需要语义理解的规则（如 COND_REQUIRED 条件必填、REGEXP 精确格式/定长编码、"
+                "NUM_RANGE 数值上下限、FIELD_COMPARE 跨字段比较、NOT_IN 禁用取值或额外业务子集 ENUM）；同一语义只给一条最准确规则，不要输出多个变体；没有则返回空数组。"
+                "显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。"
+                "COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。"
+                "数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；"
+                "跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE）。",
+                payload,
+                lambda args: bind_rules(spec, args.get("rules", [])),
+                bus=bus,
+            )
+            # 严格过滤越界字段规则（防止模型顺手为同表其他字段重复生成规则）及与确定性派生重复的规则
+            filtered = [
+                rule
+                for rule in rules
+                if rule.field == field.name
+                and (rule.table_code, rule.field, rule.operator, canonical_json(rule.params)) not in det_signatures
+                and (rule.table_code, rule.field, rule.operator) not in det_single_ops
+            ]
+            return filtered, {
+                "provider": _provider_name(llm, trace),
+                "model": trace.get("model", "unknown"),
                 "tool_name": "assign_rules",
-                "rounds": traces,
-                "arguments": {"rules": [rule.model_dump() for rule in field_rules]},
+                "rounds": [trace],
+                "arguments": {"rules": [rule.model_dump() for rule in filtered]},
             }
 
-        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(fields))) as field_executor:
+        with ThreadPoolExecutor(max_workers=max(1, min(_inner_width(concurrency, outer_workers), len(fields)))) as field_executor:
             field_results = list(field_executor.map(bind_field, fields))
         for rules, trace in field_results:
             bound_rules.extend(rules)
             batch_traces.append(trace)
-        key_counts = {}
+        key_counts = {key: 1 for key in det_keys}
         for rule in bound_rules:
             key_counts[rule.rule_key] = key_counts.get(rule.rule_key, 0) + 1
             if key_counts[rule.rule_key] > 1:
                 rule.rule_key = f"{rule.rule_key}_{key_counts[rule.rule_key]}"
                 rule.rule_hash = calculate_rule_hash(rule, spec.source_sha256)
-        if not bound_rules and gaps:
+        table_det_rules = [r for r in deterministic_rules if r.table_code == spec.table_code]
+        if not bound_rules and not table_det_rules and gaps:
             raise WorkflowError(
                 f"{spec.table_code} 的 {len(gaps)} 个字段全部未能绑定规则，"
                 f"首个失败：{gaps[0]['error']}",
                 context={"stage": "rule_binder", "table_code": spec.table_code, "field": gaps[0]["field"]},
             )
+        first_trace = batch_traces[0] if batch_traces else {}
         return bound_rules, {
-            "provider": "GLM",
-            "model": (batch_traces[0].get("model") or "unknown") if batch_traces else "unknown",
+            "provider": _provider_name(llm, first_trace),
+            "model": (first_trace.get("model") or "unknown") if first_trace else "unknown",
             "tool_name": "assign_rules",
             "batch_count": len(batch_traces),
+            "deterministic_count": len(table_det_rules),
             "batches": batch_traces,
             "gaps": gaps,
             "arguments": {"rules": [rule.model_dump() for rule in bound_rules]},
@@ -306,19 +369,40 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
     golden_overrides = {}
     if len(specs) > 1:
         selected = {spec.table_code for spec in specs}
+        specs_by_code = {spec.table_code: spec for spec in specs}
+        compact_tables = [
+            {
+                "table_code": spec.table_code,
+                "table_name": spec.table_name,
+                "section": spec.section,
+                "fields": [
+                    {
+                        "name": f.name,
+                        "content": f.content,
+                        "data_type": f.data_type,
+                        "length": f.length,
+                        "check_text": (f.check_text or "")[:240],
+                    }
+                    for f in spec.fields
+                ],
+                "terms_excerpt": (spec.terms_text or "")[:1500],
+            }
+            for spec in specs
+        ]
         payload = {
-            "tables": [spec_payload(spec) for spec in specs],
+            "tables": compact_tables,
             "table_codes": sorted(selected),
-            "instruction": "只装配有明确依据的跨表 FOREIGN_KEY 规则，并给必要的黄金记录引用值覆盖。",
+            "table_fields": {spec.table_code: [f.name for f in spec.fields] for spec in specs},
+            "instruction": "只装配有明确依据的跨表 FOREIGN_KEY 规则（支持异名关联字段），并给必要的黄金记录引用值覆盖。",
         }
 
         def cross_validator(args):
             bound = []
             for item in args.get("rules", []):
-                target = next((spec for spec in specs if spec.table_code == item.get("table_code")), None)
+                target = specs_by_code.get(item.get("table_code"))
                 if not target:
                     raise RuleValidationError("Cross rule target table is outside the confirmed set")
-                bound.extend(bind_rules(target, [item], selected))
+                bound.extend(bind_rules(target, [item], selected, specs_by_code=specs_by_code))
             overrides = args.get("golden_overrides", {})
             if any(code not in selected for code in overrides):
                 raise RuleValidationError("Golden override references an unconfirmed table")
@@ -327,7 +411,8 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
         (cross_rules, golden_overrides), trace = _call_validated(
             llm,
             "assign_rules",
-            "装配跨表 FOREIGN_KEY 规则。rule 必须额外带 table_code；references_table 必须来自已确认表。可返回 golden_overrides 对齐引用值。",
+            "装配跨表 FOREIGN_KEY 规则。rule 必须额外带 table_code；references_table 必须来自已确认表，"
+            "references_field 必须来自目标表的 table_fields 白名单（允许异名字段引用，如 CUST_ID 引用 ID）。可返回 golden_overrides 对齐引用值。",
             payload,
             cross_validator,
             bus=bus,
@@ -438,53 +523,285 @@ def _next_asset_version(session, model, run_id, table_code) -> int:
     return int(current or 0) + 1
 
 
-def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
+_GENERATOR_BATCH_SIZE = 12
+_SEMANTIC_GENERATOR_OPERATORS = {"REGEXP", "NUM_RANGE", "FIELD_COMPARE", "COND_REQUIRED", "FOREIGN_KEY"}
+
+
+def _coupled_field_names(
+    spec,
+    table_rules: List[RuleDefinition],
+    heal_report: Optional[Dict[str, Any]] = None,
+) -> set:
+    """识别需要 AI 联合语义赋值的字段（正则、数值区间、跨字段比较、条件必填、外键或误报自愈字段）。"""
+    coupled = set()
+    rule_by_key = {rule.rule_key: rule for rule in table_rules}
+    for rule in table_rules:
+        if rule.operator in _SEMANTIC_GENERATOR_OPERATORS:
+            coupled.add(rule.field)
+            if rule.operator == "FIELD_COMPARE" and rule.params.get("right_field"):
+                coupled.add(rule.params["right_field"])
+            if rule.operator == "COND_REQUIRED" and rule.params.get("if_field"):
+                coupled.add(rule.params["if_field"])
+    if heal_report:
+        for case in heal_report.get("cases", []):
+            if case.get("table_code") != spec.table_code or case.get("case_kind") != "GOLDEN":
+                continue
+            for rule_key in case.get("unexpected_rules") or []:
+                rule = rule_by_key.get(rule_key)
+                if rule:
+                    coupled.add(rule.field)
+                    if rule.params.get("right_field"):
+                        coupled.add(rule.params["right_field"])
+                    if rule.params.get("if_field"):
+                        coupled.add(rule.params["if_field"])
+    return coupled
+
+
+def _deterministic_generator_item(
+    field,
+    table_code: str,
+    table_rules: List[RuleDefinition],
+    field_code_sets: Dict[Any, Any],
+    required_ref_values: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """对无复杂语义约束的字段直接确定性构造合规生成器，减少 AI 杂活并保证码表对齐。"""
+    if field.name in required_ref_values:
+        return {"field": field.name, "generator": "FIXED", "params": {"value": required_ref_values[field.name]}}
+
+    field_rules = [rule for rule in table_rules if rule.field == field.name]
+    forbidden = {
+        str(val)
+        for rule in field_rules
+        if rule.operator == "NOT_IN"
+        for val in (rule.params.get("values") or [])
+    }
+    length_limits = [int(field.length)] if field.length else []
+    for rule in field_rules:
+        if rule.operator in {"LENGTH_MAX", "LENGTH"} and rule.params.get("length"):
+            length_limits.append(int(rule.params["length"]))
+    max_len = min(length_limits) if length_limits else 64
+
+    code_set = field_code_sets.get((table_code, field.name))
+    if code_set and code_set.get("values"):
+        candidates = [
+            str(item["value"])
+            for item in code_set["values"]
+            if item.get("value") is not None and str(item["value"]) not in forbidden
+        ]
+        if not candidates:
+            return None
+        return {"field": field.name, "generator": "ENUM", "params": {"values": candidates[:10]}}
+
+    enum_rules = [rule for rule in field_rules if rule.operator == "ENUM" and rule.params.get("values")]
+    if enum_rules:
+        allowed_sets = [
+            [str(v) for v in rule.params["values"] if str(v) not in forbidden]
+            for rule in enum_rules
+        ]
+        common = allowed_sets[0]
+        for other in allowed_sets[1:]:
+            other_set = set(other)
+            common = [v for v in common if v in other_set]
+        if not common:
+            return None
+        if len(common) == 1:
+            return {"field": field.name, "generator": "FIXED", "params": {"value": common[0]}}
+        return {"field": field.name, "generator": "ENUM", "params": {"values": common[:10]}}
+
+    if (field.data_type or "").upper() == "NUMBER":
+        for cand in (1, 10, 2, 100):
+            if str(cand) not in forbidden:
+                return {"field": field.name, "generator": "FIXED", "params": {"value": cand}}
+        return None
+
+    exact_lengths = [int(rule.params["length"]) for rule in field_rules if rule.operator == "LENGTH" and rule.params.get("length")]
+    if exact_lengths:
+        exact = exact_lengths[0]
+        candidate = ("A" * exact) if exact <= 64 else ("A" * exact)
+        if candidate not in forbidden:
+            return {"field": field.name, "generator": "FIXED", "params": {"value": candidate}}
+        return None
+
+    for base in ("SAMPLE_OK", "OK", "A", "B", "1", "V"):
+        cand = base[: max(1, max_len)]
+        if cand and cand not in forbidden:
+            return {"field": field.name, "generator": "FIXED", "params": {"value": cand}}
+    return None
+
+
+def _data_stage(
+    session,
+    run,
+    specs,
+    llm,
+    active_rules,
+    golden_overrides,
+    plans=None,
+    concurrency: int = 4,
+    bus=None,
+    events: Optional[List[tuple]] = None,
+    blob_store: Optional[LocalBlobStore] = None,
+    heal_report: Optional[Dict[str, Any]] = None,
+):
     _, field_code_sets = load_published_code_sets(session, specs)
-    outer_workers = max(1, min(concurrency, len(specs)))
 
     def worker(spec):
-        rule_views = [rule.model_dump() for rule in active_rules if rule.table_code == spec.table_code]
+        table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
+        rule_views = [rule.model_dump() for rule in table_rules]
+        required_refs = golden_overrides.get(spec.table_code, {})
+        golden_count = int(((plans or {}).get(spec.table_code) or {}).get("golden_count", 1))
+        coupled = _coupled_field_names(spec, table_rules, heal_report=heal_report)
 
-        def bind_field(field):
-            payload = {
-                **spec_payload(spec),
-                "fields": [field.model_dump()],
-                "approved_rules": rule_views,
-                "required_reference_values": golden_overrides.get(spec.table_code, {}),
-                "generation_plan": plans.get(spec.table_code) if plans else None,
-                **_code_set_context(field_code_sets, spec.table_code, field.name),
-            }
+        by_field_name: Dict[str, Dict[str, Any]] = {}
+        ai_fields = []
+        for field in spec.fields:
+            if field.name in coupled:
+                ai_fields.append(field)
+                continue
+            det_item = _deterministic_generator_item(field, spec.table_code, table_rules, field_code_sets, required_refs)
+            if det_item is not None:
+                try:
+                    binding = GeneratorBinding.model_validate(det_item)
+                    _validate_generator_item(field, binding)
+                    det_item["params"] = binding.params
+                    by_field_name[field.name] = det_item
+                    continue
+                except Exception:
+                    pass
+            ai_fields.append(field)
 
-            def validate_one(args):
-                items = args.get("generators", [])
-                if len(items) != 1 or items[0].get("field") != field.name:
-                    raise RuleValidationError("Generator response must contain exactly the requested field")
-                # 当场做单字段校验（数值字段被塞 "N/A" 之类），让 _call_validated 立刻退避重绑，
-                # 而不是等整表字段并发跑完才在 bind_generators 里失败
-                binding = GeneratorBinding.model_validate(items[0])
-                _validate_generator_item(field, binding)
-                items[0]["params"] = binding.params
-                return items[0]
+        # 若确定性字段本身触犯任何规则（极端组合冲突），自动升级交给 AI 联合求解
+        if by_field_name and not ai_fields:
+            prelim_bindings = [GeneratorBinding.model_validate(by_field_name[f.name]) for f in spec.fields]
+            prelim_record = materialize_golden_record(spec, prelim_bindings, 0)
+            prelim_violations = find_golden_rule_violations(
+                spec, table_rules, prelim_record, prelim_bindings, golden_count, golden_overrides=required_refs
+            )
+            if prelim_violations:
+                conflict_fields = {v["field"] for v in prelim_violations}
+                for field in spec.fields:
+                    if field.name in conflict_fields:
+                        by_field_name.pop(field.name, None)
+                        ai_fields.append(field)
 
-            return _call_validated(
-                llm,
-                "assign_generators",
-                "只为输入的一个字段赋予黄金合规生成器。FIXED 使用 params.value；ENUM 使用 params.values。必须满足相关规则和引用值。若提供 published_code_set，ENUM 的 values 只能是其子集。",
-                payload,
-                validate_one,
-                bus=bus,
+        batch_traces: List[Dict[str, Any]] = []
+        if by_field_name:
+            batch_traces.append(
+                {
+                    "strategy": "DETERMINISTIC_GENERATORS",
+                    "field_count": len(by_field_name),
+                    "fields": sorted(by_field_name),
+                }
             )
 
-        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(spec.fields))) as field_executor:
-            field_results = list(field_executor.map(bind_field, spec.fields))
-        generator_items = [item for item, _ in field_results]
+        heal_feedback_cases = []
+        if heal_report:
+            heal_feedback_cases = [
+                case
+                for case in heal_report.get("cases", [])
+                if case.get("table_code") == spec.table_code and case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
+            ]
+
+        chunks = [ai_fields[i : i + _GENERATOR_BATCH_SIZE] for i in range(0, len(ai_fields), _GENERATOR_BATCH_SIZE)]
+        for chunk in chunks:
+            chunk_names = [f.name for f in chunk]
+            chunk_name_set = set(chunk_names)
+            chunk_by_name = {f.name: f for f in chunk}
+            det_golden_preview = materialize_golden_record(
+                spec,
+                [GeneratorBinding.model_validate(item) for item in by_field_name.values()],
+                0,
+            ) if by_field_name else {}
+            chunk_code_sets = {
+                f.name: _code_set_context(field_code_sets, spec.table_code, f.name)["published_code_set"]
+                for f in chunk
+                if (spec.table_code, f.name) in field_code_sets
+            }
+            payload: Dict[str, Any] = {
+                **spec_payload(spec),
+                "fields": [f.model_dump() for f in chunk],
+                "deterministic_golden_values": det_golden_preview,
+                "approved_rules": rule_views,
+                "required_reference_values": required_refs,
+                "generation_plan": plans.get(spec.table_code) if plans else None,
+            }
+            if chunk_code_sets:
+                payload["published_code_sets"] = chunk_code_sets
+                if len(chunk) == 1 and chunk[0].name in chunk_code_sets:
+                    payload["published_code_set"] = chunk_code_sets[chunk[0].name]
+            if heal_feedback_cases:
+                payload["oracle_false_positive_feedback"] = heal_feedback_cases
+
+            def validate_batch(args, _chunk_names=chunk_names, _chunk_name_set=chunk_name_set, _chunk_by_name=chunk_by_name):
+                items = args.get("generators", [])
+                returned_fields = [item.get("field") for item in items if isinstance(item, dict)]
+                if set(returned_fields) != _chunk_name_set or len(items) != len(_chunk_names):
+                    raise RuleValidationError(
+                        f"Generator response must cover requested fields {_chunk_names} exactly once, got {returned_fields}"
+                    )
+                validated_items: Dict[str, Dict[str, Any]] = {}
+                for item in items:
+                    binding = GeneratorBinding.model_validate(item)
+                    _validate_generator_item(_chunk_by_name[binding.field], binding)
+                    item["params"] = binding.params
+                    validated_items[binding.field] = item
+
+                # Python 侧黄金样本自洽预检门禁：在进 Oracle 前拦截与已批准规则冲突的生成器赋值
+                merged_map = {**by_field_name, **validated_items}
+                merged_bindings = [GeneratorBinding.model_validate(v) for v in merged_map.values()]
+                covered_fields = set(merged_map)
+                checkable_rules = []
+                for rule in table_rules:
+                    needed = {rule.field}
+                    if rule.operator == "FIELD_COMPARE" and rule.params.get("right_field"):
+                        needed.add(rule.params["right_field"])
+                    if rule.operator == "COND_REQUIRED" and rule.params.get("if_field"):
+                        needed.add(rule.params["if_field"])
+                    if needed.issubset(covered_fields):
+                        checkable_rules.append(rule)
+                sample_rec = materialize_golden_record(spec, merged_bindings, 0)
+                violations = find_golden_rule_violations(
+                    spec, checkable_rules, sample_rec, merged_bindings, golden_count, golden_overrides=required_refs
+                )
+                if violations:
+                    summary = "；".join(v["message"] for v in violations[:5])
+                    raise RuleValidationError(
+                        f"黄金样本自洽门禁拦截（测试数据违反已批准规则，请修正生成器参数）：{summary}"
+                    )
+                return validated_items
+
+            instruction = (
+                "为输入的全部关联/约束字段联合赋予黄金合规生成器，确保所有字段同时满足 approved_rules 和 required_reference_values，"
+                "并且跨字段比较（FIELD_COMPARE）与条件必填（COND_REQUIRED）彼此自洽、零违规。"
+                "FIXED 使用 params.value；ENUM 使用 params.values；SEQUENCE 使用 params.start/step。"
+                "若提供 published_code_sets/published_code_set，对应字段的 ENUM values 只能取其白名单子集。"
+            )
+            if heal_feedback_cases:
+                instruction += "注意：上轮 Oracle 审计发现黄金样本触发了误报（见 oracle_false_positive_feedback），请重点修正导致误报的字段取值。"
+
+            validated_map, trace = _call_validated(
+                llm,
+                "assign_generators",
+                instruction,
+                payload,
+                validate_batch,
+                bus=bus,
+            )
+            by_field_name.update(validated_map)
+            batch_traces.append(trace)
+
+        generator_items = [by_field_name[field.name] for field in spec.fields]
         generators = bind_generators(spec, generator_items)
+        ai_traces = [tr for tr in batch_traces if tr.get("strategy") != "DETERMINISTIC_GENERATORS"]
+        first_ai = ai_traces[0] if ai_traces else None
         return generators, {
-            "provider": "GLM",
-            "model": field_results[0][1]["model"],
+            "provider": _provider_name(llm, first_ai) if first_ai else "DETERMINISTIC",
+            "model": first_ai.get("model", "unknown") if first_ai else "rule-engine",
             "tool_name": "assign_generators",
-            "batch_count": len(field_results),
-            "batches": [trace for _, trace in field_results],
+            "batch_count": len(batch_traces),
+            "deterministic_field_count": len(spec.fields) - len(ai_fields),
+            "ai_field_count": len(ai_fields),
+            "batches": batch_traces,
             "arguments": {"generators": generator_items},
         }
 
@@ -552,7 +869,20 @@ def _backfill_fixed_value_rules(session, run, specs, rules, events: Optional[Lis
     return _policy_backfill_fixed_value_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
 
 
-def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
+def _audit_stage(
+    session,
+    run,
+    specs,
+    llm,
+    active_rules,
+    golden_records,
+    plans=None,
+    concurrency: int = 4,
+    bus=None,
+    events: Optional[List[tuple]] = None,
+    blob_store: Optional[LocalBlobStore] = None,
+    heal_report: Optional[Dict[str, Any]] = None,
+):
     _, field_code_sets = load_published_code_sets(session, specs)
     outer_workers = max(1, min(concurrency, len(specs)))
 
@@ -560,31 +890,82 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
         table_rules = [rule for rule in active_rules if rule.table_code == spec.table_code]
         active_keys = {rule.rule_key for rule in table_rules}
         rule_index = {rule.rule_key: (rule.field, rule.operator, rule.params) for rule in table_rules}
+        golden_record = golden_records[spec.table_code]
+        mutations_per_rule = int(((plans or {}).get(spec.table_code) or {}).get("mutations_per_rule", 1))
+
+        heal_target_keys = set()
+        if heal_report:
+            for case in heal_report.get("cases", []):
+                if case.get("table_code") == spec.table_code:
+                    heal_target_keys.update(case.get("missing_rules") or [])
 
         gaps: List[Dict[str, Any]] = []
+        deterministic_cases = [build_golden_audit_case()]
+        ai_target_rules: List[RuleDefinition] = []
+        det_rule_count = 0
 
-        def bind_cases(target_rule=None):
+        # 确定性变异引擎先行：覆盖 GOLDEN 基线及 REQUIRED/LENGTH_MAX/ENUM/NOT_IN/NUM_RANGE/FIELD_COMPARE/COND_REQUIRED/FOREIGN_KEY
+        for rule in table_rules:
+            if rule.rule_key not in heal_target_keys:
+                det_mutations = build_deterministic_mutations(
+                    spec,
+                    rule,
+                    golden_record,
+                    field_code_sets=field_code_sets,
+                    mutations_per_rule=mutations_per_rule,
+                )
+                if det_mutations:
+                    try:
+                        validated = bind_audit_cases(
+                            spec,
+                            [item.model_dump() for item in det_mutations],
+                            active_keys,
+                            rule_index,
+                            golden_record=golden_record,
+                        )
+                        deterministic_cases.extend(validated)
+                        det_rule_count += 1
+                        continue
+                    except (RuleValidationError, ValueError):
+                        pass
+            ai_target_rules.append(rule)
+
+        def bind_cases(target_rule):
             try:
                 return _bind_one_case(target_rule)
             except WorkflowError as exc:
-                label = target_rule.rule_key if target_rule else "GOLDEN"
-                gaps.append({"target": label, "error": str(exc)})
-                if target_rule is None:
-                    # 黄金用例是整表基线，缺了就没法判"无违规"这一侧
-                    raise
+                fallback = build_regexp_fallback_mutation(spec, target_rule)
+                if fallback is not None:
+                    try:
+                        validated = bind_audit_cases(
+                            spec,
+                            [fallback.model_dump()],
+                            active_keys,
+                            rule_index,
+                            golden_record=golden_record,
+                        )
+                        return validated, {
+                            "tool_name": "assign_audit_cases",
+                            "strategy": "REGEXP_FALLBACK_MUTATION",
+                            "target": target_rule.rule_key,
+                            "fallback_from": str(exc),
+                        }
+                    except (RuleValidationError, ValueError):
+                        pass
+                gaps.append({"target": target_rule.rule_key, "error": str(exc)})
                 return [], {
                     "tool_name": "assign_audit_cases",
                     "skipped": True,
-                    "target": label,
+                    "target": target_rule.rule_key,
                     "error": str(exc),
                 }
 
-        def _bind_one_case(target_rule=None):
+        def _bind_one_case(target_rule):
             payload = {
                 "table": spec_payload(spec),
-                "golden_record": golden_records[spec.table_code],
+                "golden_record": golden_record,
                 "active_rules": [rule.model_dump() for rule in table_rules],
-                "target_rule": target_rule.model_dump() if target_rule else None,
+                "target_rule": target_rule.model_dump(),
                 "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
                 "published_code_sets": {
                     field.name: _code_set_context(field_code_sets, spec.table_code, field.name)["published_code_set"]
@@ -592,42 +973,65 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                     if (spec.table_code, field.name) in field_code_sets
                 },
             }
+            if target_rule.rule_key in heal_target_keys:
+                payload["previous_missed_cases"] = [
+                    case
+                    for case in (heal_report or {}).get("cases", [])
+                    if target_rule.rule_key in (case.get("missing_rules") or [])
+                ]
             instruction = (
                 "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例。"
                 "expected_rule_keys 至少要包含 target_rule 自身（这条用例必须打死它）；"
                 "同一变异值顺带触发的其它规则不必全部列出，也不要把它们当成额外义务。"
-                "变异值必须是真正违规的取值（例如置空用 null、超长要真的超过声明长度），"
+                "变异值必须是真正违规的取值（例如置空用 null、超长要真的超过声明长度、正则要构造贴近业务但明确不符合格式的反例），"
                 "用空格或制表符冒充空值不算违规。ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
-                if target_rule
-                else "设计一个无覆盖的黄金合规审计用例，expected_rule_keys 必须为空（黄金用例要求零命中）。"
             )
             return _call_validated(
                 llm,
                 "assign_audit_cases",
                 instruction,
                 payload,
-                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index, golden_record=golden_records.get(spec.table_code)),
+                lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index, golden_record=golden_record),
                 bus=bus,
             )
 
-        targets = [None] + table_rules
-        with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(targets))) as audit_executor:
-            audit_results = list(audit_executor.map(bind_cases, targets))
+        ai_results = []
+        if ai_target_rules:
+            with ThreadPoolExecutor(max_workers=max(1, min(_inner_width(concurrency, outer_workers), len(ai_target_rules)))) as audit_executor:
+                ai_results = list(audit_executor.map(bind_cases, ai_target_rules))
+
         case_items = []
         case_ids = set()
-        traces = []
-        for cases, trace in audit_results:
+        traces: List[Dict[str, Any]] = [
+            {
+                "strategy": "DETERMINISTIC_MUTATIONS",
+                "rule_count": det_rule_count,
+                "case_count": len(deterministic_cases),
+            }
+        ]
+        for case in deterministic_cases:
+            case.case_id = normalize_case_id(case.case_id)
+            if case.case_id in case_ids:
+                case.case_id = normalize_case_id(f"{case.case_id}_{len(case_ids) + 1}")
+            case_ids.add(case.case_id)
+            case_items.append(case)
+        for cases, trace in ai_results:
             traces.append(trace)
             for case in cases:
+                case.case_id = normalize_case_id(case.case_id)
                 if case.case_id in case_ids:
-                    case.case_id = f"{case.case_id}_{len(case_ids) + 1}"
+                    case.case_id = normalize_case_id(f"{case.case_id}_{len(case_ids) + 1}")
                 case_ids.add(case.case_id)
                 case_items.append(case)
+        ai_traces = [tr for tr in traces if tr.get("strategy") not in {"DETERMINISTIC_MUTATIONS", "REGEXP_FALLBACK_MUTATION"}]
+        first_ai = ai_traces[0] if ai_traces else None
         return case_items, {
-            "provider": "GLM",
-            "model": traces[0].get("model") if traces else "unknown",
+            "provider": _provider_name(llm, first_ai) if first_ai else "DETERMINISTIC",
+            "model": first_ai.get("model") if first_ai else "mutation-engine",
             "tool_name": "assign_audit_cases",
             "batch_count": len(traces),
+            "deterministic_case_count": len(deterministic_cases),
+            "ai_rule_count": len(ai_target_rules),
             "batches": traces,
             "gaps": gaps,
             "arguments": {"cases": [case.model_dump() for case in case_items]},
@@ -688,10 +1092,17 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
 
 
 def _dedupe_approved_rules(session: Session, run: RunModel, events: Optional[List[tuple]] = None) -> int:
+    """对同批次的 APPROVED 与 PENDING 规则统一做语义去重（APPROVED 优先保留，避免重复 PENDING 干扰人工确权）。"""
     rows = (
         session.query(RuleModel)
-        .filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED")
-        .order_by(RuleModel.source.desc(), RuleModel.created_at, RuleModel.rule_key)
+        .filter(RuleModel.run_id == run.id, RuleModel.status.in_(["APPROVED", "PENDING"]))
+        .order_by(
+            # APPROVED 排在 PENDING 之前，DOC_EXPLICIT 排在 AI_EXPANDED 之前
+            RuleModel.status.asc(),
+            RuleModel.source.desc(),
+            RuleModel.created_at,
+            RuleModel.rule_key,
+        )
         .all()
     )
     seen = set()

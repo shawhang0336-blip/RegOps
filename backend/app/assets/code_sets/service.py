@@ -53,6 +53,7 @@ from app.assets.code_sets.parser import (
     validate_code_set_draft,
 )
 from app.infra.llm import RealDesignLlm
+from app.policy.llm_guard import call_llm_validated
 from app.infra.asset_models import (
     CodeSetModel,
     CodeSetValidationModel,
@@ -253,7 +254,7 @@ def _record_code_set_validation(
     block: RawBlockModel,
     settings: Settings,
     content_changed: bool,
-    review_with_ai: bool = True,
+    review_with_ai: Any = True,
 ) -> None:
     program_issues = validate_code_set_draft(draft)
     session.add(
@@ -268,9 +269,27 @@ def _record_code_set_validation(
     )
     if row.status == "PUBLISHED":
         return
-    if not review_with_ai:
+    if review_with_ai in {False, "never"}:
         row.status = "NEEDS_REVIEW" if program_issues else "PROGRAM_VALIDATED"
         return
+
+    # adaptive 模式：对齐 metadata_service，仅对 AI 抽取或程序检查有告警的码表做 AI 复核；
+    # 规整表格提取且无告警（或超大码表会被 6000 字 raw_context 截断）走确定性交叉校验即可。
+    if review_with_ai == "adaptive":
+        needs_ai_review = (draft.source_type == "AI_EXTRACTED" or bool(program_issues)) and len(draft.values) <= 120
+        if not needs_ai_review:
+            session.add(
+                CodeSetValidationModel(
+                    id=str(uuid.uuid4()),
+                    code_set_id=row.id,
+                    validator_kind="AI_REVIEW",
+                    status="PASSED",
+                    issues_json=[],
+                    trace_json={"strategy": "DETERMINISTIC_CROSS_CHECK", "value_count": len(draft.values)},
+                )
+            )
+            row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "AI_SELF_VALIDATED"
+            return
 
     llm = None
     try:
@@ -289,7 +308,8 @@ def _record_code_set_validation(
         return
 
     try:
-        args, trace = llm.assign(
+        args, trace = call_llm_validated(
+            llm,
             "review_code_set",
             "独立复核码值表。仅输出码值遗漏、重复、含义错配、无证据码值或定义不一致的问题；无问题返回空数组。",
             {
@@ -298,6 +318,9 @@ def _record_code_set_validation(
                 "raw_context": block.raw_content[:6000],
             },
             timeout=35,
+            backoff=(1.0,),
+            transient_attempts=2,
+            validation_attempts=2,
         )
         issues = args.get("issues", [])
     except Exception as exc:
@@ -324,7 +347,7 @@ def _record_code_set_validation(
     row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) or _has_error_issues(issues) else "AI_SELF_VALIDATED"
 
 
-def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: bool = True) -> List[str]:
+def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: Any = True) -> List[str]:
     """Extract standalone CodeSets or inline field enum CodeSets from a RawBlockModel (Track B)."""
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
@@ -385,11 +408,15 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
             if not valid_vals:
                 try:
                     llm = RealDesignLlm(settings)
-                    args, _ = llm.assign(
+                    args, _ = call_llm_validated(
+                        llm,
                         "assign_code_set",
                         "从输入块中提取码值表代码、中文名、定义及全部码值项（value、label_cn、label_en、definition），不得虚构。",
                         {"source_locator": block.source_locator, "raw_content": block.raw_content[:6000]},
                         timeout=35,
+                        backoff=(1.0,),
+                        transient_attempts=2,
+                        validation_attempts=2,
                     )
                     valid_vals = _clean_value_drafts(args.get("values", []))
                     draft = CodeSetDraft(
@@ -474,18 +501,21 @@ def extract_parallel_for_blocks(
         raise ValueError(f"No table metadata produced for block {bid}")
 
     def _run_code_set_one(bid: str) -> List[str]:
-        return extract_code_sets_for_block(bid, settings, auto_link=False)
+        return extract_code_sets_for_block(bid, settings, auto_link=False, review_with_ai="adaptive")
 
     table_ids: List[str] = []
     code_set_ids: List[str] = []
     errors: List[Dict[str, str]] = []
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(metadata_block_ids)))) as executor:
-        meta_futures = {bid: executor.submit(_run_metadata_one, bid) for bid in metadata_block_ids}
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(metadata_block_ids)))) as meta_executor, ThreadPoolExecutor(
+        max_workers=min(4, max(1, len(code_set_block_ids)))
+    ) as cs_executor:
+        meta_futures = {bid: meta_executor.submit(_run_metadata_one, bid) for bid in metadata_block_ids}
+        cs_futures = {bid: cs_executor.submit(_run_code_set_one, bid) for bid in code_set_block_ids}
 
-        for bid in code_set_block_ids:
+        for bid, future in cs_futures.items():
             try:
-                for cid in _run_code_set_one(bid):
+                for cid in future.result():
                     if cid not in code_set_ids:
                         code_set_ids.append(cid)
             except Exception as exc:

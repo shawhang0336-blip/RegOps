@@ -11,6 +11,7 @@ from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.ingestion.extractors import extract_document, survey_document
 from app.infra.llm import RealDesignLlm
+from app.policy.llm_guard import call_llm_validated
 
 
 def _spec_digest(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,11 +294,15 @@ def inspect_document_overview(document_id: str, settings: Settings, force: bool 
             source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
             survey = survey_document(source_path, document.file_type)
             llm = RealDesignLlm(settings)
-            result, trace = llm.assign(
+            result, trace = call_llm_validated(
+                llm,
                 "inspect_document_structure",
                 "在初步切块前检查整份文件的目录、章节、表格或工作表结构。判断文档类型、包含内容和适合的切块方式；只输出结构结论，不提取字段，不得虚构。",
                 {"file_name": document.file_name, "survey": survey},
                 timeout=60,
+                backoff=(1.0,),
+                transient_attempts=2,
+                validation_attempts=2,
             )
             warnings = list(result.get("warnings") or [])
             expected_strategy = survey["available_chunk_strategy"]
@@ -451,8 +456,14 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                 "section": section,
                 "candidate_blocks": candidates,
             }
+            def _validate_structure_args(args):
+                validated = _validate_plan(args, group)
+                _validate_structured_guard(validated, group)
+                return validated
+
             try:
-                args, trace = llm.assign(
+                args, trace = call_llm_validated(
+                    llm,
                     "assign_document_structure",
                     (
                         "你在决定这份监管文档如何切成可解析的单元。按下面的清单逐项检查候选块，"
@@ -470,15 +481,12 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                         "不要为了\"看起来更整齐\"而合并、拆分或改名。"
                     ),
                     payload,
+                    _validate_structure_args,
                     timeout=STRUCTURE_PLAN_TIMEOUT,
+                    backoff=(1.0,),
+                    transient_attempts=2,
+                    validation_attempts=2,
                 )
-                from app.policy.regops_bus import default_bus
-
-                rejection = default_bus().adjudicate("assign_document_structure", args, payload)
-                if rejection:
-                    raise ValueError(rejection)
-                _validate_plan(args, group)
-                _validate_structured_guard(args, group)
                 return args, trace, "AI"
             except Exception as exc:  # noqa: BLE001
                 return _default_group_plan(group, exc), {"error": f"{type(exc).__name__}: {exc}"}, "DEFAULT"

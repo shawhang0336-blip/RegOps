@@ -308,6 +308,39 @@ def spec_payload(spec: SpecDocument) -> Dict[str, Any]:
     }
 
 
+_BASE_PROMPT = "你是监管报送装配器，只能调用指定工具进行结构化参数赋值，禁止输出 SQL 或自由文本。"
+
+_RULE_OPERATOR_PROMPT = (
+    "所有字段必须来自输入白名单。DICTIONARY 仅用于数据字典明确表达的规则；"
+    "术语推理、额外格式限制或不确定拓展必须使用 TERM_INFERENCE。"
+    "算子参数契约：REQUIRED={}；ENUM/NOT_IN={values:[...]}；"
+    "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；"
+    "LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}；"
+    "NUM_RANGE={min,max,min_inclusive,max_inclusive}（数值上下限，边界默认含）；"
+    "FIELD_COMPARE={right_field,operator:LT|LE|GT|GE|EQ|NE}（左字段必须满足该关系，如到期日>=起息日写 GE）。"
+    "长度口径：字典或表结构里的「字符型，N」是列宽上限，只能推出「最多 N 位」，用 LENGTH_MAX。"
+    "不要用精确长度约束——变长字段填短值是合法的，卡成「必须正好 N 位」会把正常数据判成违规。"
+    "确实需要「必须正好 N 位」（如统一社会信用代码 18 位、YYYYMMDD 8 位）时，用 REGEXP 把格式写死。"
+)
+
+_DATA_AND_AUDIT_PROMPT = (
+    "所有字段名、规则键和码表取值必须严格来自输入白名单，禁止虚构字段、规则或 SQL。"
+)
+
+_INGESTION_AND_ASSET_PROMPT = (
+    "严格依据输入原文与结构化摘要进行判断，不得凭常识虚构原文未声明的字段、类型、长度或码值。"
+)
+
+
+def _tool_prompt_preamble(tool_name: str) -> str:
+    """按工具作用域拼装最小必要的前置契约，避免第二阶段的规则算子说明书污染第一阶段解析与复核。"""
+    if tool_name == "assign_rules":
+        return f"{_BASE_PROMPT}{_RULE_OPERATOR_PROMPT}"
+    if tool_name in {"assign_generation_plan", "assign_schema", "assign_generators", "assign_audit_cases"}:
+        return f"{_BASE_PROMPT}{_DATA_AND_AUDIT_PROMPT}"
+    return f"{_BASE_PROMPT}{_INGESTION_AND_ASSET_PROMPT}"
+
+
 class RealDesignLlm:
     def __init__(self, settings: Settings) -> None:
         if not settings.llm_api_key:
@@ -326,17 +359,7 @@ class RealDesignLlm:
             timeout = self.settings.llm_timeout
         schema = TOOL_SCHEMAS[tool_name]
         prompt = (
-            "你是监管报送装配器，只能调用指定工具进行结构化参数赋值，禁止输出 SQL。"
-            "所有字段必须来自输入白名单。DICTIONARY 仅用于数据字典明确表达的规则；"
-            "术语推理、额外格式限制或不确定拓展必须使用 TERM_INFERENCE。"
-            "算子参数契约：REQUIRED={}；ENUM/NOT_IN={values:[...]}；"
-            "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；"
-            "LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}；"
-            "NUM_RANGE={min,max,min_inclusive,max_inclusive}（数值上下限，边界默认含）；"
-            "FIELD_COMPARE={right_field,operator:LT|LE|GT|GE|EQ|NE}（左字段必须满足该关系，如到期日>=起息日写 GE）。"
-            "长度口径：字典或表结构里的「字符型，N」是列宽上限，只能推出「最多 N 位」，用 LENGTH_MAX。"
-            "不要用精确长度约束——变长字段填短值是合法的，卡成「必须正好 N 位」会把正常数据判成违规。"
-            "确实需要「必须正好 N 位」（如统一社会信用代码 18 位、YYYYMMDD 8 位）时，用 REGEXP 把格式写死。"
+            f"{_tool_prompt_preamble(tool_name)}\n"
             f"任务：{instruction}\n输入：{json.dumps(payload, ensure_ascii=False)}"
         )
         if feedback:
@@ -410,7 +433,7 @@ class RealDesignLlm:
                 else:
                     arguments[key] = value
         trace = {
-            "provider": "GLM",
+            "provider": self.settings.llm_provider,
             "model": self.settings.llm_model,
             "request_id": body.get("id"),
             "tool_name": tool_name,

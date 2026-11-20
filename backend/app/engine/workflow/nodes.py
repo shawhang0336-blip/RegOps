@@ -39,7 +39,21 @@ from app.infra.models import RuleModel
 from app.kernel.blob_store import LocalBlobStore
 from app.kernel.channel import RunContext
 from app.kernel.scheduler import Outcome
-from app.policy.regops_plan import interrupt_payload, self_heal_target
+from app.policy.regops_plan import (
+    interrupt_payload,
+    self_heal_cases_target,
+    self_heal_data_target,
+    self_heal_target,
+)
+
+_DETERMINISTIC_RULE_SUFFIXES = ("_REQUIRED", "_LENGTH_MAX", "_FIXED_VALUE_ENUM", "_CODE_SET_ENUM")
+
+
+def _is_mechanically_derived_rule(rule_key: str, rule_map: Dict[str, RuleDefinition]) -> bool:
+    rule = rule_map.get(rule_key)
+    if rule and "非 AI 生成" in (rule.rationale or ""):
+        return True
+    return any(rule_key.endswith(suffix) for suffix in _DETERMINISTIC_RULE_SUFFIXES)
 
 
 def _front_bodies(specs, llm, budget, concurrency, settings):
@@ -179,6 +193,7 @@ def _back_bodies(specs, settings):
         schema_payload = ctx.get("schema_payload")
         golden_overrides = ctx.get("golden_overrides") or {}
         plans = ctx.get("plans") or {}
+        heal_data_report = ctx.shared.pop("heal_data_report", None)
         rows = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "APPROVED").all()
         rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
         rules = _backfill_required_rules(ctx.session, ctx.run, specs, rules, events=events)
@@ -192,6 +207,7 @@ def _back_bodies(specs, settings):
             ctx.session, ctx.run, specs, ctx.llm, rules,
             golden_overrides, plans, concurrency=ctx.concurrency,
             bus=ctx.bus, events=events, blob_store=blobs,
+            heal_report=heal_data_report,
         )
         return Outcome(
             shared={
@@ -207,10 +223,12 @@ def _back_bodies(specs, settings):
         events: List[tuple] = []
         blobs = LocalBlobStore(ctx.settings.blob_dir)
         plans = ctx.get("plans") or {}
+        heal_cases_report = ctx.shared.pop("heal_cases_report", None)
         audit_cases = _audit_stage(
             ctx.session, ctx.run, specs, ctx.llm, ctx.get("rules"),
             ctx.get("golden_records"), plans, concurrency=ctx.concurrency,
             bus=ctx.bus, events=events, blob_store=blobs,
+            heal_report=heal_cases_report,
         )
         return Outcome(shared={"audit_cases": audit_cases}, events=events)
 
@@ -270,7 +288,7 @@ def _back_bodies(specs, settings):
         oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
         queries = []
         for rule in rules:
-            sql, params = compile_rule_query(rule, "oracle", physical_tables)
+            sql, params = compile_rule_query(rule, "oracle", physical_tables, code_set_bindings)
             queries.append({"rule_key": rule.rule_key, "table_code": rule.table_code, "sql": sql, "params": params})
         sql_uri = blobs.put(canonical_json({"dialect": "oracle", "queries": queries}).encode())
         report_uri = blobs.put(canonical_json(report).encode())
@@ -296,27 +314,73 @@ def _back_bodies(specs, settings):
         ctx.session.flush()
 
         shared = {"report": report, "result": result, "attempt": attempt, "first_attempt": first_attempt}
-        has_missing_rules = any(case.get("missing_rules") for case in report.get("cases", []))
-        if not report["all_passed"] and has_missing_rules and attempt < first_attempt + max_attempts - 1:
-            # 自愈：只将失败报告放入 Channel 并声明 goto="rule_binder"，
-            # 由 Scheduler 切回 rule_binder 执行靶向 _rebind_failed_rules，绝不在本节点越权调用或全表重绑。
-            return Outcome(
-                shared={
-                    **shared,
-                    "self_heal_report": report,
-                    "approval_origin": "self_heal",
-                    "prepared_assets": None,
-                },
-                events=events,
-                goto=self_heal_target(),
-                when="audit_failed_self_heal",
-                control={
-                    "failed_result": result,
-                    "reason": "scheduler self-heal",
-                    "origin": "self_heal",
-                    "attempt": attempt,
-                },
-            )
+        cases = report.get("cases", [])
+        golden_fp_cases = [
+            case for case in cases
+            if case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
+        ]
+        missing_rule_keys = sorted(
+            {rule_key for case in cases for rule_key in case.get("missing_rules", [])}
+        )
+        if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
+            # 确定性归因分流（Root-Cause Router）：
+            # 1) 黄金样本触发误报：优先回 data_generator_binder 修正测试数据，绝不削弱规则；
+            if golden_fp_cases and not missing_rule_keys:
+                return Outcome(
+                    shared={
+                        **shared,
+                        "heal_data_report": report,
+                        "prepared_assets": None,
+                    },
+                    events=events,
+                    goto=self_heal_data_target(),
+                    when="audit_failed_heal_data",
+                    control={
+                        "failed_result": result,
+                        "reason": "golden false positive -> heal test data without weakening rules",
+                        "origin": "self_heal_data",
+                        "attempt": attempt,
+                    },
+                )
+            # 2) 变异样本漏报：若全部漏报规则均属机械派生确定性规则（规则本身无误），先回 audit_case_binder 重建反例；
+            #    否则回 rule_binder 执行靶向 _rebind_failed_rules。
+            if missing_rule_keys:
+                rule_map = {rule.rule_key: rule for rule in (rules or [])}
+                all_mechanical = all(_is_mechanically_derived_rule(k, rule_map) for k in missing_rule_keys)
+                if all_mechanical:
+                    return Outcome(
+                        shared={
+                            **shared,
+                            "heal_cases_report": report,
+                            "prepared_assets": None,
+                        },
+                        events=events,
+                        goto=self_heal_cases_target(),
+                        when="audit_failed_heal_cases",
+                        control={
+                            "failed_result": result,
+                            "reason": "deterministic rule missed -> regenerate targeted audit mutations",
+                            "origin": "self_heal_cases",
+                            "attempt": attempt,
+                        },
+                    )
+                return Outcome(
+                    shared={
+                        **shared,
+                        "self_heal_report": report,
+                        "approval_origin": "self_heal",
+                        "prepared_assets": None,
+                    },
+                    events=events,
+                    goto=self_heal_target(),
+                    when="audit_failed_self_heal",
+                    control={
+                        "failed_result": result,
+                        "reason": "scheduler self-heal",
+                        "origin": "self_heal",
+                        "attempt": attempt,
+                    },
+                )
 
         events.append((
             "AUDIT_COMPLETED" if report["all_passed"] else "AUDIT_REJECTED",

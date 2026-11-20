@@ -1,3 +1,4 @@
+import hashlib
 import re
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,22 @@ from app.infra.domain import (
     field_map,
 )
 from app.engine.rules import RuleValidationError, validate_rule
+
+
+def compile_schema_bindings(spec: SpecDocument) -> List[SchemaBinding]:
+    """根据已确认字段元数据确定性编译物理存储 Schema（零 AI 抄写、零漏字段）。"""
+    items = []
+    for field in spec.fields:
+        is_number = (field.data_type or "").upper() == "NUMBER"
+        items.append(
+            {
+                "field": field.name,
+                "storage_type": "NUMBER" if is_number else "TEXT",
+                "length": int(field.length or (22 if is_number else 128)),
+                "decimal_places": int(field.decimal_places or 0) if is_number else 0,
+            }
+        )
+    return bind_schema(spec, items)
 
 
 def bind_schema(spec: SpecDocument, items: List[Dict[str, Any]]) -> List[SchemaBinding]:
@@ -35,6 +52,7 @@ def bind_rules(
     spec: SpecDocument,
     items: List[Dict[str, Any]],
     selected_table_codes: Optional[set] = None,
+    specs_by_code: Optional[Dict[str, SpecDocument]] = None,
 ) -> List[RuleDefinition]:
     rules = []
     seen = set()
@@ -57,10 +75,18 @@ def bind_rules(
             )
         params = item.get("params", {})
         if operator == "FOREIGN_KEY":
-            if selected_table_codes is None or params.get("references_table") not in selected_table_codes:
+            ref_table = params.get("references_table")
+            ref_field = params.get("references_field")
+            if selected_table_codes is None or ref_table not in selected_table_codes:
                 raise RuleValidationError("Cross-rule reference is outside the confirmed table set")
-            if params.get("references_field") != field:
-                raise RuleValidationError("This slice requires matching cross-table field names")
+            if not ref_field:
+                raise RuleValidationError("Cross-table FOREIGN_KEY requires references_field")
+            if specs_by_code is not None:
+                target_spec = specs_by_code.get(ref_table)
+                if not target_spec or ref_field not in field_map(target_spec):
+                    raise RuleValidationError(
+                        f"Cross-table reference field `{ref_table}.{ref_field}` is outside the target table whitelist"
+                    )
         raw_key = item.get("rule_key") or f"R_{spec.section.replace('.', '_')}_{index}_{field}_{operator}"
         rule_key = re.sub(r"[^A-Z0-9_]", "_", raw_key.upper())
         if rule_key in seen:
@@ -268,6 +294,99 @@ def violates_field_compare(operator: str, left: Any, right: Any) -> Optional[boo
         return None
 
 
+def violates_cond_required(params: Dict[str, Any], record: Dict[str, Any], target_field: str) -> Optional[bool]:
+    """预判记录是否触发 COND_REQUIRED（条件成立且目标字段缺失）。"""
+    if_field = params.get("if_field")
+    if_op = params.get("if_operator")
+    if_values = params.get("if_values") or []
+    if not if_field or if_op not in {"EQ", "NE"} or not if_values:
+        return None
+    cond_val = record.get(if_field)
+    if cond_val is None:
+        return False
+    str_values = {str(v) for v in if_values}
+    matched = (str(cond_val) in str_values) if if_op == "EQ" else (str(cond_val) not in str_values)
+    return bool(matched and _is_blank(record.get(target_field)))
+
+
+def find_golden_rule_violations(
+    spec: SpecDocument,
+    rules: List[RuleDefinition],
+    golden_record: Dict[str, Any],
+    golden_generators: Optional[List[GeneratorBinding]] = None,
+    golden_count: int = 1,
+    golden_overrides: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Python 侧黄金样本自洽门禁：在入 Oracle 前检查黄金样本是否会误触任何已批准规则。"""
+    table_rules = [rule for rule in rules if rule.table_code == spec.table_code]
+    if not table_rules:
+        return []
+    sample_records: List[Dict[str, Any]] = []
+    if golden_generators:
+        total = min(max(int(golden_count or 1), 1), 5)
+        for idx in range(total):
+            rec = materialize_golden_record(spec, golden_generators, idx)
+            if golden_overrides:
+                rec.update(golden_overrides)
+            sample_records.append(rec)
+    else:
+        sample_records.append(dict(golden_record))
+
+    violations: List[Dict[str, Any]] = []
+    seen = set()
+    for rec in sample_records:
+        for rule in table_rules:
+            if rule.rule_key in seen:
+                continue
+            op = rule.operator
+            params = rule.params or {}
+            broken = False
+            detail = ""
+            if op in SELF_FIELD_OPERATORS:
+                val = rec.get(rule.field)
+                if violates_single_field_rule(op, params, val) is True:
+                    broken = True
+                    detail = f"{rule.field}={val!r} 违反 {op}({params})"
+            elif op == "FIELD_COMPARE":
+                right_field = params.get("right_field")
+                left_val = rec.get(rule.field)
+                right_val = rec.get(right_field) if right_field else None
+                if violates_field_compare(params.get("operator"), left_val, right_val) is True:
+                    broken = True
+                    detail = f"{rule.field}={left_val!r} 与 {right_field}={right_val!r} 不满足 {params.get('operator')}"
+            elif op == "COND_REQUIRED":
+                if violates_cond_required(params, rec, rule.field) is True:
+                    broken = True
+                    detail = (
+                        f"当 {params.get('if_field')}={rec.get(params.get('if_field'))!r} 时 "
+                        f"{rule.field} 不能为空"
+                    )
+            if broken:
+                seen.add(rule.rule_key)
+                violations.append(
+                    {
+                        "rule_key": rule.rule_key,
+                        "field": rule.field,
+                        "operator": op,
+                        "message": f"规则 {rule.rule_key} 误报风险：{detail}",
+                    }
+                )
+    return violations
+
+
+MAX_CASE_ID_LENGTH = 64
+
+
+def normalize_case_id(case_id: str, max_len: int = MAX_CASE_ID_LENGTH) -> str:
+    """将审计用例 ID 收敛至 Oracle record_id 列宽上限以内，避免长表名+长规则名触发 ORA-12899。"""
+    cleaned = str(case_id or "").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:8].upper()
+    prefix = cleaned[: max(1, max_len - 9)].rstrip("_")
+    return f"{prefix}_{digest}"
+
+
 def bind_audit_cases(
     spec: SpecDocument,
     items: List[Dict[str, Any]],
@@ -283,7 +402,7 @@ def bind_audit_cases(
     }
     case_ids = set()
     for case in cases:
-
+        case.case_id = normalize_case_id(case.case_id)
         if case.case_id in case_ids:
             raise RuleValidationError("Duplicate audit case ID")
         case_ids.add(case.case_id)

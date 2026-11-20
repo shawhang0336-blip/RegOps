@@ -37,6 +37,7 @@ from app.engine.workflow.stages import (
     _backfill_fixed_value_rules,
     _backfill_length_rules,
     _backfill_required_rules,
+    _code_set_enum_backfill_candidates,
     _data_stage,
     _declaration_quote,
     _dedupe_approved_rules,
