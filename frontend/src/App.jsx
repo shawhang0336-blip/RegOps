@@ -5,7 +5,6 @@ import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
 import ArtifactsPage from './pages/ArtifactsPage.jsx'
 import RunsPage from './pages/RunsPage.jsx'
 import VersionsPage from './pages/VersionsPage.jsx'
-import LegacyApp from './LegacyApp.jsx'
 
 const pipelineNavigation = [
   ['/documents', '规范解析与核对', '01', '上传文件，自动解析并核对字段和码表'],
@@ -109,7 +108,6 @@ function WorkbenchLayout() {
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/versions" element={<VersionsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/legacy" element={<LegacyApp />} />
         </Routes>
       </main>
     </div>

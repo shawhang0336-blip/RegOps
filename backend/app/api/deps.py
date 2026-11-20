@@ -25,18 +25,9 @@ def db_session():
 # ── 请求体契约 ────────────────────────────────────────────────────────────────
 
 
-class ImportRequest(BaseModel):
-    pass
-
-
 class RunRequest(BaseModel):
     spec_id: str
     provider: str = "live"
-
-
-class ConfirmationRequest(BaseModel):
-    table_codes: List[str]
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
 
 
 class TestConfirmationRequest(BaseModel):
@@ -55,34 +46,6 @@ class ApprovalRequest(BaseModel):
 
 
 # ── 视图序列化 ────────────────────────────────────────────────────────────────
-
-
-def spec_summary(row: SpecificationModel) -> Dict:
-    content = row.content_json
-    is_catalog = content.get("document_kind") == "CATALOG"
-    if is_catalog:
-        field_count = sum(table.get("field_count", 0) for table in content["tables"])
-        eligible_count = sum(1 for table in content["tables"] if table["eligible"])
-    elif "tables" in content:
-        field_count = sum(len(table["fields"]) for table in content["tables"])
-        eligible_count = len(content["tables"])
-    else:
-        field_count = len(content["fields"])
-        eligible_count = 1
-    return {
-        "id": row.id,
-        "version": row.version,
-        "table_code": row.table_code,
-        "table_name": content["table_name"],
-        "source_name": row.source_name,
-        "source_sha256": row.source_sha256,
-        "field_count": field_count,
-        "table_count": len(content["tables"]) if "tables" in content else 1,
-        "eligible_count": eligible_count,
-        "document_kind": content.get("document_kind", "CONFIRMED_SNAPSHOT"),
-        "selection_confirmed": bool(content.get("selection_confirmed")),
-        "created_at": row.created_at.isoformat(),
-    }
 
 
 def rule_view(row: RuleModel) -> Dict:

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import runs as runs_v1
-from app.api import specs as specs_v1
+from app.api import system as system_v1
 from app.api.deps import ACTIVE_RUN_STATUSES
 from app.api.v2 import artifacts as artifacts_v2
 from app.api.v2 import code_sets as code_sets_v2
@@ -56,8 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# v1 核心路由（健康检查 / 规范快照 / 运行批次 / 回放 / 总线事件流）
-app.include_router(specs_v1.router)
+# 核心系统与运行批次路由（健康检查 / Blob 读取 / 业务库抽样 / 运行批次 / 回放 / 总线事件流）
+app.include_router(system_v1.router)
 app.include_router(runs_v1.router)
 
 # v2 工作台资产与生成路由

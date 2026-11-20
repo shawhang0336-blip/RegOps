@@ -75,7 +75,7 @@ backend/app/
 │
 └── api/                         # ⑧ HTTP 接口层（v1 与 v2 统一收口）
     ├── deps.py                  #    公共 Session 依赖、请求体契约与视图序列化
-    ├── specs.py                 #    /api/health / /api/specs/* / /api/blobs/* / /api/business/*
+    ├── system.py                #    /api/health / /api/blobs/* / /api/business/preview
     ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / bus-events）
     └── v2/                      #    /api/v2/* 工作台资产与生成路由
         ├── documents.py

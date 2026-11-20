@@ -7,7 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_SPEC_PATH = (
     ROOT_DIR
-    / "外汇业务数据采集规范_1.4版_公开资料"
+    / "data"
+    / "specs"
     / "金融机构外汇业务数据采集规范_1.3版_全文.pdf"
 )
 
