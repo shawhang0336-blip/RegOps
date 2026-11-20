@@ -1,0 +1,82 @@
+"""ProdAgent 微内核（机制层）：机制在内，策略在外。
+
+本包只包含与监管报送业务完全解耦的六大内核构件：
+1. EventLog (`event_log.py`)：带 SHA-256 哈希链的只追加事件账本与状态折叠引擎；
+2. BlobStore (`blob_store.py`)：基于 SHA-256 内容寻址的不可变大对象存储；
+3. Bus (`bus.py`)：事前门禁裁决（check/adjudicate）+ 全生命周期事后广播（fire/subscribe）；
+4. Channel & RunContext (`channel.py`)：带 Reducer 合并语义的跨节点命名数据通道与运行时上下文；
+5. Plan (`plan.py`)：静态只读工作流蓝图（PlanNode / PlanEdge / WorkflowPlan）；
+6. Scheduler (`scheduler.py`)：零业务硬编码的唯一执行引擎与屏障落账调度器。
+"""
+
+from .blob_store import LocalBlobStore
+from .bus import LIFECYCLE_TOPICS, MAX_BUS_HISTORY, Adjudicator, Bus, Subscriber, global_bus
+from .channel import (
+    ChannelSpec,
+    Identity,
+    Reducer,
+    RunContext,
+    append_list,
+    last_value,
+    merge_dict,
+    resolve_event_tables,
+)
+from .event_log import (
+    GENESIS_HASH,
+    RunState,
+    StateReducer,
+    append_event,
+    canonical_event_json,
+    compute_event_hash,
+    fold_with,
+    latest_interrupt,
+    make_interrupt_payload,
+    matching_answer,
+    pending_interrupt_with,
+    project_many_with,
+    project_with,
+    register_default_reducer,
+    verify_chain,
+)
+from .plan import PlanEdge, PlanNode, WorkflowPlan
+from .scheduler import NodeBody, Outcome, Scheduler, StepResult
+
+__all__ = [
+    "Adjudicator",
+    "Bus",
+    "ChannelSpec",
+    "GENESIS_HASH",
+    "Identity",
+    "LIFECYCLE_TOPICS",
+    "LocalBlobStore",
+    "MAX_BUS_HISTORY",
+    "NodeBody",
+    "Outcome",
+    "PlanEdge",
+    "PlanNode",
+    "Reducer",
+    "RunContext",
+    "RunState",
+    "Scheduler",
+    "StateReducer",
+    "StepResult",
+    "Subscriber",
+    "WorkflowPlan",
+    "append_event",
+    "append_list",
+    "canonical_event_json",
+    "compute_event_hash",
+    "fold_with",
+    "global_bus",
+    "last_value",
+    "latest_interrupt",
+    "make_interrupt_payload",
+    "matching_answer",
+    "merge_dict",
+    "pending_interrupt_with",
+    "project_many_with",
+    "project_with",
+    "register_default_reducer",
+    "resolve_event_tables",
+    "verify_chain",
+]

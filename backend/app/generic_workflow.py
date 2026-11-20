@@ -9,10 +9,17 @@ import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .blobs import LocalBlobStore
-from .bus import default_bus, global_bus
-from .context import Identity, RunContext, build_context
-from .scheduler import Outcome, Scheduler
+from .kernel import Identity, LocalBlobStore, Outcome, RunContext, Scheduler, global_bus
+from .policy import DEFAULT_PLAN, build_context, default_bus, self_heal_target
+from .policy.rule_backfill import (
+    _backfill_fixed_value_rules as _policy_backfill_fixed_value_rules,
+    _backfill_length_rules as _policy_backfill_length_rules,
+    _backfill_required_rules as _policy_backfill_required_rules,
+    _declaration_quote,
+    _fixed_value_candidates,
+    _length_backfill_candidates,
+    _required_backfill_candidates,
+)
 from .code_set_oracle import (
     code_set_compile_bindings,
     compile_code_set_oracle_ddl,
@@ -27,7 +34,6 @@ from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical
 from .errors import WorkflowError
 from .events import append_event, interrupt_payload, latest_interrupt, matching_answer, pending_interrupt, project
 from .identity import OPERATOR_PLACEHOLDER
-from .workflow import DEFAULT_PLAN, self_heal_target
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
     GeneratorBinding,
@@ -812,235 +818,16 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
     return golden_records, generator_payload
 
 
-def _required_backfill_candidates(specs, rules) -> List[tuple]:
-    """找出「原文句首写必填、但规则集里没有 REQUIRED」的字段。
-
-    只认句首的「必填」：「非必填项，当…时必填」和「条件必填」都不是无条件必填，
-    误补一条 REQUIRED 会把合法的空值判成违规，比漏补伤害更大。
-    """
-    covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "REQUIRED"}
-    candidates = []
-    for spec in specs:
-        for field in spec.fields:
-            if (spec.table_code, field.name) in covered:
-                continue
-            if not (field.check_text or "").strip().startswith("必填"):
-                continue
-            candidates.append((spec, field))
-    return candidates
-
-
 def _backfill_required_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    """按字典原文机械补齐必填规则。"""
-    added: List[RuleDefinition] = []
-    for spec, field in _required_backfill_candidates(specs, rules):
-        text = (field.check_text or "").strip()
-        rule_key = f"{spec.table_code}_{field.name}_REQUIRED"
-        try:
-            bound = bind_rules(
-                spec,
-                [
-                    {
-                        "field": field.name,
-                        "operator": "REQUIRED",
-                        "params": {},
-                        "rule_key": rule_key,
-                        "evidence_kind": "DICTIONARY",
-                        "rationale": f"数据字典校验原文以「必填」开头：{text[:80]}（由元数据机械补齐，非 AI 生成）",
-                    }
-                ],
-            )
-        except (RuleValidationError, WorkflowError) as exc:
-            _emit(
-                events,
-                session,
-                run,
-                "RULE_BACKFILL_GAP",
-                "rule_backfill",
-                {"table_code": spec.table_code, "field": field.name, "error": str(exc)},
-            )
-            continue
-        _upsert_rule(session, run, bound[0], "APPROVED")
-        added.append(bound[0])
-    if added:
-        session.flush()
-        _emit(
-            events,
-            session,
-            run,
-            "RULE_BACKFILL",
-            "rule_backfill",
-            {
-                "total": len(added),
-                "rules": [
-                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
-                    for rule in added
-                ],
-                "note": "原文句首为「必填」但 AI 未生成对应 REQUIRED 规则，已确定性补齐",
-            },
-        )
-    return rules + added
-
-
-def _length_backfill_candidates(specs, rules) -> List[tuple]:
-    """找出「字典声明了长度、但规则集里没有任何长度约束」的文本字段。"""
-    covered = {
-        (rule.table_code, rule.field)
-        for rule in rules
-        if rule.operator in {"LENGTH", "LENGTH_MAX"}
-    }
-    candidates = []
-    for spec in specs:
-        for field in spec.fields:
-            if (spec.table_code, field.name) in covered:
-                continue
-            if (field.data_type or "").upper() != "VARCHAR":
-                continue
-            # 长度 0 或超 Oracle VARCHAR2 上限的不是「声明了列宽」，交给码值/格式规则去管
-            if not (0 < (field.length or 0) <= 4000):
-                continue
-            candidates.append((spec, field))
-    return candidates
-
-
-def _declaration_quote(spec, field) -> str:
-    """从字典原文里取该字段那一行做证据；取不到就退回类型声明本身。"""
-    want = (field.name or "").lower()
-    for line in (spec.dictionary_text or "").splitlines():
-        low = line.lower()
-        if want and want in low and str(field.length) in line:
-            return " ".join(line.split())
-    return f"{field.name} 类型（长度）列：{field.data_type}({field.length})"
+    return _policy_backfill_required_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
 
 
 def _backfill_length_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    """按类型（长度）列机械补齐 LENGTH_MAX。"""
-    added: List[RuleDefinition] = []
-    for spec, field in _length_backfill_candidates(specs, rules):
-        rule_key = f"{spec.table_code}_{field.name}_LENGTH_MAX"
-        try:
-            bound = bind_rules(
-                spec,
-                [
-                    {
-                        "field": field.name,
-                        "operator": "LENGTH_MAX",
-                        "params": {"length": int(field.length)},
-                        "rule_key": rule_key,
-                        "evidence_kind": "DICTIONARY",
-                        "rationale": (
-                            f"数据字典类型（长度）列声明 {field.data_type}({field.length})，"
-                            f"故 {field.name} 最多 {field.length} 位（由元数据机械补齐，非 AI 生成）"
-                        ),
-                    }
-                ],
-            )
-        except (RuleValidationError, WorkflowError) as exc:
-            _emit(
-                events,
-                session,
-                run,
-                "RULE_BACKFILL_GAP",
-                "rule_backfill",
-                {"table_code": spec.table_code, "field": field.name, "operator": "LENGTH_MAX", "error": str(exc)},
-            )
-            continue
-        bound[0].evidence.quote = _declaration_quote(spec, field)
-        bound[0].rule_hash = calculate_rule_hash(bound[0], spec.source_sha256)
-        _upsert_rule(session, run, bound[0], "APPROVED")
-        added.append(bound[0])
-    if added:
-        session.flush()
-        _emit(
-            events,
-            session,
-            run,
-            "RULE_BACKFILL",
-            "rule_backfill",
-            {
-                "total": len(added),
-                "rules": [
-                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
-                    for rule in added
-                ],
-                "note": "字典声明了列宽但 AI 未生成长度规则，已按 LENGTH_MAX 确定性补齐",
-            },
-        )
-    return rules + added
-
-
-def _fixed_value_candidates(specs, rules) -> List[tuple]:
-    """找出「原文明确要求本项固定填某个值」的字段。"""
-    from .code_service import is_conditional_phrase, parse_fixed_value
-
-    covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
-    candidates = []
-    for spec in specs:
-        for field in spec.fields:
-            if (spec.table_code, field.name) in covered:
-                continue
-            value = parse_fixed_value(field.code_reference or "") or parse_fixed_value(field.check_text or "")
-            if not value:
-                continue
-            if is_conditional_phrase(field.check_text or ""):
-                continue
-            candidates.append((spec, field, value))
-    return candidates
+    return _policy_backfill_length_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
 
 
 def _backfill_fixed_value_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    """按原文的固定值要求补齐 ENUM。"""
-    added: List[RuleDefinition] = []
-    for spec, field, value in _fixed_value_candidates(specs, rules):
-        rule_key = f"{spec.table_code}_{field.name}_FIXED_VALUE_ENUM"
-        try:
-            bound = bind_rules(
-                spec,
-                [
-                    {
-                        "field": field.name,
-                        "operator": "ENUM",
-                        "params": {"values": [value]},
-                        "rule_key": rule_key,
-                        "evidence_kind": "DICTIONARY",
-                        "rationale": (
-                            f"原文要求本项固定为「{value}」"
-                            f"（{(field.code_reference or field.check_text)[:60]}），"
-                            "故取值只能是这一个（由元数据机械补齐，非 AI 生成）"
-                        ),
-                    }
-                ],
-            )
-        except (RuleValidationError, WorkflowError) as exc:
-            _emit(
-                events,
-                session,
-                run,
-                "RULE_BACKFILL_GAP",
-                "rule_backfill",
-                {"table_code": spec.table_code, "field": field.name, "value": value, "error": str(exc)},
-            )
-            continue
-        _upsert_rule(session, run, bound[0], "APPROVED")
-        added.append(bound[0])
-    if added:
-        session.flush()
-        _emit(
-            events,
-            session,
-            run,
-            "RULE_BACKFILL",
-            "rule_backfill",
-            {
-                "total": len(added),
-                "rules": [
-                    {"table_code": rule.table_code, "rule_key": rule.rule_key, "field": rule.field}
-                    for rule in added
-                ],
-                "note": "原文要求固定取值但 AI 未生成 ENUM 规则，已确定性补齐",
-            },
-        )
-    return rules + added
+    return _policy_backfill_fixed_value_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
 
 
 def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
