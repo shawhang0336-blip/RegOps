@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from .blobs import LocalBlobStore
 from .bus import default_bus
+from .context import Identity, RunContext, build_context
+from .scheduler import Outcome, Scheduler
 from .code_set_oracle import (
     code_set_compile_bindings,
     compile_code_set_oracle_ddl,
@@ -24,6 +26,7 @@ from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
 from .errors import WorkflowError
 from .events import append_event, project
+from .workflow import DEFAULT_PLAN, front_half_nodes, self_heal_target
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
     GeneratorBinding,
@@ -1225,7 +1228,7 @@ def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer
         run,
         "GO_REDIRECT",
         "human_retry",
-        {"target": "rule_binder", "reason": "Repair rules from the persisted failed audit before regenerating data"},
+        {"target": self_heal_target(), "reason": "Repair rules from the persisted failed audit before regenerating data"},
     )
     revised = _rebind_failed_rules(session, run, specs, llm, report)
     if not revised:
@@ -1253,7 +1256,7 @@ def _latest_payload(session: Session, run_id: str, kind: str) -> Dict[str, Any]:
     return event.payload_json
 
 
-def _create_run(session: Session, spec_id: str, settings: Settings) -> RunModel:
+def _create_run(session: Session, spec_id: str, settings: Settings, operator: str = "UNSPECIFIED_OPERATOR") -> RunModel:
     _specs(session, spec_id)  # 校验 spec 存在且已确认；非法则抛 WorkflowError
     run = RunModel(id=str(uuid.uuid4()), spec_id=spec_id)
     session.add(run)
@@ -1264,67 +1267,117 @@ def _create_run(session: Session, spec_id: str, settings: Settings) -> RunModel:
         run,
         "RUN_CREATED",
         "table_confirmation",
-        {"spec_id": spec_id, "provider": "REAL_GLM", "confirmation": specification.content_json.get("confirmation")},
+        {
+            "spec_id": spec_id,
+            "provider": "REAL_GLM",
+            "confirmation": specification.content_json.get("confirmation"),
+            "operator": operator,
+        },
     )
     return run
 
 
+def _front_bodies(specs, llm, budget, concurrency, settings):
+    """前半段节点 body：只做本节点的事，产物写 ctx.shared，不调用下游。"""
+    from .context import RunContext
+    from .scheduler import Outcome
+
+    def body_generation_planner(_input, ctx: RunContext) -> Outcome:
+        # 无预算时不走规划阶段（保持原有语义：生成计划是可选阶段）
+        plans = _plan_stage(ctx.session, ctx.run, specs, ctx.llm, ctx.budget, ctx.concurrency) if ctx.get("use_plan") else None
+        return Outcome(output=plans, shared={"plans": plans})
+
+    def body_schema_mapper(_input, ctx: RunContext) -> Outcome:
+        _schema_stage(ctx.session, ctx.run, specs, ctx.llm, ctx.concurrency)
+        schema_payload = _latest_payload(ctx.session, ctx.run.id, "SCHEMA_ASSIGNED")["tables"]
+        return Outcome(shared={"schema_payload": schema_payload})
+
+    def body_rule_binder(_input, ctx: RunContext) -> Outcome:
+        plans = ctx.get("plans")
+        pending_count = _rules_stage(ctx.session, ctx.run, specs, ctx.llm, plans, concurrency=ctx.concurrency)
+        # pending 只写入 Channel；人工门事件在 asset builder 之后才落，
+        # 保证即使有待确认规则，Oracle 资产也先建好（与既有语义一致）
+        return Outcome(shared={"pending_count": pending_count})
+
+    def body_oracle_asset_builder(_input, ctx: RunContext) -> Outcome:
+        schema_payload = ctx.get("schema_payload")
+        generated_rules = [
+            RuleDefinition.model_validate(row.definition_json)
+            for row in ctx.session.query(RuleModel)
+            .filter(RuleModel.run_id == ctx.run.id, RuleModel.status != "SUPERSEDED").all()
+        ]
+        _ensure_oracle_assets(ctx.session, ctx.run, specs, schema_payload, generated_rules, ctx.settings)
+        pending_count = ctx.get("pending_count", 0)
+        events = []
+        if pending_count:
+            events.append(("APPROVAL_REQUIRED", "human_gate", {
+                "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, ctx.run.id)],
+                "pending_count": pending_count,
+                **ctx.identity.as_payload(),
+            }))
+        return Outcome(shared={"rules": generated_rules}, events=events)
+
+    return {
+        "generation_planner": body_generation_planner,
+        "schema_mapper": body_schema_mapper,
+        "rule_binder": body_rule_binder,
+        "oracle_asset_builder": body_oracle_asset_builder,
+    }
+
+
 def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
+    """前半段：由 Scheduler 按 Plan 驱动，节点之间不再直接调用。"""
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
     resolved_budget, concurrency = _resolve_budget(session, generation_budget)
-    current_stage = "created"
+    ctx = build_context(
+        session, run, settings,
+        llm=llm, budget=resolved_budget, concurrency=concurrency,
+    )
+    ctx.put("use_plan", generation_budget is not None)
+    scheduler = Scheduler(DEFAULT_PLAN, _front_bodies(specs, llm, resolved_budget, concurrency, settings))
     try:
-        current_stage = "generation_planner"
-        plans = _plan_stage(session, run, specs, llm, resolved_budget, concurrency) if generation_budget else None
-        session.commit()
-        current_stage = "schema_mapper"
-        _schema_stage(session, run, specs, llm, concurrency)
-        session.commit()
-        current_stage = "rule_binder"
-        pending_count = _rules_stage(session, run, specs, llm, plans, concurrency=concurrency)
-        session.commit()
-        current_stage = "oracle_asset_builder"
-        schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
-        generated_rules = [
-            RuleDefinition.model_validate(row.definition_json)
-            for row in session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status != "SUPERSEDED").all()
-        ]
-        _ensure_oracle_assets(session, run, specs, schema_payload, generated_rules, settings)
-        session.commit()
+        scheduler.drive(ctx)
     except Exception as exc:
+        current = ctx.state.current_node or "created"
         append_event(
-            session,
-            run,
-            "RUN_FAILED",
-            current_stage,
+            session, run, "RUN_FAILED", current,
             {
-                "node": current_stage,
+                "node": current,
                 "result": {
                     "error": f"{type(exc).__name__}: {exc}",
-                    "error_details": _error_details(exc, current_stage),
+                    "error_details": _error_details(exc, current),
                 },
             },
         )
         session.commit()
         return run
-    if pending_count:
-        append_event(
-            session,
-            run,
-            "APPROVAL_REQUIRED",
-            "human_gate",
-            {"pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(session, run.id)]},
-        )
-        session.commit()
+    state = project(session, run)
+    if state.status == "READY_TO_AUDIT":
+        # 无 pending：沿 Plan 进后半段（保持原有续跑语义）
+        return continue_generic_run(session, run, settings, llm, resolved_budget)
+    return run
+
+def drive(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base=None) -> RunModel:
+    """统一执行器：读事件投影的 current_node，查 Plan 决定调用哪一段。
+
+    这是 Plan/Run 分离的关键——拓扑判定只在这里发生一次，
+    审批、重试、重审、后台续跑全部走这一个入口，不再各自硬编码"从哪继续"。
+    """
+    state = project(session, run)
+    node = state.current_node
+    # 终态与中断点不再推进
+    if state.status in {"COMPLETED", "FAILED", "WAITING_APPROVAL", "WAITING_TEST_APPROVAL"}:
         return run
-    session.commit()
-    return continue_generic_run(session, run, settings, llm, resolved_budget)
+    if node in front_half_nodes():
+        return _execute_run(session, run, settings, llm, generation_budget)
+    return continue_generic_run(session, run, settings, llm, generation_budget, attempt_base)
+
 
 def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     """同步入口：创建 run 并执行到第一个 gate。测试与内部调用使用。"""
     run = _create_run(session, spec_id, settings)
-    return _execute_run(session, run, settings, llm, generation_budget)
+    return drive(session, run, settings, llm, generation_budget)
 
 
 def approve_generic_rules(
@@ -1531,7 +1584,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
             run,
             "GO_REDIRECT",
             "oracle_executor",
-            {"target": "rule_binder", "failed_result": result},
+            {"target": self_heal_target(), "failed_result": result},
         )
         revised = _rebind_failed_rules(session, run, specs, llm, report)
         if revised:

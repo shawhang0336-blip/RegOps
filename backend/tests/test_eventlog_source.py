@@ -28,12 +28,12 @@ def test_state_is_folded_from_events_only():
 
     append_event(session, run, "RUN_CREATED", "table_confirmation", {})
     assert project(session, run).status == "RUNNING"
-    assert project(session, run).current_node == "bind_rules"
+    assert project(session, run).current_node == "created"
 
     append_event(session, run, "RULES_BOUND", "rule_binder", {"pending_count": 2})
     state = project(session, run)
     assert state.status == "WAITING_APPROVAL"
-    assert state.current_node == "human_gate"
+    assert state.current_node == "rule_binder"
 
     append_event(
         session,

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from .domain import canonical_json
 from .models import EventModel, RunModel
+from .workflow import DEFAULT_PLAN
 
 GENESIS_HASH = "0" * 64
 
@@ -29,16 +30,35 @@ class RunState:
     result_json: Optional[Dict[str, Any]] = None
 
 
+# 事件 → Plan 节点推进的条件标签。拓扑后继由 DEFAULT_PLAN.next() 查得，
+# 这里只声明"发生了哪类条件"，节点名不再散落在状态机里硬编码。
+_EVENT_CONDITIONS = {
+    "RULES_BOUND": "rules_bound",
+    "HUMAN_DECISIONS_RECORDED": "human_decided",
+}
+
+
 def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
+    """把一条事件折进状态。
+
+    current_node 表示"最近完成的阶段节点"。执行器读它 + status，
+    再查 DEFAULT_PLAN 的后继边决定下一步——拓扑只存在于 Plan 里。
+    """
     if kind == "RUN_CREATED":
-        return replace(state, status="RUNNING", current_node="bind_rules")
+        return replace(state, status="RUNNING", current_node="created")
+    if kind == "GENERATION_PLANNED":
+        return replace(state, current_node="generation_planner")
+    if kind == "SCHEMA_ASSIGNED":
+        return replace(state, current_node="schema_mapper")
     if kind == "RULES_BOUND":
         pending = bool(payload.get("pending_count"))
         return replace(
             state,
             status="WAITING_APPROVAL" if pending else "READY_TO_AUDIT",
-            current_node="human_gate" if pending else "build_audit",
+            current_node="rule_binder",
         )
+    if kind == "ORACLE_ASSETS_PREPARED":
+        return replace(state, current_node="oracle_asset_builder", result_json=payload.get("result"))
     if kind == "APPROVAL_REQUIRED":
         return replace(state, status="WAITING_APPROVAL", current_node="human_gate")
     if kind == "HUMAN_DECISIONS_RECORDED":
@@ -46,28 +66,35 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
         return replace(
             state,
             status="READY_TO_AUDIT" if decided else "WAITING_APPROVAL",
-            current_node="build_audit" if decided else "human_gate",
+            current_node="human_gate",
         )
     if kind == "REAUDIT_REQUESTED":
-        # 人工改参后只重跑造数与 Oracle 验证，规则集合保持不动
-        return replace(state, status="READY_TO_AUDIT", current_node="build_audit")
-    if kind == "ORACLE_ASSETS_PREPARED":
-        return replace(state, result_json=payload.get("result"))
+        # 人工改参后只重跑造数与验证，规则集合不动；执行器从 data_generator_binder 起
+        return replace(state, status="READY_TO_AUDIT", current_node="human_gate")
+    if kind == "GENERATORS_ASSIGNED":
+        return replace(state, current_node="data_generator_binder")
+    if kind == "AUDIT_CASES_ASSIGNED":
+        return replace(state, current_node="audit_case_binder")
     if kind == "TEST_CONFIRMATION_REQUIRED":
-        return replace(state, status="WAITING_TEST_APPROVAL", current_node="test_confirmation")
+        return replace(state, status="WAITING_TEST_APPROVAL", current_node="oracle_executor")
     if kind == "TEST_RESULTS_CONFIRMED":
-        return replace(state, status="COMPLETED", current_node="export")
+        return replace(state, status="COMPLETED", current_node="test_confirmation")
     if kind == "AUDIT_STARTED":
         return replace(
             state,
             status="AUDITING",
-            current_node="sandbox_audit",
+            current_node="oracle_executor",
             attempt=payload.get("attempt", state.attempt),
         )
     if kind == "GO_REDIRECT":
-        return replace(state, status="RUNNING", current_node=payload["target"])
+        target = payload["target"]
+        if not any(node.name == target for node in DEFAULT_PLAN.nodes):
+            raise ValueError(f"GO_REDIRECT 目标 {target} 不在 Plan 中")
+        return replace(state, status="RUNNING", current_node=target)
     if kind == "AUDIT_COMPLETED":
-        return replace(state, status="COMPLETED", current_node="export", result_json=payload.get("result"))
+        return replace(
+            state, status="COMPLETED", current_node="oracle_executor", result_json=payload.get("result")
+        )
     if kind in {"RUN_FAILED", "AUDIT_REJECTED"}:
         return replace(
             state,
@@ -76,7 +103,6 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             result_json=payload.get("result"),
         )
     return state
-
 
 def fold(events: Iterable[EventModel]) -> RunState:
     """按 seq 顺序折叠事件流，得到当前状态。纯函数，同一批事件永远得到同一结果。"""

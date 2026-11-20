@@ -29,7 +29,7 @@ from .generic_workflow import (
     _pending_rules,
     approve_generic_rules,
     confirm_generic_test_results,
-    continue_generic_run,
+    drive,
     retry_generic_run,
     start_generic_run,
 )
@@ -667,7 +667,7 @@ def _spawn_run_continuation(run_id: str) -> None:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
                 if run and project(session, run).status in {"READY_TO_AUDIT", "RUNNING"}:
-                    continue_generic_run(session, run, settings)
+                    drive(session, run, settings)
         except Exception:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)

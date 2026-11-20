@@ -381,4 +381,4 @@ def test_create_run_marks_run_running(organization_spec):
     run = _create_run(session, spec_id, Settings())
     state = project(session, run)
     assert state.status == "RUNNING"
-    assert state.current_node == "bind_rules"
+    assert state.current_node == "created"

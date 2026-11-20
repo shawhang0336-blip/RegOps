@@ -15,7 +15,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..domain import canonical_json
 from ..events import append_event, project
-from ..generic_workflow import _create_run, _execute_run
+from ..generic_workflow import _create_run, drive
 from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_service import metadata_to_spec, publish_table
 from ..models import RunModel, SpecificationModel
@@ -76,7 +76,7 @@ def _spawn_background_run(run_id: str, settings, generation_budget) -> None:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
                 if run and project(session, run).status == "RUNNING":
-                    _execute_run(session, run, settings, generation_budget=generation_budget)
+                    drive(session, run, settings, generation_budget=generation_budget)
         except Exception as exc:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
@@ -227,7 +227,7 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
         )
         session.add(snapshot)
         session.flush()
-        run = _create_run(session, snapshot.id, settings)
+        run = _create_run(session, snapshot.id, settings, operator=request.approver.strip())
         budget = get_budget(session)
         session.commit()
         run_id = run.id
