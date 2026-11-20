@@ -235,7 +235,7 @@ def create_generation(request: GenerationRequest) -> Dict[str, Any]:
 
     _spawn_background_run(run_id, settings, budget)
 
-    from app.main import run_view
+    from app.api.deps import run_view
 
     with SessionLocal() as session:
         run = session.get(RunModel, run_id)

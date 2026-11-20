@@ -1,0 +1,93 @@
+"""规则装配与审计流水线编排包（Engine Workflow）。
+
+结构一览（从 1,665 行单文件拆分为 4 个单一职责模块）：
+- `runtime.py`：受控 LLM 退避调用（`_call_validated`）+ Bus 前置门禁 + BSP 并发扇出（`_fanout`）；
+- `stages.py`：规划 / Schema / 规则 / Oracle 资产 / 黄金造数 / 审计用例 / 自愈重绑 7 大阶段实现；
+- `nodes.py`：面向 ProdAgent `Scheduler` 的前后段 `NodeBody` 装配；
+- `entrypoints.py`：`drive` / `start_generic_run` / `approve_generic_rules` / `confirm_generic_test_results` / `retry_generic_run`。
+"""
+
+from app.engine.workflow.entrypoints import (
+    _create_run,
+    approve_generic_rules,
+    confirm_generic_test_results,
+    continue_generic_run,
+    drive,
+    retry_generic_run,
+    start_generic_run,
+)
+from app.engine.workflow.nodes import _back_bodies, _front_bodies
+from app.engine.workflow.runtime import (
+    ERROR_SUGGESTIONS,
+    STAGE_BY_TOOL,
+    _call_validated,
+    _code_set_context,
+    _emit,
+    _error_details,
+    _fanout,
+    _inner_width,
+    _latest_payload,
+    _pending_rules,
+    _resolve_budget,
+    _specs,
+    _upsert_rule,
+)
+from app.engine.workflow.stages import (
+    _audit_stage,
+    _backfill_fixed_value_rules,
+    _backfill_length_rules,
+    _backfill_required_rules,
+    _data_stage,
+    _declaration_quote,
+    _dedupe_approved_rules,
+    _ensure_oracle_assets,
+    _fixed_value_candidates,
+    _length_backfill_candidates,
+    _plan_stage,
+    _rebind_failed_rules,
+    _required_backfill_candidates,
+    _rules_stage,
+    _schema_stage,
+    _validate_plan,
+)
+
+__all__ = [
+    "ERROR_SUGGESTIONS",
+    "STAGE_BY_TOOL",
+    "_audit_stage",
+    "_back_bodies",
+    "_backfill_fixed_value_rules",
+    "_backfill_length_rules",
+    "_backfill_required_rules",
+    "_call_validated",
+    "_code_set_context",
+    "_create_run",
+    "_data_stage",
+    "_declaration_quote",
+    "_dedupe_approved_rules",
+    "_emit",
+    "_ensure_oracle_assets",
+    "_error_details",
+    "_fanout",
+    "_fixed_value_candidates",
+    "_front_bodies",
+    "_inner_width",
+    "_latest_payload",
+    "_length_backfill_candidates",
+    "_pending_rules",
+    "_plan_stage",
+    "_rebind_failed_rules",
+    "_required_backfill_candidates",
+    "_resolve_budget",
+    "_rules_stage",
+    "_schema_stage",
+    "_specs",
+    "_upsert_rule",
+    "_validate_plan",
+    "approve_generic_rules",
+    "confirm_generic_test_results",
+    "continue_generic_run",
+    "drive",
+    "retry_generic_run",
+    "start_generic_run",
+]
