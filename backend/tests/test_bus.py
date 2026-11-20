@@ -4,7 +4,15 @@
 原因回喂模型；这不是写在 prompt 里的软约束。
 """
 
-from app.bus import Bus, cross_table_adjudicator, default_bus, field_whitelist_adjudicator
+from app.bus import (
+    Bus,
+    code_set_values_adjudicator,
+    cross_table_adjudicator,
+    default_bus,
+    field_whitelist_adjudicator,
+    operator_whitelist_adjudicator,
+    structure_block_adjudicator,
+)
 from app.generic_workflow import _call_validated
 from app.generic_ai import LlmTimeoutError
 from app.errors import WorkflowError
@@ -93,5 +101,66 @@ def test_call_validated_feeds_bus_rejection_back_to_model():
     )
     assert result["rules"][0]["field"] == "CUSTCODE"
     assert trace["attempts"] == 2
-    assert "bus_rejected" in trace or seen_feedback[1] is not None
+    assert "bus_rejected" in trace
+    assert len(trace["bus_rejections"]) == 1
     assert "字段白名单" in (seen_feedback[1] or "")
+
+
+def test_field_whitelist_covers_schema_generators_and_audit_cases():
+    payload = {"field_names": ["CUSTCODE", "ACTIONTYPE"]}
+    assert field_whitelist_adjudicator(
+        "assign_schema",
+        {"fields": [{"field": "FAKE_COL", "storage_type": "TEXT", "length": 10, "decimal_places": 0}]},
+        payload,
+    ) is not None
+    assert field_whitelist_adjudicator(
+        "assign_generators",
+        {"generators": [{"field": "FAKE_GEN", "generator": "FIXED", "params": {"value": "A"}}]},
+        payload,
+    ) is not None
+    assert field_whitelist_adjudicator(
+        "assign_audit_cases",
+        {"cases": [{"case_id": "C1", "overrides": {"FAKE_OVERRIDE": "X"}, "expected_rule_keys": ["R1"]}]},
+        {"table": payload},
+    ) is not None
+
+
+def test_operator_and_code_set_and_structure_adjudicators():
+    assert operator_whitelist_adjudicator(
+        "assign_rules",
+        {"rules": [{"field": "CUSTCODE", "operator": "LENGTH", "params": {"length": 18}}]},
+        {},
+    ) is not None
+    assert operator_whitelist_adjudicator(
+        "assign_rules",
+        {"rules": [{"field": "CUSTCODE", "operator": "LENGTH_MAX", "params": {"length": 18}}]},
+        {},
+    ) is None
+
+    cs_payload = {"published_code_set": {"code": "ACTION_CS", "values": ["A", "C", "D"]}}
+    assert code_set_values_adjudicator(
+        "assign_rules",
+        {"rules": [{"field": "ACTIONTYPE", "operator": "ENUM", "params": {"values": ["A", "Z"]}}]},
+        cs_payload,
+    ) is not None
+    assert code_set_values_adjudicator(
+        "assign_generators",
+        {"generators": [{"field": "ACTIONTYPE", "generator": "ENUM", "params": {"values": ["X"]}}]},
+        cs_payload,
+    ) is not None
+    assert code_set_values_adjudicator(
+        "assign_rules",
+        {"rules": [{"field": "ACTIONTYPE", "operator": "ENUM", "params": {"values": ["A", "C"]}}]},
+        cs_payload,
+    ) is None
+
+    assert structure_block_adjudicator(
+        "assign_document_structure",
+        {"blocks": [{"source_block_ids": ["b_unknown"]}]},
+        {"candidate_blocks": [{"id": "b1"}]},
+    ) is not None
+    assert structure_block_adjudicator(
+        "assign_document_structure",
+        {"blocks": [{"source_block_ids": ["b1"]}]},
+        {"candidate_blocks": [{"id": "b1"}]},
+    ) is None

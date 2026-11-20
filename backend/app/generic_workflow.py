@@ -166,8 +166,23 @@ def _backoff_wait(steps, attempt: int) -> None:
         time.sleep(delay)
 
 
+def _emit(
+    events: Optional[List[tuple]],
+    session: Session,
+    run: RunModel,
+    kind: str,
+    node: str,
+    payload: Dict[str, Any],
+) -> None:
+    """将事件收入节点写集（由 Scheduler 屏障处统一落账）；仅在单测直调辅助函数时直接写库。"""
+    if events is not None:
+        events.append((kind, node, payload))
+    else:
+        append_event(session, run, kind, node, payload)
+
+
 def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None, backoff=None, bus=None):
-    """带退避的模型调用。
+    """带退避与 Bus 前置门禁的模型调用。
 
     原来只重试 2 次、HTTP 错误直接抛、超时只给 1 次机会。线上 8 次失败里有 6 次是
     这类瞬时错误（"The read operation timed out" / "Model returned no tool call"），
@@ -175,10 +190,11 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
 
     - 网络/超时：重试 4 次，超时窗口逐次放宽，不回喂 feedback（模型侧可能压根没收到）；
     - 模型没调工具：重试 4 次，给一句更硬的指令（这是行为问题，不是网络问题）；
-    - 参数校验不过：重试 3 次，把拒绝原因回喂给模型。
+    - Bus 门禁拦截 / 参数校验不过：重试 3 次，把拒绝原因回喂给模型，且全程保留拦截记录。
     """
     feedback = None
     rejection = None
+    bus_rejections: List[Dict[str, Any]] = []
     last_kind = "validation"
     last_error = ""
     retried_after_timeout = False
@@ -197,13 +213,24 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
                 arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
             else:
                 arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
-            # Bus 前置裁决：字段名白名单、跨表引用白名单等硬门。
-            # 裁决失败按校验失败处理，原因回喂模型重试，并记入 trace 供审计。
+            # Bus 前置裁决：字段名白名单、跨表引用白名单、算子白名单、码表值域等硬门。
+            # 裁决失败按校验失败处理，原因回喂模型重试，并跨轮次保留在 bus_rejections 供审计。
             rejection_reason = bus.adjudicate(tool_name, arguments, payload)
             if rejection_reason:
+                bus_rejections.append(
+                    {
+                        "attempt": attempt,
+                        "tool_name": tool_name,
+                        "reason": rejection_reason,
+                        "arguments": arguments,
+                    }
+                )
                 trace["bus_rejected"] = rejection_reason
                 raise RuleValidationError(rejection_reason)
             result = validator(arguments)
+            if bus_rejections:
+                trace["bus_rejected"] = bus_rejections[-1]["reason"]
+                trace["bus_rejections"] = bus_rejections
             if rejection:
                 trace["previous_rejection"] = rejection
             if retried_after_timeout:
@@ -265,8 +292,17 @@ def _inner_width(concurrency: int, outer_workers: int) -> int:
     return max(1, concurrency // max(1, outer_workers))
 
 
-def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocument], worker, max_workers: int = 4) -> List[Any]:
-    append_event(
+def _fanout(
+    session: Session,
+    run: RunModel,
+    stage: str,
+    specs: List[SpecDocument],
+    worker,
+    max_workers: int = 4,
+    events: Optional[List[tuple]] = None,
+) -> List[Any]:
+    _emit(
+        events,
         session,
         run,
         "BSP_FANOUT",
@@ -277,7 +313,8 @@ def _fanout(session: Session, run: RunModel, stage: str, specs: List[SpecDocumen
         futures = [executor.submit(worker, spec) for spec in specs]
         results = [future.result() for future in futures]
     for spec, (_, trace) in zip(specs, results):
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "AI_TOOL_ASSIGNED",
@@ -307,7 +344,7 @@ def _validate_plan(args, budget):
     return plan
 
 
-def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4):
+def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None):
     def worker(spec):
         return _call_validated(
             llm,
@@ -315,11 +352,13 @@ def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4):
             "根据表复杂度自行决定必做规则数、拓展规则数、黄金数据量和每规则变异数，并说明理由；不得超出输入预算。",
             {**spec_payload(spec), "budget": budget},
             lambda args: _validate_plan(args, budget),
+            bus=bus,
         )
 
-    results = _fanout(session, run, "generation_planner", specs, worker, max_workers=concurrency)
+    results = _fanout(session, run, "generation_planner", specs, worker, max_workers=concurrency, events=events)
     plans = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "GENERATION_PLANNED",
@@ -337,11 +376,18 @@ def _plan_stage(session, run, specs, llm, budget, concurrency: int = 4):
             )
         )
     session.flush()
-    append_event(session, run, "BSP_BARRIER_JOIN", "plan_barrier", {"stage": "generation_planner", "table_codes": list(plans)})
+    _emit(
+        events,
+        session,
+        run,
+        "BSP_BARRIER_JOIN",
+        "plan_barrier",
+        {"stage": "generation_planner", "table_codes": list(plans)},
+    )
     return plans
 
 
-def _schema_stage(session, run, specs, llm, concurrency: int = 4):
+def _schema_stage(session, run, specs, llm, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
     def worker(spec):
         return _call_validated(
             llm,
@@ -349,9 +395,10 @@ def _schema_stage(session, run, specs, llm, concurrency: int = 4):
             "为每个白名单字段赋予物理存储类型和长度。必须逐字段全覆盖，不得改变数值字段语义。",
             spec_payload(spec),
             lambda args: bind_schema(spec, args.get("fields", [])),
+            bus=bus,
         )
 
-    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency)
+    results = _fanout(session, run, "schema_mapper", specs, worker, max_workers=concurrency, events=events)
     schemas = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     for spec in specs:
         session.add(
@@ -364,24 +411,30 @@ def _schema_stage(session, run, specs, llm, concurrency: int = 4):
             )
         )
     session.flush()
-    append_event(
+    tables_payload = {code: [item.model_dump() for item in items] for code, items in schemas.items()}
+    event_payload: Dict[str, Any] = {"tables": tables_payload}
+    if blob_store is not None:
+        event_payload["tables_blob"] = blob_store.put(canonical_json(tables_payload).encode("utf-8"))
+    _emit(
+        events,
         session,
         run,
         "SCHEMA_ASSIGNED",
         "schema_barrier",
-        {"tables": {code: [item.model_dump() for item in items] for code, items in schemas.items()}},
+        event_payload,
     )
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "BSP_BARRIER_JOIN",
         "schema_barrier",
         {"stage": "schema_mapper", "table_codes": list(schemas)},
     )
-    return schemas
+    return tables_payload
 
 
-def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> int:
+def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None):
     _, field_code_sets = load_published_code_sets(session, specs)
     outer_workers = max(1, min(concurrency, len(specs)))
 
@@ -428,6 +481,7 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
                     "根据生成计划返回本字段下一条最重要的规则，最多一条；已有规则不得重复，没有更多可靠规则就返回空数组。显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE）。",
                     payload,
                     lambda args: bind_rules(spec, args.get("rules", [])),
+                    bus=bus,
                 )
                 traces.append(trace)
                 if not rules:
@@ -468,14 +522,15 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
             "arguments": {"rules": [rule.model_dump() for rule in bound_rules]},
         }
 
-    results = _fanout(session, run, "rule_binder", specs, worker, max_workers=concurrency)
+    results = _fanout(session, run, "rule_binder", specs, worker, max_workers=concurrency, events=events)
     gaps_by_table = {
         spec.table_code: trace["gaps"]
         for spec, (_, trace) in zip(specs, results)
         if trace.get("gaps")
     }
     if gaps_by_table:
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "RULE_BIND_GAPS",
@@ -489,7 +544,8 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
     for spec, (rules, _) in zip(specs, results):
         for rule in rules:
             _upsert_rule(session, run, rule, "APPROVED" if rule.source == "DOC_EXPLICIT" else "PENDING")
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "BSP_BARRIER_JOIN",
@@ -530,38 +586,43 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
             "装配跨表 FOREIGN_KEY 规则。rule 必须额外带 table_code；references_table 必须来自已确认表。可返回 golden_overrides 对齐引用值。",
             payload,
             cross_validator,
+            bus=bus,
         )
-        append_event(session, run, "AI_TOOL_ASSIGNED", "cross_rule_binder", trace)
+        _emit(events, session, run, "AI_TOOL_ASSIGNED", "cross_rule_binder", trace)
         for rule in cross_rules:
             _upsert_rule(session, run, rule, "APPROVED" if rule.source == "DOC_EXPLICIT" else "PENDING")
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "CROSS_RULES_ASSIGNED",
         "cross_rule_binder",
         {"rule_keys": [rule.rule_key for rule in cross_rules], "golden_overrides": golden_overrides},
     )
-    _dedupe_approved_rules(session, run)
+    _dedupe_approved_rules(session, run, events=events)
     bound = session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
     pending_count = len(_pending_rules(session, run.id))
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "RULES_BOUND",
         "rule_barrier",
         {
             "pending_count": pending_count,
+            "origin": "rule_binder",
             "rule_set": [
                 {"rule_key": rule.rule_key, "rule_hash": rule.rule_hash, "source": rule.source, "table_code": rule.table_code}
                 for rule in sorted(bound, key=lambda item: (item.table_code, item.rule_key))
             ],
         },
     )
-    return pending_count
+    return pending_count, golden_overrides
 
 
-def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
-    attempt = project(session, run).attempt + 1
+def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings, events: Optional[List[tuple]] = None, attempt: Optional[int] = None):
+    if attempt is None:
+        attempt = project(session, run).attempt + 1
     existing = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id, EventModel.kind == "ORACLE_ASSETS_PREPARED")
@@ -616,8 +677,12 @@ def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
             id=str(uuid.uuid4()), run_id=run.id, artifact_type=artifact_type, blob_uri=uri,
             sha256=uri.removeprefix("blob://"), version=attempt,
         ))
-    append_event(
-        session, run, "ORACLE_ASSETS_PREPARED", "oracle_asset_builder",
+    _emit(
+        events,
+        session,
+        run,
+        "ORACLE_ASSETS_PREPARED",
+        "oracle_asset_builder",
         {"attempt": attempt, "assets": assets, "result": result},
     )
     session.flush()
@@ -629,7 +694,7 @@ def _next_asset_version(session, model, run_id, table_code) -> int:
     return int(current or 0) + 1
 
 
-def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None, concurrency: int = 4):
+def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
     _, field_code_sets = load_published_code_sets(session, specs)
     outer_workers = max(1, min(concurrency, len(specs)))
 
@@ -642,7 +707,7 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 "fields": [field.model_dump()],
                 "approved_rules": rule_views,
                 "required_reference_values": golden_overrides.get(spec.table_code, {}),
-                "generation_plan": plans.get(spec.table_code),
+                "generation_plan": plans.get(spec.table_code) if plans else None,
                 **_code_set_context(field_code_sets, spec.table_code, field.name),
             }
 
@@ -663,6 +728,7 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
                 "只为输入的一个字段赋予黄金合规生成器。FIXED 使用 params.value；ENUM 使用 params.values。必须满足相关规则和引用值。若提供 published_code_set，ENUM 的 values 只能是其子集。",
                 payload,
                 validate_one,
+                bus=bus,
             )
 
         with ThreadPoolExecutor(max_workers=min(_inner_width(concurrency, outer_workers), len(spec.fields))) as field_executor:
@@ -678,13 +744,14 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
             "arguments": {"generators": generator_items},
         }
 
-    results = _fanout(session, run, "data_generator_binder", specs, worker)
+    results = _fanout(session, run, "data_generator_binder", specs, worker, max_workers=concurrency, events=events)
     generators = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
     golden_records = {
         spec.table_code: materialize_golden_record(spec, generators[spec.table_code]) for spec in specs
     }
     for table_code, overrides in golden_overrides.items():
-        golden_records[table_code].update(overrides)
+        if table_code in golden_records:
+            golden_records[table_code].update(overrides)
     for spec in specs:
         session.add(
             GeneratorDefinitionModel(
@@ -700,29 +767,33 @@ def _data_stage(session, run, specs, llm, active_rules, golden_overrides, plans=
             )
         )
     session.flush()
-    append_event(
+    generator_payload = {
+        spec.table_code: {
+            "generators": [item.model_dump() for item in generators[spec.table_code]],
+            "golden_record": golden_records[spec.table_code],
+        }
+        for spec in specs
+    }
+    event_payload: Dict[str, Any] = {"tables": generator_payload}
+    if blob_store is not None:
+        event_payload["tables_blob"] = blob_store.put(canonical_json(generator_payload).encode("utf-8"))
+    _emit(
+        events,
         session,
         run,
         "GENERATORS_ASSIGNED",
         "data_barrier",
-        {
-            "tables": {
-                spec.table_code: {
-                    "generators": [item.model_dump() for item in generators[spec.table_code]],
-                    "golden_record": golden_records[spec.table_code],
-                }
-                for spec in specs
-            }
-        },
+        event_payload,
     )
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "BSP_BARRIER_JOIN",
         "data_barrier",
         {"stage": "data_generator_binder", "table_codes": list(generators)},
     )
-    return golden_records
+    return golden_records, generator_payload
 
 
 def _required_backfill_candidates(specs, rules) -> List[tuple]:
@@ -743,16 +814,8 @@ def _required_backfill_candidates(specs, rules) -> List[tuple]:
     return candidates
 
 
-def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]:
-    """按字典原文机械补齐必填规则。
-
-    必填是最不需要推理的一条：原文写「必填项」就是必填。但 AI 会漏——
-    实测 SAFE_6_7_1_2 的 BASERE（担保责任余额）校验原文是
-    「必填项，0<=担保责任余额<=保函金额。」，元数据 required=True，
-    planner 也明说「BASERE 必填」，最后规则集里一条 BASERE 规则都没有。
-    这种漏项不该靠 AI 的注意力，靠原文前缀就能判，所以在这里确定性补齐，
-    并留一条 RULE_BACKFILL 事件说明是补的不是 AI 生成的。
-    """
+def _backfill_required_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
+    """按字典原文机械补齐必填规则。"""
     added: List[RuleDefinition] = []
     for spec, field in _required_backfill_candidates(specs, rules):
         text = (field.check_text or "").strip()
@@ -772,7 +835,8 @@ def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]
                 ],
             )
         except (RuleValidationError, WorkflowError) as exc:
-            append_event(
+            _emit(
+                events,
                 session,
                 run,
                 "RULE_BACKFILL_GAP",
@@ -784,7 +848,8 @@ def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]
         added.append(bound[0])
     if added:
         session.flush()
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "RULE_BACKFILL",
@@ -802,12 +867,7 @@ def _backfill_required_rules(session, run, specs, rules) -> List[RuleDefinition]
 
 
 def _length_backfill_candidates(specs, rules) -> List[tuple]:
-    """找出「字典声明了长度、但规则集里没有任何长度约束」的文本字段。
-
-    「字符型，28」能推出且只能推出「最多 28 位」，这是机械结论，不该由模型决定
-    要不要生成。实测同一份原文三次运行给出了三个答案：
-    LENGTH=28（错，误杀短值）、LENGTH_MAX=28（对）、完全没有长度规则（漏）。
-    """
+    """找出「字典声明了长度、但规则集里没有任何长度约束」的文本字段。"""
     covered = {
         (rule.table_code, rule.field)
         for rule in rules
@@ -837,14 +897,8 @@ def _declaration_quote(spec, field) -> str:
     return f"{field.name} 类型（长度）列：{field.data_type}({field.length})"
 
 
-def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
-    """按类型（长度）列机械补齐 LENGTH_MAX。
-
-    LENGTH 已从模型的算子白名单里移除，因为「字符型，N」是列宽上限而不是定长，
-    卡成「必须正好 N 位」会把所有短值判违规。但移除之后模型干脆不生成任何长度
-    规则了（实测第三个 run 的 EXGUARANCODE 只剩 REQUIRED），
-    等于用漏规则换掉错规则。所以这里按声明确定性补上。
-    """
+def _backfill_length_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
+    """按类型（长度）列机械补齐 LENGTH_MAX。"""
     added: List[RuleDefinition] = []
     for spec, field in _length_backfill_candidates(specs, rules):
         rule_key = f"{spec.table_code}_{field.name}_LENGTH_MAX"
@@ -866,7 +920,8 @@ def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
                 ],
             )
         except (RuleValidationError, WorkflowError) as exc:
-            append_event(
+            _emit(
+                events,
                 session,
                 run,
                 "RULE_BACKFILL_GAP",
@@ -880,7 +935,8 @@ def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
         added.append(bound[0])
     if added:
         session.flush()
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "RULE_BACKFILL",
@@ -898,13 +954,7 @@ def _backfill_length_rules(session, run, specs, rules) -> List[RuleDefinition]:
 
 
 def _fixed_value_candidates(specs, rules) -> List[tuple]:
-    """找出「原文明确要求本项固定填某个值」的字段。
-
-    这类表述原来被当成码表引用，在码值页堆出一堆空占位表等人去补，
-    其实根本没有码表可补。无条件固定值直接生成 ENUM 即可；
-    条件性的（「如为个人主体，则填写 N/A」）不在这里处理——非个人主体时
-    要填真实名称，卡成固定值会把正常数据全判违规。
-    """
+    """找出「原文明确要求本项固定填某个值」的字段。"""
     from .code_service import is_conditional_phrase, parse_fixed_value
 
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
@@ -922,7 +972,7 @@ def _fixed_value_candidates(specs, rules) -> List[tuple]:
     return candidates
 
 
-def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefinition]:
+def _backfill_fixed_value_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
     """按原文的固定值要求补齐 ENUM。"""
     added: List[RuleDefinition] = []
     for spec, field, value in _fixed_value_candidates(specs, rules):
@@ -946,7 +996,8 @@ def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefiniti
                 ],
             )
         except (RuleValidationError, WorkflowError) as exc:
-            append_event(
+            _emit(
+                events,
                 session,
                 run,
                 "RULE_BACKFILL_GAP",
@@ -958,7 +1009,8 @@ def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefiniti
         added.append(bound[0])
     if added:
         session.flush()
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "RULE_BACKFILL",
@@ -975,7 +1027,7 @@ def _backfill_fixed_value_rules(session, run, specs, rules) -> List[RuleDefiniti
     return rules + added
 
 
-def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None, concurrency: int = 4):
+def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None, blob_store: Optional[LocalBlobStore] = None):
     _, field_code_sets = load_published_code_sets(session, specs)
     outer_workers = max(1, min(concurrency, len(specs)))
 
@@ -1030,6 +1082,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
                 instruction,
                 payload,
                 lambda args: bind_audit_cases(spec, args.get("cases", []), active_keys, rule_index, golden_record=golden_records.get(spec.table_code)),
+                bus=bus,
             )
 
         targets = [None] + table_rules
@@ -1055,14 +1108,15 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
             "arguments": {"cases": [case.model_dump() for case in case_items]},
         }
 
-    results = _fanout(session, run, "audit_case_binder", specs, worker)
+    results = _fanout(session, run, "audit_case_binder", specs, worker, max_workers=concurrency, events=events)
     audit_gaps = {
         spec.table_code: trace["gaps"]
         for spec, (_, trace) in zip(specs, results)
         if trace.get("gaps")
     }
     if audit_gaps:
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "AUDIT_CASE_GAPS",
@@ -1085,14 +1139,20 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
             )
         )
     session.flush()
-    append_event(
+    cases_payload = {code: [item.model_dump() for item in items] for code, items in cases.items()}
+    event_payload: Dict[str, Any] = {"tables": cases_payload}
+    if blob_store is not None:
+        event_payload["tables_blob"] = blob_store.put(canonical_json(cases_payload).encode("utf-8"))
+    _emit(
+        events,
         session,
         run,
         "AUDIT_CASES_ASSIGNED",
         "audit_barrier",
-        {"tables": {code: [item.model_dump() for item in items] for code, items in cases.items()}},
+        event_payload,
     )
-    append_event(
+    _emit(
+        events,
         session,
         run,
         "BSP_BARRIER_JOIN",
@@ -1102,7 +1162,7 @@ def _audit_stage(session, run, specs, llm, active_rules, golden_records, plans=N
     return cases
 
 
-def _dedupe_approved_rules(session: Session, run: RunModel) -> int:
+def _dedupe_approved_rules(session: Session, run: RunModel, events: Optional[List[tuple]] = None) -> int:
     rows = (
         session.query(RuleModel)
         .filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED")
@@ -1125,18 +1185,26 @@ def _dedupe_approved_rules(session: Session, run: RunModel) -> int:
         else:
             seen.add(signature)
     if superseded:
-        append_event(session, run, "RULE_DUPLICATES_SUPERSEDED", "rule_barrier", {"rules": superseded})
+        _emit(events, session, run, "RULE_DUPLICATES_SUPERSEDED", "rule_barrier", {"rules": superseded})
         session.flush()
     return len(superseded)
 
 
-def _rebind_failed_rules(session, run, specs, llm, report) -> int:
-    changed_count = _dedupe_approved_rules(session, run)
+def _rebind_failed_rules(
+    session,
+    run,
+    specs,
+    llm,
+    report,
+    bus=None,
+    events: Optional[List[tuple]] = None,
+) -> int:
+    changed_count = _dedupe_approved_rules(session, run, events=events)
     # 只修「该命中却没命中」的规则。黄金用例上的误报（unexpected_rules）不进自动修正：
     # 让 AI 去「调到不报」等于允许它把规则改弱以通过测试，那条规则就废了，
     # 而且原文证据还挂着，事后完全看不出来。误报交给人判断。
     failed_keys = sorted(
-        {rule_key for case in report["cases"] for rule_key in case["missing_rules"]}
+        {rule_key for case in report.get("cases", []) for rule_key in case.get("missing_rules", [])}
     )
     if not failed_keys:
         return 0
@@ -1149,7 +1217,7 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
     for row in rows:
         spec = next(item for item in specs if item.table_code == row.table_code)
         current = RuleDefinition.model_validate(row.definition_json)
-        failed_cases = [case for case in report["cases"] if row.rule_key in case["missing_rules"]]
+        failed_cases = [case for case in report.get("cases", []) if row.rule_key in case.get("missing_rules", [])]
         payload = {
             **spec_payload(spec),
             "fields": [next(field for field in spec.fields if field.name == current.field).model_dump()],
@@ -1186,9 +1254,11 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
                 "只返回修正后的一条规则。",
                 payload,
                 validate_revision,
+                bus=bus,
             )
         except WorkflowError as exc:
-            append_event(
+            _emit(
+                events,
                 session,
                 run,
                 "RULE_REBIND_GAP",
@@ -1196,7 +1266,8 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
                 {"table_code": spec.table_code, "rule_key": current.rule_key, "error": str(exc)},
             )
             continue
-        append_event(
+        _emit(
+            events,
             session,
             run,
             "AI_TOOL_ASSIGNED",
@@ -1209,8 +1280,19 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
     return changed_count + revised_count
 
 
-def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer_continuation: bool = False) -> RunModel:
-    report_uri = (project(session, run).result_json or {}).get("audit_report_blob")
+def retry_generic_run(
+    session: Session,
+    run: RunModel,
+    settings: Settings,
+    defer_continuation: bool = False,
+    llm=None,
+) -> RunModel:
+    """统一重试与断点恢复入口：
+    1. 若存在失败的审计报告（AUDIT_REJECTED）：触发 GO_REDIRECT 回到 rule_binder，由 Scheduler 驱动靶向重绑与重验；
+    2. 若在审计前因超时/网络/进程重启中断（无审计报告）：写 RUN_RESUMED 事件，从 EventLog 最后一个已完成节点断点续跑。
+    """
+    state = project(session, run)
+    report_uri = (state.result_json or {}).get("audit_report_blob")
     if not report_uri:
         redirect = (
             session.query(EventModel)
@@ -1219,39 +1301,58 @@ def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer
             .first()
         )
         report_uri = ((redirect.payload_json.get("failed_result") or {}).get("audit_report_blob") if redirect else None)
+
     if not report_uri:
-        raise WorkflowError("This failure has no persisted audit report to repair")
-    specs = _specs(session, run.spec_id)
-    llm = RealDesignLlm(settings)
+        # 节点中途异常或重启中断：从 EventLog 折叠出的最近检查点原地续跑
+        append_event(
+            session,
+            run,
+            "RUN_RESUMED",
+            "human_retry",
+            {
+                "resume_from_node": state.resume_from_node,
+                "resume_when": state.resume_when,
+                "pending_target": state.pending_target,
+                "failed_node": state.current_node,
+                "reason": "Resume interrupted run from the last completed EventLog checkpoint",
+            },
+        )
+        session.commit()
+        if defer_continuation:
+            return run
+        return drive(session, run, settings, llm)
+
+    _specs(session, run.spec_id)
     report = json.loads(LocalBlobStore(settings.blob_dir).get(report_uri).decode("utf-8"))
+    failed_keys = sorted(
+        {rule_key for case in report.get("cases", []) for rule_key in case.get("missing_rules", [])}
+    )
+    revisable = (
+        session.query(RuleModel)
+        .filter(RuleModel.run_id == run.id, RuleModel.rule_key.in_(failed_keys), RuleModel.status == "APPROVED")
+        .count()
+        if failed_keys
+        else 0
+    )
+    if not revisable:
+        raise WorkflowError("No failed active rules could be revised")
+
     append_event(
         session,
         run,
         "GO_REDIRECT",
         "human_retry",
-        {"target": self_heal_target(), "reason": "Repair rules from the persisted failed audit before regenerating data"},
+        {
+            "target": self_heal_target(),
+            "reason": "Repair rules from the persisted failed audit before regenerating data",
+            "origin": "human_retry",
+            "failed_result": {"audit_report_blob": report_uri},
+        },
     )
-    revised = _rebind_failed_rules(session, run, specs, llm, report)
-    if not revised:
-        raise WorkflowError("No failed active rules could be revised")
-    pending_count = len(_pending_rules(session, run.id))
-    if pending_count:
-        hashes = [rule.rule_hash for rule in _pending_rules(session, run.id)]
-        append_event(
-            session, run, "APPROVAL_REQUIRED", "human_gate",
-            interrupt_payload(
-                "APPROVAL_REQUIRED",
-                f"重试修复后有 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。",
-                {"pending_count": pending_count, "pending_rule_hashes": hashes, "origin": "human_retry"},
-                {"operator": OPERATOR_PLACEHOLDER},
-            ),
-        )
-        session.commit()
-        return run
     session.commit()
     if defer_continuation:
         return run
-    return continue_generic_run(session, run, settings, llm)
+    return drive(session, run, settings, llm, attempt_base=state.attempt + 1)
 
 
 def _latest_payload(session: Session, run_id: str, kind: str) -> Dict[str, Any]:
@@ -1288,49 +1389,126 @@ def _create_run(session: Session, spec_id: str, settings: Settings, operator: st
 
 
 def _front_bodies(specs, llm, budget, concurrency, settings):
-    """前半段节点 body：只做本节点的事，产物写 ctx.shared，不调用下游。"""
+    """前半段节点 body：只做本节点的事，事件与产物统一放入 Outcome 交由 Scheduler 屏障落账。"""
     from .context import RunContext
     from .scheduler import Outcome
 
     def body_generation_planner(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
         # 无预算时不走规划阶段（保持原有语义：生成计划是可选阶段）
-        plans = _plan_stage(ctx.session, ctx.run, specs, ctx.llm, ctx.budget, ctx.concurrency) if ctx.get("use_plan") else None
-        return Outcome(output=plans, shared={"plans": plans})
+        plans = (
+            _plan_stage(
+                ctx.session, ctx.run, specs, ctx.llm, ctx.budget, ctx.concurrency,
+                bus=ctx.bus, events=events,
+            )
+            if ctx.get("use_plan")
+            else None
+        )
+        return Outcome(output=plans, shared={"plans": plans or {}}, events=events)
 
     def body_schema_mapper(_input, ctx: RunContext) -> Outcome:
-        _schema_stage(ctx.session, ctx.run, specs, ctx.llm, ctx.concurrency)
-        schema_payload = _latest_payload(ctx.session, ctx.run.id, "SCHEMA_ASSIGNED")["tables"]
-        return Outcome(shared={"schema_payload": schema_payload})
+        events: List[tuple] = []
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
+        schema_payload = _schema_stage(
+            ctx.session, ctx.run, specs, ctx.llm, ctx.concurrency,
+            bus=ctx.bus, events=events, blob_store=blobs,
+        )
+        return Outcome(shared={"schema_payload": schema_payload}, events=events)
 
     def body_rule_binder(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        self_heal_report = ctx.shared.pop("self_heal_report", None)
+        if self_heal_report is not None:
+            # 自愈或人工重试回边：只靶向重绑缺失命中的失败规则，绝不全表重新提取
+            origin = ctx.get("approval_origin") or "self_heal"
+            revised = _rebind_failed_rules(
+                ctx.session, ctx.run, specs, ctx.llm, self_heal_report,
+                bus=ctx.bus, events=events,
+            )
+            if origin == "human_retry" and not revised:
+                raise WorkflowError("No failed active rules could be revised")
+            bound = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id).all()
+            pending_count = len(_pending_rules(ctx.session, ctx.run.id))
+            events.append(
+                (
+                    "RULES_BOUND",
+                    "rule_barrier",
+                    {
+                        "pending_count": pending_count,
+                        "origin": origin,
+                        "revised_count": revised,
+                        "rule_set": [
+                            {
+                                "rule_key": rule.rule_key,
+                                "rule_hash": rule.rule_hash,
+                                "source": rule.source,
+                                "table_code": rule.table_code,
+                            }
+                            for rule in sorted(bound, key=lambda item: (item.table_code, item.rule_key))
+                        ],
+                    },
+                )
+            )
+            return Outcome(
+                shared={"pending_count": pending_count, "approval_origin": origin},
+                events=events,
+            )
+
         plans = ctx.get("plans")
-        pending_count = _rules_stage(ctx.session, ctx.run, specs, ctx.llm, plans, concurrency=ctx.concurrency)
+        pending_count, golden_overrides = _rules_stage(
+            ctx.session, ctx.run, specs, ctx.llm, plans,
+            concurrency=ctx.concurrency, bus=ctx.bus, events=events,
+        )
         # pending 只写入 Channel；人工门事件在 asset builder 之后才落，
         # 保证即使有待确认规则，Oracle 资产也先建好（与既有语义一致）
-        return Outcome(shared={"pending_count": pending_count})
+        return Outcome(
+            shared={
+                "pending_count": pending_count,
+                "golden_overrides": golden_overrides,
+                "approval_origin": "rule_binder",
+            },
+            events=events,
+        )
 
     def body_oracle_asset_builder(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
         schema_payload = ctx.get("schema_payload")
         generated_rules = [
             RuleDefinition.model_validate(row.definition_json)
             for row in ctx.session.query(RuleModel)
             .filter(RuleModel.run_id == ctx.run.id, RuleModel.status != "SUPERSEDED").all()
         ]
-        _ensure_oracle_assets(ctx.session, ctx.run, specs, schema_payload, generated_rules, ctx.settings)
-        pending_count = ctx.get("pending_count", 0)
-        events = []
+        assets = _ensure_oracle_assets(
+            ctx.session, ctx.run, specs, schema_payload, generated_rules, ctx.settings,
+            events=events, attempt=ctx.state.attempt + 1,
+        )
+        pending_count = len(_pending_rules(ctx.session, ctx.run.id))
+        origin = ctx.get("approval_origin") or "rule_binder"
         if pending_count:
-            events.append(("APPROVAL_REQUIRED", "human_gate", interrupt_payload(
+            if origin == "self_heal":
+                question = f"Oracle 自愈修正后有 {pending_count} 条规则需要人工确认，请批准或拒绝后重新验证。"
+            elif origin == "human_retry":
+                question = f"重试修复后有 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。"
+            else:
+                question = f"AI 推断出 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。"
+            pending_meta: Dict[str, Any] = {
+                "pending_count": pending_count,
+                "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, ctx.run.id)],
+                "origin": origin,
+            }
+            if origin == "self_heal":
+                pending_meta["attempt"] = ctx.state.attempt
+            events.append((
                 "APPROVAL_REQUIRED",
-                f"AI 推断出 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。",
-                {
-                    "pending_count": pending_count,
-                    "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, ctx.run.id)],
-                    "origin": "rule_binder",
-                },
-                ctx.identity.as_payload(),
-            )))
-        return Outcome(shared={"rules": generated_rules}, events=events)
+                "human_gate",
+                interrupt_payload("APPROVAL_REQUIRED", question, pending_meta, ctx.identity.as_payload()),
+            ))
+        when = "pending_rules" if pending_count else "no_pending_rules"
+        return Outcome(
+            shared={"rules": generated_rules, "prepared_assets": assets, "pending_count": pending_count},
+            events=events,
+            when=when,
+        )
 
     return {
         "generation_planner": body_generation_planner,
@@ -1344,6 +1522,7 @@ def drive(session: Session, run: RunModel, settings: Settings, llm=None, generat
     """唯一执行入口：一个 Scheduler 按 Plan 驱动全流程。
 
     前后段节点全部注册到同一张 Plan，节点之间不直接调用；
+    跨节点上下文由 build_context 从 EventLog + BlobStore 自动折叠恢复；
     人工门由 status 中断，自愈由 Outcome.goto 交回 Scheduler 重新调度。
     """
     state = project(session, run)
@@ -1357,22 +1536,8 @@ def drive(session: Session, run: RunModel, settings: Settings, llm=None, generat
         session, run, settings, llm=llm, budget=resolved_budget,
         concurrency=concurrency, attempt_base=attempt_base,
     )
-    ctx.put("use_plan", generation_budget is not None)
-
-    # 从事件账本恢复跨节点上下文（续跑时 ctx 是新建的）。
-    # 全新 run 时这些事件还没产生，给空值即可——Scheduler 跑到相应节点时会写入 Channel。
-    schema_event = (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == "SCHEMA_ASSIGNED")
-        .order_by(EventModel.seq.desc()).first()
-    )
-    ctx.put("schema_payload", (schema_event.payload_json.get("tables") if schema_event else None) or {})
-    plan_event = (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == "GENERATION_PLANNED")
-        .order_by(EventModel.seq.desc()).first()
-    )
-    ctx.put("plans", plan_event.payload_json["tables"] if plan_event else {})
+    if generation_budget is not None or ctx.get("use_plan"):
+        ctx.put("use_plan", True)
 
     bodies = {}
     bodies.update(_front_bodies(specs, llm, resolved_budget, concurrency, settings))
@@ -1382,19 +1547,24 @@ def drive(session: Session, run: RunModel, settings: Settings, llm=None, generat
     try:
         scheduler.drive(ctx)
     except Exception as exc:
-        current = ctx.state.current_node or "created"
+        failed_node = ctx.current_node or ctx.state.current_node or "created"
+        for rej in (ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []):
+            append_event(session, run, "BUS_REJECTED", failed_node, rej)
         append_event(
-            session, run, "RUN_FAILED", current,
+            session, run, "RUN_FAILED", failed_node,
             {
-                "node": current,
+                "node": failed_node,
+                "resume_from_node": ctx.state.resume_from_node,
+                "resume_when": ctx.state.resume_when,
                 "result": {
                     "error": f"{type(exc).__name__}: {exc}",
-                    "error_details": _error_details(exc, current),
+                    "error_details": _error_details(exc, failed_node),
                 },
             },
         )
         session.commit()
     return run
+
 
 def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     """同步入口：创建 run 并执行到第一个 gate。测试与内部调用使用。"""
@@ -1508,36 +1678,49 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
 
 
 def _back_bodies(specs, settings):
-    """后半段节点 body：产物写 Channel，节点之间不直接调用下游。"""
+    """后半段节点 body：产物与事件全部通过 Outcome 返回，节点之间不直接调用下游。"""
     from .generic_domain import GeneratorBinding, SchemaBinding
 
     def body_data_generator_binder(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
         schema_payload = ctx.get("schema_payload")
-        cross = _latest_payload(ctx.session, ctx.run.id, "CROSS_RULES_ASSIGNED")
+        golden_overrides = ctx.get("golden_overrides") or {}
         plans = ctx.get("plans") or {}
         rows = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "APPROVED").all()
         rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
-        rules = _backfill_required_rules(ctx.session, ctx.run, specs, rules)
-        rules = _backfill_length_rules(ctx.session, ctx.run, specs, rules)
-        rules = _backfill_fixed_value_rules(ctx.session, ctx.run, specs, rules)
-        prepared_assets = _ensure_oracle_assets(ctx.session, ctx.run, specs, schema_payload, rules, ctx.settings)
-        golden_records = _data_stage(
-            ctx.session, ctx.run, specs, ctx.llm, rules,
-            cross.get("golden_overrides", {}), plans, concurrency=ctx.concurrency,
+        rules = _backfill_required_rules(ctx.session, ctx.run, specs, rules, events=events)
+        rules = _backfill_length_rules(ctx.session, ctx.run, specs, rules, events=events)
+        rules = _backfill_fixed_value_rules(ctx.session, ctx.run, specs, rules, events=events)
+        prepared_assets = _ensure_oracle_assets(
+            ctx.session, ctx.run, specs, schema_payload, rules, ctx.settings,
+            events=events, attempt=ctx.state.attempt + 1,
         )
-        return Outcome(shared={
-            "rules": rules,
-            "prepared_assets": prepared_assets,
-            "golden_records": golden_records,
-        })
+        golden_records, generator_payload = _data_stage(
+            ctx.session, ctx.run, specs, ctx.llm, rules,
+            golden_overrides, plans, concurrency=ctx.concurrency,
+            bus=ctx.bus, events=events, blob_store=blobs,
+        )
+        return Outcome(
+            shared={
+                "rules": rules,
+                "prepared_assets": prepared_assets,
+                "golden_records": golden_records,
+                "generator_payload": generator_payload,
+            },
+            events=events,
+        )
 
     def body_audit_case_binder(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
         plans = ctx.get("plans") or {}
         audit_cases = _audit_stage(
             ctx.session, ctx.run, specs, ctx.llm, ctx.get("rules"),
             ctx.get("golden_records"), plans, concurrency=ctx.concurrency,
+            bus=ctx.bus, events=events, blob_store=blobs,
         )
-        return Outcome(shared={"audit_cases": audit_cases})
+        return Outcome(shared={"audit_cases": audit_cases}, events=events)
 
     def body_oracle_executor(_input, ctx: RunContext) -> Outcome:
         run = ctx.run
@@ -1547,11 +1730,11 @@ def _back_bodies(specs, settings):
         golden_records = ctx.get("golden_records")
         audit_cases = ctx.get("audit_cases")
         prepared_assets = ctx.get("prepared_assets")
-        attempt = project(ctx.session, run).attempt + 1
+        attempt = ctx.state.attempt + 1
         first_attempt = ctx.attempt_base or attempt
         max_attempts = int((ctx.budget or {}).get("max_retries", 3))
 
-        generator_payload = _latest_payload(ctx.session, run.id, "GENERATORS_ASSIGNED")["tables"]
+        generator_payload = ctx.get("generator_payload") or _latest_payload(ctx.session, run.id, "GENERATORS_ASSIGNED")["tables"]
         golden_generators = {
             code: [GeneratorBinding.model_validate(item) for item in values["generators"]]
             for code, values in generator_payload.items()
@@ -1621,28 +1804,26 @@ def _back_bodies(specs, settings):
         ctx.session.flush()
 
         shared = {"report": report, "result": result, "attempt": attempt, "first_attempt": first_attempt}
-        if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
-            # 自愈：声明 goto，由 Scheduler 应用；不在这里调用 rebind 或下游
-            revised = _rebind_failed_rules(ctx.session, run, specs, ctx.llm, report)
-            pending_count = len(_pending_rules(ctx.session, run.id))
-            if pending_count:
-                events.append(("APPROVAL_REQUIRED", "human_gate", interrupt_payload(
-                    "APPROVAL_REQUIRED",
-                    f"Oracle 自愈修正后有 {pending_count} 条规则需要人工确认，请批准或拒绝后重新验证。",
-                    {
-                        "pending_count": pending_count,
-                        "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, run.id)],
-                        "origin": "self_heal",
-                        "attempt": attempt,
-                    },
-                    ctx.identity.as_payload(),
-                )))
-                return Outcome(shared=shared, events=events)
-            # goto 由 Scheduler 统一落 GO_REDIRECT 事件，避免与 body 重复落账
+        has_missing_rules = any(case.get("missing_rules") for case in report.get("cases", []))
+        if not report["all_passed"] and has_missing_rules and attempt < first_attempt + max_attempts - 1:
+            # 自愈：只将失败报告放入 Channel 并声明 goto="rule_binder"，
+            # 由 Scheduler 切回 rule_binder 执行靶向 _rebind_failed_rules，绝不在本节点越权调用或全表重绑。
             return Outcome(
-                shared=shared, events=events,
+                shared={
+                    **shared,
+                    "self_heal_report": report,
+                    "approval_origin": "self_heal",
+                    "prepared_assets": None,
+                },
+                events=events,
                 goto=self_heal_target(),
-                control={"failed_result": result, "reason": "scheduler self-heal"},
+                when="audit_failed_self_heal",
+                control={
+                    "failed_result": result,
+                    "reason": "scheduler self-heal",
+                    "origin": "self_heal",
+                    "attempt": attempt,
+                },
             )
 
         events.append((
@@ -1660,7 +1841,8 @@ def _back_bodies(specs, settings):
                 },
                 ctx.identity.as_payload(),
             )))
-        return Outcome(shared=shared, events=events)
+            return Outcome(shared=shared, events=events, when="audit_passed")
+        return Outcome(shared=shared, events=events, when="audit_rejected")
 
     return {
         "data_generator_binder": body_data_generator_binder,

@@ -190,3 +190,65 @@ def test_goto_is_applied_by_scheduler_not_by_node():
     assert len(redirects) == 1
     assert redirects[0].payload_json["target"] == "generation_planner"
     assert redirects[0].payload_json["reason"] == "self-heal"
+
+
+def test_scheduler_routes_custom_conditional_edges_and_drains_bus_rejections():
+    """Scheduler 完全依据 Outcome.when 查 Plan 条件边，不依赖任何硬编码节点名；
+    同时在屏障处自动把 ctx.bus 拦截记录落为 BUS_REJECTED 事件。
+    """
+    session = make_session()
+    run = _run(session)
+    ctx = build_context(session, run, object())
+
+    visited = []
+
+    def body_router(_input, c):
+        visited.append("router")
+        # 触发一次 Bus 门禁拦截，验证屏障处自动落 BUS_REJECTED
+        c.bus.adjudicate("assign_rules", {"rules": [{"field": "FAKE_COL"}]}, {"field_names": ["REAL_COL"]})
+        return Outcome(shared={"plans": {"T1": {"k": 1}}}, when="custom_branch_b")
+
+    def body_branch_b(_input, c):
+        visited.append("branch_b")
+        # Channel merge_dict reducer：二次写入自动合并字典，不丢 T1
+        return Outcome(shared={"plans": {"T2": {"k": 2}}})
+
+    plan = WorkflowPlan(
+        name="custom-when",
+        nodes=(
+            PlanNode("created", "起点", "stage"),
+            PlanNode("router", "路由", "stage"),
+            PlanNode("branch_a", "分支A", "terminal"),
+            PlanNode("branch_b", "分支B", "stage"),
+            PlanNode("done", "完成", "terminal"),
+        ),
+        edges=(
+            PlanEdge("created", "router", "always"),
+            PlanEdge("router", "branch_a", "custom_branch_a"),
+            PlanEdge("router", "branch_b", "custom_branch_b"),
+            PlanEdge("branch_b", "done", "always"),
+        ),
+        entry="created",
+    )
+    Scheduler(plan, {"router": body_router, "branch_b": body_branch_b}).drive(ctx)
+
+    assert visited == ["router", "branch_b"]
+    assert ctx.get("plans") == {"T1": {"k": 1}, "T2": {"k": 2}}
+    bus_events = session.query(EventModel).filter(EventModel.run_id == run.id, EventModel.kind == "BUS_REJECTED").all()
+    assert len(bus_events) == 1
+    assert "FAKE_COL" in bus_events[0].payload_json["reason"]
+
+
+def test_build_context_recovers_channels_from_event_log():
+    session = make_session()
+    run = _run(session)
+    append_event(session, run, "GENERATION_PLANNED", "plan_barrier", {"tables": {"T1": {"golden_count": 3}}})
+    append_event(session, run, "SCHEMA_ASSIGNED", "schema_barrier", {"tables": {"T1": [{"field": "A"}]}})
+    append_event(session, run, "CROSS_RULES_ASSIGNED", "cross_rule_binder", {"golden_overrides": {"T1": {"A": "X"}}})
+    session.commit()
+
+    recovered_ctx = build_context(session, run, object())
+    assert recovered_ctx.get("use_plan") is True
+    assert recovered_ctx.get("plans") == {"T1": {"golden_count": 3}}
+    assert recovered_ctx.get("schema_payload") == {"T1": [{"field": "A"}]}
+    assert recovered_ctx.get("golden_overrides") == {"T1": {"A": "X"}}

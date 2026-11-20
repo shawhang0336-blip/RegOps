@@ -34,6 +34,7 @@ class Outcome:
     events: List[tuple] = field(default_factory=list)  # [(kind, node, payload), ...]
     goto: Optional[str] = None  # 运行时跳转目标（必须合法节点）
     control: Dict[str, Any] = field(default_factory=dict)  # goto 附带的控制信息
+    when: str = "always"  # Plan 条件出边标签
 
     def add_event(self, kind: str, node: str, payload: Dict[str, Any]) -> "Outcome":
         self.events.append((kind, node, payload))
@@ -56,46 +57,55 @@ class Scheduler:
         if unknown:
             raise ValueError(f"Node body 不在 Plan 中：{sorted(unknown)}")
 
-    def _next(self, node: str, ctx: RunContext) -> Optional[str]:
-        """从当前游标算下一节点。调度推进不依赖事件——
-        某些节点（如可选规划）不写事件，若靠 folded current_node 推进会原地打转。
-        事件只负责把状态落账供审计与恢复，游标由 Scheduler 自己持有。"""
+    def _next(self, node: str, ctx: RunContext, when: Optional[str] = None) -> Optional[str]:
+        """从当前游标 + 条件标签查 Plan 下一节点。
+
+        Scheduler 不认识任何具体业务节点名：
+          - terminal 节点一律停止；
+          - gate 节点在 status 处于 WAITING_* 时挂起中断，已放行时按条件标签前进；
+          - 普通 stage 节点按 outcome.when / state.when / 'always' 查 Plan 出边。
+        """
         if node not in {item.name for item in self.plan.nodes}:
             return None
         plan_node = self.plan.node(node)
-        # 人工门在已放行时允许继续；其他 gate 与终态一律停
         if plan_node.kind == "terminal":
             return None
-        if is_gate(node) and not (node == "human_gate" and ctx.state.status == "READY_TO_AUDIT"):
+        if plan_node.kind == "gate" and ctx.state.status.startswith("WAITING_"):
             return None
-        if node == "oracle_asset_builder":
-            # 有 pending → 停在人工门；无 pending → 沿 no_pending_rules 进后半段入口
-            when = "pending_rules" if ctx.get("pending_count", 0) else "no_pending_rules"
-            return self.plan.next(node, when)
-        if node == "human_gate" and ctx.state.status == "READY_TO_AUDIT":
-            # 人工已放行：沿 all_decided 进后半段入口
-            return self.plan.next("human_gate", "all_decided")
-        nxt = self.plan.next(node, "always")
-        return nxt
+        if when and when != "always":
+            nxt = self.plan.next(node, when)
+            if nxt:
+                return nxt
+        if ctx.state.when and ctx.state.when != "always":
+            nxt = self.plan.next(node, ctx.state.when)
+            if nxt:
+                return nxt
+        return self.plan.next(node, "always")
 
     def drive(self, ctx: RunContext, max_steps: int = 64) -> List[StepResult]:
         """执行到人工门或终态，返回本轮执行的节点轨迹。"""
         executed: List[StepResult] = []
         cursor = ctx.state.current_node
-        target: Optional[str] = None  # 下一步要执行的节点；goto 时直接指定目标本身
+        target: Optional[str] = ctx.state.pending_target  # 若停在 GO_REDIRECT，直接重入目标节点本身
+        last_when: Optional[str] = None
         for _ in range(max_steps):
             if target is None:
-                target = self._next(cursor, ctx)
+                target = self._next(cursor, ctx, when=last_when)
             node = target
             target = None
+            last_when = None
             if not node:
                 break
             body = self.bodies.get(node)
             if body is None:
-                # 该节点没有 body（如由外部事件推进的节点）→ 停下
+                # 该节点没有 body（如由外部事件推进的 gate / terminal 节点）→ 停下
                 break
+            ctx.current_node = node
             outcome = body(None, ctx)
-            # 屏障：先落账，再折叠，再应用 goto
+            # 屏障：先落 Bus 拦截事件与节点事件，再写 Channel，再折叠 state，最后应用 goto
+            bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
+            for rej in bus_rejections:
+                append_event(ctx.session, ctx.run, "BUS_REJECTED", node, rej)
             for kind, ev_node, payload in outcome.events:
                 append_event(ctx.session, ctx.run, kind, ev_node, payload)
             ctx.session.flush()
@@ -115,6 +125,7 @@ class Scheduler:
                 cursor = outcome.goto
             else:
                 cursor = node
+                last_when = outcome.when
             # 只在终态停；WAITING_* 由 _next 在 gate 处返回 None 实现中断
             if ctx.state.status in {"COMPLETED", "FAILED"}:
                 ctx.session.commit()

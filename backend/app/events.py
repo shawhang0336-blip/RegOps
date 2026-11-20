@@ -116,79 +116,204 @@ class RunState:
     current_node: str = "created"
     attempt: int = 0
     result_json: Optional[Dict[str, Any]] = None
-
-
-# 事件 → Plan 节点推进的条件标签。拓扑后继由 DEFAULT_PLAN.next() 查得，
-# 这里只声明"发生了哪类条件"，节点名不再散落在状态机里硬编码。
-_EVENT_CONDITIONS = {
-    "RULES_BOUND": "rules_bound",
-    "HUMAN_DECISIONS_RECORDED": "human_decided",
-}
+    when: str = "always"
+    pending_target: Optional[str] = None
+    resume_from_node: str = "created"
+    resume_when: str = "always"
 
 
 def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
     """把一条事件折进状态。
 
-    current_node 表示"最近完成的阶段节点"。执行器读它 + status，
-    再查 DEFAULT_PLAN 的后继边决定下一步——拓扑只存在于 Plan 里。
+    current_node 表示"最近完成的阶段节点"（或终态/中断节点）。
+    when 表示当前节点产出、供 Scheduler 查询 Plan 出边的条件标签。
+    pending_target 表示 GO_REDIRECT 声明待立即重入的目标节点。
+    resume_from_node / resume_when 记录最近一次成功完成的节点检查点，供异常中断后原地断点续跑。
     """
+    payload = payload or {}
     if kind == "RUN_CREATED":
-        return replace(state, status="RUNNING", current_node="created")
+        return replace(
+            state,
+            status="RUNNING",
+            current_node="created",
+            when="always",
+            pending_target=None,
+            resume_from_node="created",
+            resume_when="always",
+        )
     if kind == "GENERATION_PLANNED":
-        return replace(state, current_node="generation_planner")
+        return replace(
+            state,
+            current_node="generation_planner",
+            when="always",
+            pending_target=None,
+            resume_from_node="generation_planner",
+            resume_when="always",
+        )
     if kind == "SCHEMA_ASSIGNED":
-        return replace(state, current_node="schema_mapper")
+        return replace(
+            state,
+            current_node="schema_mapper",
+            when="always",
+            pending_target=None,
+            resume_from_node="schema_mapper",
+            resume_when="always",
+        )
     if kind == "RULES_BOUND":
         pending = bool(payload.get("pending_count"))
         return replace(
             state,
             status="WAITING_APPROVAL" if pending else "READY_TO_AUDIT",
             current_node="rule_binder",
+            when="always",
+            pending_target=None,
+            resume_from_node="rule_binder",
+            resume_when="always",
         )
     if kind == "ORACLE_ASSETS_PREPARED":
-        return replace(state, current_node="oracle_asset_builder", result_json=payload.get("result"))
+        when = "pending_rules" if state.status == "WAITING_APPROVAL" else "no_pending_rules"
+        return replace(
+            state,
+            current_node="oracle_asset_builder",
+            result_json=payload.get("result"),
+            when=when,
+            pending_target=None,
+            resume_from_node="oracle_asset_builder",
+            resume_when=when,
+        )
     if kind == "APPROVAL_REQUIRED":
-        return replace(state, status="WAITING_APPROVAL", current_node="human_gate")
+        return replace(
+            state,
+            status="WAITING_APPROVAL",
+            current_node="human_gate",
+            when="partial_decided",
+            pending_target=None,
+            resume_from_node="human_gate",
+            resume_when="partial_decided",
+        )
     if kind == "HUMAN_DECISIONS_RECORDED":
         decided = bool(payload.get("all_decided"))
+        when = "all_decided" if decided else "partial_decided"
         return replace(
             state,
             status="READY_TO_AUDIT" if decided else "WAITING_APPROVAL",
             current_node="human_gate",
+            when=when,
+            pending_target=None,
+            resume_from_node="human_gate",
+            resume_when=when,
         )
     if kind == "REAUDIT_REQUESTED":
-        # 人工改参后只重跑造数与验证，规则集合不动；执行器从 data_generator_binder 起
-        return replace(state, status="READY_TO_AUDIT", current_node="human_gate")
+        # 人工改参后只重跑造数与验证，规则集合不动；执行器沿 human_gate --[all_decided]--> data_generator_binder 起
+        return replace(
+            state,
+            status="READY_TO_AUDIT",
+            current_node="human_gate",
+            when="all_decided",
+            pending_target=None,
+            resume_from_node="human_gate",
+            resume_when="all_decided",
+        )
     if kind == "GENERATORS_ASSIGNED":
-        return replace(state, current_node="data_generator_binder")
+        return replace(
+            state,
+            status="RUNNING",
+            current_node="data_generator_binder",
+            when="always",
+            pending_target=None,
+            resume_from_node="data_generator_binder",
+            resume_when="always",
+        )
     if kind == "AUDIT_CASES_ASSIGNED":
-        return replace(state, current_node="audit_case_binder")
+        return replace(
+            state,
+            status="RUNNING",
+            current_node="audit_case_binder",
+            when="always",
+            pending_target=None,
+            resume_from_node="audit_case_binder",
+            resume_when="always",
+        )
     if kind == "TEST_CONFIRMATION_REQUIRED":
-        return replace(state, status="WAITING_TEST_APPROVAL", current_node="oracle_executor")
+        return replace(
+            state,
+            status="WAITING_TEST_APPROVAL",
+            current_node="test_confirmation",
+            when="confirmed",
+            pending_target=None,
+            resume_from_node="test_confirmation",
+            resume_when="confirmed",
+        )
     if kind == "TEST_RESULTS_CONFIRMED":
-        return replace(state, status="COMPLETED", current_node="test_confirmation")
+        return replace(
+            state,
+            status="COMPLETED",
+            current_node="export",
+            when="confirmed",
+            pending_target=None,
+            resume_from_node="export",
+            resume_when="confirmed",
+        )
     if kind == "AUDIT_STARTED":
         return replace(
             state,
             status="AUDITING",
             current_node="oracle_executor",
             attempt=payload.get("attempt", state.attempt),
+            when="always",
+            pending_target=None,
         )
     if kind == "GO_REDIRECT":
         target = payload["target"]
         if not any(node.name == target for node in DEFAULT_PLAN.nodes):
             raise ValueError(f"GO_REDIRECT 目标 {target} 不在 Plan 中")
-        return replace(state, status="RUNNING", current_node=target)
+        return replace(
+            state,
+            status="RUNNING",
+            current_node=target,
+            when="always",
+            pending_target=target,
+            resume_from_node=target,
+            resume_when="always",
+        )
     if kind == "AUDIT_COMPLETED":
         return replace(
-            state, status="COMPLETED", current_node="oracle_executor", result_json=payload.get("result")
+            state,
+            status="COMPLETED",
+            current_node="oracle_executor",
+            result_json=payload.get("result"),
+            when="audit_passed",
+            pending_target=None,
+            resume_from_node="oracle_executor",
+            resume_when="audit_passed",
         )
-    if kind in {"RUN_FAILED", "AUDIT_REJECTED"}:
+    if kind == "AUDIT_REJECTED":
+        return replace(
+            state,
+            status="FAILED",
+            current_node="failed",
+            result_json=payload.get("result"),
+            when="audit_rejected",
+            pending_target=None,
+        )
+    if kind == "RUN_FAILED":
         return replace(
             state,
             status="FAILED",
             current_node=payload.get("node", state.current_node),
             result_json=payload.get("result"),
+        )
+    if kind == "RUN_RESUMED":
+        resume_node = payload.get("resume_from_node") or state.resume_from_node
+        resume_when = payload.get("resume_when") or state.resume_when
+        pending_target = payload.get("pending_target") if "pending_target" in payload else state.pending_target
+        restored_status = "READY_TO_AUDIT" if resume_node == "human_gate" and not pending_target else "RUNNING"
+        return replace(
+            state,
+            status=restored_status,
+            current_node=resume_node,
+            when=resume_when,
+            pending_target=pending_target,
         )
     return state
 

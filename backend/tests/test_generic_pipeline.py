@@ -8,7 +8,7 @@ from app.generic_domain import bind_generators, bind_rules, bind_schema
 from app.generic_oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
 from app.generic_ai import LlmTimeoutError
 from app.events import project
-from app.generic_workflow import _call_validated, _create_run, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
+from app.generic_workflow import _call_validated, _create_run, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, retry_generic_run, start_generic_run
 from app.production_service import build_production_bundle
 from app.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.rules import RuleValidationError
@@ -398,3 +398,246 @@ def test_create_run_marks_run_running(organization_spec):
     state = project(session, run)
     assert state.status == "RUNNING"
     assert state.current_node == "created"
+
+
+def test_self_heal_goto_rule_binder_only_rebinds_failed_rules_not_full_table(organization_spec, monkeypatch, tmp_path):
+    """回归验证：沙箱首轮发现漏拦触发 goto='rule_binder' 自愈时，
+    rule_binder 只靶向重绑失败的那条规则，绝不把整表 33 个字段重新跑一遍 _rules_stage。
+    """
+    session = make_session()
+    spec_id = str(uuid.uuid4())
+    # 只留 2 个字段加速单测，验证自愈时只修失败规则
+    slim_spec = organization_spec.model_copy(update={"fields": organization_spec.fields[:2]})
+    session.add(
+        SpecificationModel(
+            id=spec_id,
+            version="SAFE_1.3",
+            table_code="CONFIRMED_SNAPSHOT",
+            source_name=slim_spec.source_name,
+            source_sha256=slim_spec.source_sha256,
+            content_json={"table_name": "confirmed", "selection_confirmed": True, "tables": [slim_spec.model_dump()]},
+        )
+    )
+    session.commit()
+
+    rule_call_payloads = []
+
+    class SelfHealLlm(FixtureDesignLlm):
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "assign_rules":
+                rule_call_payloads.append(payload)
+                if "current_rule" in payload:
+                    # 自愈靶向重绑：将 DOC_EXPLICIT 规则从错误枚举 ['A'] 修正为 ['A', 'C', 'D']
+                    cur = payload["current_rule"]
+                    args = {
+                        "rules": [
+                            {
+                                "rule_key": cur["rule_key"],
+                                "field": cur["field"],
+                                "operator": "ENUM",
+                                "params": {"values": ["A", "C", "D"]},
+                                "evidence_kind": "DICTIONARY",
+                                "rationale": "self-healed explicit enum",
+                            }
+                        ]
+                    }
+                    return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
+                # 初次绑定：只在第 1 个字段产出 1 条 DOC_EXPLICIT 规则（无 PENDING，直接进沙箱）
+                if payload.get("existing_rule_keys"):
+                    args = {"rules": []}
+                elif payload["fields"][0]["name"] == slim_spec.fields[0].name:
+                    args = {
+                        "rules": [
+                            {
+                                "rule_key": "R_EXPLICIT_ENUM",
+                                "field": slim_spec.fields[0].name,
+                                "operator": "ENUM",
+                                "params": {"values": ["A"]},
+                                "evidence_kind": "DICTIONARY",
+                                "rationale": "initial incomplete enum",
+                            }
+                        ]
+                    }
+                else:
+                    args = {"rules": []}
+                return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
+            if tool_name == "assign_audit_cases":
+                target = payload.get("target_rule")
+                if target is None:
+                    args = {"cases": [{"case_id": "GOLDEN", "overrides": {}, "expected_rule_keys": []}]}
+                else:
+                    r_key = target["rule_key"]
+                    r_field = target["field"]
+                    r_op = target["operator"]
+                    bad_val = "X" * 300 if r_op == "LENGTH_MAX" else ("" if r_op == "REQUIRED" else "INVALID_Z")
+                    args = {"cases": [{"case_id": f"BREAK_{r_key}", "overrides": {r_field: bad_val}, "expected_rule_keys": [r_key]}]}
+                return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
+            return super().assign(tool_name, instruction, payload, feedback=feedback, timeout=timeout)
+
+    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
+        physical = {spec.table_code: f"STAGING_{attempt}" for spec in specs}
+        return {
+            "attempt": attempt,
+            "physical_tables": physical,
+            "target_tables": {code: f"TARGET_{attempt}" for code in physical},
+            "code_set_tables": {},
+            "code_set_versions": {},
+            "code_set_record_counts": {},
+            "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])},
+        }
+
+    execute_attempts = []
+
+    def execute(self, run_id, attempt, specs, schemas, golden_records, audit_cases, rules, *args, **kwargs):
+        execute_attempts.append(attempt)
+        passed = attempt >= 2
+        return {
+            "all_passed": passed,
+            "coverage_complete": True,
+            "coverage_rate": 1.0,
+            "uncovered_rules": [],
+            "backend": "ORACLE",
+            "table_count": len(specs),
+            "case_count": 2,
+            "active_rule_count": len(rules),
+            "false_positive_count": 0,
+            "false_negative_count": 0 if passed else 1,
+            "record_counts": {},
+            "physical_tables": kwargs["prepared_assets"]["physical_tables"],
+            "target_tables": kwargs["prepared_assets"]["target_tables"],
+            "code_set_tables": {},
+            "code_set_versions": {},
+            "code_set_record_counts": {},
+            "cases": [
+                {
+                    "table_code": slim_spec.table_code,
+                    "case_id": "BREAK_REQUIRED",
+                    "case_kind": "MUTATION",
+                    "expected_rules": ["R_EXPLICIT_ENUM"],
+                    "actual_rules": ["R_EXPLICIT_ENUM"] if passed else [],
+                    "missing_rules": [] if passed else ["R_EXPLICIT_ENUM"],
+                    "unexpected_rules": [],
+                    "co_triggered_rules": [],
+                    "passed": passed,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
+    settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
+    budget = {"max_rules_per_table": 10, "max_cases_per_table": 20, "max_retries": 3, "max_llm_concurrency": 2}
+
+    run = start_generic_run(session, spec_id, settings, SelfHealLlm(), generation_budget=budget)
+    state = project(session, run)
+    assert state.status == "WAITING_TEST_APPROVAL"
+    assert execute_attempts == [1, 2]
+    # 自愈阶段只调用了 1 次带 current_rule 的靶向重绑，没有重新跑全表初绑
+    rebind_calls = [p for p in rule_call_payloads if "current_rule" in p]
+    initial_calls = [p for p in rule_call_payloads if "current_rule" not in p]
+    assert len(rebind_calls) == 1
+    assert len(initial_calls) == 3  # 字段1调2次（第1条+空结束）+ 字段2调1次（空结束），自愈未新增初绑调用
+    kinds = [e.kind for e in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
+    assert "GO_REDIRECT" in kinds
+
+
+def test_retry_generic_run_resumes_from_last_completed_checkpoint_when_no_audit_report(organization_spec, monkeypatch, tmp_path):
+    """当批次在中途（如 data_generator_binder）因超时或重启失败、尚未产生 audit_report_blob 时，
+    retry_generic_run 应通过 RUN_RESUMED 从上一个已完成节点断点续跑，不重跑前半段。
+    """
+    session = make_session()
+    spec_id = str(uuid.uuid4())
+    slim_spec = organization_spec.model_copy(update={"fields": organization_spec.fields[:1]})
+    session.add(
+        SpecificationModel(
+            id=spec_id,
+            version="SAFE_1.3",
+            table_code="CONFIRMED_SNAPSHOT",
+            source_name=slim_spec.source_name,
+            source_sha256=slim_spec.source_sha256,
+            content_json={"table_name": "confirmed", "selection_confirmed": True, "tables": [slim_spec.model_dump()]},
+        )
+    )
+    session.commit()
+
+    schema_calls = []
+    fail_generators = {"should_fail": True}
+
+    class FlakyGeneratorLlm(FixtureDesignLlm):
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            if tool_name == "assign_schema":
+                schema_calls.append(1)
+            if tool_name == "assign_rules":
+                if payload.get("existing_rule_keys"):
+                    args = {"rules": []}
+                else:
+                    args = {
+                        "rules": [
+                            {
+                                "rule_key": "R_DOC_REQ",
+                                "field": slim_spec.fields[0].name,
+                                "operator": "REQUIRED",
+                                "params": {},
+                                "evidence_kind": "DICTIONARY",
+                                "rationale": "explicit required",
+                            }
+                        ]
+                    }
+                return args, {"provider": "FIXTURE", "model": "fixture", "tool_name": tool_name, "arguments": args}
+            if tool_name == "assign_generators" and fail_generators["should_fail"]:
+                raise RuleValidationError("simulated generator failure")
+            return super().assign(tool_name, instruction, payload, feedback=feedback, timeout=timeout)
+
+    def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
+        physical = {spec.table_code: f"STAGING_{attempt}" for spec in specs}
+        return {
+            "attempt": attempt,
+            "physical_tables": physical,
+            "target_tables": {code: f"TARGET_{attempt}" for code in physical},
+            "code_set_tables": {},
+            "code_set_versions": {},
+            "code_set_record_counts": {},
+            "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])},
+        }
+
+    def execute(self, run_id, attempt, specs, schemas, golden_records, audit_cases, rules, *args, **kwargs):
+        return {
+            "all_passed": True,
+            "coverage_complete": True,
+            "coverage_rate": 1.0,
+            "uncovered_rules": [],
+            "backend": "ORACLE",
+            "table_count": len(specs),
+            "case_count": 2,
+            "active_rule_count": len(rules),
+            "false_positive_count": 0,
+            "false_negative_count": 0,
+            "record_counts": {},
+            "physical_tables": kwargs["prepared_assets"]["physical_tables"],
+            "target_tables": kwargs["prepared_assets"]["target_tables"],
+            "code_set_tables": {},
+            "code_set_versions": {},
+            "code_set_record_counts": {},
+            "cases": [],
+        }
+
+    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
+    settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
+    llm = FlakyGeneratorLlm()
+
+    run = start_generic_run(session, spec_id, settings, llm)
+    failed_state = project(session, run)
+    assert failed_state.status == "FAILED"
+    assert failed_state.current_node == "data_generator_binder"
+    assert failed_state.resume_from_node == "oracle_asset_builder"
+    assert len(schema_calls) == 1
+
+    # 恢复正常后调用 retry_generic_run：从 oracle_asset_builder 之后断点续跑，不重跑 schema_mapper
+    fail_generators["should_fail"] = False
+    run = retry_generic_run(session, run, settings, llm=llm)
+    resumed_state = project(session, run)
+    assert resumed_state.status == "WAITING_TEST_APPROVAL"
+    assert len(schema_calls) == 1  # schema_mapper 未被重复调用
+    kinds = [e.kind for e in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
+    assert "RUN_RESUMED" in kinds

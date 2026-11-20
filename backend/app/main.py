@@ -514,10 +514,13 @@ def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
 
 
 def _latest_event_tables(events: List[EventModel], kind: str) -> Dict:
+    from .context import resolve_event_tables
+
+    blob_store = LocalBlobStore(settings.blob_dir)
     tables: Dict = {}
     for event in events:
         if event.kind == kind:
-            tables = (event.payload_json or {}).get("tables") or {}
+            tables = resolve_event_tables(event.payload_json or {}, blob_store)
     return tables
 
 
@@ -731,7 +734,7 @@ def retry_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if project(session, run).status == "RUNNING":
+    if project(session, run).status in {"RUNNING", "READY_TO_AUDIT"}:
         _spawn_run_continuation(run.id)
     return run_view(session, run)
 

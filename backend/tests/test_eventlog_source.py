@@ -81,3 +81,38 @@ def test_hash_chain_detects_tampering():
     session.expire_all()
 
     assert verify_chain(session, run) is False
+
+
+def test_terminal_nodes_and_breakpoint_resume_folding():
+    session = make_session()
+    run = _new_run(session)
+    append_event(session, run, "RUN_CREATED", "created", {})
+    append_event(session, run, "SCHEMA_ASSIGNED", "schema_mapper", {"tables": {}})
+    assert project(session, run).current_node == "schema_mapper"
+
+    # 模拟在 rule_binder 执行中途异常失败
+    append_event(session, run, "RUN_FAILED", "rule_binder", {"node": "rule_binder", "result": {"error": "timeout"}})
+    failed_state = project(session, run)
+    assert failed_state.status == "FAILED"
+    assert failed_state.current_node == "rule_binder"
+    assert failed_state.resume_from_node == "schema_mapper"
+
+    # 断点恢复后回到最近完成的 schema_mapper，准备重跑 rule_binder
+    append_event(session, run, "RUN_RESUMED", "human_retry", {
+        "resume_from_node": failed_state.resume_from_node,
+        "resume_when": failed_state.resume_when,
+    })
+    resumed = project(session, run)
+    assert resumed.status == "RUNNING"
+    assert resumed.current_node == "schema_mapper"
+
+    # 终态折叠到 Plan 的 export / failed 节点
+    append_event(session, run, "TEST_RESULTS_CONFIRMED", "test_confirmation", {"approver": "u"})
+    assert project(session, run).current_node == "export"
+    assert project(session, run).status == "COMPLETED"
+
+    run2 = _new_run(session)
+    append_event(session, run2, "RUN_CREATED", "created", {})
+    append_event(session, run2, "AUDIT_REJECTED", "oracle_executor", {"result": {"all_passed": False}})
+    assert project(session, run2).current_node == "failed"
+    assert project(session, run2).status == "FAILED"

@@ -444,6 +444,13 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
             if not _group_needs_ai(group, scope):
                 return _default_group_plan(group), {"skipped": "结构化块无需重新决策"}, "DEFAULT"
             candidates = [_candidate(block) for block in group]
+            payload = {
+                "file_name": document.file_name,
+                "file_type": document.file_type,
+                "document_overview": overview,
+                "section": section,
+                "candidate_blocks": candidates,
+            }
             try:
                 args, trace = llm.assign(
                     "assign_document_structure",
@@ -462,15 +469,14 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                         "重要：如果没有发现上述任一问题，就把每个块原样返回（role/title 保持不变），"
                         "不要为了\"看起来更整齐\"而合并、拆分或改名。"
                     ),
-                    {
-                        "file_name": document.file_name,
-                        "file_type": document.file_type,
-                        "document_overview": overview,
-                        "section": section,
-                        "candidate_blocks": candidates,
-                    },
+                    payload,
                     timeout=STRUCTURE_PLAN_TIMEOUT,
                 )
+                from .bus import default_bus
+
+                rejection = default_bus().adjudicate("assign_document_structure", args, payload)
+                if rejection:
+                    raise ValueError(rejection)
                 _validate_plan(args, group)
                 _validate_structured_guard(args, group)
                 return args, trace, "AI"
