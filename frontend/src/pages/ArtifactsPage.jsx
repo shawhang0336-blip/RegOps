@@ -27,6 +27,8 @@ const POLL_INTERVAL_MS = 5000
 function runTone(row) {
   if (!row.generated) return 'neutral'
   if (row.run_status === 'FAILED') return 'red'
+  if (row.run_status === 'WAITING_APPROVAL') return 'amber'
+  if (row.run_status === 'WAITING_TEST_APPROVAL') return 'green'
   if (row.run_status === 'COMPLETED') return row.all_passed ? 'green' : 'amber'
   return 'blue'
 }
@@ -34,6 +36,8 @@ function runTone(row) {
 function runLabel(row) {
   if (!row.generated) return '未生成'
   if (row.run_status === 'FAILED') return '验证失败'
+  if (row.run_status === 'WAITING_APPROVAL') return '待确认规则'
+  if (row.run_status === 'WAITING_TEST_APPROVAL') return '待确认测试'
   if (row.run_status === 'COMPLETED') return row.all_passed ? '已验证' : '验证未过'
   return '生成中'
 }
@@ -777,7 +781,8 @@ function sortRules(rows) {
 function groupStatusMeta(runStatus) {
   if (runStatus === 'FAILED') return ['red', '验证失败']
   if (runStatus === 'COMPLETED') return ['green', '已完成']
-  if (runStatus === 'WAITING_APPROVAL') return ['amber', '待确认']
+  if (runStatus === 'WAITING_APPROVAL') return ['amber', '待确认规则']
+  if (runStatus === 'WAITING_TEST_APPROVAL') return ['green', '待确认测试']
   if (ACTIVE_RUN_STATUSES.includes(runStatus)) return ['blue', '生成中']
   return ['neutral', runStatus || '未知']
 }

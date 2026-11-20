@@ -40,6 +40,9 @@ export default function RunsPage() {
   const [active, setActive] = useState(null)
   const [validation, setValidation] = useState(null)
   const [plans, setPlans] = useState([])
+  const [busEvents, setBusEvents] = useState([])
+  const [replay, setReplay] = useState(null)
+  const [traceTab, setTraceTab] = useState('ledger')
   const [tableIdByCode, setTableIdByCode] = useState({})
   const [artifact, setArtifact] = useState(null)
   const [tableFilter, setTableFilter] = useState('ALL')
@@ -52,14 +55,18 @@ export default function RunsPage() {
   const [error, setError] = useState('')
 
   const select = useCallback(async (id) => {
-    const [run, detail, planList] = await Promise.all([
+    const [run, detail, planList, busData, replayData] = await Promise.all([
       api(`/api/runs/${id}`),
       api(`/api/runs/${id}/validation-detail`).catch(() => null),
       v2(`/generation/plans/${id}`).catch(() => []),
+      api(`/api/runs/${id}/bus-events`).catch(() => ({ events: [] })),
+      api(`/api/runs/${id}/replay`).catch(() => null),
     ])
     setActive(run)
     setValidation(detail)
     setPlans(planList)
+    setBusEvents(busData?.events || [])
+    setReplay(replayData)
     setArtifact(null)
     setTableFilter('ALL')
     setRuleResultFilter('ALL')
@@ -229,17 +236,62 @@ export default function RunsPage() {
   const readyToDownload = active?.status === 'COMPLETED' && summary.all_passed && !validation?.audit_stale && !coverageIncomplete
   const goldenTotal = testData.reduce((total, item) => total + (item.golden_count || 0), 0)
 
+  const runEvents = active?.events || []
+  const latestApprovalInterrupt = useMemo(
+    () => [...runEvents].reverse().find((ev) => ev.kind === 'APPROVAL_REQUIRED'),
+    [runEvents]
+  )
+  const latestTestInterrupt = useMemo(
+    () => [...runEvents].reverse().find((ev) => ev.kind === 'TEST_CONFIRMATION_REQUIRED'),
+    [runEvents]
+  )
+  const busRejectEvents = useMemo(
+    () => runEvents.filter((ev) => ev.kind === 'BUS_REJECTED'),
+    [runEvents]
+  )
+  const goRedirectEvents = useMemo(
+    () => runEvents.filter((ev) => ev.kind === 'GO_REDIRECT'),
+    [runEvents]
+  )
+  const resumeEvents = useMemo(
+    () => runEvents.filter((ev) => ev.kind === 'RUN_RESUMED'),
+    [runEvents]
+  )
+  const backfillEvents = useMemo(
+    () => runEvents.filter((ev) => ev.kind === 'RULE_BACKFILL'),
+    [runEvents]
+  )
+  const hasAuditReport = Boolean(active?.result?.audit_report_blob)
+  const errorDetails = active?.result?.error_details || null
+  const errorMessage = active?.result?.error || ''
+
   const outcome = !active ? null : active.status === 'WAITING_APPROVAL'
-    ? { tone: 'attention', title: `还有 ${pending.length} 条规则需要在第二步确认`, description: active.result?.oracle_precheck?.all_passed ? `Oracle 建表与 ${active.result.oracle_precheck.statement_count} 条规则空跑已通过；完成批准或拒绝后继续生成 AI 测试数据。` : '第三步不修改规则。完成批准或拒绝后，系统会继续生成 AI 测试数据并执行验证。' }
+    ? {
+        tone: 'attention',
+        title: latestApprovalInterrupt?.payload?.question || `还有 ${pending.length} 条规则需要在第二步确认`,
+        description: active.result?.oracle_precheck?.all_passed
+          ? `中断节点：${latestApprovalInterrupt?.payload?.resume_node || 'human_gate'}（来源：${latestApprovalInterrupt?.payload?.pending_input?.origin || 'rule_binder'}）· Oracle 建表与 ${active.result.oracle_precheck.statement_count} 条规则空跑已通过。`
+          : '第三步不修改规则。完成批准或拒绝后，系统会从中断点自动恢复并继续生成 AI 测试数据。',
+      }
     : validation?.audit_stale
       ? { tone: 'danger', title: '规则在审计后发生过修改', description: '当前报告属于旧规则版本，请返回第二步重新生成并验证。' }
       : active.status === 'FAILED'
-        ? { tone: 'danger', title: '本次验证发现问题', description: '请按规则、测试数据或环境原因分别处理，不必重新上传规范文件。' }
+        ? {
+            tone: 'danger',
+            title: hasAuditReport ? '本次沙箱验证发现未通过规则' : `执行在节点 ${active.current_node || 'unknown'} 中断`,
+            description: hasAuditReport
+              ? '可点击下方“AI 靶向自愈修复并重验”由 Scheduler 触发 GO_REDIRECT 只重绑失败规则，或回第二步手动微调参数。'
+              : `${errorDetails?.suggestion || errorMessage || '运行中途因超时或服务重启中断'}。点击“从断点继续执行”将通过 RUN_RESUMED 从上一个已完成节点原地续跑，不重跑已完成阶段。`,
+          }
         : active.status === 'WAITING_TEST_APPROVAL'
-          ? { tone: 'success', title: 'Oracle 验证已完成', description: '可以先浏览 AI 测试数据和逐规则结果，再确认测试结果并下载。' }
+          ? {
+              tone: 'success',
+              title: latestTestInterrupt?.payload?.question || 'Oracle 验证已完成，等待测试结果确认',
+              description: `中断节点：${latestTestInterrupt?.payload?.resume_node || 'test_confirmation'} · 可以先浏览 AI 测试数据和逐规则结果，再确认开放生产包导出。`,
+            }
           : active.status === 'COMPLETED'
-            ? { tone: readyToDownload ? 'success' : 'attention', title: readyToDownload ? '验证通过，生产产出包可下载' : '验证完成，但仍有事项需要处理', description: readyToDownload ? '生产包包含报表与码表 DDL、码值 INSERT/MERGE 和校验 SQL。' : '请检查未覆盖规则或审计版本，再开放生产下载。' }
-            : { tone: 'working', title: 'AI 正在生成数据并执行验证', description: '页面会自动刷新；生成完成后可直接浏览每张报表的测试数据。' }
+            ? { tone: readyToDownload ? 'success' : 'attention', title: readyToDownload ? '验证通过，已抵达 export 终态，生产产出包可下载' : '验证完成，但仍有事项需要处理', description: readyToDownload ? '生产包包含报表与码表 DDL、码值 INSERT/MERGE 和校验 SQL。' : '请检查未覆盖规则或审计版本，再开放生产下载。' }
+            : { tone: 'working', title: `Scheduler 正在驱动节点：${active.current_node || 'created'}`, description: '页面会自动刷新；生成完成后可直接浏览每张报表的测试数据。' }
 
   return (
     <>
@@ -385,7 +437,30 @@ export default function RunsPage() {
 
               {(failedCases.length > 0 || active.status === 'FAILED' || validation?.audit_stale || uncoveredCount > 0) && (
                 <section className="run-section issue-section">
-                  <div className="panel-heading"><div><h2>问题处理</h2><p>规则问题回第二步，数据问题重新生成，环境问题检查配置。</p></div>{active.status === 'FAILED' && <button type="button" className="button secondary sm" disabled={busy} onClick={retry}>重新处理失败项</button>}</div>
+                  <div className="panel-heading">
+                    <div>
+                      <h2>问题诊断与恢复</h2>
+                      <p>
+                        {active.status === 'FAILED' && !hasAuditReport
+                          ? `失败节点：${active.current_node} · 支持从 EventLog 最近检查点原地断点续跑（RUN_RESUMED）。`
+                          : '支持 AI 靶向自愈重绑（GO_REDIRECT）或返回第二步手工微调参数后轻量重审。'}
+                      </p>
+                    </div>
+                    {active.status === 'FAILED' && (
+                      <button type="button" className="button primary sm" disabled={busy} onClick={retry}>
+                        {hasAuditReport ? 'AI 靶向自愈修复并重验' : '从断点继续执行 (Resume)'}
+                      </button>
+                    )}
+                  </div>
+                  {active.status === 'FAILED' && errorMessage && (
+                    <div className="action-callout danger">
+                      <div>
+                        <strong>{errorDetails?.stage ? `阶段 ${errorDetails.stage} 异常` : '运行异常详情'}</strong>
+                        <p>{errorMessage}</p>
+                        {errorDetails?.suggestion && <small>{errorDetails.suggestion}</small>}
+                      </div>
+                    </div>
+                  )}
                   {validation?.audit_stale && <div className="action-callout danger"><div><strong>当前审计已经过期</strong><p>规则哈希与审计时不一致，必须重新生成并验证。</p></div><button type="button" className="button primary sm" onClick={() => navigate('/generation')}>返回第二步</button></div>}
                   {uncoveredCount > 0 && <div className="action-callout"><div><strong>{uncoveredCount} 条规则没有有效覆盖</strong><p>未覆盖不能视为规则有效，也不会开放生产下载。</p></div><button type="button" className="button secondary sm" onClick={() => { setValidationTab('rules'); setRuleResultFilter('UNCOVERED') }}>查看未覆盖规则</button></div>}
                   <div className="issue-list">
@@ -414,17 +489,86 @@ export default function RunsPage() {
                 )}
               </section>
 
-              <details className="run-section technical-run-details">
-                <summary>技术产物、AI 生成计划与事件日志</summary>
-                <div className="artifact-actions">
+              <details className="run-section technical-run-details" open={busRejectEvents.length > 0 || goRedirectEvents.length > 0 || resumeEvents.length > 0}>
+                <summary>
+                  ProdAgent 内核轨迹 · 当前节点 <code>{active.current_node || 'created'}</code>
+                  {' · '}EventLog ({runEvents.length})
+                  {' · '}Bus 门禁拦截 ({busRejectEvents.length})
+                  {' · '}自愈回边 ({goRedirectEvents.length})
+                  {replay && ` · ${replay.chain_valid ? '哈希链完整' : '哈希链异常'}`}
+                </summary>
+
+                <div className="audit-metrics" style={{ marginTop: 12, marginBottom: 12 }}>
+                  <div>
+                    <span>当前 Plan 节点</span>
+                    <strong><code>{active.current_node || 'created'}</code></strong>
+                  </div>
+                  <div>
+                    <span>Bus 物理拦截</span>
+                    <strong>{busRejectEvents.length} 次</strong>
+                  </div>
+                  <div>
+                    <span>goto 自愈 / 断点续跑</span>
+                    <strong>{goRedirectEvents.length} / {resumeEvents.length} 次</strong>
+                  </div>
+                  <div>
+                    <span>确定性规则补齐</span>
+                    <strong>{backfillEvents.reduce((acc, ev) => acc + (ev.payload?.total || 0), 0)} 条</strong>
+                  </div>
+                </div>
+
+                {busRejectEvents.length > 0 && (
+                  <div className="action-callout" style={{ marginBottom: 12 }}>
+                    <div>
+                      <strong>Bus 门禁成功拦截了 {busRejectEvents.length} 次 AI 参数幻觉并触发自动修正</strong>
+                      <ul>
+                        {busRejectEvents.map((ev) => (
+                          <li key={ev.seq}>
+                            <code>#{ev.seq} {ev.node} · {ev.payload?.tool}</code>：{ev.payload?.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                <div className="artifact-actions" style={{ marginBottom: 12 }}>
                   {[
                     ['oracle_ddl_blob', 'Oracle 建表语句'],
                     ['validation_sql_blob', '校验规则 SQL'],
                     ['audit_report_blob', '完整验证报告'],
-                  ].filter(([key]) => active.result?.[key]).map(([key, title]) => <button type="button" className="button secondary sm" key={key} onClick={() => openArtifact(active.result[key], title)}>{title}</button>)}
+                  ].filter(([key]) => active.result?.[key]).map(([key, title]) => (
+                    <button type="button" className="button secondary sm" key={key} onClick={() => openArtifact(active.result[key], title)}>{title}</button>
+                  ))}
                 </div>
-                {plans.length > 0 && <pre className="run-json">{JSON.stringify(plans, null, 2)}</pre>}
-                <pre className="run-json">{JSON.stringify((active.events || []).slice(-12), null, 2)}</pre>
+
+                <nav className="validation-tab-bar" style={{ marginBottom: 8 }}>
+                  <button type="button" className={traceTab === 'ledger' ? 'active' : ''} onClick={() => setTraceTab('ledger')}>
+                    EventLog 不可变事件账本 ({runEvents.length})
+                  </button>
+                  <button type="button" className={traceTab === 'bus' ? 'active' : ''} onClick={() => setTraceTab('bus')}>
+                    Bus 全生命周期广播流 ({busEvents.length})
+                  </button>
+                  {plans.length > 0 && (
+                    <button type="button" className={traceTab === 'plan' ? 'active' : ''} onClick={() => setTraceTab('plan')}>
+                      AI 生成预算规划 ({plans.length})
+                    </button>
+                  )}
+                </nav>
+
+                {traceTab === 'ledger' && (
+                  <pre className="run-json">{JSON.stringify(runEvents.slice(-25), null, 2)}</pre>
+                )}
+                {traceTab === 'bus' && (
+                  <pre className="run-json">
+                    {busEvents.length
+                      ? JSON.stringify(busEvents.slice(-30), null, 2)
+                      : '当前进程内存中暂无该历史批次的实时 Bus 广播缓存（新发起或续跑批次会实时记录 node.* / wave.* / tool.* / event.appended 信号）。'}
+                  </pre>
+                )}
+                {traceTab === 'plan' && plans.length > 0 && (
+                  <pre className="run-json">{JSON.stringify(plans, null, 2)}</pre>
+                )}
               </details>
             </>
           )}
