@@ -142,3 +142,51 @@ def test_identity_lands_in_event_payload():
 def test_scheduler_rejects_body_outside_plan():
     with __import__("pytest").raises(ValueError, match="不在 Plan 中"):
         Scheduler(DEFAULT_PLAN, {"ghost_node": lambda i, c: Outcome()})
+
+
+def test_goto_is_applied_by_scheduler_not_by_node():
+    """自愈回边由 Outcome.goto 声明，Scheduler 统一落账与改游标；
+    节点 body 自己不调用下游、也不写 GO_REDIRECT。
+    """
+    session = make_session()
+    run = _run(session)
+    ctx = build_context(session, run, object())
+
+    executed = []
+
+    def body_a(_input, c):
+        executed.append("a")
+        # 第一次执行声明 goto 回自身，第二次正常完成
+        if "visited" not in c.shared:
+            return Outcome(
+                shared={"visited": True},
+                events=[("AUDIT_STARTED", "oracle_executor", {"attempt": 1})],
+                goto="generation_planner",
+                control={"reason": "self-heal"},
+            )
+        return Outcome(events=[("SCHEMA_ASSIGNED", "schema_mapper", {"tables": {}})])
+
+    plan = WorkflowPlan(
+        name="goto-test",
+        nodes=(
+            PlanNode("created", "起点", "stage"),
+            PlanNode("generation_planner", "A", "stage"),
+            PlanNode("schema_mapper", "终点", "terminal"),
+        ),
+        edges=(
+            PlanEdge("created", "generation_planner", "always"),
+            PlanEdge("generation_planner", "schema_mapper", "always"),
+            PlanEdge("generation_planner", "generation_planner", "self_heal"),
+        ),
+        entry="created",
+    )
+    scheduler = Scheduler(plan, {"generation_planner": body_a})
+    steps = scheduler.drive(ctx, max_steps=10)
+
+    assert executed == ["a", "a"]  # body 被调用两次，都是 Scheduler 调的
+    assert len(steps) == 2
+    events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
+    redirects = [e for e in events if e.kind == "GO_REDIRECT"]
+    assert len(redirects) == 1
+    assert redirects[0].payload_json["target"] == "generation_planner"
+    assert redirects[0].payload_json["reason"] == "self-heal"

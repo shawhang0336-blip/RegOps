@@ -9,7 +9,7 @@ Run 只回答动态问题：这次跑到哪了——由事件账本折叠得到�
 """
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -202,9 +202,3 @@ def audit_passed_target() -> str:
     if not target:
         raise RuntimeError("Plan 缺少审计通过边")
     return target
-
-
-def front_half_nodes() -> FrozenSet[str]:
-    """Plan 前半段：从 entry 到 oracle_asset_builder（含），由首轮执行器负责。"""
-    front = {"created", "generation_planner", "schema_mapper", "rule_binder", "oracle_asset_builder"}
-    return frozenset(front & {node.name for node in DEFAULT_PLAN.nodes})

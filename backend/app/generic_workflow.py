@@ -26,7 +26,7 @@ from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
 from .errors import WorkflowError
 from .events import append_event, project
-from .workflow import DEFAULT_PLAN, front_half_nodes, self_heal_target
+from .workflow import DEFAULT_PLAN, self_heal_target
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
     GeneratorBinding,
@@ -1325,17 +1325,45 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
     }
 
 
-def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None) -> RunModel:
-    """前半段：由 Scheduler 按 Plan 驱动，节点之间不再直接调用。"""
+def drive(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base=None) -> RunModel:
+    """唯一执行入口：一个 Scheduler 按 Plan 驱动全流程。
+
+    前后段节点全部注册到同一张 Plan，节点之间不直接调用；
+    人工门由 status 中断，自愈由 Outcome.goto 交回 Scheduler 重新调度。
+    """
+    state = project(session, run)
+    if state.status in {"COMPLETED", "FAILED", "WAITING_APPROVAL", "WAITING_TEST_APPROVAL"}:
+        return run
+
     specs = _specs(session, run.spec_id)
     llm = llm or RealDesignLlm(settings)
     resolved_budget, concurrency = _resolve_budget(session, generation_budget)
     ctx = build_context(
-        session, run, settings,
-        llm=llm, budget=resolved_budget, concurrency=concurrency,
+        session, run, settings, llm=llm, budget=resolved_budget,
+        concurrency=concurrency, attempt_base=attempt_base,
     )
     ctx.put("use_plan", generation_budget is not None)
-    scheduler = Scheduler(DEFAULT_PLAN, _front_bodies(specs, llm, resolved_budget, concurrency, settings))
+
+    # 从事件账本恢复跨节点上下文（续跑时 ctx 是新建的）。
+    # 全新 run 时这些事件还没产生，给空值即可——Scheduler 跑到相应节点时会写入 Channel。
+    schema_event = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == "SCHEMA_ASSIGNED")
+        .order_by(EventModel.seq.desc()).first()
+    )
+    ctx.put("schema_payload", (schema_event.payload_json.get("tables") if schema_event else None) or {})
+    plan_event = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == "GENERATION_PLANNED")
+        .order_by(EventModel.seq.desc()).first()
+    )
+    ctx.put("plans", plan_event.payload_json["tables"] if plan_event else {})
+
+    bodies = {}
+    bodies.update(_front_bodies(specs, llm, resolved_budget, concurrency, settings))
+    bodies.update(_back_bodies(specs, settings))
+    scheduler = Scheduler(DEFAULT_PLAN, bodies)
+
     try:
         scheduler.drive(ctx)
     except Exception as exc:
@@ -1351,28 +1379,7 @@ def _execute_run(session: Session, run: RunModel, settings: Settings, llm=None, 
             },
         )
         session.commit()
-        return run
-    state = project(session, run)
-    if state.status == "READY_TO_AUDIT":
-        # 无 pending：沿 Plan 进后半段（保持原有续跑语义）
-        return continue_generic_run(session, run, settings, llm, resolved_budget)
     return run
-
-def drive(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base=None) -> RunModel:
-    """统一执行器：读事件投影的 current_node，查 Plan 决定调用哪一段。
-
-    这是 Plan/Run 分离的关键——拓扑判定只在这里发生一次，
-    审批、重试、重审、后台续跑全部走这一个入口，不再各自硬编码"从哪继续"。
-    """
-    state = project(session, run)
-    node = state.current_node
-    # 终态与中断点不再推进
-    if state.status in {"COMPLETED", "FAILED", "WAITING_APPROVAL", "WAITING_TEST_APPROVAL"}:
-        return run
-    if node in front_half_nodes():
-        return _execute_run(session, run, settings, llm, generation_budget)
-    return continue_generic_run(session, run, settings, llm, generation_budget, attempt_base)
-
 
 def start_generic_run(session: Session, spec_id: str, settings: Settings, llm=None, generation_budget=None) -> RunModel:
     """同步入口：创建 run 并执行到第一个 gate。测试与内部调用使用。"""
@@ -1458,178 +1465,155 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
     return run
 
 
-def _continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base: Optional[int] = None) -> RunModel:
-    specs = _specs(session, run.spec_id)
-    llm = llm or RealDesignLlm(settings)
-    resolved_budget, concurrency = _resolve_budget(session, generation_budget)
-    max_attempts = int(resolved_budget.get("max_retries", 3))
-    # 自愈窗口按本轮续跑的起始 attempt 算：reaudit/重试时 run.attempt 可能已是 3+，
-    # 用绝对值比较（attempt < max_attempts）会让重审直接失去自愈机会
-    first_attempt = attempt_base or (project(session, run).attempt + 1)
-    schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
-    schemas = {code: [item for item in items] for code, items in schema_payload.items()}
-    cross = _latest_payload(session, run.id, "CROSS_RULES_ASSIGNED")
-    plan_event = (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == "GENERATION_PLANNED")
-        .order_by(EventModel.seq.desc())
-        .first()
-    )
-    plans = plan_event.payload_json["tables"] if plan_event else {}
-    rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
-    rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
-    rules = _backfill_required_rules(session, run, specs, rules)
-    rules = _backfill_length_rules(session, run, specs, rules)
-    rules = _backfill_fixed_value_rules(session, run, specs, rules)
-    prepared_assets = _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings)
-    golden_records = _data_stage(session, run, specs, llm, rules, cross.get("golden_overrides", {}), plans, concurrency=concurrency)
-    session.commit()
-    audit_cases = _audit_stage(session, run, specs, llm, rules, golden_records, plans, concurrency=concurrency)
-    session.commit()
-    attempt = project(session, run).attempt + 1
-    append_event(session, run, "AUDIT_STARTED", "oracle_executor", {"attempt": attempt})
-    schema_models = {code: [item for item in items] for code, items in schema_payload.items()}
+def _back_bodies(specs, settings):
+    """后半段节点 body：产物写 Channel，节点之间不直接调用下游。"""
     from .generic_domain import GeneratorBinding, SchemaBinding
 
-    generator_payload = _latest_payload(session, run.id, "GENERATORS_ASSIGNED")["tables"]
-    golden_generators = {
-        code: [GeneratorBinding.model_validate(item) for item in values["generators"]]
-        for code, values in generator_payload.items()
-    }
-    golden_counts = {code: int(plan.get("golden_count", 1)) for code, plan in plans.items()}
-    typed_schemas = {
-        code: [SchemaBinding.model_validate(item) for item in items] for code, items in schema_models.items()
-    }
-    code_sets, field_code_sets = load_published_code_sets(session, specs)
-    validate_code_set_usage(rules, golden_generators, field_code_sets)
-    code_set_bindings = code_set_compile_bindings(
-        field_code_sets,
-        {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
-    )
-    report = GenericOracleExecutor(settings.oracle_sandbox_url).execute(
-        run.id,
-        attempt,
-        specs,
-        typed_schemas,
-        golden_records,
-        audit_cases,
-        rules,
-        golden_counts,
-        golden_generators,
-        code_sets=code_sets,
-        prepared_assets=prepared_assets,
-        code_set_bindings=code_set_bindings,
-    )
-    blobs = LocalBlobStore(settings.blob_dir)
-    if report.get("uncovered_rules"):
-        append_event(
-            session,
-            run,
-            "RULE_COVERAGE_GAP",
-            "oracle_executor",
-            {
+    def body_data_generator_binder(_input, ctx: RunContext) -> Outcome:
+        schema_payload = ctx.get("schema_payload")
+        cross = _latest_payload(ctx.session, ctx.run.id, "CROSS_RULES_ASSIGNED")
+        plans = ctx.get("plans") or {}
+        rows = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "APPROVED").all()
+        rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
+        rules = _backfill_required_rules(ctx.session, ctx.run, specs, rules)
+        rules = _backfill_length_rules(ctx.session, ctx.run, specs, rules)
+        rules = _backfill_fixed_value_rules(ctx.session, ctx.run, specs, rules)
+        prepared_assets = _ensure_oracle_assets(ctx.session, ctx.run, specs, schema_payload, rules, ctx.settings)
+        golden_records = _data_stage(
+            ctx.session, ctx.run, specs, ctx.llm, rules,
+            cross.get("golden_overrides", {}), plans, concurrency=ctx.concurrency,
+        )
+        return Outcome(shared={
+            "rules": rules,
+            "prepared_assets": prepared_assets,
+            "golden_records": golden_records,
+        })
+
+    def body_audit_case_binder(_input, ctx: RunContext) -> Outcome:
+        plans = ctx.get("plans") or {}
+        audit_cases = _audit_stage(
+            ctx.session, ctx.run, specs, ctx.llm, ctx.get("rules"),
+            ctx.get("golden_records"), plans, concurrency=ctx.concurrency,
+        )
+        return Outcome(shared={"audit_cases": audit_cases})
+
+    def body_oracle_executor(_input, ctx: RunContext) -> Outcome:
+        run = ctx.run
+        schema_payload = ctx.get("schema_payload")
+        plans = ctx.get("plans") or {}
+        rules = ctx.get("rules")
+        golden_records = ctx.get("golden_records")
+        audit_cases = ctx.get("audit_cases")
+        prepared_assets = ctx.get("prepared_assets")
+        attempt = project(ctx.session, run).attempt + 1
+        first_attempt = ctx.attempt_base or attempt
+        max_attempts = int((ctx.budget or {}).get("max_retries", 3))
+
+        generator_payload = _latest_payload(ctx.session, run.id, "GENERATORS_ASSIGNED")["tables"]
+        golden_generators = {
+            code: [GeneratorBinding.model_validate(item) for item in values["generators"]]
+            for code, values in generator_payload.items()
+        }
+        golden_counts = {code: int(plan.get("golden_count", 1)) for code, plan in plans.items()}
+        typed_schemas = {
+            code: [SchemaBinding.model_validate(item) for item in items]
+            for code, items in schema_payload.items()
+        }
+        code_sets, field_code_sets = load_published_code_sets(ctx.session, specs)
+        validate_code_set_usage(rules, golden_generators, field_code_sets)
+        code_set_bindings = code_set_compile_bindings(
+            field_code_sets,
+            {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
+        )
+        report = GenericOracleExecutor(ctx.settings.oracle_sandbox_url).execute(
+            run.id, attempt, specs, typed_schemas, golden_records, audit_cases, rules,
+            golden_counts, golden_generators,
+            code_sets=code_sets, prepared_assets=prepared_assets, code_set_bindings=code_set_bindings,
+        )
+
+        events = [("AUDIT_STARTED", "oracle_executor", {"attempt": attempt})]
+        if report.get("uncovered_rules"):
+            events.append(("RULE_COVERAGE_GAP", "oracle_executor", {
                 "coverage_rate": report.get("coverage_rate"),
                 "uncovered_rules": report["uncovered_rules"],
                 "note": "这些规则没有任何变异用例命中过，等于没被验证；审计通过不代表它们对",
-            },
+            }))
+
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
+        ddl_uri = blobs.put(
+            "\n\n".join(compile_ai_schema_mysql_ddl(spec.table_code, typed_schemas[spec.table_code]) for spec in specs).encode()
         )
-    ddl_uri = blobs.put(
-        "\n\n".join(compile_ai_schema_mysql_ddl(spec.table_code, typed_schemas[spec.table_code]) for spec in specs).encode()
-    )
-    physical_tables = report["physical_tables"]
-    oracle_ddl_parts = [
-        compile_code_set_oracle_ddl(report["code_set_tables"][code_set["code"]]) for code_set in code_sets
-    ] + [
-        compile_ai_schema_oracle_ddl(report["target_tables"][spec.table_code], typed_schemas[spec.table_code])
-        for spec in specs
-    ]
-    oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
-    queries = []
-    for rule in rules:
-        sql, params = compile_rule_query(rule, "oracle", physical_tables)
-        queries.append({"rule_key": rule.rule_key, "table_code": rule.table_code, "sql": sql, "params": params})
-    sql_uri = blobs.put(canonical_json({"dialect": "oracle", "queries": queries}).encode())
-    report_uri = blobs.put(canonical_json(report).encode())
-    result = {
-        "ddl_blob": ddl_uri,
-        "oracle_ddl_blob": oracle_ddl_uri,
-        "validation_sql_blob": sql_uri,
-        "audit_report_blob": report_uri,
-        "oracle_tables": physical_tables,
-        "oracle_target_tables": report["target_tables"],
-        "oracle_code_set_tables": report["code_set_tables"],
-        "active_rule_hashes": sorted(rule.rule_hash for rule in rules),
-        "audit_summary": {key: value for key, value in report.items() if key not in {"cases", "physical_tables", "target_tables"}},
-    }
-    for artifact_type, uri in [
-        ("MYSQL_DDL", ddl_uri),
-        ("ORACLE_DDL", oracle_ddl_uri),
-        ("VALIDATION_SQL", sql_uri),
-        ("AUDIT_REPORT", report_uri),
-    ]:
-        session.add(
-            ArtifactModel(
-                id=str(uuid.uuid4()),
-                run_id=run.id,
-                artifact_type=artifact_type,
-                blob_uri=uri,
-                sha256=uri.removeprefix("blob://"),
-                version=attempt,
-            )
-        )
-    session.flush()
-    if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
-        append_event(
-            session,
-            run,
-            "GO_REDIRECT",
-            "oracle_executor",
-            {"target": self_heal_target(), "failed_result": result},
-        )
-        revised = _rebind_failed_rules(session, run, specs, llm, report)
-        if revised:
-            pending_count = len(_pending_rules(session, run.id))
+        physical_tables = report["physical_tables"]
+        oracle_ddl_parts = [
+            compile_code_set_oracle_ddl(report["code_set_tables"][cs["code"]]) for cs in code_sets
+        ] + [
+            compile_ai_schema_oracle_ddl(report["target_tables"][spec.table_code], typed_schemas[spec.table_code])
+            for spec in specs
+        ]
+        oracle_ddl_uri = blobs.put("\n\n".join(oracle_ddl_parts).encode())
+        queries = []
+        for rule in rules:
+            sql, params = compile_rule_query(rule, "oracle", physical_tables)
+            queries.append({"rule_key": rule.rule_key, "table_code": rule.table_code, "sql": sql, "params": params})
+        sql_uri = blobs.put(canonical_json({"dialect": "oracle", "queries": queries}).encode())
+        report_uri = blobs.put(canonical_json(report).encode())
+        result = {
+            "ddl_blob": ddl_uri,
+            "oracle_ddl_blob": oracle_ddl_uri,
+            "validation_sql_blob": sql_uri,
+            "audit_report_blob": report_uri,
+            "oracle_tables": physical_tables,
+            "oracle_target_tables": report["target_tables"],
+            "oracle_code_set_tables": report["code_set_tables"],
+            "active_rule_hashes": sorted(rule.rule_hash for rule in rules),
+            "audit_summary": {k: v for k, v in report.items() if k not in {"cases", "physical_tables", "target_tables"}},
+        }
+        for artifact_type, uri in [
+            ("MYSQL_DDL", ddl_uri), ("ORACLE_DDL", oracle_ddl_uri),
+            ("VALIDATION_SQL", sql_uri), ("AUDIT_REPORT", report_uri),
+        ]:
+            ctx.session.add(ArtifactModel(
+                id=str(uuid.uuid4()), run_id=run.id, artifact_type=artifact_type,
+                blob_uri=uri, sha256=uri.removeprefix("blob://"), version=attempt,
+            ))
+        ctx.session.flush()
+
+        shared = {"report": report, "result": result, "attempt": attempt, "first_attempt": first_attempt}
+        if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
+            # 自愈：声明 goto，由 Scheduler 应用；不在这里调用 rebind 或下游
+            revised = _rebind_failed_rules(ctx.session, run, specs, ctx.llm, report)
+            pending_count = len(_pending_rules(ctx.session, run.id))
             if pending_count:
-                append_event(session, run, "APPROVAL_REQUIRED", "human_gate", {"pending_count": pending_count})
-                session.commit()
-                return run
-            return continue_generic_run(session, run, settings, llm, resolved_budget, first_attempt)
-    append_event(
-        session,
-        run,
-        "AUDIT_COMPLETED" if report["all_passed"] else "AUDIT_REJECTED",
-        "oracle_executor",
-        {"result": result, "node": "oracle_executor"},
-    )
-    if report["all_passed"]:
-        append_event(
-            session,
-            run,
-            "TEST_CONFIRMATION_REQUIRED",
-            "test_confirmation",
-            {"audit_report_blob": report_uri, "active_rule_hashes": result["active_rule_hashes"]},
-        )
-    session.commit()
-    return run
+                events.append(("APPROVAL_REQUIRED", "human_gate", {
+                    "pending_count": pending_count, **ctx.identity.as_payload(),
+                }))
+                return Outcome(shared=shared, events=events)
+            # goto 由 Scheduler 统一落 GO_REDIRECT 事件，避免与 body 重复落账
+            return Outcome(
+                shared=shared, events=events,
+                goto=self_heal_target(),
+                control={"failed_result": result, "reason": "scheduler self-heal"},
+            )
+
+        events.append((
+            "AUDIT_COMPLETED" if report["all_passed"] else "AUDIT_REJECTED",
+            "oracle_executor", {"result": result, "node": "oracle_executor"},
+        ))
+        if report["all_passed"]:
+            events.append(("TEST_CONFIRMATION_REQUIRED", "test_confirmation", {
+                "audit_report_blob": report_uri,
+                "active_rule_hashes": result["active_rule_hashes"],
+                **ctx.identity.as_payload(),
+            }))
+        return Outcome(shared=shared, events=events)
+
+    return {
+        "data_generator_binder": body_data_generator_binder,
+        "audit_case_binder": body_audit_case_binder,
+        "oracle_executor": body_oracle_executor,
+    }
 
 
 def continue_generic_run(session: Session, run: RunModel, settings: Settings, llm=None, generation_budget=None, attempt_base: Optional[int] = None) -> RunModel:
-    try:
-        return _continue_generic_run(session, run, settings, llm, generation_budget, attempt_base)
-    except Exception as exc:
-        fallback_stage = project(session, run).current_node or "oracle_executor"
-        append_event(
-            session,
-            run,
-            "RUN_FAILED",
-            fallback_stage,
-            {
-                "node": fallback_stage,
-                "result": {
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "error_details": _error_details(exc, fallback_stage),
-                },
-            },
-        )
-        session.commit()
-        return run
+    """兼容入口：统一走唯一 Scheduler（drive）。"""
+    return drive(session, run, settings, llm, generation_budget, attempt_base)

@@ -14,7 +14,6 @@ from app.workflow import (
     approval_target,
     audit_passed_target,
     decided_target,
-    front_half_nodes,
     is_gate,
     self_heal_target,
 )
@@ -38,8 +37,6 @@ def test_plan_semantic_edges():
     assert decided_target(False) == "human_gate"
     assert self_heal_target() == "rule_binder"
     assert audit_passed_target() == "test_confirmation"
-    assert "rule_binder" in front_half_nodes()
-    assert "oracle_executor" not in front_half_nodes()
 
 
 def test_plan_rejects_dangling_edge():
