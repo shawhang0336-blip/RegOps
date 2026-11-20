@@ -6,6 +6,7 @@ result_json）由 append-only 的事件账本折叠产生，任何时刻都能�
 """
 
 import hashlib
+import uuid
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -18,6 +19,93 @@ from .models import EventModel, RunModel
 from .workflow import DEFAULT_PLAN
 
 GENESIS_HASH = "0" * 64
+
+# 中断类型 → 恢复节点（与 Plan 节点名严格一致）
+INTERRUPT_RESUME_NODES = {
+    "APPROVAL_REQUIRED": "human_gate",
+    "TEST_CONFIRMATION_REQUIRED": "test_confirmation",
+}
+
+
+def interrupt_payload(
+    kind: str,
+    question: str,
+    pending_input: Dict[str, Any],
+    identity: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构造一条 Interrupt 事件的 payload。
+
+    ProdAgent 的 Interrupt 三要素全部落账：
+      - question：问人什么（人可读，不再硬编码在前端）
+      - resume_node：回答后从哪个 Plan 节点恢复
+      - pending_input：挂起时节点的输入摘要，供审计与恢复核对
+      - interrupt_id：本次中断的唯一标识，回答事件用 interrupt_seq 指回它
+    """
+    if kind not in INTERRUPT_RESUME_NODES:
+        raise ValueError(f"未知中断类型：{kind}")
+    payload: Dict[str, Any] = {
+        "question": question,
+        "resume_node": INTERRUPT_RESUME_NODES[kind],
+        "pending_input": pending_input,
+        "interrupt_id": uuid.uuid4().hex,
+    }
+    if identity:
+        payload.update(identity)
+    return payload
+
+
+def matching_answer(
+    session: Session,
+    run: RunModel,
+    answer_kind: str,
+    interrupt_id: str,
+    answer_fingerprint: str,
+) -> Optional[EventModel]:
+    """同一中断 + 同样的回答内容 → 认为是一次幂等重入，直接返回原回答事件。"""
+    for event in (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == answer_kind)
+        .order_by(EventModel.seq)
+        .all()
+    ):
+        payload = event.payload_json or {}
+        if payload.get("interrupt_id") == interrupt_id and payload.get("answer_fingerprint") == answer_fingerprint:
+            return event
+    return None
+
+
+def latest_interrupt(session: Session, run: RunModel, kind: str) -> Optional[EventModel]:
+    """最近一条指定类型的中断事件，不论是否已回答。用于幂等重入判定。"""
+    return (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == kind)
+        .order_by(EventModel.seq.desc())
+        .first()
+    )
+
+
+def pending_interrupt(session: Session, run: RunModel, kind: str) -> Optional[EventModel]:
+    """找最近一条尚未被回答的指定类型中断事件。"""
+    answers = {"APPROVAL_REQUIRED": "HUMAN_DECISIONS_RECORDED", "TEST_CONFIRMATION_REQUIRED": "TEST_RESULTS_CONFIRMED"}
+    answer_kind = answers.get(kind)
+    if not answer_kind:
+        return None
+    answered_ids = {
+        (event.payload_json or {}).get("interrupt_id")
+        for event in session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == answer_kind)
+        .all()
+    }
+    for event in (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == kind)
+        .order_by(EventModel.seq.desc())
+        .all()
+    ):
+        interrupt_id = (event.payload_json or {}).get("interrupt_id")
+        if interrupt_id and interrupt_id not in answered_ids:
+            return event
+    return None
 
 
 @dataclass(frozen=True)

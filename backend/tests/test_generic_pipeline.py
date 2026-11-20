@@ -257,12 +257,28 @@ def test_assets_precede_rule_approval_and_export_follows_test_confirmation(organ
     with pytest.raises(Exception):
         build_production_bundle(session, run, str(tmp_path))
 
-    run = confirm_generic_test_results(session, run, "测试审核员")
+    # 幂等重入：同样的审批/确认重复提交，返回原结果且不重复记账
+    before = session.query(EventModel).filter(EventModel.run_id == run.id).count()
+    run = approve_generic_rules(
+        session, run, "规则审核员", {rule.rule_hash: "APPROVED" for rule in pending}, settings, FixtureDesignLlm()
+    )
+    assert session.query(EventModel).filter(EventModel.run_id == run.id).count() == before
 
+    run = confirm_generic_test_results(session, run, "测试审核员")
     assert project(session, run).status == "COMPLETED"
+    again = session.query(EventModel).filter(EventModel.run_id == run.id).count()
+    run = confirm_generic_test_results(session, run, "测试审核员")
+    assert session.query(EventModel).filter(EventModel.run_id == run.id).count() == again
+
     assert build_production_bundle(session, run, str(tmp_path))[1]
     kinds = [event.kind for event in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
     assert kinds.index("ORACLE_ASSETS_PREPARED") < kinds.index("HUMAN_DECISIONS_RECORDED") < kinds.index("AUDIT_STARTED") < kinds.index("TEST_CONFIRMATION_REQUIRED") < kinds.index("TEST_RESULTS_CONFIRMED")
+    # 回答事件带 interrupt_id / interrupt_seq 指回具体中断
+    approval = next(e for e in session.query(EventModel).filter(EventModel.run_id == run.id, EventModel.kind == "HUMAN_DECISIONS_RECORDED").all())
+    assert approval.payload_json.get("interrupt_id")
+    assert approval.payload_json.get("interrupt_seq")
+    confirmation = next(e for e in session.query(EventModel).filter(EventModel.run_id == run.id, EventModel.kind == "TEST_RESULTS_CONFIRMED").all())
+    assert confirmation.payload_json.get("interrupt_id")
 
 
 def test_call_validated_retries_once_after_timeout():

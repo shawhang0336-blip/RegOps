@@ -25,7 +25,8 @@ from .asset_models import ApprovalModel, ArtifactModel, AuditCaseDefinitionModel
 from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
 from .errors import WorkflowError
-from .events import append_event, project
+from .events import append_event, interrupt_payload, latest_interrupt, matching_answer, pending_interrupt, project
+from .identity import OPERATOR_PLACEHOLDER
 from .workflow import DEFAULT_PLAN, self_heal_target
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
@@ -1235,7 +1236,16 @@ def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer
         raise WorkflowError("No failed active rules could be revised")
     pending_count = len(_pending_rules(session, run.id))
     if pending_count:
-        append_event(session, run, "APPROVAL_REQUIRED", "human_gate", {"pending_count": pending_count})
+        hashes = [rule.rule_hash for rule in _pending_rules(session, run.id)]
+        append_event(
+            session, run, "APPROVAL_REQUIRED", "human_gate",
+            interrupt_payload(
+                "APPROVAL_REQUIRED",
+                f"重试修复后有 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。",
+                {"pending_count": pending_count, "pending_rule_hashes": hashes, "origin": "human_retry"},
+                {"operator": OPERATOR_PLACEHOLDER},
+            ),
+        )
         session.commit()
         return run
     session.commit()
@@ -1310,11 +1320,16 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         pending_count = ctx.get("pending_count", 0)
         events = []
         if pending_count:
-            events.append(("APPROVAL_REQUIRED", "human_gate", {
-                "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, ctx.run.id)],
-                "pending_count": pending_count,
-                **ctx.identity.as_payload(),
-            }))
+            events.append(("APPROVAL_REQUIRED", "human_gate", interrupt_payload(
+                "APPROVAL_REQUIRED",
+                f"AI 推断出 {pending_count} 条规则需要人工确认，请批准或拒绝后继续生成。",
+                {
+                    "pending_count": pending_count,
+                    "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, ctx.run.id)],
+                    "origin": "rule_binder",
+                },
+                ctx.identity.as_payload(),
+            )))
         return Outcome(shared={"rules": generated_rules}, events=events)
 
     return {
@@ -1396,8 +1411,27 @@ def approve_generic_rules(
     llm=None,
     defer_continuation: bool = False,
 ) -> RunModel:
+    # 幂等检查先于 status 校验：全决断后状态已离开 WAITING_APPROVAL，
+    # 同样的请求重放应返回原结果，而不是报 409。
+    normalized_input = {rule_hash: decision for rule_hash, decision in decisions.items()}
+    fingerprint = hashlib.sha256(canonical_json(normalized_input).encode()).hexdigest()
+    latest = latest_interrupt(session, run, "APPROVAL_REQUIRED")
+    if latest and (latest.payload_json or {}).get("interrupt_id"):
+        interrupt_id = latest.payload_json["interrupt_id"]
+        prior = matching_answer(session, run, "HUMAN_DECISIONS_RECORDED", interrupt_id, fingerprint)
+        if prior:
+            return run
+        answered = [
+            event for event in session.query(EventModel)
+            .filter(EventModel.run_id == run.id, EventModel.kind == "HUMAN_DECISIONS_RECORDED")
+            .all()
+            if (event.payload_json or {}).get("interrupt_id") == interrupt_id
+        ]
+        if answered:
+            raise WorkflowError("This interrupt was already answered with different decisions")
     if project(session, run).status != "WAITING_APPROVAL":
         raise WorkflowError("Run is not waiting for rule approval")
+    interrupt = pending_interrupt(session, run, "APPROVAL_REQUIRED")
     pending = {rule.rule_hash: rule for rule in _pending_rules(session, run.id)}
     if not decisions or any(rule_hash not in pending for rule_hash in decisions):
         raise WorkflowError("Decisions must target currently pending rules")
@@ -1419,13 +1453,14 @@ def approve_generic_rules(
         )
     session.flush()
     all_decided = not _pending_rules(session, run.id)
-    append_event(
-        session,
-        run,
-        "HUMAN_DECISIONS_RECORDED",
-        "human_gate",
-        {"approver": approver, "decisions": normalized, "all_decided": all_decided},
-    )
+    answer_payload = {"approver": approver, "decisions": normalized, "all_decided": all_decided}
+    if interrupt and all_decided:
+        # 只有全部决断才算"回答完成这次中断"；部分决断是同一中断的逐步收敛，
+        # 不标记关联，否则下一次提交会被误判为"已用不同内容回答"
+        answer_payload["interrupt_id"] = interrupt.payload_json["interrupt_id"]
+        answer_payload["interrupt_seq"] = interrupt.seq
+        answer_payload["answer_fingerprint"] = fingerprint
+    append_event(session, run, "HUMAN_DECISIONS_RECORDED", "human_gate", answer_payload)
     session.commit()
     if not all_decided:
         return run
@@ -1435,8 +1470,16 @@ def approve_generic_rules(
 
 
 def confirm_generic_test_results(session: Session, run: RunModel, approver: str) -> RunModel:
+    # 幂等：同一中断 + 同一确认人重放，直接返回原结果
+    latest = latest_interrupt(session, run, "TEST_CONFIRMATION_REQUIRED")
+    fingerprint = hashlib.sha256(canonical_json({"approver": approver}).encode()).hexdigest()
+    if latest and (latest.payload_json or {}).get("interrupt_id"):
+        interrupt_id = latest.payload_json["interrupt_id"]
+        if matching_answer(session, run, "TEST_RESULTS_CONFIRMED", interrupt_id, fingerprint):
+            return run
     if project(session, run).status != "WAITING_TEST_APPROVAL":
         raise WorkflowError("Run is not waiting for test result confirmation")
+    interrupt = pending_interrupt(session, run, "TEST_CONFIRMATION_REQUIRED")
     summary = (project(session, run).result_json or {}).get("audit_summary", {})
     if not summary.get("all_passed"):
         raise WorkflowError("Test results can only be confirmed after all Oracle checks pass")
@@ -1454,13 +1497,12 @@ def confirm_generic_test_results(session: Session, run: RunModel, approver: str)
             comment="",
         )
     )
-    append_event(
-        session,
-        run,
-        "TEST_RESULTS_CONFIRMED",
-        "test_confirmation",
-        {"approver": approver, "object_hash": object_hash},
-    )
+    answer_payload = {"approver": approver, "object_hash": object_hash}
+    if interrupt:
+        answer_payload["interrupt_id"] = interrupt.payload_json["interrupt_id"]
+        answer_payload["interrupt_seq"] = interrupt.seq
+        answer_payload["answer_fingerprint"] = fingerprint
+    append_event(session, run, "TEST_RESULTS_CONFIRMED", "test_confirmation", answer_payload)
     session.commit()
     return run
 
@@ -1584,9 +1626,17 @@ def _back_bodies(specs, settings):
             revised = _rebind_failed_rules(ctx.session, run, specs, ctx.llm, report)
             pending_count = len(_pending_rules(ctx.session, run.id))
             if pending_count:
-                events.append(("APPROVAL_REQUIRED", "human_gate", {
-                    "pending_count": pending_count, **ctx.identity.as_payload(),
-                }))
+                events.append(("APPROVAL_REQUIRED", "human_gate", interrupt_payload(
+                    "APPROVAL_REQUIRED",
+                    f"Oracle 自愈修正后有 {pending_count} 条规则需要人工确认，请批准或拒绝后重新验证。",
+                    {
+                        "pending_count": pending_count,
+                        "pending_rule_hashes": [rule.rule_hash for rule in _pending_rules(ctx.session, run.id)],
+                        "origin": "self_heal",
+                        "attempt": attempt,
+                    },
+                    ctx.identity.as_payload(),
+                )))
                 return Outcome(shared=shared, events=events)
             # goto 由 Scheduler 统一落 GO_REDIRECT 事件，避免与 body 重复落账
             return Outcome(
@@ -1600,11 +1650,16 @@ def _back_bodies(specs, settings):
             "oracle_executor", {"result": result, "node": "oracle_executor"},
         ))
         if report["all_passed"]:
-            events.append(("TEST_CONFIRMATION_REQUIRED", "test_confirmation", {
-                "audit_report_blob": report_uri,
-                "active_rule_hashes": result["active_rule_hashes"],
-                **ctx.identity.as_payload(),
-            }))
+            events.append(("TEST_CONFIRMATION_REQUIRED", "test_confirmation", interrupt_payload(
+                "TEST_CONFIRMATION_REQUIRED",
+                "Oracle 沙箱验证已全部通过，请确认测试结果后导出生产包。",
+                {
+                    "audit_report_blob": report_uri,
+                    "active_rule_hashes": result["active_rule_hashes"],
+                    "attempt": attempt,
+                },
+                ctx.identity.as_payload(),
+            )))
         return Outcome(shared=shared, events=events)
 
     return {
