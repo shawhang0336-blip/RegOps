@@ -303,6 +303,7 @@ def spec_payload(spec: SpecDocument) -> Dict[str, Any]:
         "table_name": spec.table_name,
         "section": spec.section,
         "fields": [field.model_dump() for field in spec.fields],
+        "field_names": [field.name for field in spec.fields],
         "terms_text": spec.terms_text[:6000],
     }
 

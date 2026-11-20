@@ -20,6 +20,7 @@ from ..asset_models import (
     TableMetadataModel,
 )
 from ..blobs import LocalBlobStore
+from ..events import project
 from ..compiler import compile_where
 from ..config import get_settings
 from ..db import SessionLocal
@@ -87,7 +88,7 @@ def _rules_payload(session: Session, table: TableMetadataModel, run: RunModel) -
             for item in (spec_model.content_json or {}).get("tables") or []
             if item.get("table_code") == table.table_code
         ]
-        code_set_tables = ((run.result_json or {}).get("oracle_code_set_tables")) or {}
+        code_set_tables = ((project(session, run).result_json or {}).get("oracle_code_set_tables")) or {}
         if specs and code_set_tables:
             _, field_bindings = load_published_code_sets(session, specs)
             code_set_bindings = code_set_compile_bindings(field_bindings, code_set_tables)
@@ -134,7 +135,8 @@ def all_table_rules() -> Dict[str, Any]:
             if not run:
                 continue
             rules = _rules_payload(session, table, run)
-            result = run.result_json or {}
+            state = project(session, run)
+            result = state.result_json or {}
             items.append(
                 {
                     "table": {
@@ -145,7 +147,7 @@ def all_table_rules() -> Dict[str, Any]:
                     },
                     "run": {
                         "id": run.id,
-                        "status": run.status,
+                        "status": state.status,
                         "created_at": run.created_at.isoformat() if run.created_at else None,
                     },
                     "rules": rules,
@@ -200,7 +202,8 @@ def artifacts_status() -> Dict[str, Any]:
         for table in tables:
             run_id = latest.get(table.table_code)
             run = runs.get(run_id)
-            run_result = (run.result_json or {}) if run else {}
+            run_state = project(session, run) if run else None
+            run_result = (run_state.result_json or {}) if run_state else {}
             summary = run_result.get("audit_summary") or {}
             result.append(
                 {
@@ -213,7 +216,7 @@ def artifacts_status() -> Dict[str, Any]:
                     "status": table.status,
                     "generated": run_id is not None,
                     "run_id": run_id,
-                    "run_status": run.status if run else None,
+                    "run_status": run_state.status if run_state else None,
                     "all_passed": summary.get("all_passed") if summary else None,
                     "created_at": run.created_at.isoformat() if run and run.created_at else None,
                     # 清单直接展示产物状态，避免前端逐表请求详情后才能统计。
@@ -316,10 +319,11 @@ def table_artifacts(table_id: str) -> Dict[str, Any]:
         if not run:
             return payload
 
+        state = project(session, run)
         payload["run"] = {
             "id": run.id,
-            "status": run.status,
-            "current_node": run.current_node,
+            "status": state.status,
+            "current_node": state.current_node,
             "created_at": run.created_at.isoformat() if run.created_at else None,
         }
 
@@ -332,7 +336,7 @@ def table_artifacts(table_id: str) -> Dict[str, Any]:
         payload["rule_groups"] = groups
 
         # 表结构：建表 SQL（Oracle 为主，MySQL 备用）
-        result = run.result_json or {}
+        result = state.result_json or {}
         ddl_uri = result.get("ddl_blob") or result.get("oracle_ddl_blob")
         if ddl_uri:
             payload["ddl"] = _blob_text(store, ddl_uri)

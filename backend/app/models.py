@@ -37,14 +37,14 @@ class RuleModel(Base):
 
 
 class RunModel(Base):
+    """Run 只保存身份。status/current_node/attempt/result_json 全部由事件账本折叠，
+    见 events.project()。这里故意不存状态列，杜绝双写与状态漂移。
+    """
+
     __tablename__ = "runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     spec_id: Mapped[str] = mapped_column(String(36), index=True)
-    status: Mapped[str] = mapped_column(String(32), index=True)
-    current_node: Mapped[str] = mapped_column(String(64))
-    attempt: Mapped[int] = mapped_column(Integer, default=0)
-    result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

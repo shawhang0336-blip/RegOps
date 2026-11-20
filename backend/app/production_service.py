@@ -11,6 +11,7 @@ from .asset_models import ArtifactModel
 from .blobs import LocalBlobStore
 from .code_set_oracle import code_set_compile_bindings, compile_code_set_oracle_ddl, compile_code_set_oracle_insert, compile_code_set_oracle_merge, load_published_code_sets, stable_code_set_table
 from .domain import RuleDefinition, canonical_json
+from .events import project
 from .generic_domain import SchemaBinding
 from .generic_workflow import _latest_payload, _specs
 from .models import RuleModel, RunModel
@@ -19,9 +20,10 @@ from .errors import WorkflowError
 
 
 def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> Tuple[str, bytes]:
-    if run.status != "COMPLETED" or not run.result_json or not run.result_json.get("audit_summary", {}).get("all_passed"):
+    state = project(session, run)
+    if state.status != "COMPLETED" or not state.result_json or not state.result_json.get("audit_summary", {}).get("all_passed"):
         raise WorkflowError("Production export requires a completed, fully passed Oracle audit")
-    if run.result_json.get("audit_summary", {}).get("coverage_complete") is False:
+    if state.result_json.get("audit_summary", {}).get("coverage_complete") is False:
         raise WorkflowError("Production export is blocked by uncovered validation rules")
     pending = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "PENDING").count()
     if pending:
@@ -34,9 +36,9 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
     }
     rows = session.query(RuleModel).filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED").all()
     rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
-    expected_versions = run.result_json["audit_summary"].get("code_set_versions", {})
+    expected_versions = state.result_json["audit_summary"].get("code_set_versions", {})
     code_sets, field_code_sets = load_published_code_sets(session, specs, expected_versions=expected_versions)
-    if code_sets and "code_set_versions" not in run.result_json["audit_summary"]:
+    if code_sets and "code_set_versions" not in state.result_json["audit_summary"]:
         raise WorkflowError("This run predates code set auditing; rerun the Oracle audit before production export")
     code_set_tables = {item["code"]: stable_code_set_table(item["code"]) for item in code_sets}
     rule_bindings = code_set_compile_bindings(field_code_sets, code_set_tables)
@@ -64,7 +66,7 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
         "bundle_type": "PRODUCTION_DEPLOYMENT",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "run_id": run.id,
-        "audit": run.result_json["audit_summary"],
+        "audit": state.result_json["audit_summary"],
         "tables": [
             {
                 "table_code": spec.table_code,
@@ -118,7 +120,7 @@ def build_production_bundle(session: Session, run: RunModel, blob_dir: str) -> T
             artifact_type="PRODUCTION_BUNDLE",
             blob_uri=uri,
             sha256=uri.removeprefix("blob://"),
-            version=run.attempt,
+            version=state.attempt,
         )
     )
     session.commit()

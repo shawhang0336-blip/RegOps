@@ -7,6 +7,7 @@ from app.config import Settings, get_settings
 from app.generic_domain import bind_generators, bind_rules, bind_schema
 from app.generic_oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
 from app.generic_ai import LlmTimeoutError
+from app.events import project
 from app.generic_workflow import _call_validated, _create_run, _dedupe_approved_rules, approve_generic_rules, confirm_generic_test_results, start_generic_run
 from app.production_service import build_production_bundle
 from app.models import EventModel, RuleModel, RunModel, SpecificationModel
@@ -139,7 +140,7 @@ def test_generic_run_records_ai_tool_calls_before_human_gate(organization_spec, 
         return {"attempt": attempt, "physical_tables": physical, "target_tables": {code: f"TARGET_{attempt}" for code in physical}, "code_set_tables": {}, "code_set_versions": {}, "code_set_record_counts": {}, "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])}}
     monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
     run = start_generic_run(session, spec_id, Settings(oracle_sandbox_url=None, blob_dir=str(tmp_path)), FixtureDesignLlm())
-    assert run.status == "WAITING_APPROVAL"
+    assert project(session, run).status == "WAITING_APPROVAL"
     events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
     kinds = [event.kind for event in events]
     assert kinds.count("AI_TOOL_ASSIGNED") == 2
@@ -163,7 +164,7 @@ def test_target_ddl_stays_narrow_while_staging_accepts_mutations(organization_sp
 
 def test_rule_barrier_supersedes_semantic_duplicates():
     session = make_session()
-    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()), status="RUNNING", current_node="rule_binder")
+    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
     session.add(run)
     session.flush()
     for index, key in enumerate(["REQUIRED_A", "REQUIRED_B"]):
@@ -242,21 +243,23 @@ def test_assets_precede_rule_approval_and_export_follows_test_confirmation(organ
 
     run = start_generic_run(session, spec_id, settings, FixtureDesignLlm(), generation_budget=budget)
 
-    assert run.status == "WAITING_APPROVAL"
+    state = project(session, run)
+    assert state.status == "WAITING_APPROVAL"
     assert calls == ["PREPARE"]
-    assert run.result_json["oracle_target_tables"][organization_spec.table_code] == "TARGET_1"
+    assert state.result_json["oracle_target_tables"][organization_spec.table_code] == "TARGET_1"
     pending = [rule for rule in session.query(RuleModel).filter(RuleModel.run_id == run.id).all() if rule.status == "PENDING"]
     run = approve_generic_rules(
         session, run, "规则审核员", {rule.rule_hash: "APPROVED" for rule in pending}, settings, FixtureDesignLlm()
     )
-    assert calls == ["PREPARE", "EXECUTE"], run.result_json
-    assert run.status == "WAITING_TEST_APPROVAL"
+    state = project(session, run)
+    assert calls == ["PREPARE", "EXECUTE"], state.result_json
+    assert state.status == "WAITING_TEST_APPROVAL"
     with pytest.raises(Exception):
         build_production_bundle(session, run, str(tmp_path))
 
     run = confirm_generic_test_results(session, run, "测试审核员")
 
-    assert run.status == "COMPLETED"
+    assert project(session, run).status == "COMPLETED"
     assert build_production_bundle(session, run, str(tmp_path))[1]
     kinds = [event.kind for event in session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()]
     assert kinds.index("ORACLE_ASSETS_PREPARED") < kinds.index("HUMAN_DECISIONS_RECORDED") < kinds.index("AUDIT_STARTED") < kinds.index("TEST_CONFIRMATION_REQUIRED") < kinds.index("TEST_RESULTS_CONFIRMED")
@@ -376,5 +379,6 @@ def test_create_run_marks_run_running(organization_spec):
     session.commit()
 
     run = _create_run(session, spec_id, Settings())
-    assert run.status == "RUNNING"
-    assert run.current_node == "bind_rules"
+    state = project(session, run)
+    assert state.status == "RUNNING"
+    assert state.current_node == "bind_rules"

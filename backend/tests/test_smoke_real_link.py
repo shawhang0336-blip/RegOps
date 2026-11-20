@@ -22,6 +22,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.asset_models  # noqa: F401  确保所有 ORM 模型注册到 Base.metadata
+from app.events import project
 from app.config import Settings
 from app.db import Base
 from app.generic_workflow import approve_generic_rules, confirm_generic_test_results, start_generic_run
@@ -72,7 +73,7 @@ def test_real_link_organization_end_to_end(organization_spec, tmp_path):
 
         # 阶段2：plan -> schema -> rules -> Oracle 建表 + 空跑，停在规则审批 gate
         run = start_generic_run(session, spec_id, settings)
-        assert run.status == "WAITING_APPROVAL", run.result_json
+        assert project(session, run).status == "WAITING_APPROVAL", project(session, run).result_json
 
         pending = [
             rule
@@ -85,13 +86,13 @@ def test_real_link_organization_end_to_end(organization_spec, tmp_path):
         run = approve_generic_rules(
             session, run, "smoke-approver", {rule.rule_hash: "APPROVED" for rule in pending}, settings
         )
-        assert run.status == "WAITING_TEST_APPROVAL", run.result_json
+        assert project(session, run).status == "WAITING_TEST_APPROVAL", project(session, run).result_json
 
-        summary = run.result_json["audit_summary"]
+        summary = project(session, run).result_json["audit_summary"]
         assert summary["all_passed"] is True, summary
         assert summary["false_positive_count"] == 0, summary
         assert summary["false_negative_count"] == 0, summary
 
         # 测试确认 -> 完成，可导出生产部署包
         run = confirm_generic_test_results(session, run, "smoke-approver")
-        assert run.status == "COMPLETED"
+        assert project(session, run).status == "COMPLETED"

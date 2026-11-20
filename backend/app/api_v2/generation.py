@@ -14,7 +14,7 @@ from ..code_set_readiness import auto_publish_referenced_code_sets
 from ..config import get_settings
 from ..db import SessionLocal
 from ..domain import canonical_json
-from ..events import append_event
+from ..events import append_event, project
 from ..generic_workflow import _create_run, _execute_run
 from ..identity import OPERATOR_PLACEHOLDER
 from ..metadata_service import metadata_to_spec, publish_table
@@ -75,7 +75,7 @@ def _spawn_background_run(run_id: str, settings, generation_budget) -> None:
         try:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
-                if run and run.status == "RUNNING":
+                if run and project(session, run).status == "RUNNING":
                     _execute_run(session, run, settings, generation_budget=generation_budget)
         except Exception as exc:
             with SessionLocal() as session:

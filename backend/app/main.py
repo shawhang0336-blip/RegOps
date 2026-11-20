@@ -24,7 +24,7 @@ from .catalog import parse_document_catalog
 from .config import get_settings
 from .identity import OPERATOR_PLACEHOLDER
 from .db import SessionLocal, init_db
-from .events import append_event, fold_events
+from .events import append_event, project, project_many, verify_chain
 from .generic_workflow import (
     _pending_rules,
     approve_generic_rules,
@@ -47,13 +47,16 @@ from .errors import WorkflowError
 
 
 def _mark_interrupted_runs():
+    """进程重启后把仍在运行态的批次记为失败。
+
+    状态从事件账本折叠得到（唯一事实源），因此这里扫描全部 Run 的投影，
+    而不是查一个可能漂移的状态列。
+    """
     with SessionLocal() as session:
-        rows = (
-            session.query(RunModel)
-            .filter(RunModel.status.in_(["RUNNING", "AUDITING", "READY_TO_AUDIT"]))
-            .all()
-        )
-        for run in rows:
+        runs = session.query(RunModel).all()
+        states = project_many(session, runs)
+        interrupted = [run for run in runs if states[run.id].status in ACTIVE_RUN_STATUSES]
+        for run in interrupted:
             append_event(
                 session,
                 run,
@@ -61,7 +64,7 @@ def _mark_interrupted_runs():
                 "startup",
                 {"node": "startup", "result": {"error": "Run interrupted by process restart"}},
             )
-        if rows:
+        if interrupted:
             session.commit()
 
 
@@ -183,22 +186,24 @@ def run_view(
     session: Session,
     run: RunModel,
     include_events: bool = True,
+    run_state=None,
     prefetched_rules: Optional[List[RuleModel]] = None,
     prefetched_tables: Optional[List[Dict]] = None,
 ) -> Dict:
+    state = run_state if run_state is not None else project(session, run)
     rules = prefetched_rules if prefetched_rules is not None else session.query(RuleModel).filter(RuleModel.run_id == run.id).all()
     tables = prefetched_tables if prefetched_tables is not None else _run_tables(session, run)
     result = {
         "id": run.id,
         "spec_id": run.spec_id,
-        "status": run.status,
-        "current_node": run.current_node,
-        "attempt": run.attempt,
+        "status": state.status,
+        "current_node": state.current_node,
+        "attempt": state.attempt,
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "tables": tables,
         "table_count": len(tables),
-        "result": run.result_json,
+        "result": state.result_json,
         "rules": [rule_view(rule) for rule in sorted(rules, key=lambda item: item.rule_key)],
     }
     if include_events:
@@ -376,6 +381,7 @@ def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
     runs = session.query(RunModel).order_by(RunModel.created_at.desc()).limit(50).all()
     if not runs:
         return []
+    states = project_many(session, runs)
     # 批量预取：规则与 spec 各一次 IN 查询，避免 50 个批次 × 3 次循环查询
     run_ids = [run.id for run in runs]
     spec_ids = {run.spec_id for run in runs}
@@ -391,6 +397,7 @@ def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
             session,
             run,
             include_events=False,
+            run_state=states[run.id],
             prefetched_rules=rules_by_run.get(run.id, []),
             prefetched_tables=_run_tables_from_content(
                 (spec_by_id[run.spec_id].content_json or {}) if run.spec_id in spec_by_id else {}
@@ -406,6 +413,7 @@ ACTIVE_RUN_STATUSES = {"RUNNING", "AUDITING", "READY_TO_AUDIT"}
 def _history_cleanup_plan(session: Session):
     """每组报表保留最新批次和最近一次通过验证的批次，运行中批次永不清理。"""
     runs = session.query(RunModel).order_by(RunModel.created_at.desc()).all()
+    states = project_many(session, runs)
     groups: Dict[tuple, List[RunModel]] = {}
     for run in runs:
         key = tuple(sorted(item["table_code"] for item in _run_tables(session, run))) or (run.spec_id,)
@@ -414,10 +422,10 @@ def _history_cleanup_plan(session: Session):
     for group in groups.values():
         ordered = sorted(group, key=lambda item: item.created_at or datetime.min, reverse=True)
         keep.add(ordered[0].id)
-        completed = next((item for item in ordered if item.status == "COMPLETED"), None)
+        completed = next((item for item in ordered if states[item.id].status == "COMPLETED"), None)
         if completed:
             keep.add(completed.id)
-        keep.update(item.id for item in ordered if item.status in ACTIVE_RUN_STATUSES)
+        keep.update(item.id for item in ordered if states[item.id].status in ACTIVE_RUN_STATUSES)
     deletes = [run for run in runs if run.id not in keep]
     return runs, deletes
 
@@ -432,7 +440,7 @@ def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
         "runs": [
             {
                 "id": run.id,
-                "status": run.status,
+                "status": states[run.id].status,
                 "created_at": run.created_at.isoformat() if run.created_at else None,
                 "tables": _run_tables(session, run),
             }
@@ -442,7 +450,7 @@ def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
 
 
 def _delete_run_rows(session: Session, run: RunModel):
-    result = run.result_json or {}
+    result = project(session, run).result_json or {}
     oracle_tables = set()
     for key in ("oracle_tables", "oracle_target_tables", "oracle_code_set_tables"):
         oracle_tables.update((result.get(key) or {}).values())
@@ -490,11 +498,6 @@ def get_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
-    replayed = RunModel(id=run.id, spec_id=run.spec_id, status="NEW", current_node="created")
-    fold_events(replayed, events)
-    if (replayed.status, replayed.current_node, replayed.result_json) != (run.status, run.current_node, run.result_json):
-        raise HTTPException(status_code=500, detail="Event projection does not match the stored run projection")
     return run_view(session, run)
 
 
@@ -503,7 +506,7 @@ def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status in ACTIVE_RUN_STATUSES:
+    if project(session, run).status in ACTIVE_RUN_STATUSES:
         raise HTTPException(status_code=409, detail="Running validation batches cannot be deleted")
     blob_uris, oracle_tables = _delete_run_rows(session, run)
     warnings = _finish_run_deletion(session, blob_uris, oracle_tables)
@@ -524,7 +527,7 @@ def validation_detail(run_id: str, session: Session = Depends(db_session)) -> Di
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    result = run.result_json or {}
+    result = project(session, run).result_json or {}
     report: Dict = {}
     report_uri = result.get("audit_report_blob")
     if report_uri:
@@ -641,7 +644,7 @@ def validation_detail(run_id: str, session: Session = Depends(db_session)) -> Di
         summary = result.get("audit_summary") or {}
     return {
         "run_id": run.id,
-        "status": run.status,
+        "status": project(session, run).status,
         "ai_generated": bool(generators),
         "audit_stale": bool(active_hashes and active_hashes != approved_hashes),
         "summary": summary,
@@ -663,12 +666,12 @@ def _spawn_run_continuation(run_id: str) -> None:
         try:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
-                if run and run.status in {"READY_TO_AUDIT", "RUNNING"}:
+                if run and project(session, run).status in {"READY_TO_AUDIT", "RUNNING"}:
                     continue_generic_run(session, run, settings)
         except Exception:
             with SessionLocal() as session:
                 run = session.get(RunModel, run_id)
-                if run and run.status in {"READY_TO_AUDIT", "RUNNING"}:
+                if run and project(session, run).status in {"READY_TO_AUDIT", "RUNNING"}:
                     append_event(
                         session,
                         run,
@@ -698,7 +701,7 @@ def approve_run(run_id: str, request: ApprovalRequest, session: Session = Depend
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if run.status == "READY_TO_AUDIT":
+    if project(session, run).status == "READY_TO_AUDIT":
         _spawn_run_continuation(run.id)
     return run_view(session, run)
 
@@ -721,14 +724,14 @@ def retry_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "FAILED":
+    if project(session, run).status != "FAILED":
         raise HTTPException(status_code=409, detail="Only failed runs can be retried")
     try:
         run = retry_generic_run(session, run, settings, defer_continuation=True)
     except WorkflowError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if run.status == "RUNNING":
+    if project(session, run).status == "RUNNING":
         _spawn_run_continuation(run.id)
     return run_view(session, run)
 
@@ -743,7 +746,7 @@ def reaudit_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status in ACTIVE_RUN_STATUSES:
+    if project(session, run).status in ACTIVE_RUN_STATUSES:
         raise HTTPException(status_code=409, detail="批次正在执行中，请等当前验证结束后再发起重审")
     pending = _pending_rules(session, run.id)
     if pending:
@@ -782,10 +785,14 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
-    replayed = RunModel(id=run.id, spec_id=run.spec_id, status="NEW", current_node="created")
-    fold_events(replayed, events)
-    return {"status": replayed.status, "current_node": replayed.current_node, "result": replayed.result_json}
+    state = project(session, run)
+    return {
+        "status": state.status,
+        "current_node": state.current_node,
+        "attempt": state.attempt,
+        "result": state.result_json,
+        "chain_valid": verify_chain(session, run),
+    }
 
 
 @app.get("/api/blobs/{digest}")
@@ -820,9 +827,10 @@ def oracle_preview(
 ) -> List[Dict]:
     run = session.get(RunModel, run_id)
     result_key = "oracle_target_tables" if dataset == "golden" else "oracle_tables"
-    if not run or not run.result_json or not run.result_json.get(result_key):
+    state = project(session, run) if run else None
+    if not run or not state.result_json or not state.result_json.get(result_key):
         raise HTTPException(status_code=404, detail="Oracle run artifacts not found")
-    physical_table = run.result_json[result_key].get(table_code)
+    physical_table = state.result_json[result_key].get(table_code)
     if not physical_table:
         raise HTTPException(status_code=404, detail="Table is outside this run")
     try:

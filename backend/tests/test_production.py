@@ -3,6 +3,7 @@ import uuid
 import pytest
 
 from app.generic_domain import bind_schema
+from app.events import append_event
 from app.models import RunModel
 from app.production import compile_production_mysql_ddl, compile_production_oracle_ddl, compile_production_rule_query, inline_sql_literals
 from app.production_service import build_production_bundle
@@ -39,6 +40,10 @@ def test_sql_literal_inlining_escapes_quotes():
 
 def test_failed_audit_cannot_export():
     session = make_session()
-    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()), status="FAILED", current_node="audit", result_json={"audit_summary": {"all_passed": False}})
+    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
+    session.add(run)
+    session.flush()
+    append_event(session, run, "AUDIT_REJECTED", "audit", {"result": {"audit_summary": {"all_passed": False}}, "node": "audit"})
+    session.commit()
     with pytest.raises(WorkflowError):
         build_production_bundle(session, run, "/tmp/not-used")

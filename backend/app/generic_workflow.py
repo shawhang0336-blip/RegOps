@@ -10,6 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .blobs import LocalBlobStore
+from .bus import default_bus
 from .code_set_oracle import (
     code_set_compile_bindings,
     compile_code_set_oracle_ddl,
@@ -22,7 +23,7 @@ from .asset_models import ApprovalModel, ArtifactModel, AuditCaseDefinitionModel
 from .config import Settings
 from .domain import RuleDefinition, SpecDocument, calculate_rule_hash, canonical_json
 from .errors import WorkflowError
-from .events import append_event
+from .events import append_event, project
 from .generic_ai import LlmTimeoutError, RealDesignLlm, configure_llm_concurrency, spec_payload
 from .generic_domain import (
     GeneratorBinding,
@@ -161,7 +162,7 @@ def _backoff_wait(steps, attempt: int) -> None:
         time.sleep(delay)
 
 
-def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None, backoff=None):
+def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None, backoff=None, bus=None):
     """带退避的模型调用。
 
     原来只重试 2 次、HTTP 错误直接抛、超时只给 1 次机会。线上 8 次失败里有 6 次是
@@ -180,6 +181,7 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
     transient_used = 0
     validation_used = 0
     wait_steps = _BACKOFF_SECONDS if backoff is None else backoff
+    bus = bus if bus is not None else default_bus()
 
     for attempt in range(1, _TRANSIENT_ATTEMPTS + _VALIDATION_ATTEMPTS + 1):
         # 超时过就放宽窗口，避免同一个请求反复被同一个超时掐掉
@@ -191,6 +193,12 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
                 arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
             else:
                 arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
+            # Bus 前置裁决：字段名白名单、跨表引用白名单等硬门。
+            # 裁决失败按校验失败处理，原因回喂模型重试，并记入 trace 供审计。
+            rejection_reason = bus.adjudicate(tool_name, arguments, payload)
+            if rejection_reason:
+                trace["bus_rejected"] = rejection_reason
+                raise RuleValidationError(rejection_reason)
             result = validator(arguments)
             if rejection:
                 trace["previous_rejection"] = rejection
@@ -496,6 +504,7 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
         selected = {spec.table_code for spec in specs}
         payload = {
             "tables": [spec_payload(spec) for spec in specs],
+            "table_codes": sorted(selected),
             "instruction": "只装配有明确依据的跨表 FOREIGN_KEY 规则，并给必要的黄金记录引用值覆盖。",
         }
 
@@ -548,7 +557,7 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4) -> 
 
 
 def _ensure_oracle_assets(session, run, specs, schema_payload, rules, settings):
-    attempt = run.attempt + 1
+    attempt = project(session, run).attempt + 1
     existing = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id, EventModel.kind == "ORACLE_ASSETS_PREPARED")
@@ -1197,7 +1206,7 @@ def _rebind_failed_rules(session, run, specs, llm, report) -> int:
 
 
 def retry_generic_run(session: Session, run: RunModel, settings: Settings, defer_continuation: bool = False) -> RunModel:
-    report_uri = (run.result_json or {}).get("audit_report_blob")
+    report_uri = (project(session, run).result_json or {}).get("audit_report_blob")
     if not report_uri:
         redirect = (
             session.query(EventModel)
@@ -1246,7 +1255,7 @@ def _latest_payload(session: Session, run_id: str, kind: str) -> Dict[str, Any]:
 
 def _create_run(session: Session, spec_id: str, settings: Settings) -> RunModel:
     _specs(session, spec_id)  # 校验 spec 存在且已确认；非法则抛 WorkflowError
-    run = RunModel(id=str(uuid.uuid4()), spec_id=spec_id, status="NEW", current_node="created")
+    run = RunModel(id=str(uuid.uuid4()), spec_id=spec_id)
     session.add(run)
     session.flush()
     specification = session.get(SpecificationModel, spec_id)
@@ -1327,7 +1336,7 @@ def approve_generic_rules(
     llm=None,
     defer_continuation: bool = False,
 ) -> RunModel:
-    if run.status != "WAITING_APPROVAL":
+    if project(session, run).status != "WAITING_APPROVAL":
         raise WorkflowError("Run is not waiting for rule approval")
     pending = {rule.rule_hash: rule for rule in _pending_rules(session, run.id)}
     if not decisions or any(rule_hash not in pending for rule_hash in decisions):
@@ -1366,14 +1375,14 @@ def approve_generic_rules(
 
 
 def confirm_generic_test_results(session: Session, run: RunModel, approver: str) -> RunModel:
-    if run.status != "WAITING_TEST_APPROVAL":
+    if project(session, run).status != "WAITING_TEST_APPROVAL":
         raise WorkflowError("Run is not waiting for test result confirmation")
-    summary = (run.result_json or {}).get("audit_summary", {})
+    summary = (project(session, run).result_json or {}).get("audit_summary", {})
     if not summary.get("all_passed"):
         raise WorkflowError("Test results can only be confirmed after all Oracle checks pass")
     if summary.get("coverage_complete") is False:
         raise WorkflowError("Test results cannot be confirmed while validation rules remain uncovered")
-    report_uri = run.result_json.get("audit_report_blob", "")
+    report_uri = (project(session, run).result_json or {}).get("audit_report_blob", "")
     object_hash = hashlib.sha256(f"{run.id}:{report_uri}".encode()).hexdigest()
     session.add(
         ApprovalModel(
@@ -1403,7 +1412,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     max_attempts = int(resolved_budget.get("max_retries", 3))
     # 自愈窗口按本轮续跑的起始 attempt 算：reaudit/重试时 run.attempt 可能已是 3+，
     # 用绝对值比较（attempt < max_attempts）会让重审直接失去自愈机会
-    first_attempt = attempt_base or (run.attempt + 1)
+    first_attempt = attempt_base or (project(session, run).attempt + 1)
     schema_payload = _latest_payload(session, run.id, "SCHEMA_ASSIGNED")["tables"]
     schemas = {code: [item for item in items] for code, items in schema_payload.items()}
     cross = _latest_payload(session, run.id, "CROSS_RULES_ASSIGNED")
@@ -1424,7 +1433,7 @@ def _continue_generic_run(session: Session, run: RunModel, settings: Settings, l
     session.commit()
     audit_cases = _audit_stage(session, run, specs, llm, rules, golden_records, plans, concurrency=concurrency)
     session.commit()
-    attempt = run.attempt + 1
+    attempt = project(session, run).attempt + 1
     append_event(session, run, "AUDIT_STARTED", "oracle_executor", {"attempt": attempt})
     schema_models = {code: [item for item in items] for code, items in schema_payload.items()}
     from .generic_domain import GeneratorBinding, SchemaBinding
@@ -1555,7 +1564,7 @@ def continue_generic_run(session: Session, run: RunModel, settings: Settings, ll
     try:
         return _continue_generic_run(session, run, settings, llm, generation_budget, attempt_base)
     except Exception as exc:
-        fallback_stage = run.current_node or "oracle_executor"
+        fallback_stage = project(session, run).current_node or "oracle_executor"
         append_event(
             session,
             run,
