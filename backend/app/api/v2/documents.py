@@ -1,13 +1,18 @@
 import hashlib
-import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import db_session
+from app.assets.code_sets.service import (
+    auto_link_all_references,
+    extract_code_sets_for_block,
+    extract_parallel_for_blocks,
+)
 from app.infra.asset_models import (
     DocumentArchitectureModel,
     FieldCodeReferenceModel,
@@ -16,19 +21,15 @@ from app.infra.asset_models import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.assets.code_sets.service import (
-    auto_link_all_references,
-    extract_code_sets_for_block,
-    extract_parallel_for_blocks,
-)
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
+from app.infra.task_runner import task_runner
+from app.ingestion.extractors import extract_document
+from app.ingestion.import_progress import ensure as progress_ensure
 from app.ingestion.import_progress import finish as progress_finish
 from app.ingestion.import_progress import snapshot as progress_snapshot
-from app.ingestion.import_progress import ensure as progress_ensure
 from app.ingestion.import_progress import start as progress_start
 from app.ingestion.import_progress import update as progress_update
-from app.ingestion.extractors import extract_document
 from app.ingestion.spec_quality import inspect_block
 from app.ingestion.structure_service import (
     analyze_document_structure,
@@ -169,7 +170,6 @@ def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True)
             session.commit()
             document_id = document.id
     if not prepare:
-        # 只落库，结构检查与切块交给 prepare_document_work 在后台做
         with SessionLocal() as session:
             return session.get(SourceDocumentModel, document_id)
     inspect_document_overview(document_id, settings, force=reimport_deleted)
@@ -185,11 +185,7 @@ def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True)
 
 
 def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool = False) -> None:
-    """后台执行"结构检查 + 初步切块"，并把每一步写进进度。
-
-    从 ingest_uploaded_file 里拆出来，是为了让上传请求立刻返回，
-    前端能轮询到"现在到底在做什么"。
-    """
+    """后台执行“结构检查 + 初步切块”，并把每一步写进进度与 Bus 广播。"""
     progress_update(
         document_id,
         stage=2,
@@ -206,8 +202,6 @@ def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool 
         document = session.get(SourceDocumentModel, document_id)
         status = document.status if document else ""
     if status == "OVERVIEW_FAILED":
-        # 体检只是个前置判断，切块本身按文件类型走确定性路径，
-        # 所以这里继续往下走，让切块阶段的 AI 决策仍然有机会纠正结构。
         progress_update(
             document_id,
             detail="结构体检未完成，继续按文件类型切块",
@@ -242,10 +236,7 @@ def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool 
 
 @router.post("", status_code=201)
 async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """保存文件后立即返回，结构检查与切块放到后台线程跑。
-
-    这样前端才有东西可以轮询：不然一个请求闷几十秒，界面只能干等。
-    """
+    """保存文件后立即返回，结构检查与切块交给统一后台 TaskRunner。"""
     content = await file.read()
     document = ingest_uploaded_file(file.filename, content, prepare=False)
     already_ready = document.status in {"UPLOADED", "EXTRACTED", "EXTRACTION_PARTIAL", "STRUCTURE_REVIEWED"} and document.block_count
@@ -261,116 +252,104 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         log=f"已保存 {document.file_name}（{len(content) // 1024} KB）",
     )
     settings = get_settings()
-
-    def _worker() -> None:
-        try:
-            prepare_document_work(document.id, settings)
-        except Exception:  # noqa: BLE001
-            # 具体原因已经在 prepare_document_work 里写进进度，这里只保证线程不炸
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+    task_runner().submit(f"doc:prepare:{document.id}", prepare_document_work, document.id, settings)
     return {**document_summary(document), "processing": True}
 
 
 @router.get("")
-def list_documents() -> list:
-    with SessionLocal() as session:
-        rows = (
-            session.query(SourceDocumentModel)
-            .filter(SourceDocumentModel.status != "DELETED")
-            .order_by(SourceDocumentModel.created_at.desc())
-            .all()
-        )
-        return [document_summary(row) for row in rows]
+def list_documents(session: Session = Depends(db_session)) -> list:
+    rows = (
+        session.query(SourceDocumentModel)
+        .filter(SourceDocumentModel.status != "DELETED")
+        .order_by(SourceDocumentModel.created_at.desc())
+        .all()
+    )
+    return [document_summary(row) for row in rows]
 
 
 @router.delete("/{document_id}")
-def delete_document(document_id: str) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-        document.status = "DELETED"
-        session.commit()
-        return {"id": document.id, "status": document.status, "assets_preserved": True}
+def delete_document(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    document = session.get(SourceDocumentModel, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    document.status = "DELETED"
+    session.commit()
+    return {"id": document.id, "status": document.status, "assets_preserved": True}
 
 
 @router.get("/{document_id}")
-def document_detail(document_id: str) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        row = session.get(SourceDocumentModel, document_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Document not found")
-        blocks = (
-            session.query(RawBlockModel)
-            .filter(RawBlockModel.document_id == document_id)
-            .order_by(RawBlockModel.ordinal)
-            .all()
-        )
-        return {
-            **document_summary(row),
-            "blocks": [
-                {
-                    "id": block.id,
-                    "ordinal": block.ordinal,
-                    "block_type": block.block_type,
-                    "candidate_role": block.content_json.get(
-                        "candidate_role",
-                        "CODE_SET" if block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} else "TABLE_METADATA",
-                    ),
-                    "table_name": block.content_json.get("table_name", ""),
-                    "source_locator": block.source_locator,
-                    "raw_hash": block.raw_hash,
-                    "eligible": block.content_json.get("eligible", True),
-                    "reason": block.content_json.get("reason", ""),
-                    "field_count": block.content_json.get("field_count"),
-                    "inline_code_count": len(block.content_json.get("inline_code_sets", [])),
-                    "superseded": block.content_json.get("superseded", False),
-                    "column_mapping": block.content_json.get("column_mapping", {}),
-                    "human_required": block.content_json.get("human_required", False),
-                    "structure_warnings": block.content_json.get("structure_warnings", block.content_json.get("parse_warnings", [])),
-                    "quality_issues": block.content_json.get("quality_issues", []),
-                }
-                for block in blocks
-            ],
-        }
+def document_detail(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    row = session.get(SourceDocumentModel, document_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    blocks = (
+        session.query(RawBlockModel)
+        .filter(RawBlockModel.document_id == document_id)
+        .order_by(RawBlockModel.ordinal)
+        .all()
+    )
+    return {
+        **document_summary(row),
+        "blocks": [
+            {
+                "id": block.id,
+                "ordinal": block.ordinal,
+                "block_type": block.block_type,
+                "candidate_role": block.content_json.get(
+                    "candidate_role",
+                    "CODE_SET" if block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} else "TABLE_METADATA",
+                ),
+                "table_name": block.content_json.get("table_name", ""),
+                "source_locator": block.source_locator,
+                "raw_hash": block.raw_hash,
+                "eligible": block.content_json.get("eligible", True),
+                "reason": block.content_json.get("reason", ""),
+                "field_count": block.content_json.get("field_count"),
+                "inline_code_count": len(block.content_json.get("inline_code_sets", [])),
+                "superseded": block.content_json.get("superseded", False),
+                "column_mapping": block.content_json.get("column_mapping", {}),
+                "human_required": block.content_json.get("human_required", False),
+                "structure_warnings": block.content_json.get("structure_warnings", block.content_json.get("parse_warnings", [])),
+                "quality_issues": block.content_json.get("quality_issues", []),
+            }
+            for block in blocks
+        ],
+    }
 
 
 @router.get("/{document_id}/progress")
-def document_progress(document_id: str) -> Dict[str, Any]:
-    """前端轮询用：既给进程内阶段，也给库里的真实计数。"""
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-        block_total = (
-            session.query(RawBlockModel)
-            .filter(RawBlockModel.document_id == document_id)
-            .count()
-        )
-        table_total = (
-            session.query(TableMetadataModel)
-            .filter(TableMetadataModel.document_id == document_id)
-            .count()
-        )
-        field_total = (
-            session.query(FieldMetadataModel)
+def document_progress(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    """前端进度视图：既给进程内阶段，也给库里的真实计数。"""
+    document = session.get(SourceDocumentModel, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    block_total = (
+        session.query(RawBlockModel)
+        .filter(RawBlockModel.document_id == document_id)
+        .count()
+    )
+    table_total = (
+        session.query(TableMetadataModel)
+        .filter(TableMetadataModel.document_id == document_id)
+        .count()
+    )
+    field_total = (
+        session.query(FieldMetadataModel)
+        .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+        .filter(TableMetadataModel.document_id == document_id)
+        .count()
+    )
+    code_set_total = len(
+        {
+            row.code_set_id
+            for row in session.query(FieldCodeReferenceModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
             .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
             .filter(TableMetadataModel.document_id == document_id)
-            .count()
-        )
-        code_set_total = len(
-            {
-                row.code_set_id
-                for row in session.query(FieldCodeReferenceModel)
-                .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-                .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
-                .filter(TableMetadataModel.document_id == document_id)
-                .all()
-            }
-        )
-        summary = document_summary(document)
+            .all()
+        }
+    )
+    summary = document_summary(document)
 
     snapshot = progress_snapshot(document_id)
     counters = {
@@ -380,7 +359,6 @@ def document_progress(document_id: str) -> Dict[str, Any]:
         "code_sets": code_set_total,
     }
     if snapshot:
-        # 库里的计数更准，优先；进程内的额外计数（进度分子分母、字节数）补在后面
         for key, value in snapshot.get("counters", {}).items():
             if key in {"blocks", "tables", "fields", "code_sets"}:
                 continue
@@ -418,12 +396,11 @@ def document_progress(document_id: str) -> Dict[str, Any]:
 
 
 @router.post("/{document_id}/prepare", status_code=202)
-def prepare_document(document_id: str) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-        file_name = document.file_name
+def prepare_document(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    document = session.get(SourceDocumentModel, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    file_name = document.file_name
     progress_ensure(document_id, file_name)
     progress_update(
         document_id,
@@ -433,14 +410,13 @@ def prepare_document(document_id: str) -> Dict[str, Any]:
         log="收到“重新检查并解析”请求",
     )
     settings = get_settings()
-
-    def _worker() -> None:
-        try:
-            prepare_document_work(document_id, settings, reimport_deleted=True)
-        except Exception:  # noqa: BLE001
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
+    task_runner().submit(
+        f"doc:prepare:{document_id}",
+        prepare_document_work,
+        document_id,
+        settings,
+        reimport_deleted=True,
+    )
     return {"status": "PREPARING", "document_id": document_id}
 
 
@@ -454,20 +430,20 @@ def reextract_blocks(document_id: str) -> Dict[str, Any]:
 
 
 @router.post("/{document_id}/analyze-structure")
-def analyze_structure(document_id: str) -> Dict[str, Any]:
+def analyze_structure(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
     try:
         architecture_id = analyze_document_structure(document_id, get_settings())
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    with SessionLocal() as session:
-        architecture = session.get(DocumentArchitectureModel, architecture_id)
-        return {
-            "id": architecture.id,
-            "status": architecture.status,
-            "plan": architecture.plan_json,
-            "warnings": architecture.warnings_json,
-            "trace": architecture.trace_json,
-        }
+    session.expire_all()
+    architecture = session.get(DocumentArchitectureModel, architecture_id)
+    return {
+        "id": architecture.id,
+        "status": architecture.status,
+        "plan": architecture.plan_json,
+        "warnings": architecture.warnings_json,
+        "trace": architecture.trace_json,
+    }
 
 
 def _run_extraction(document_id: str, block_ids: List[str], targets: Optional[List[str]], needs_analysis: bool) -> None:
@@ -519,31 +495,30 @@ def _run_extraction(document_id: str, block_ids: List[str], targets: Optional[Li
     if final_status == "EXTRACTION_FAILED":
         progress_finish(document_id, status="FAILED", detail=result["errors"][0]["error"] if result.get("errors") else "解析失败")
     else:
-        progress_finish(
-            document_id,
-            status="DONE",
-            detail=f"解析完成：{tables} 张报表、{code_sets} 张码表",
-        )
+        summary_text = f"解析完成：{tables} 张报表、{code_sets} 张码表"
         progress_update(
             document_id,
             counters={"tables": tables, "code_sets": code_sets, "blocks_done": total, "blocks_total": total},
-            log=f"解析完成：{tables} 张报表、{code_sets} 张码表",
+            log=summary_text,
         )
-        progress_finish(document_id, status="DONE", detail=f"解析完成：{tables} 张报表、{code_sets} 张码表")
+        progress_finish(document_id, status="DONE", detail=summary_text)
 
 
 @router.post("/{document_id}/extract-parallel", status_code=202)
-def extract_document_parallel(document_id: str, request: ParallelExtractRequest) -> Dict[str, Any]:
+def extract_document_parallel(
+    document_id: str,
+    request: ParallelExtractRequest,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
     if not request.block_ids:
         raise HTTPException(status_code=422, detail="Select at least one raw block")
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-        needs_analysis = document.status == "UPLOADED"
-        file_name = document.file_name
-        document.status = "EXTRACTING"
-        session.commit()
+    document = session.get(SourceDocumentModel, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    needs_analysis = document.status == "UPLOADED"
+    file_name = document.file_name
+    document.status = "EXTRACTING"
+    session.commit()
     progress_ensure(document_id, file_name)
     progress_update(
         document_id,
@@ -553,11 +528,14 @@ def extract_document_parallel(document_id: str, request: ParallelExtractRequest)
         counters={"blocks_total": len(request.block_ids), "blocks_done": 0},
         log=f"收到解析请求：{len(request.block_ids)} 个内容块",
     )
-    threading.Thread(
-        target=_run_extraction,
-        args=(document_id, list(request.block_ids), request.targets, needs_analysis),
-        daemon=True,
-    ).start()
+    task_runner().submit(
+        f"doc:extract:{document_id}",
+        _run_extraction,
+        document_id,
+        list(request.block_ids),
+        request.targets,
+        needs_analysis,
+    )
     return {
         "status": "EXTRACTING",
         "document_id": document_id,
@@ -566,58 +544,60 @@ def extract_document_parallel(document_id: str, request: ParallelExtractRequest)
 
 
 @router.get("/{document_id}/architecture")
-def get_architecture(document_id: str) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        architecture = latest_document_architecture(session, document_id)
-        if not architecture:
-            raise HTTPException(status_code=404, detail="No architecture analysis found")
-        return {
-            "id": architecture.id,
-            "status": architecture.status,
-            "plan": architecture.plan_json,
-            "warnings": architecture.warnings_json,
-            "trace": architecture.trace_json,
-        }
+def get_architecture(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    architecture = latest_document_architecture(session, document_id)
+    if not architecture:
+        raise HTTPException(status_code=404, detail="No architecture analysis found")
+    return {
+        "id": architecture.id,
+        "status": architecture.status,
+        "plan": architecture.plan_json,
+        "warnings": architecture.warnings_json,
+        "trace": architecture.trace_json,
+    }
 
 
 @router.patch("/{document_id}/blocks/{block_id}/structure")
-def adjust_structure(document_id: str, block_id: str, changes: Dict[str, Any]) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        block = session.get(RawBlockModel, block_id)
-        document = session.get(SourceDocumentModel, document_id)
-        if not block or block.document_id != document_id or not document:
-            raise HTTPException(status_code=404, detail="Raw block not found")
-        for key in ["block_type", "column_mapping", "human_required"]:
-            if key in changes:
-                if key == "block_type":
-                    setattr(block, key, changes[key])
-                else:
-                    block.content_json = {**block.content_json, key: changes[key]}
-        document.status = "STRUCTURE_REVIEWED"
-        architecture = DocumentArchitectureModel(
-            id=str(uuid.uuid4()),
-            document_id=document.id,
-            status="HUMAN_ADJUSTED",
-            plan_json={"block_id": block_id, "changes": changes},
-            warnings_json=[] if changes.get("human_required") is False else block.content_json.get("structure_warnings", []),
-            trace_json={"editor": changes.get("editor", "HUMAN")},
-        )
-        session.add(architecture)
-        session.commit()
-        return {"id": block.id, "block_type": block.block_type, "content_json": block.content_json}
+def adjust_structure(
+    document_id: str,
+    block_id: str,
+    changes: Dict[str, Any],
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    block = session.get(RawBlockModel, block_id)
+    document = session.get(SourceDocumentModel, document_id)
+    if not block or block.document_id != document_id or not document:
+        raise HTTPException(status_code=404, detail="Raw block not found")
+    for key in ["block_type", "column_mapping", "human_required"]:
+        if key in changes:
+            if key == "block_type":
+                setattr(block, key, changes[key])
+            else:
+                block.content_json = {**block.content_json, key: changes[key]}
+    document.status = "STRUCTURE_REVIEWED"
+    architecture = DocumentArchitectureModel(
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        status="HUMAN_ADJUSTED",
+        plan_json={"block_id": block_id, "changes": changes},
+        warnings_json=[] if changes.get("human_required") is False else block.content_json.get("structure_warnings", []),
+        trace_json={"editor": changes.get("editor", "HUMAN")},
+    )
+    session.add(architecture)
+    session.commit()
+    return {"id": block.id, "block_type": block.block_type, "content_json": block.content_json}
 
 
 @router.get("/{document_id}/blocks/{block_id}")
-def raw_block_detail(document_id: str, block_id: str) -> Dict[str, Any]:
-    with SessionLocal() as session:
-        block = session.get(RawBlockModel, block_id)
-        if not block or block.document_id != document_id:
-            raise HTTPException(status_code=404, detail="Raw block not found")
-        return {
-            "id": block.id,
-            "block_type": block.block_type,
-            "raw_content": block.raw_content,
-            "source_locator": block.source_locator,
-            "content_json": block.content_json,
-            "raw_hash": block.raw_hash,
-        }
+def raw_block_detail(document_id: str, block_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    block = session.get(RawBlockModel, block_id)
+    if not block or block.document_id != document_id:
+        raise HTTPException(status_code=404, detail="Raw block not found")
+    return {
+        "id": block.id,
+        "block_type": block.block_type,
+        "raw_content": block.raw_content,
+        "source_locator": block.source_locator,
+        "content_json": block.content_json,
+        "raw_hash": block.raw_hash,
+    }

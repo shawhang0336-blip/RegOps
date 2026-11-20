@@ -1,13 +1,14 @@
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
+from app.api.deps import db_session
 from app.infra.asset_models import SystemSettingModel
 from app.infra.config import get_settings
-from app.infra.db import SessionLocal
 from app.infra.llm import RealDesignLlm
 from app.infra.settings_store import DEFAULT_BUDGET, get_budget
 
@@ -23,14 +24,13 @@ class SettingRequest(BaseModel):
 
 
 @router.get("")
-def settings_view() -> Dict[str, Any]:
+def settings_view(session: Session = Depends(db_session)) -> Dict[str, Any]:
     settings = get_settings()
-    with SessionLocal() as session:
-        stored = {
-            row.key: {"value": row.value_json, "secret_reference": row.secret_reference}
-            for row in session.query(SystemSettingModel).all()
-        }
-        budget = get_budget(session)
+    stored = {
+        row.key: {"value": row.value_json, "secret_reference": row.secret_reference}
+        for row in session.query(SystemSettingModel).all()
+    }
+    budget = get_budget(session)
     return {
         "mysql": {"configured": bool(settings.database_url), "driver": settings.database_url.split(":", 1)[0]},
         "oracle": {"configured": bool(settings.oracle_sandbox_url)},
@@ -45,7 +45,7 @@ def settings_view() -> Dict[str, Any]:
 
 
 @router.put("/{key}")
-def save_setting(key: str, request: SettingRequest) -> Dict[str, Any]:
+def save_setting(key: str, request: SettingRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
     if key in READONLY_ENV_SETTINGS:
         raise HTTPException(
             status_code=422,
@@ -53,25 +53,23 @@ def save_setting(key: str, request: SettingRequest) -> Dict[str, Any]:
         )
     if key not in EDITABLE_SETTINGS:
         raise HTTPException(status_code=404, detail="Unknown setting")
-    with SessionLocal() as session:
-        row = session.get(SystemSettingModel, key)
-        if not row:
-            row = SystemSettingModel(key=key, value_json=request.value, secret_reference=request.secret_reference)
-            session.add(row)
-        else:
-            row.value_json = request.value
-            row.secret_reference = request.secret_reference
-        session.commit()
+    row = session.get(SystemSettingModel, key)
+    if not row:
+        row = SystemSettingModel(key=key, value_json=request.value, secret_reference=request.secret_reference)
+        session.add(row)
+    else:
+        row.value_json = request.value
+        row.secret_reference = request.secret_reference
+    session.commit()
     return {"key": key, "saved": True}
 
 
 @router.post("/test/{kind}")
-def test_connection(kind: str) -> Dict[str, Any]:
+def test_connection(kind: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
     settings = get_settings()
     try:
         if kind == "mysql":
-            with SessionLocal() as session:
-                row = session.execute(text("SELECT VERSION(), CURRENT_USER(), @@character_set_database")).one()
+            row = session.execute(text("SELECT VERSION(), CURRENT_USER(), @@character_set_database")).one()
             return {"kind": kind, "ok": True, "version": row[0], "user": row[1], "charset": row[2]}
         if kind == "oracle":
             if not settings.oracle_sandbox_url:

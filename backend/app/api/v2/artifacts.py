@@ -5,24 +5,31 @@
 让「这张表最终产出了什么」一眼可见。
 """
 
-from typing import Any, Dict, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.infra.asset_models import CodeSetModel, CodeValueModel, FieldMetadataModel, TableMetadataModel
-from app.kernel.blob_store import LocalBlobStore
-from app.policy.regops_plan import project
+from app.api.deps import db_session
+from app.assets.code_sets.oracle import code_set_compile_bindings, load_published_code_sets
 from app.engine.compiler import compile_where
+from app.engine.rules import RuleValidationError, validate_rule
+from app.infra.asset_models import (
+    CodeSetModel,
+    CodeValueModel,
+    FieldMetadataModel,
+    SourceDocumentModel,
+    TableMetadataModel,
+)
 from app.infra.config import get_settings
-from app.infra.db import SessionLocal
 from app.infra.domain import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.infra.identity import OPERATOR_PLACEHOLDER
 from app.infra.models import RuleModel, RunModel, SpecificationModel
-from app.engine.rules import RuleValidationError, validate_rule
+from app.kernel.blob_store import LocalBlobStore
+from app.policy.regops_plan import project
 
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])
 
@@ -74,9 +81,6 @@ def _rules_payload(session: Session, table: TableMetadataModel, run: RunModel) -
     # 尽力还原执行时的码表子查询形态：码表版本漂移或老批次缺上下文时回退为内联列表
     code_set_bindings = None
     try:
-        from app.assets.code_sets.oracle import code_set_compile_bindings, load_published_code_sets
-        from app.infra.models import SpecificationModel
-
         spec_model = session.get(SpecificationModel, run.spec_id)
         specs = [
             SpecDocument.model_validate(item)
@@ -116,112 +120,104 @@ def _rules_payload(session: Session, table: TableMetadataModel, run: RunModel) -
 
 
 @router.get("/rules")
-def all_table_rules() -> Dict[str, Any]:
-    """所有已生成表的规则总览：按表分组，每组带最近一次 run 的状态。
-
-    第二步的校验规则视图按「做了哪些表」组织，不暴露批次概念；
-    每张表的规则来自它最近一次产出规则的 run。
-    """
-    with SessionLocal() as session:
-        tables = session.query(TableMetadataModel).order_by(TableMetadataModel.table_code).all()
-        items: List[Dict[str, Any]] = []
-        for table in tables:
-            run = _latest_run_for_table(session, table.table_code)
-            if not run:
-                continue
-            rules = _rules_payload(session, table, run)
-            state = project(session, run)
-            result = state.result_json or {}
-            items.append(
-                {
-                    "table": {
-                        "id": table.id,
-                        "table_code": table.table_code,
-                        "table_name": table.table_name,
-                        "status": table.status,
-                    },
-                    "run": {
-                        "id": run.id,
-                        "status": state.status,
-                        "created_at": run.created_at.isoformat() if run.created_at else None,
-                    },
-                    "rules": rules,
-                    "active_count": sum(1 for rule in rules if rule["status"] != "SUPERSEDED"),
-                    "pending_count": sum(1 for rule in rules if rule["status"] == "PENDING"),
-                    "superseded_count": sum(1 for rule in rules if rule["status"] == "SUPERSEDED"),
-                    "precheck": result.get("oracle_precheck"),
-                }
-            )
-        # 最近有产出的表排前面，同批次的表按表代码稳定排序
-        items.sort(key=lambda item: (item["run"]["created_at"] or "", item["table"]["table_code"]), reverse=True)
-        return {"tables": items}
+def all_table_rules(session: Session = Depends(db_session)) -> Dict[str, Any]:
+    """所有已生成表的规则总览：按表分组，每组带最近一次 run 的状态。"""
+    tables = session.query(TableMetadataModel).order_by(TableMetadataModel.table_code).all()
+    items: List[Dict[str, Any]] = []
+    for table in tables:
+        run = _latest_run_for_table(session, table.table_code)
+        if not run:
+            continue
+        rules = _rules_payload(session, table, run)
+        state = project(session, run)
+        result = state.result_json or {}
+        items.append(
+            {
+                "table": {
+                    "id": table.id,
+                    "table_code": table.table_code,
+                    "table_name": table.table_name,
+                    "status": table.status,
+                },
+                "run": {
+                    "id": run.id,
+                    "status": state.status,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                },
+                "rules": rules,
+                "active_count": sum(1 for rule in rules if rule["status"] != "SUPERSEDED"),
+                "pending_count": sum(1 for rule in rules if rule["status"] == "PENDING"),
+                "superseded_count": sum(1 for rule in rules if rule["status"] == "SUPERSEDED"),
+                "precheck": result.get("oracle_precheck"),
+            }
+        )
+    items.sort(key=lambda item: (item["run"]["created_at"] or "", item["table"]["table_code"]), reverse=True)
+    return {"tables": items}
 
 
 @router.get("")
-def artifacts_status() -> Dict[str, Any]:
+def artifacts_status(session: Session = Depends(db_session)) -> Dict[str, Any]:
     """每张表最近一次生成的状态，用于列表显示（未生成/生成中/已验证/失败）。"""
-    with SessionLocal() as session:
-        # 聚合查询代替全表扫进内存：规则行会无限增长，前端又每 5 秒轮询
-        candidates = (
-            session.query(RuleModel.table_code, RuleModel.run_id, func.max(RuleModel.created_at))
-            .group_by(RuleModel.table_code, RuleModel.run_id)
-            .all()
+    candidates = (
+        session.query(RuleModel.table_code, RuleModel.run_id, func.max(RuleModel.created_at))
+        .group_by(RuleModel.table_code, RuleModel.run_id)
+        .all()
+    )
+    latest: Dict[str, str] = {}
+    newest_at: Dict[str, Any] = {}
+    for table_code, run_id, newest in candidates:
+        if table_code not in newest_at or (newest or datetime.min) > newest_at[table_code]:
+            newest_at[table_code] = newest or datetime.min
+            latest[table_code] = run_id
+    count_rows = (
+        session.query(RuleModel.run_id, RuleModel.table_code, func.count())
+        .filter(RuleModel.status != "SUPERSEDED")
+        .group_by(RuleModel.run_id, RuleModel.table_code)
+        .all()
+    )
+    rule_counts: Dict[str, Dict[str, int]] = {}
+    for run_id, table_code, count in count_rows:
+        rule_counts.setdefault(run_id, {})[table_code] = count
+    run_ids = set(latest.values())
+    runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
+    tables = session.query(TableMetadataModel).all()
+    doc_ids = {table.document_id for table in tables if table.document_id}
+    doc_names = (
+        {
+            row.id: row.file_name
+            for row in session.query(SourceDocumentModel).filter(SourceDocumentModel.id.in_(doc_ids)).all()
+        }
+        if doc_ids
+        else {}
+    )
+    result = []
+    for table in tables:
+        run_id = latest.get(table.table_code)
+        run = runs.get(run_id)
+        run_state = project(session, run) if run else None
+        run_result = (run_state.result_json or {}) if run_state else {}
+        summary = run_result.get("audit_summary") or {}
+        result.append(
+            {
+                "id": table.id,
+                "table_id": table.id,
+                "table_code": table.table_code,
+                "table_name": table.table_name,
+                "document_id": table.document_id,
+                "document_name": doc_names.get(table.document_id, ""),
+                "status": table.status,
+                "generated": run_id is not None,
+                "run_id": run_id,
+                "run_status": run_state.status if run_state else None,
+                "all_passed": summary.get("all_passed") if summary else None,
+                "created_at": run.created_at.isoformat() if run and run.created_at else None,
+                "ddl_generated": bool(run_result.get("ddl_blob") or run_result.get("oracle_ddl_blob")),
+                "rule_count": rule_counts.get(run_id, {}).get(table.table_code, 0) if run_id else 0,
+                "code_set_count": len(summary.get("code_set_record_counts") or {}),
+                "audit_case_count": summary.get("case_count"),
+            }
         )
-        latest: Dict[str, str] = {}
-        newest_at: Dict[str, Any] = {}
-        for table_code, run_id, newest in candidates:
-            if table_code not in newest_at or (newest or datetime.min) > newest_at[table_code]:
-                newest_at[table_code] = newest or datetime.min
-                latest[table_code] = run_id
-        # SUPERSEDED 是被去重替换掉的重复规则，不算有效规则数
-        count_rows = (
-            session.query(RuleModel.run_id, RuleModel.table_code, func.count())
-            .filter(RuleModel.status != "SUPERSEDED")
-            .group_by(RuleModel.run_id, RuleModel.table_code)
-            .all()
-        )
-        rule_counts: Dict[str, Dict[str, int]] = {}
-        for run_id, table_code, count in count_rows:
-            rule_counts.setdefault(run_id, {})[table_code] = count
-        run_ids = set(latest.values())
-        runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
-        tables = session.query(TableMetadataModel).all()
-        doc_names: Dict[str, str] = {}
-        for table in tables:
-            if table.document_id not in doc_names:
-                from app.infra.asset_models import SourceDocumentModel
-
-                doc = session.get(SourceDocumentModel, table.document_id)
-                doc_names[table.document_id] = doc.file_name if doc else ""
-        result = []
-        for table in tables:
-            run_id = latest.get(table.table_code)
-            run = runs.get(run_id)
-            run_state = project(session, run) if run else None
-            run_result = (run_state.result_json or {}) if run_state else {}
-            summary = run_result.get("audit_summary") or {}
-            result.append(
-                {
-                    "id": table.id,
-                    "table_id": table.id,
-                    "table_code": table.table_code,
-                    "table_name": table.table_name,
-                    "document_id": table.document_id,
-                    "document_name": doc_names.get(table.document_id, ""),
-                    "status": table.status,
-                    "generated": run_id is not None,
-                    "run_id": run_id,
-                    "run_status": run_state.status if run_state else None,
-                    "all_passed": summary.get("all_passed") if summary else None,
-                    "created_at": run.created_at.isoformat() if run and run.created_at else None,
-                    # 清单直接展示产物状态，避免前端逐表请求详情后才能统计。
-                    "ddl_generated": bool(run_result.get("ddl_blob") or run_result.get("oracle_ddl_blob")),
-                    "rule_count": rule_counts.get(run_id, {}).get(table.table_code, 0) if run_id else 0,
-                    "code_set_count": len(summary.get("code_set_record_counts") or {}),
-                    "audit_case_count": summary.get("case_count"),
-                }
-            )
-        return {"tables": result}
+    return {"tables": result}
 
 
 class RuleEditRequest(BaseModel):
@@ -243,134 +239,124 @@ def _spec_for_rule(session: Session, rule: RuleModel) -> SpecDocument:
 
 
 @router.patch("/rules/{rule_row_id}")
-def edit_rule(rule_row_id: str, request: RuleEditRequest) -> Dict[str, Any]:
-    """改一条规则的参数，保存后由前端决定要不要重新生成验证。
-
-    只允许改 params（长度、枚举值、格式、条件），不允许换算子或字段——
-    那是另一条规则，改了会让审批记录失去意义。
-    """
-    with SessionLocal() as session:
-        row = session.get(RuleModel, rule_row_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Rule not found")
-        definition = RuleDefinition.model_validate(row.definition_json)
-        spec = _spec_for_rule(session, row)
-        previous = definition.model_dump()
-        definition.params = dict(request.params)
-        try:
-            validate_rule(definition, spec)
-        except RuleValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        definition.rule_hash = calculate_rule_hash(definition, spec.source_sha256)
-        row.definition_json = definition.model_dump()
-        row.rule_hash = definition.rule_hash
-        session.commit()
-        return {
-            "rule": {
-                "rule_key": definition.rule_key,
-                "field": definition.field,
-                "operator": definition.operator,
-                "params": definition.params,
-                "rule_hash": definition.rule_hash,
-            },
-            "previous_params": previous.get("params"),
-            "editor": request.editor,
-            "reason": request.reason,
-        }
+def edit_rule(rule_row_id: str, request: RuleEditRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    """改一条规则的参数，保存后由前端决定要不要重新生成验证。"""
+    row = session.get(RuleModel, rule_row_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    definition = RuleDefinition.model_validate(row.definition_json)
+    spec = _spec_for_rule(session, row)
+    previous = definition.model_dump()
+    definition.params = dict(request.params)
+    try:
+        validate_rule(definition, spec)
+    except RuleValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    definition.rule_hash = calculate_rule_hash(definition, spec.source_sha256)
+    row.definition_json = definition.model_dump()
+    row.rule_hash = definition.rule_hash
+    session.commit()
+    return {
+        "rule": {
+            "rule_key": definition.rule_key,
+            "field": definition.field,
+            "operator": definition.operator,
+            "params": definition.params,
+            "rule_hash": definition.rule_hash,
+        },
+        "previous_params": previous.get("params"),
+        "editor": request.editor,
+        "reason": request.reason,
+    }
 
 
 @router.get("/{table_id}")
-def table_artifacts(table_id: str) -> Dict[str, Any]:
+def table_artifacts(table_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
     settings = get_settings()
     store = LocalBlobStore(settings.blob_dir)
-    with SessionLocal() as session:
-        table = session.get(TableMetadataModel, table_id)
-        if not table:
-            raise HTTPException(status_code=404, detail="Metadata table not found")
-        fields = (
-            session.query(FieldMetadataModel)
-            .filter(FieldMetadataModel.table_id == table_id)
-            .order_by(FieldMetadataModel.sort_order)
-            .all()
-        )
-        run = _latest_run_for_table(session, table.table_code)
+    table = session.get(TableMetadataModel, table_id)
+    if not table:
+        raise HTTPException(status_code=404, detail="Metadata table not found")
+    fields = (
+        session.query(FieldMetadataModel)
+        .filter(FieldMetadataModel.table_id == table_id)
+        .order_by(FieldMetadataModel.sort_order)
+        .all()
+    )
+    run = _latest_run_for_table(session, table.table_code)
 
-        payload: Dict[str, Any] = {
-            "table": {
-                "id": table.id,
-                "table_code": table.table_code,
-                "table_name": table.table_name,
-                "field_count": len(fields),
-                "status": table.status,
-            },
-            "run": None,
-            "rules": [],
-            "rule_groups": {},
-            "ddl": None,
-            "code_sets": [],
-            "precheck": None,
-            "audit": None,
-        }
-        if not run:
-            return payload
-
-        state = project(session, run)
-        payload["run"] = {
-            "id": run.id,
-            "status": state.status,
-            "current_node": state.current_node,
-            "created_at": run.created_at.isoformat() if run.created_at else None,
-        }
-
-        # 规则：核心产物，按算子分组，每条带原文依据和编译后的 SQL
-        rules = _rules_payload(session, table, run)
-        groups: Dict[str, int] = {}
-        for rule in rules:
-            groups[rule["operator"]] = groups.get(rule["operator"], 0) + 1
-        payload["rules"] = rules
-        payload["rule_groups"] = groups
-
-        # 表结构：建表 SQL（Oracle 为主，MySQL 备用）
-        result = state.result_json or {}
-        ddl_uri = result.get("ddl_blob") or result.get("oracle_ddl_blob")
-        if ddl_uri:
-            payload["ddl"] = _blob_text(store, ddl_uri)
-
-        # 码表迁移：这几张码表灌了多少条进 Oracle 沙箱
-        summary = result.get("audit_summary") or {}
-        record_counts = summary.get("code_set_record_counts") or {}
-        for code, count in record_counts.items():
-            row = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
-            value_count = (
-                session.query(CodeValueModel)
-                .filter(CodeValueModel.code_set_id == row.id, CodeValueModel.enabled.is_(True))
-                .count()
-                if row
-                else 0
-            )
-            payload["code_sets"].append(
-                {
-                    "code": code,
-                    "name": row.name if row else code,
-                    "value_count": value_count,
-                    "oracle_records": count,
-                    "oracle_table": (summary.get("code_set_tables") or {}).get(code),
-                }
-            )
-
-        payload["precheck"] = result.get("oracle_precheck")
-        # 验证结果
-        if summary:
-            payload["audit"] = {
-                "all_passed": summary.get("all_passed"),
-                "case_count": summary.get("case_count"),
-                "active_rule_count": summary.get("active_rule_count"),
-                "coverage_rate": summary.get("coverage_rate"),
-                "coverage_complete": summary.get("coverage_complete"),
-                "false_negative_count": summary.get("false_negative_count"),
-                "false_positive_count": summary.get("false_positive_count"),
-                "co_triggered_count": summary.get("co_triggered_count"),
-                "record_counts": summary.get("record_counts"),
-                "audit_report_blob": result.get("audit_report_blob"),
-            }
+    payload: Dict[str, Any] = {
+        "table": {
+            "id": table.id,
+            "table_code": table.table_code,
+            "table_name": table.table_name,
+            "field_count": len(fields),
+            "status": table.status,
+        },
+        "run": None,
+        "rules": [],
+        "rule_groups": {},
+        "ddl": None,
+        "code_sets": [],
+        "precheck": None,
+        "audit": None,
+    }
+    if not run:
         return payload
+
+    state = project(session, run)
+    payload["run"] = {
+        "id": run.id,
+        "status": state.status,
+        "current_node": state.current_node,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+    rules = _rules_payload(session, table, run)
+    groups: Dict[str, int] = {}
+    for rule in rules:
+        groups[rule["operator"]] = groups.get(rule["operator"], 0) + 1
+    payload["rules"] = rules
+    payload["rule_groups"] = groups
+
+    result = state.result_json or {}
+    ddl_uri = result.get("ddl_blob") or result.get("oracle_ddl_blob")
+    if ddl_uri:
+        payload["ddl"] = _blob_text(store, ddl_uri)
+
+    summary = result.get("audit_summary") or {}
+    record_counts = summary.get("code_set_record_counts") or {}
+    for code, count in record_counts.items():
+        row = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+        value_count = (
+            session.query(CodeValueModel)
+            .filter(CodeValueModel.code_set_id == row.id, CodeValueModel.enabled.is_(True))
+            .count()
+            if row
+            else 0
+        )
+        payload["code_sets"].append(
+            {
+                "code": code,
+                "name": row.name if row else code,
+                "value_count": value_count,
+                "oracle_records": count,
+                "oracle_table": (summary.get("code_set_tables") or {}).get(code),
+            }
+        )
+
+    payload["precheck"] = result.get("oracle_precheck")
+    if summary:
+        payload["audit"] = {
+            "all_passed": summary.get("all_passed"),
+            "case_count": summary.get("case_count"),
+            "active_rule_count": summary.get("active_rule_count"),
+            "coverage_rate": summary.get("coverage_rate"),
+            "coverage_complete": summary.get("coverage_complete"),
+            "false_negative_count": summary.get("false_negative_count"),
+            "false_positive_count": summary.get("false_positive_count"),
+            "co_triggered_count": summary.get("co_triggered_count"),
+            "record_counts": summary.get("record_counts"),
+            "audit_report_blob": result.get("audit_report_blob"),
+        }
+    return payload

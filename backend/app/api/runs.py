@@ -1,7 +1,6 @@
 """装配运行批次路由（`/api/runs/*`）：创建、查询、清理、人工审批、测试确认、重试重审与回放。"""
 
 import json
-import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -17,13 +16,13 @@ from app.api.deps import (
     run_tables,
     run_tables_from_content,
     run_view,
+    spawn_run_driver,
 )
 from app.engine.oracle import OracleSandbox
 from app.engine.workflow import (
     _pending_rules,
     approve_generic_rules,
     confirm_generic_test_results,
-    drive,
     retry_generic_run,
     start_generic_run,
 )
@@ -35,7 +34,6 @@ from app.infra.asset_models import (
     SchemaDefinitionModel,
 )
 from app.infra.config import get_settings
-from app.infra.db import SessionLocal
 from app.infra.errors import WorkflowError
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.blob_store import LocalBlobStore
@@ -119,29 +117,8 @@ def _latest_event_tables(events: List[EventModel], kind: str) -> Dict:
 
 
 def _spawn_run_continuation(run_id: str) -> None:
-    """在后台线程里继续跑造数 + Oracle 验证，让审批/重试/重审接口立即返回。"""
-    settings = get_settings()
-
-    def _run():
-        try:
-            with SessionLocal() as session:
-                run = session.get(RunModel, run_id)
-                if run and project(session, run).status in {"READY_TO_AUDIT", "RUNNING"}:
-                    drive(session, run, settings)
-        except Exception:
-            with SessionLocal() as session:
-                run = session.get(RunModel, run_id)
-                if run and project(session, run).status in {"READY_TO_AUDIT", "RUNNING"}:
-                    append_event(
-                        session,
-                        run,
-                        "RUN_FAILED",
-                        "background_executor",
-                        {"node": "background_executor", "result": {"error": "后台续跑线程异常退出"}},
-                    )
-                    session.commit()
-
-    threading.Thread(target=_run, daemon=True).start()
+    """在统一后台任务执行器里继续跑造数 + Oracle 验证，让审批/重试/重审接口立即返回。"""
+    spawn_run_driver(run_id, get_settings(), allowed_statuses=("READY_TO_AUDIT", "RUNNING"))
 
 
 # ── Run 生命周期路由 ──────────────────────────────────────────────────────────

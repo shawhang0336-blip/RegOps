@@ -1,257 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { useEventStream, watchDocumentProgress } from '../hooks/useEventStream.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { SourceLocatorTag, StatusBadge, formatTime, friendlyError } from './SharedUI.jsx'
-
-const IMPORT_STAGES = [
-  ['校验并保存文件', '检查格式、大小和文件指纹'],
-  ['检查整份文件结构', 'AI 判断文档结构与切块方式'],
-  ['程序执行初步切块', '按文件类型生成初始内容块'],
-  ['提取报表字段和码表', '自动解析并复核，完成后直接进入结果'],
-]
-
-function CurrentFilePicker({ documents, currentId, busy, onSelect }) {
-  const [open, setOpen] = useState(false)
-  const boxRef = useRef(null)
-
-  useEffect(() => {
-    if (!open) return undefined
-    const onPointerDown = (event) => {
-      if (boxRef.current && !boxRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('mousedown', onPointerDown)
-    document.addEventListener('keydown', onKeyDown)
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown)
-      document.removeEventListener('keydown', onKeyDown)
-    }
-  }, [open])
-
-  const current = documents.find((doc) => doc.id === currentId)
-  const disabled = busy || !documents.length
-
-  return (
-    <div className="file-picker" ref={boxRef}>
-      <button
-        type="button"
-        className={`file-picker-trigger ${open ? 'open' : ''}`}
-        disabled={disabled}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-      >
-        <span className="file-picker-name">{current ? current.file_name : '还没有选择文件'}</span>
-        <span className="file-picker-caret" aria-hidden="true" />
-      </button>
-      {open && (
-        <ul className="file-picker-menu" role="listbox">
-          {documents.map((doc) => (
-            <li key={doc.id}>
-              <button
-                type="button"
-                role="option"
-                aria-selected={doc.id === currentId}
-                className={`file-picker-option ${doc.id === currentId ? 'selected' : ''}`}
-                onClick={() => {
-                  onSelect(doc.id)
-                  setOpen(false)
-                }}
-              >
-                <span className="file-picker-option-name">{doc.file_name}</span>
-                <span className="file-picker-option-meta">
-                  {[String(doc.file_type || '').toUpperCase(), `${doc.block_count ?? 0} 个内容块`, formatTime(doc.created_at)]
-                    .filter(Boolean)
-                    .join(' · ')}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  )
-}
-
-
-async function fileSha256(file) {
-  const content = await file.arrayBuffer()
-  const digest = await window.crypto.subtle.digest('SHA-256', content)
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
-}
-
-function updateImportProgress(current, document) {
-  if (!current || !document) return current
-  if (document.status === 'OVERVIEW_REQUIRED') return { ...current, stage: 1, status: 'WORKING' }
-  if (['OVERVIEW_REVIEWED', 'OVERVIEW_NEEDS_REVIEW'].includes(document.status)) return { ...current, stage: 2, status: 'WORKING' }
-  if (document.status === 'OVERVIEW_FAILED') return { ...current, stage: 1, status: 'FAILED' }
-  if (document.status === 'BLOCK_EXTRACTION_FAILED') return { ...current, stage: 2, status: 'FAILED' }
-  if (document.status === 'EXTRACTING') return { ...current, stage: 3, status: 'WORKING' }
-  if (document.status === 'EXTRACTED') return { ...current, stage: 4, status: 'DONE' }
-  if (['EXTRACTION_PARTIAL', 'EXTRACTION_FAILED'].includes(document.status)) return { ...current, stage: 3, status: 'FAILED' }
-  if (document.status === 'UPLOADED' || document.status === 'STRUCTURE_REVIEWED') {
-    if (current.awaitReextract) return { ...current, stage: 2, status: 'WORKING' }
-    return current.autoParse
-      ? { ...current, stage: 3, status: 'WORKING' }
-      : { ...current, stage: 4, status: 'DONE' }
-  }
-  return current
-}
-
-const COLUMN_MAPPING_FIELDS = [
-  ['field_cn', '字段中文名列'],
-  ['field_en', '字段英文名列'],
-  ['field_definition', '字段定义列'],
-  ['check_text_raw', '字段校验列'],
-  ['data_type', '数据类型列'],
-  ['length', '字段长度列'],
-]
-
-async function pollImportProgress(documentId, onUpdate, { interval = 1200, timeout = 20 * 60 * 1000 } = {}) {
-  const startedAt = Date.now()
-  let snapshot = null
-  while (Date.now() - startedAt < timeout) {
-    const next = await v2(`/documents/${documentId}/progress`).catch(() => null)
-    if (next) {
-      snapshot = next
-      onUpdate?.(next)
-      if (!next.processing) return next
-    }
-    await new Promise((resolve) => setTimeout(resolve, interval))
-  }
-  return snapshot
-}
-
-function formatDuration(seconds) {
-  const total = Math.max(0, Math.round(seconds || 0))
-  if (total < 60) return `${total}s`
-  const minutes = Math.floor(total / 60)
-  const rest = total % 60
-  return `${minutes}m${String(rest).padStart(2, '0')}s`
-}
-
-function ImportProgressPanel({ progress, onClose }) {
-  if (!progress) return null
-
-  const stages = progress.stages?.length
-    ? progress.stages
-    : IMPORT_STAGES.map(([label, description], index) => ({ index: index + 1, label, description }))
-
-  const stage = Number(progress.stage || 0)
-  const counters = progress.counters || {}
-  const status = String(progress.status || 'WORKING').toUpperCase()
-  const working = status === 'WORKING'
-  const failed = status === 'FAILED'
-
-  const blocksTotal = Number(counters.blocks_total || counters.blocks || 0)
-  const blocksDone = Number(counters.blocks_done || 0)
-  const ratio = blocksTotal > 0 ? Math.min(1, blocksDone / blocksTotal) : 0
-
-  // 阶段内按已处理块数推进；阶段整体占 25%，第 4 阶段再多分 25% 给块进度
-  const base = Math.max(0, stage - 1) * 25
-  const inStage = stage === 4 && blocksTotal > 0 ? ratio * 25 : working ? 8 : (status === 'READY' ? 25 : 0)
-  const percent = Math.min(100, Math.round(status === 'DONE' ? 100 : base + inStage))
-
-  const headline = status === 'DONE'
-    ? '解析完成'
-    : failed
-      ? '解析已中断'
-      : status === 'READY'
-        ? '结构已就绪，等待解析'
-        : working
-          ? `正在${stages[Math.min(stage, stages.length) - 1]?.label || '处理'}`
-          : '准备中'
-
-  return (
-    <section className={`import-progress-panel ${status.toLowerCase()}`} aria-live="polite">
-      <header className="import-progress-head">
-        <div className="import-progress-title">
-          <strong>{headline}</strong>
-          <span className="import-progress-file">{progress.file_name}</span>
-        </div>
-        <div className="import-progress-meta">
-          {progress.elapsed > 0 && <span className="import-timer">{formatDuration(progress.elapsed)}</span>}
-          {!working && <button type="button" className="button-link" onClick={onClose}>关闭</button>}
-        </div>
-      </header>
-
-      <div className="import-progress-bar" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
-        <div className={`import-progress-fill ${working ? 'striped' : ''}`} style={{ width: `${percent}%` }} />
-      </div>
-
-      <div className="import-progress-summary">
-        <span>{progress.detail || '—'}</span>
-        <div className="import-progress-counters">
-          {counters.blocks ? <span>{counters.blocks} 个内容块</span> : null}
-          {counters.tables ? <span>{counters.tables} 张报表</span> : null}
-          {counters.fields ? <span>{counters.fields} 个字段</span> : null}
-          {counters.code_sets ? <span>{counters.code_sets} 张码表</span> : null}
-        </div>
-      </div>
-
-      <ol className="import-timeline">
-        {stages.map((item) => {
-          const index = item.index
-          const state = status === 'DONE' || index < stage
-            ? 'done'
-            : index === stage
-              ? (working ? 'working' : failed ? 'failed' : 'done')
-              : 'pending'
-          const stageLogs = (progress.logs || []).filter((entry) => Number(entry.stage) === index)
-          return (
-            <li className={`import-timeline-item ${state}`} key={item.index}>
-              <span className="import-timeline-dot" aria-hidden="true">
-                {state === 'done' ? '✓' : state === 'failed' ? '!' : ''}
-              </span>
-              <div className="import-timeline-body">
-                <div className="import-timeline-row">
-                  <strong>{item.label}</strong>
-                  <em>{state === 'done' ? '完成' : state === 'working' ? '进行中' : state === 'failed' ? '中断' : '等待'}</em>
-                </div>
-                <small>{item.description}</small>
-                {index === 4 && blocksTotal > 0 && (
-                  <div className="import-timeline-detail">
-                    <span>已处理 {blocksDone}/{blocksTotal} 个内容块</span>
-                    <div className="import-mini-bar"><div style={{ width: `${Math.round(ratio * 100)}%` }} /></div>
-                  </div>
-                )}
-                {stageLogs.length > 0 && (
-                  <ul className="import-log">
-                    {stageLogs.slice(-4).map((entry, logIndex) => (
-                      <li key={logIndex}>{entry.text}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </li>
-          )
-        })}
-      </ol>
-
-      {progress.logs?.length > 0 && (
-        <details className="import-progress-log">
-          <summary>查看完整记录（{progress.logs.length} 条）</summary>
-          <ul>
-            {progress.logs.map((entry, index) => (
-              <li key={index}>{entry.text}</li>
-            ))}
-          </ul>
-        </details>
-      )}
-
-      {failed && (
-        <p className="import-progress-foot">
-          已保存的内容不会丢失。处理后可以重新点击“解析当前文件”。
-        </p>
-      )}
-    </section>
-  )
-}
-
+import CurrentFilePicker from './documents/CurrentFilePicker.jsx'
+import ImportProgressPanel from './documents/ImportProgressPanel.jsx'
+import {
+  COLUMN_MAPPING_FIELDS,
+  fileSha256,
+  updateImportProgress,
+} from './documents/documentHelpers.js'
 
 export default function DocumentsPage({ embedded = false, importOnly = false, autoParse = false, onShowAssets, onSelectDocument }) {
   const navigate = useNavigate()
@@ -307,18 +67,23 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     else window.localStorage.removeItem('regops-import-progress')
   }, [importProgress])
 
-  useEffect(() => {
-    if (importProgress?.status !== 'WORKING' || !importProgress.digest) return undefined
-    const timer = window.setInterval(async () => {
-      try {
-        const list = await v2('/documents')
-        const document = list.find((item) => item.sha256 === importProgress.digest)
-        if (document) setImportProgress((current) => updateImportProgress(current, document))
-      } catch {
-      }
-    }, 1200)
-    return () => window.clearInterval(timer)
-  }, [importProgress?.status, importProgress?.digest])
+  const syncDigestProgress = async () => {
+    if (!importProgress?.digest) return
+    try {
+      const list = await v2('/documents')
+      const document = list.find((item) => item.sha256 === importProgress.digest)
+      if (document) setImportProgress((current) => updateImportProgress(current, document))
+    } catch {
+    }
+  }
+
+  useEventStream({
+    enabled: importProgress?.status === 'WORKING' && Boolean(importProgress.digest),
+    topics: 'document.progress',
+    fallbackIntervalMs: 1200,
+    onEvent: syncDigestProgress,
+    onFallbackTick: syncDigestProgress,
+  })
 
   async function selectDocument(id) {
     const doc = await v2(`/documents/${id}`)
@@ -341,7 +106,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
       body: JSON.stringify({ block_ids: blockIds, targets: ['metadata', 'code_sets'] }),
     })
     // 接口是 202：真正的结果要轮询进度拿到
-    return pollImportProgress(documentId, setImportProgress)
+    return watchDocumentProgress(documentId, setImportProgress)
   }
 
   async function parseCurrentDocument() {
@@ -382,7 +147,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
       let snapshot = null
       if (document.processing) {
-        snapshot = await pollImportProgress(document.id, setImportProgress)
+        snapshot = await watchDocumentProgress(document.id, setImportProgress)
       } else {
         snapshot = await v2(`/documents/${document.id}/progress`).catch(() => null)
         setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
@@ -444,7 +209,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     setImportProgress({ fileName: detail.file_name, stage: 1, status: 'WORKING', detail: '正在重新检查文档结构', counters: {}, logs: [] })
     try {
       await v2(`/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
-      const snapshot = await pollImportProgress(detail.id, setImportProgress)
+      const snapshot = await watchDocumentProgress(detail.id, setImportProgress)
       await load(detail.id)
       if (snapshot?.status === 'FAILED') {
         setError('文件结构检查仍未完成，请查看提示后重试。')

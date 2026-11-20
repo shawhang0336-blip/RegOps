@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, v2 } from '../api.js'
+import { useEventStream } from '../hooks/useEventStream.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { DataTableModal, StatusBadge, formatTime } from './SharedUI.jsx'
@@ -87,13 +88,19 @@ export default function RunsPage() {
     }).catch(() => {})
   }, [])
 
-  useEffect(() => {
-    if (!active || !['RUNNING', 'AUDITING', 'READY_TO_AUDIT'].includes(active.status)) return undefined
-    const timer = window.setInterval(() => {
-      if (!busy) load(active.id).catch(() => {})
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [active?.id, active?.status, busy, load])
+  const runIsActive = Boolean(active && ['RUNNING', 'AUDITING', 'READY_TO_AUDIT'].includes(active.status))
+  const refreshActiveRun = useCallback(() => {
+    if (!busy && active?.id) load(active.id).catch(() => {})
+  }, [active?.id, busy, load])
+
+  useEventStream({
+    enabled: runIsActive,
+    runId: active?.id || '',
+    topics: 'node.enter,node.exit,node.redirect,node.error,wave.barrier,tool.rejected,run.interrupted,run.completed,run.failed,event.appended',
+    fallbackIntervalMs: 5000,
+    onEvent: refreshActiveRun,
+    onFallbackTick: refreshActiveRun,
+  })
 
   async function openArtifact(uri, title) {
     try {

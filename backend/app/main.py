@@ -17,6 +17,7 @@ from app.api.v2 import settings as settings_v2
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal, init_db
 from app.infra.models import RunModel
+from app.infra.task_runner import task_runner
 from app.kernel.event_log import append_event
 from app.policy.regops_plan import project_many
 
@@ -43,7 +44,10 @@ def _mark_interrupted_runs() -> None:
 async def lifespan(_app: FastAPI):
     init_db()
     _mark_interrupted_runs()
-    yield
+    try:
+        yield
+    finally:
+        task_runner().shutdown(wait=False)
 
 
 settings = get_settings()

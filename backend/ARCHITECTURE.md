@@ -24,6 +24,7 @@ backend/app/
 │   ├── sql.py                   #    跨方言 SQL 安全标识符转义（quote_identifier）
 │   ├── llm.py                   #    受控 Tool-Call 大模型客户端与并发限流
 │   ├── settings_store.py        #    运行时执行预算配置读取（DEFAULT_BUDGET / get_budget）
+│   ├── task_runner.py           #    带任务键去重的进程内有界后台任务执行器（TaskRunner）
 │   ├── models.py                #    核心运行时表（runs / events / rules / specifications）
 │   └── asset_models.py          #    资产表（文档 / 原始块 / 元数据 / 码表 / 审批 / 产物 / 系统设置）
 │
@@ -80,8 +81,8 @@ backend/app/
 │   └── business_db.py           #    业务库只读抽样探查连接器
 │
 └── api/                         # 层 7：HTTP 接口层（v1 与 v2 统一收口）
-    ├── deps.py                  #    公共 Session 依赖、请求体契约与视图序列化
-    ├── system.py                #    /api/health / /api/blobs/* / /api/business/preview
+    ├── deps.py                  #    公共 Session 依赖（db_session）、spawn_run_driver 与视图序列化
+    ├── system.py                #    /api/health / /api/events/stream（SSE） / /api/blobs/* / /api/business/preview
     ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / bus-events）
     └── v2/                      #    /api/v2/* 工作台资产与生成路由
         ├── documents.py

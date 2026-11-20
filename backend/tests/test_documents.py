@@ -2,8 +2,6 @@ import hashlib
 import io
 import uuid
 
-import pytest
-from fastapi import HTTPException
 from openpyxl import Workbook
 
 from app.api.v2 import code_sets, documents, metadata
@@ -16,6 +14,7 @@ from app.infra.asset_models import (
     TableMetadataModel,
 )
 from app.infra.config import Settings
+from app.infra.task_runner import TaskRunner
 from .helpers import make_session
 
 
@@ -55,15 +54,14 @@ def make_document(session, digest=None):
     return document, block, table
 
 
-def test_delete_hides_document_and_preserves_assets(monkeypatch):
+def test_delete_hides_document_and_preserves_assets():
     session = make_session()
-    monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     document, block, table = make_document(session)
 
-    result = documents.delete_document(document.id)
+    result = documents.delete_document(document.id, session=session)
 
     assert result == {"id": document.id, "status": "DELETED", "assets_preserved": True}
-    assert documents.list_documents() == []
+    assert documents.list_documents(session=session) == []
     assert session.get(RawBlockModel, block.id) is not None
     assert session.get(TableMetadataModel, table.id) is not None
 
@@ -100,7 +98,7 @@ def test_uploading_deleted_document_rebuilds_blocks(monkeypatch, tmp_path):
     assert session.get(RawBlockModel, old_block.id).content_json["superseded"] is True
     assert sum(not block.content_json.get("superseded") for block in blocks) == 1
     assert session.get(TableMetadataModel, table.id) is not None
-    assert [row["id"] for row in documents.list_documents()] == [document.id]
+    assert [row["id"] for row in documents.list_documents(session=session)] == [document.id]
 
 
 def xlsx_content():
@@ -191,23 +189,27 @@ def test_failed_overview_blocks_chunking_and_can_retry(monkeypatch, tmp_path):
     assert session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).count() == 0
 
     should_fail = False
-    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
-    result = documents.prepare_document(document.id)
+    inline_runner = TaskRunner(inline=True)
+    monkeypatch.setattr(documents, "task_runner", lambda: inline_runner)
+    result = documents.prepare_document(document.id, session=session)
     assert result["status"] == "PREPARING"
-    # 接口立即返回，真实结果落在 document 上
     prepared = session.get(SourceDocumentModel, document.id)
     assert prepared.status == "UPLOADED"
     assert prepared.block_count == 1
 
 
-def test_confirming_block_clears_pending_state(monkeypatch):
+def test_confirming_block_clears_pending_state():
     session = make_session()
-    monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     document, block, _ = make_document(session)
     block.content_json = {**block.content_json, "human_required": True, "structure_warnings": ["请核对字段长度"]}
     session.commit()
 
-    result = documents.adjust_structure(document.id, block.id, {"human_required": False, "editor": "测试审核员"})
+    result = documents.adjust_structure(
+        document.id,
+        block.id,
+        {"human_required": False, "editor": "测试审核员"},
+        session=session,
+    )
 
     assert result["content_json"]["human_required"] is False
     architecture = session.query(DocumentArchitectureModel).filter(DocumentArchitectureModel.document_id == document.id).one()
@@ -215,11 +217,8 @@ def test_confirming_block_clears_pending_state(monkeypatch):
     assert architecture.trace_json["editor"] == "测试审核员"
 
 
-def test_assets_can_be_scoped_to_selected_document(monkeypatch):
+def test_assets_can_be_scoped_to_selected_document():
     session = make_session()
-    monkeypatch.setattr(documents, "SessionLocal", lambda: session)
-    monkeypatch.setattr(metadata, "SessionLocal", lambda: session)
-    monkeypatch.setattr(code_sets, "SessionLocal", lambda: session)
     first, first_block, first_table = make_document(session)
     second, second_block, second_table = make_document(session)
     first_set = CodeSetModel(id=str(uuid.uuid4()), code="FIRST", name="第一份码表", definition="", source_type="DOCUMENT_TABLE", status="DRAFT", current_version=1)
@@ -232,24 +231,10 @@ def test_assets_can_be_scoped_to_selected_document(monkeypatch):
     ])
     session.commit()
 
-    assert [row["id"] for row in metadata.list_tables(document_id=first.id)] == [first_table.id]
-    assert [row["id"] for row in metadata.list_tables(document_id=second.id)] == [second_table.id]
-    assert [row["id"] for row in code_sets.list_code_sets(document_id=first.id)] == [first_set.id]
-    assert [row["id"] for row in code_sets.list_code_sets(document_id=second.id)] == [second_set.id]
-
-
-class _InlineThread:
-    """同步执行 target 的假线程，让后台流程在测试里可断言。"""
-
-    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
-        self._target = target
-        self._args = args
-        self._kwargs = kwargs or {}
-        self.daemon = daemon
-
-    def start(self):
-        if self._target:
-            self._target(*self._args, **self._kwargs)
+    assert [row["id"] for row in metadata.list_tables(document_id=first.id, session=session)] == [first_table.id]
+    assert [row["id"] for row in metadata.list_tables(document_id=second.id, session=session)] == [second_table.id]
+    assert [row["id"] for row in code_sets.list_code_sets(document_id=first.id, session=session)] == [first_set.id]
+    assert [row["id"] for row in code_sets.list_code_sets(document_id=second.id, session=session)] == [second_set.id]
 
 
 def test_extraction_records_completion_state(monkeypatch):
@@ -262,11 +247,15 @@ def test_extraction_records_completion_state(monkeypatch):
         "extract_parallel_for_blocks",
         lambda *args, **kwargs: {"table_ids": [table.id], "code_set_ids": [], "errors": [], "resolved_reference_count": 0},
     )
-    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
+    inline_runner = TaskRunner(inline=True)
+    monkeypatch.setattr(documents, "task_runner", lambda: inline_runner)
 
-    result = documents.extract_document_parallel(document.id, documents.ParallelExtractRequest(block_ids=[block.id]))
+    result = documents.extract_document_parallel(
+        document.id,
+        documents.ParallelExtractRequest(block_ids=[block.id]),
+        session=session,
+    )
 
-    # 接口是 202：立刻返回，真正的完成状态落在 document 上
     assert result["status"] == "EXTRACTING"
     assert session.get(SourceDocumentModel, document.id).status == "EXTRACTED"
     architecture = session.query(DocumentArchitectureModel).filter(DocumentArchitectureModel.document_id == document.id).one()
@@ -278,13 +267,17 @@ def test_extraction_exception_does_not_leave_running_state(monkeypatch):
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     document, block, _ = make_document(session)
     monkeypatch.setattr(documents, "analyze_document_structure", lambda *args: None)
+
     def fail(*args, **kwargs):
         raise RuntimeError("offline extraction failure")
+
     monkeypatch.setattr(documents, "extract_parallel_for_blocks", fail)
-    monkeypatch.setattr(documents.threading, "Thread", _InlineThread)
+    inline_runner = TaskRunner(inline=True)
+    monkeypatch.setattr(documents, "task_runner", lambda: inline_runner)
 
-    # 异步执行：异常不会冒泡给调用方，但必须落到 document 状态上，不能停留在 EXTRACTING
-    documents.extract_document_parallel(document.id, documents.ParallelExtractRequest(block_ids=[block.id]))
-    assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
-
+    documents.extract_document_parallel(
+        document.id,
+        documents.ParallelExtractRequest(block_ids=[block.id]),
+        session=session,
+    )
     assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
