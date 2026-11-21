@@ -143,21 +143,56 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
         if min_float is not None and max_float is not None and min_float > max_float:
             raise RuleValidationError("NUM_RANGE min cannot exceed max")
     if rule.operator == "FIELD_COMPARE":
-        if rule.params.get("right_field") not in fields:
+        right_name = rule.params.get("right_field")
+        if right_name not in fields:
             raise RuleValidationError("Unknown comparison field")
-        if rule.params.get("right_field") == rule.field:
+        if right_name == rule.field:
             raise RuleValidationError("FIELD_COMPARE cannot compare a field with itself")
-        if rule.params.get("operator") not in {"LT", "LE", "GT", "GE", "EQ", "NE"}:
+        cmp_op = rule.params.get("operator")
+        if cmp_op not in {"LT", "LE", "GT", "GE", "EQ", "NE"}:
             raise RuleValidationError("Unsupported comparison operator")
+        left_meta = fields[rule.field]
+        right_meta = fields[right_name]
+        left_type = (left_meta.data_type or "").upper()
+        right_type = (right_meta.data_type or "").upper()
+        if left_type != right_type:
+            raise RuleValidationError(
+                f"FIELD_COMPARE 不能跨数据类型比较：{rule.field}({left_type}) vs {right_name}({right_type})"
+            )
+        if left_type == "VARCHAR" and cmp_op == "EQ":
+            l_len = int(left_meta.length or 0)
+            r_len = int(right_meta.length or 0)
+            if l_len > 0 and r_len > 0 and min(l_len, r_len) == 1 and max(l_len, r_len) >= 8:
+                raise RuleValidationError(
+                    f"FIELD_COMPARE(EQ) 不合理：{rule.field}(长度{l_len}) 与 {right_name}(长度{r_len}) 长度量级悬殊，"
+                    "不能将单字符代码与长编码/编号整列判等；若原文要求与另一字段某一位/子串含义一致，请勿生成 FIELD_COMPARE(EQ)。"
+                )
     if rule.operator == "REGEXP":
+        pattern = rule.params.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise RuleValidationError("Invalid regular expression")
+        if any(tok in pattern for tok in ("(?=", "(?!", "(?<=", "(?<!", "(?:")):
+            raise RuleValidationError(
+                "Oracle REGEXP_LIKE 不支持前后瞻或非捕获分组 (?= / (?! / (?:，请改用标准 POSIX 正则或配合 NOT_IN/ENUM 规则。"
+            )
         try:
-            re.compile(rule.params["pattern"])
+            re.compile(pattern)
         except (KeyError, re.error) as exc:
             raise RuleValidationError("Invalid regular expression") from exc
     if rule.evidence.field not in fields:
         raise RuleValidationError("Evidence field is outside the whitelist")
-    if rule.source == "DOC_EXPLICIT" and rule.evidence.quote != fields[rule.evidence.field].check_text:
-        raise RuleValidationError("Explicit-rule evidence does not match the parsed source")
+    if rule.source == "DOC_EXPLICIT":
+        evidence_field = fields[rule.evidence.field]
+        allowed_quotes = {evidence_field.check_text}
+        if rule.operator in {"LENGTH", "LENGTH_MAX"}:
+            allowed_quotes.add(f"{evidence_field.name} 类型（长度）列：{evidence_field.data_type}({evidence_field.length})")
+            want = (evidence_field.name or "").lower()
+            for line in (spec.dictionary_text or "").splitlines():
+                if want and want in line.lower() and str(evidence_field.length) in line:
+                    allowed_quotes.add(" ".join(line.split()))
+                    break
+        if rule.evidence.quote not in allowed_quotes:
+            raise RuleValidationError("Explicit-rule evidence does not match the parsed source")
 
 
 def validate_rules(rules: Iterable[RuleDefinition], spec: SpecDocument) -> None:

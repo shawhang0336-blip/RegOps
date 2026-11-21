@@ -68,6 +68,10 @@ def update_field(
     # 人工改过类型/长度，就不再是"原文声明"或"AI 推断"，标成人工口径
     if {"data_type", "length", "decimal_places"} & set(changes) and "type_basis" not in changes:
         field.type_basis = TYPE_BASIS_MANUAL
+    if "code_reference_text" in changes:
+        from app.assets.code_sets.linking import ensure_field_reference
+
+        ensure_field_reference(session, field)
     table.current_version += 1
     table.status = "DRAFT"
     session.add(

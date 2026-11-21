@@ -279,6 +279,10 @@ def lookup_term_definition(terms_text: str, field_cn: str) -> str:
     if index < 0:
         return ""
     tail = terms_text[index + len(name) :].split("\n", 1)[0]
+    # 非制表符展平文本常把相邻字段定义拼在同一行（"字段A 定义A。 字段B 见XX代码表。"），
+    # 仅保留到首个句号，防止把后面字段的码表引用串味到当前字段。
+    if "。" in tail:
+        tail = tail.split("。", 1)[0] + "。"
     return tail.strip(" \t：:")
 
 

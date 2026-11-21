@@ -734,3 +734,415 @@ def test_rule_binder_drops_cross_field_bleed_and_dedupes_pending_rules():
     assert _dedupe_approved_rules(session, run) == 1
 
 
+def test_data_stage_filters_extra_ai_fields_and_aligns_cross_table_fk_golden_values():
+    """回归：AI 超范围多返回确定性字段时不崩溃、不覆盖确定性值，且并发多表外键黄金值自动对齐（含异名外键）。"""
+    session = make_session()
+    parent = SpecDocument(
+        version="TEST",
+        table_code="T_ORG",
+        table_name="机构主档",
+        source_name="s.xlsx",
+        source_sha256="1" * 64,
+        section="1",
+        fields=[
+            FieldSpec(name="ORG_ID", content="机构主键", data_type="VARCHAR", length=18, check_text="必填", evidence_page="1"),
+            FieldSpec(name="ORG_NAME", content="机构名称", data_type="VARCHAR", length=64, check_text="必填", evidence_page="1"),
+        ],
+        terms_text="",
+        dictionary_text="",
+    )
+    child = SpecDocument(
+        version="TEST",
+        table_code="T_TXN",
+        table_name="交易明细",
+        source_name="s.xlsx",
+        source_sha256="1" * 64,
+        section="2",
+        fields=[
+            FieldSpec(name="TXN_NO", content="流水号", data_type="VARCHAR", length=32, check_text="必填", evidence_page="2"),
+            FieldSpec(name="CUST_ORG_REF", content="关联机构", data_type="VARCHAR", length=18, check_text="关联主表ORG_ID", evidence_page="2"),
+            FieldSpec(name="TXN_AMT", content="交易金额", data_type="NUMBER", length=16, decimal_places=2, check_text="大于0", evidence_page="2"),
+        ],
+        terms_text="",
+        dictionary_text="",
+    )
+    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
+    session.add(run)
+    session.flush()
+
+    rules = [
+        _make_rule("T_ORG", "R_ORG_REQ", "ORG_ID", "REQUIRED", {}),
+        _make_rule("T_TXN", "R_TXN_REQ", "TXN_NO", "REQUIRED", {}),
+        _make_rule("T_TXN", "R_TXN_FK", "CUST_ORG_REF", "FOREIGN_KEY", {"references_table": "T_ORG", "references_field": "ORG_ID"}),
+        _make_rule("T_TXN", "R_TXN_AMT", "TXN_AMT", "NUM_RANGE", {"min": 1, "max": 9999}),
+    ]
+
+    class OverReturningGeneratorLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            assert tool_name == "assign_generators"
+            assert payload["target_fields"] == ["CUST_ORG_REF", "TXN_AMT"]
+            # 故意顺手把确定性字段 TXN_NO 也一起返回，且 CUST_ORG_REF 给一个与主表不同的值
+            return {
+                "generators": [
+                    {"field": "TXN_NO", "generator": "FIXED", "params": {"value": "AI_SHOULD_NOT_OVERWRITE"}},
+                    {"field": "CUST_ORG_REF", "generator": "FIXED", "params": {"value": "DIFF_ORG_999"}},
+                    {"field": "TXN_AMT", "generator": "FIXED", "params": {"value": 88.5}},
+                ]
+            }, {"provider": "test", "model": "test"}
+
+    golden_records, generator_payload = _data_stage(session, run, [parent, child], OverReturningGeneratorLlm(), rules, {})
+    # 确定性字段 TXN_NO 未被 AI 覆盖
+    assert golden_records["T_TXN"]["TXN_NO"] == "SAMPLE_OK"
+    assert golden_records["T_TXN"]["TXN_AMT"] == 88.5
+    # 跨表异名外键黄金值与生成器均已与主表 ORG_ID 自动对齐
+    assert golden_records["T_TXN"]["CUST_ORG_REF"] == golden_records["T_ORG"]["ORG_ID"]
+    child_gens = {g["field"]: g for g in generator_payload["T_TXN"]["generators"]}
+    assert child_gens["CUST_ORG_REF"]["params"]["value"] == golden_records["T_ORG"]["ORG_ID"]
+
+    # 码表门禁：存在 published_code_sets 时不得把单字段 published_code_set 错套到其他字段
+    assert (
+        code_set_values_adjudicator(
+            "assign_generators",
+            {
+                "generators": [
+                    {"field": "CURRENCY_code", "generator": "ENUM", "params": {"values": ["USD"]}},
+                    {"field": "ACTIONTYPE", "generator": "ENUM", "params": {"values": ["A"]}},
+                ]
+            },
+            {
+                "published_code_set": {"code": "CS_CCY", "values": ["USD", "CNY"]},
+                "published_code_sets": {"CURRENCY_code": {"code": "CS_CCY", "values": ["USD", "CNY"]}},
+            },
+        )
+        is None
+    )
+
+
+def test_delete_run_rows_collects_oracle_tables_from_failed_and_multi_attempt_events():
+    """回归：失败批次或经历多轮自愈/重审的批次，删除时必须收集所有历史 attempt 的 Oracle 沙箱表。"""
+    from app.api.runs import _delete_run_rows
+    from app.kernel.event_log import append_event
+
+    session = make_session()
+    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
+    session.add(run)
+    session.flush()
+
+    append_event(session, run, "RUN_CREATED", "created", {})
+    append_event(
+        session,
+        run,
+        "ORACLE_ASSETS_PREPARED",
+        "oracle_asset_builder",
+        {
+            "attempt": 1,
+            "assets": {
+                "physical_tables": {"T1": "DQ_AAA_1_T1"},
+                "target_tables": {"T1": "DQ_AAA_1_T1_TARGET"},
+                "code_set_tables": {"CS1": "DQ_AAA_1_CS1"},
+            },
+            "result": {
+                "oracle_tables": {"T1": "DQ_AAA_1_T1"},
+                "oracle_target_tables": {"T1": "DQ_AAA_1_T1_TARGET"},
+                "oracle_code_set_tables": {"CS1": "DQ_AAA_1_CS1"},
+            },
+        },
+    )
+    append_event(
+        session,
+        run,
+        "GO_REDIRECT",
+        "oracle_executor",
+        {
+            "target": "data_generator_binder",
+            "failed_result": {
+                "oracle_tables": {"T1": "DQ_AAA_2_T1"},
+                "oracle_target_tables": {"T1": "DQ_AAA_2_T1_TARGET"},
+                "oracle_code_set_tables": {"CS1": "DQ_AAA_2_CS1"},
+            },
+        },
+    )
+    # 模拟最终失败覆盖投影 result_json
+    append_event(session, run, "RUN_FAILED", "data_generator_binder", {"error": "boom"})
+    session.flush()
+
+    _, oracle_tables = _delete_run_rows(session, run)
+    assert oracle_tables == {
+        "DQ_AAA_1_T1",
+        "DQ_AAA_1_T1_TARGET",
+        "DQ_AAA_1_CS1",
+        "DQ_AAA_2_T1",
+        "DQ_AAA_2_T1_TARGET",
+        "DQ_AAA_2_CS1",
+    }
+
+
+def test_partition_coupled_chunks_keeps_distant_field_compare_cluster_together():
+    """回归：相隔超过 12 个字段的 FIELD_COMPARE 关联字段（如 TXCCY 与 INCHARGECCY/OUTCHARGECCY）必须在同一批联合造数。"""
+    from app.engine.workflow.stages import _partition_coupled_chunks
+
+    fields = [
+        FieldSpec(name=f"F_{i:02d}", content=f"字段{i}", data_type="VARCHAR", length=8, check_text="必填", evidence_page="1")
+        for i in range(18)
+    ]
+    rules = [
+        _make_rule("T", "R_EQ_1", "F_16", "FIELD_COMPARE", {"right_field": "F_01", "operator": "EQ"}),
+        _make_rule("T", "R_EQ_2", "F_17", "FIELD_COMPARE", {"right_field": "F_01", "operator": "EQ"}),
+    ]
+    chunks = _partition_coupled_chunks(fields, rules, batch_size=12)
+    chunk_sets = [{f.name for f in c} for c in chunks]
+    # F_01, F_16, F_17 必须落在同一个 chunk，绝不被切开
+    assert any({"F_01", "F_16", "F_17"}.issubset(s) for s in chunk_sets)
+    assert sum(len(s) for s in chunk_sets) == 18
+
+
+def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbinds():
+    """回归：非制表符展平术语文本不得把相邻字段的「见币种代码表」串味到前面字段；清空 code_reference_text 必须解绑旧引用。"""
+    from app.assets.code_sets.linking import ensure_field_reference
+    from app.assets.metadata_service import _deterministic_field_draft
+    from app.infra.asset_models import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
+    from app.ingestion.spec_parser import lookup_term_definition
+
+    flattened = "金融机构标识码 国家外汇管理局签发的12位标识码。 发生日期 账户收支余发生变动日期。 币种 币种代码，见币种代码表。"
+    assert lookup_term_definition(flattened, "发生日期") == "账户收支余发生变动日期。"
+    assert "币种代码表" not in lookup_term_definition(flattened, "发生日期")
+
+    draft = _deterministic_field_draft(
+        {"name": "DEAL_DATE", "content": "发生日期", "data_type": "VARCHAR", "length": 8, "check_text": "必填项，格式YYYYMMDD"},
+        flattened,
+        {"page": "130"},
+    )
+    assert draft.code_reference_text == ""
+
+    # 清空 code_reference_text 时 ensure_field_reference 必须删除残留关联
+    session = make_session()
+    doc = SourceDocumentModel(
+        id=str(uuid.uuid4()), file_name="a.pdf", file_type="pdf", sha256=uuid.uuid4().hex, blob_uri="blob://a", spec_version="V1", status="DONE", block_count=1
+    )
+    block = RawBlockModel(
+        id=str(uuid.uuid4()), document_id=doc.id, ordinal=0, block_type="TABLE_METADATA", raw_content="", source_locator={}, content_json={}, raw_hash="h"
+    )
+    tbl = TableMetadataModel(
+        id=str(uuid.uuid4()), document_id=doc.id, block_id=block.id, table_code="T1", table_name="T1", table_definition="", status="DRAFT", current_version=1
+    )
+    fld = FieldMetadataModel(
+        id=str(uuid.uuid4()), table_id=tbl.id, field_cn="发生日期", field_en="DEAL_DATE", field_definition="", check_text_raw="必填",
+        data_type="VARCHAR", length=8, decimal_places=0, required=True, code_reference_text="币种代码表", confidence=0.9, evidence_json={}, ai_value_json={}, sort_order=0,
+    )
+    cs = CodeSetModel(id=str(uuid.uuid4()), code="CS_CCY", name="币种代码表", definition="", source_type="MANUAL", status="PUBLISHED", current_version=1, published_version=1)
+    session.add_all([doc, block, tbl, fld, cs])
+    session.flush()
+    session.add(FieldCodeReferenceModel(id=str(uuid.uuid4()), field_id=fld.id, code_set_id=cs.id, reference_text="币种代码表", status="RESOLVED", condition_json={}, confidence=0.9))
+    session.flush()
+    assert session.query(FieldCodeReferenceModel).filter_by(field_id=fld.id).count() == 1
+
+    fld.code_reference_text = ""
+    ensure_field_reference(session, fld)
+    assert session.query(FieldCodeReferenceModel).filter_by(field_id=fld.id).count() == 0
+
+
+def test_fullwidth_unicode_digits_rejected_on_number_field_and_large_num_range_precision():
+    """回归：拦截全角数字 '１００' 避免 Oracle ORA-01722；22 位金额大边界（±1e20）不因 float64 精度丢失导致漏变异。"""
+    from app.engine.binding import bind_audit_cases
+
+    spec = _sample_spec()
+    with pytest.raises(RuleValidationError, match="非法数值"):
+        bind_audit_cases(
+            spec,
+            [{"case_id": "MUT_FULLWIDTH", "overrides": {"AMOUNT": "１００"}, "expected_rule_keys": ["R_AMT"]}],
+            {"R_AMT"},
+            {"R_AMT": ("AMOUNT", "REGEXP", {"pattern": "^[0-9]+$"})},
+        )
+
+    huge_rule = _make_rule("T_FLOW", "R_AMT_HUGE", "AMOUNT", "NUM_RANGE", {"min": -1e20, "max": 1e20, "min_inclusive": True, "max_inclusive": True})
+    cases = build_deterministic_mutations(spec, huge_rule, {"AMOUNT": 100}, mutations_per_rule=2)
+    assert cases and len(cases) == 2
+    for c in cases:
+        assert violates_single_field_rule("NUM_RANGE", huge_rule.params, c.overrides["AMOUNT"]) is True
+
+
+def test_call_llm_validated_retries_wrapped_httpx_connect_error():
+    """回归：llm.py 将 httpx.ConnectError 包装成 RuntimeError 后，守卫层仍应判定为瞬时网络错误并退避重试。"""
+    import httpx
+
+    attempts = []
+
+    class FlakyConnectLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            attempts.append(1)
+            if len(attempts) == 1:
+                try:
+                    raise httpx.ConnectError("temporary dns blip")
+                except httpx.HTTPError as exc:
+                    raise RuntimeError("ConnectError after 0.19s; request_chars=8300") from exc
+            return {"rules": []}, {"provider": "test"}
+
+    res, _ = call_llm_validated(FlakyConnectLlm(), "assign_rules", "instr", {}, backoff=(0,))
+    assert res == {"rules": []}
+    assert len(attempts) == 2
+
+
+def test_backfilled_length_max_rule_remains_editable_and_impossible_field_compare_is_rejected():
+    """回归：确定性补齐的 LENGTH_MAX 规则在人工修改参数后仍能通过 validate_rule；单字符 vs 长编码的 FIELD_COMPARE(EQ) 被硬拦截。"""
+    from app.engine.rule_backfill import _backfill_length_rules
+    from app.engine.rules import validate_rule
+
+    session = make_session()
+    spec = _sample_spec().model_copy(
+        update={
+            "fields": [
+                FieldSpec(name="CUSTYPE", content="收款人类型", data_type="VARCHAR", length=1, check_text="C-对公 D-对私，需与申报号码第19位一致", evidence_page="1"),
+                FieldSpec(name="RPTNO", content="申报号码", data_type="VARCHAR", length=22, check_text="必填项，22位编号", evidence_page="1"),
+                FieldSpec(name="AMOUNT", content="金额", data_type="NUMBER", length=16, decimal_places=2, check_text="必填项", evidence_page="1"),
+            ]
+        }
+    )
+    run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
+    session.add(run)
+    session.flush()
+
+    added = _backfill_length_rules(session, run, [spec], [], lambda *a, **kw: None, lambda *a, **kw: None)
+    rptno_len = next(r for r in added if r.field == "RPTNO" and r.operator == "LENGTH_MAX")
+    # 模拟前端 PATCH /api/v2/artifacts/rules/{row_id} 修改 length 参数
+    edited = rptno_len.model_copy(update={"params": {"length": 18}})
+    validate_rule(edited, spec)  # 不得抛出 Explicit-rule evidence does not match
+
+    # 1位枚举 vs 22位编号的整列 EQ 必须被拦截
+    with pytest.raises(RuleValidationError, match="长度量级悬殊"):
+        bind_rules(
+            spec,
+            [
+                {
+                    "rule_key": "R_BAD_EQ",
+                    "field": "CUSTYPE",
+                    "operator": "FIELD_COMPARE",
+                    "params": {"right_field": "RPTNO", "operator": "EQ"},
+                    "evidence_kind": "DICTIONARY",
+                    "rationale": "错误建模",
+                }
+            ],
+        )
+
+    # 跨数据类型（VARCHAR vs NUMBER）的 FIELD_COMPARE 必须被拦截
+    with pytest.raises(RuleValidationError, match="不能跨数据类型比较"):
+        bind_rules(
+            spec,
+            [
+                {
+                    "rule_key": "R_BAD_TYPE_CMP",
+                    "field": "RPTNO",
+                    "operator": "FIELD_COMPARE",
+                    "params": {"right_field": "AMOUNT", "operator": "GE"},
+                    "evidence_kind": "DICTIONARY",
+                    "rationale": "错类型比较",
+                }
+            ],
+        )
+
+
+def test_oracle_regexp_normalization_and_mysql8_large_int_event_hash_stability():
+    """回归：Oracle POSIX 字符类 [...] 内规范化 \\- / \\d / \\. 防止 ORA-12728；超大整数事件在 MySQL 8 JSON 往返后哈希链仍有效。"""
+    import re
+    from app.engine.compiler import normalize_oracle_regexp
+    from app.kernel.event_log import canonical_event_json
+
+    assert normalize_oracle_regexp(r"^[0-9+\-() ]+$") == r"^[0-9+() -]+$"
+    assert normalize_oracle_regexp(r"^[\d\-]+$") == r"^[0-9-]+$"
+    assert normalize_oracle_regexp(r"^[a-zA-Z0-9_\-\.]+$") == r"^[a-zA-Z0-9_.-]+$"
+    assert re.search(normalize_oracle_regexp(r"^[0-9+\-() ]+$"), "+86-010 (8888)") is not None
+
+    spec = _sample_spec()
+    # PCRE 负向前瞻在 Oracle REGEXP_LIKE 中不被支持，绑定阶段必须硬拦截
+    with pytest.raises(RuleValidationError, match="前后瞻"):
+        bind_rules(
+            spec,
+            [
+                {
+                    "rule_key": "R_LOOKAHEAD",
+                    "field": "ORG_ID",
+                    "operator": "REGEXP",
+                    "params": {"pattern": r"^(?!000)[0-9]{6}$"},
+                    "evidence_kind": "DICTIONARY",
+                    "rationale": "前瞻",
+                }
+            ],
+        )
+
+    # MySQL 8 JSON 会把超过 2^64-1 的 int 存成 double，规范化序列化后写入与读出必须哈希一致
+    assert canonical_event_json({"override": 101000000000000000000}) == canonical_event_json({"override": 1.01e+20})
+    assert canonical_event_json({"normal_int": 42}) == '{"normal_int":42}'
+
+
+def test_cond_required_blank_sentinel_compiles_for_oracle_without_null_trap():
+    """回归：COND_REQUIRED 的 if_values 含空串/None（如「某字段非空时本字段必填」）不得编译出 Oracle 恒假谓词 <> '' / NOT IN (NULL, '')。"""
+    from app.engine.binding import violates_cond_required
+
+    spec = _sample_spec()
+    rule_ne_blank = _make_rule(
+        "T_FLOW", "R_COND_NONBLANK", "EXTRA_NAME", "COND_REQUIRED",
+        {"if_field": "TYPE_CODE", "if_operator": "NE", "if_values": [None, ""]},
+    )
+    sql, params = compile_rule_query(rule_ne_blank, "oracle")
+    assert "NOT (" in sql and "IS NULL" in sql
+    assert "<>" not in sql and "NOT IN" not in sql
+    assert "if_value_0" not in params
+    assert violates_cond_required(rule_ne_blank.params, {"TYPE_CODE": "01", "EXTRA_NAME": None}, "EXTRA_NAME") is True
+    assert violates_cond_required(rule_ne_blank.params, {"TYPE_CODE": None, "EXTRA_NAME": None}, "EXTRA_NAME") is False
+
+    rule_ne_mixed = _make_rule(
+        "T_FLOW", "R_COND_NONBLANK_NE0", "EXTRA_NAME", "COND_REQUIRED",
+        {"if_field": "AMOUNT", "if_operator": "NE", "if_values": ["", "0"]},
+    )
+    sql_m, params_m = compile_rule_query(rule_ne_mixed, "oracle")
+    assert "NOT (" in sql_m and "<> :if_value_0" in sql_m
+    assert params_m["if_value_0"] == "0"
+
+    rule_eq_blank = _make_rule(
+        "T_FLOW", "R_COND_WHEN_BLANK", "EXTRA_NAME", "COND_REQUIRED",
+        {"if_field": "TYPE_CODE", "if_operator": "EQ", "if_values": [""]},
+    )
+    sql_eq, params_eq = compile_rule_query(rule_eq_blank, "oracle")
+    assert "IS NULL" in sql_eq and "= :if_value_0" not in sql_eq
+    assert violates_cond_required(rule_eq_blank.params, {"TYPE_CODE": None, "EXTRA_NAME": None}, "EXTRA_NAME") is True
+    muts = build_deterministic_mutations(spec, rule_eq_blank, {"TYPE_CODE": "01", "EXTRA_NAME": "OK"})
+    assert muts and muts[0].overrides == {"TYPE_CODE": None, "EXTRA_NAME": None}
+
+
+def test_audit_binding_rejects_empty_string_and_canonical_number_noops_for_oracle_regexp():
+    """回归：Oracle 中 '' 等同于 NULL（不触发 REGEXP），且 NUMBER 列将 '100.00'/'00100' 规范化为 '100'，绑定阶段必须拦截此类空转反例。"""
+    from app.engine.binding import bind_audit_cases
+
+    spec = _sample_spec()
+    # 空串 '' 期望命中 REGEXP 必须被拦下
+    with pytest.raises(RuleValidationError, match="并不违规"):
+        bind_audit_cases(
+            spec,
+            [{"case_id": "MUT_EMPTY_REGEX", "overrides": {"ORG_ID": ""}, "expected_rule_keys": ["R_ORG_REG"]}],
+            {"R_ORG_REG"},
+            {"R_ORG_REG": ("ORG_ID", "REGEXP", {"pattern": "^[A-Z0-9]{18}$"})},
+        )
+    # 数值列 "100.00" 存入 Oracle NUMBER 后变成 "100"，仍匹配 ^[1-9][0-9]*$，必须被拦下
+    with pytest.raises(RuleValidationError, match="Oracle 实际评估值 '100'"):
+        bind_audit_cases(
+            spec,
+            [{"case_id": "MUT_NUM_ZERO_DEC", "overrides": {"AMOUNT": "100.00"}, "expected_rule_keys": ["R_AMT_INT"]}],
+            {"R_AMT_INT"},
+            {"R_AMT_INT": ("AMOUNT", "REGEXP", {"pattern": "^[1-9][0-9]*$"})},
+        )
+    # 真正带非零小数的 "100.5" 存入 Oracle 后仍为 "100.5"，违反整数正则 -> 放行
+    bound = bind_audit_cases(
+        spec,
+        [{"case_id": "MUT_NUM_REAL_DEC", "overrides": {"AMOUNT": "100.5"}, "expected_rule_keys": ["R_AMT_INT"]}],
+        {"R_AMT_INT"},
+        {"R_AMT_INT": ("AMOUNT", "REGEXP", {"pattern": "^[1-9][0-9]*$"})},
+    )
+    assert len(bound) == 1
+
+
+
+
+
+
+
+
+

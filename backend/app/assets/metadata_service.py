@@ -234,19 +234,14 @@ def _deterministic_field_draft(
     else:
         raise ValueError("Cannot deterministically map unstructured raw_field without name or row")
 
-    # Find term definition in terms_text if available
+    # Find term definition in terms_text if available (strictly scoped to this field)
     field_def = field_cn
     term_definition = lookup_term_definition(terms_text, field_cn)
     if term_definition:
         field_def = term_definition[:500]
-    elif terms_text and field_cn:
-        idx = terms_text.find(field_cn)
-        if idx >= 0:
-            snippet = re.sub(r"\s+", " ", terms_text[idx : idx + 240]).strip()
-            field_def = snippet[:180]
 
     required = bool(raw_field.get("required_basis")) or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text)
-    code_ref = extract_code_reference_from_text(check_text) or extract_code_reference_from_text(field_def)
+    code_ref = extract_code_reference_from_text(check_text) or extract_code_reference_from_text(term_definition)
     if not code_ref:
         inline_enums = extract_inline_enum_values(check_text)
         if inline_enums:

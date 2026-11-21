@@ -24,9 +24,30 @@ from .bus import global_bus
 GENESIS_HASH = "0" * 64
 
 
+_MYSQL_JSON_INT_MIN = -(1 << 63)
+_MYSQL_JSON_INT_MAX = (1 << 64) - 1
+
+
+def _normalize_event_value(value: Any) -> Any:
+    """对齐 MySQL 8 JSON 列数值表示：超出 64 位整数范围的超大 int 在落库后会被 MySQL 转为 DOUBLE。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value < _MYSQL_JSON_INT_MIN or value > _MYSQL_JSON_INT_MAX:
+            return float(value)
+        return value
+    if isinstance(value, dict):
+        return {k: _normalize_event_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_event_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_normalize_event_value(v) for v in value]
+    return value
+
+
 def canonical_event_json(value: Any) -> str:
     """确定性 JSON 序列化（按 key 排序、紧凑分隔符），用于计算事件 SHA-256 哈希链。"""
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(_normalize_event_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)

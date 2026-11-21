@@ -19,9 +19,13 @@ from app.infra.domain import AuditCaseBinding, GeneratorBinding, RuleDefinition,
 from app.infra.sql import quote_identifier
 
 
-def physical_table_name(run_id: str, attempt: int, table_code: str) -> str:
+def run_table_prefix(run_id: str) -> str:
     run_part = run_id.replace("-", "").upper()[:12]
-    return f"DQ_{run_part}_{attempt}_{table_code}"
+    return f"DQ_{run_part}_"
+
+
+def physical_table_name(run_id: str, attempt: int, table_code: str) -> str:
+    return f"{run_table_prefix(run_id)}{attempt}_{table_code}"
 
 
 class OracleSandbox:
@@ -40,15 +44,37 @@ class OracleSandbox:
         finally:
             self.engine.dispose()
 
-    def drop_tables(self, tables: List[str]) -> List[str]:
+    def _discover_run_tables(self, connection, run_ids: List[str]) -> List[str]:
+        discovered: List[str] = []
+        for run_id in run_ids:
+            if not run_id:
+                continue
+            prefix = run_table_prefix(run_id).replace("_", r"\_") + "%"
+            try:
+                rows = connection.execute(
+                    text("SELECT TABLE_NAME FROM USER_TABLES WHERE TABLE_NAME LIKE :prefix ESCAPE '\\'"),
+                    {"prefix": prefix},
+                ).fetchall()
+                discovered.extend(str(row[0]) for row in rows if row and row[0])
+            except Exception:
+                # 非 Oracle 测试方言或无 USER_TABLES 视图时回退到事件中收集的表清单
+                continue
+        return discovered
+
+    def drop_tables(self, tables: List[str], run_ids: Optional[List[str]] = None) -> List[str]:
         """清理批次专属沙箱表；单表失败不影响其他表，也不触碰生产表。"""
         errors: List[str] = []
         try:
             with self.engine.begin() as connection:
-                for table in sorted(set(item for item in tables if item)):
+                all_tables = {item for item in tables if item}
+                if run_ids:
+                    all_tables.update(self._discover_run_tables(connection, list(run_ids)))
+                for table in sorted(all_tables):
                     try:
                         connection.execute(text(f"DROP TABLE {quote_identifier(table, 'oracle')} PURGE"))
                     except Exception as exc:
+                        if "ORA-00942" in str(exc):
+                            continue
                         errors.append(f"{table}: {type(exc).__name__}")
         finally:
             self.engine.dispose()

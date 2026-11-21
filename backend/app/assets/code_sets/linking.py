@@ -340,6 +340,15 @@ def ensure_field_reference(
 ) -> None:
     text = (field.code_reference_text or "").strip()
     if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
+        # 字段引用被人工清空时同步解绑旧引用，避免残留失效码表关联
+        existing_empty = (
+            existing_ref_by_field.pop(field.id, None)
+            if existing_ref_by_field is not None
+            else session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.field_id == field.id).first()
+        )
+        if existing_empty:
+            session.delete(existing_empty)
+            session.flush()
         return
     fixed = parse_fixed_value(text)
     if fixed:
@@ -533,7 +542,7 @@ def auto_link_all_references(session: Session) -> int:
     candidate_norms = [(normalize_code_set_name(cs.name), cs) for cs in all_sets]
     for field in session.query(FieldMetadataModel).all():
         text = (field.code_reference_text or "").strip()
-        if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
+        if (not text or text.upper() in {"无", "N/A", "NONE", "无引用"}) and field.id not in existing_ref_by_field:
             continue
         ensure_field_reference(
             session,

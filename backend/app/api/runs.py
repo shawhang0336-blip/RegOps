@@ -68,11 +68,38 @@ def _history_cleanup_plan(session: Session):
     return runs, deletes, states
 
 
-def _delete_run_rows(session: Session, run: RunModel):
-    result = project(session, run).result_json or {}
+def _collect_run_oracle_tables(session: Session, run: RunModel) -> set:
+    """从投影结果与全量历史事件中收集该批次历次 attempt 建过的所有 Oracle 沙箱表（含失败/自愈/重审批次）。"""
     oracle_tables = set()
-    for key in ("oracle_tables", "oracle_target_tables", "oracle_code_set_tables"):
-        oracle_tables.update((result.get(key) or {}).values())
+
+    def _add_from_mapping(container) -> None:
+        if not isinstance(container, dict):
+            return
+        for key in (
+            "oracle_tables",
+            "oracle_target_tables",
+            "oracle_code_set_tables",
+            "physical_tables",
+            "target_tables",
+            "code_set_tables",
+        ):
+            mapping = container.get(key)
+            if isinstance(mapping, dict):
+                oracle_tables.update(str(v) for v in mapping.values() if v)
+
+    _add_from_mapping(project(session, run).result_json)
+    for event in session.query(EventModel).filter(EventModel.run_id == run.id).all():
+        payload = event.payload_json or {}
+        if not isinstance(payload, dict):
+            continue
+        _add_from_mapping(payload)
+        for nested_key in ("result", "failed_result", "assets"):
+            _add_from_mapping(payload.get(nested_key))
+    return oracle_tables
+
+
+def _delete_run_rows(session: Session, run: RunModel):
+    oracle_tables = _collect_run_oracle_tables(session, run)
     blob_uris = {row.blob_uri for row in session.query(ArtifactModel).filter(ArtifactModel.run_id == run.id).all()}
     for model in (
         RuleModel,
@@ -88,7 +115,12 @@ def _delete_run_rows(session: Session, run: RunModel):
     return blob_uris, oracle_tables
 
 
-def _finish_run_deletion(session: Session, blob_uris: set, oracle_tables: set) -> List[str]:
+def _finish_run_deletion(
+    session: Session,
+    blob_uris: set,
+    oracle_tables: set,
+    run_ids: Optional[List[str]] = None,
+) -> List[str]:
     settings = get_settings()
     session.flush()
     remaining_uris = {row[0] for row in session.query(ArtifactModel.blob_uri).distinct().all()}
@@ -99,10 +131,10 @@ def _finish_run_deletion(session: Session, blob_uris: set, oracle_tables: set) -
         except ValueError:
             pass
     session.commit()
-    if not oracle_tables or not settings.oracle_sandbox_url:
+    if (not oracle_tables and not run_ids) or not settings.oracle_sandbox_url:
         return []
     try:
-        return OracleSandbox(settings.oracle_sandbox_url).drop_tables(sorted(oracle_tables))
+        return OracleSandbox(settings.oracle_sandbox_url).drop_tables(sorted(oracle_tables), run_ids=run_ids)
     except Exception as exc:
         return [f"沙箱表清理失败：{type(exc).__name__}"]
 
@@ -198,7 +230,7 @@ def history_cleanup(session: Session = Depends(db_session)) -> Dict:
         run_blobs, run_tables_set = _delete_run_rows(session, run)
         blob_uris.update(run_blobs)
         oracle_tables.update(run_tables_set)
-    warnings = _finish_run_deletion(session, blob_uris, oracle_tables)
+    warnings = _finish_run_deletion(session, blob_uris, oracle_tables, run_ids=deleted_ids)
     return {"deleted_count": len(deleted_ids), "deleted_ids": deleted_ids, "sandbox_cleanup": warnings}
 
 
@@ -218,7 +250,7 @@ def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     if project(session, run).status in ACTIVE_RUN_STATUSES:
         raise HTTPException(status_code=409, detail="Running validation batches cannot be deleted")
     blob_uris, oracle_tables = _delete_run_rows(session, run)
-    warnings = _finish_run_deletion(session, blob_uris, oracle_tables)
+    warnings = _finish_run_deletion(session, blob_uris, oracle_tables, run_ids=[run_id])
     return {"deleted_id": run_id, "sandbox_cleanup": warnings}
 
 

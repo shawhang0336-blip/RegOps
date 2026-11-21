@@ -52,6 +52,21 @@ _NO_TOOL_CALL_HINT = (
 )
 
 _TRANSIENT_HTTP_MARKERS = ("LLM HTTP 429", "LLM HTTP 500", "LLM HTTP 502", "LLM HTTP 503", "LLM HTTP 504")
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadError",
+    "WriteError",
+    "RemoteProtocolError",
+    "PoolTimeout",
+    "NetworkError",
+    "ProxyError",
+    "CloseError",
+    "ProtocolError",
+    "TimeoutException",
+    "ConnectionResetError",
+    "ConnectionError",
+)
 
 
 def _locate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -82,11 +97,15 @@ def _backoff_wait(steps: Tuple[float, ...], attempt: int) -> None:
 
 
 def _classify_runtime_error(exc: RuntimeError) -> str:
+    if isinstance(exc.__cause__, (httpx.HTTPError, TimeoutError, ConnectionError)):
+        return "transport"
     text = str(exc)
     low = text.lower()
     if "no tool call" in low or "unexpected tool" in low:
         return "model_no_tool_call"
-    if any(marker in text for marker in _TRANSIENT_HTTP_MARKERS):
+    if any(marker in text for marker in _TRANSIENT_HTTP_MARKERS) or any(
+        marker in text for marker in _TRANSIENT_TRANSPORT_MARKERS
+    ):
         return "transport"
     return "fatal_model_error"
 

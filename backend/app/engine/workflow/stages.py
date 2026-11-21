@@ -34,6 +34,7 @@ from app.engine.binding import (
     find_golden_rule_violations,
     materialize_golden_record,
     normalize_case_id,
+    violates_single_field_rule,
 )
 from app.engine.mutations import (
     build_deterministic_mutations,
@@ -205,6 +206,45 @@ def _summarize_deterministic_rule(rule: RuleDefinition) -> Dict[str, Any]:
     }
 
 
+def _drop_unsatisfiable_field_compare_eq(
+    all_table_rules: List[RuleDefinition],
+    bound_rules: List[RuleDefinition],
+) -> List[RuleDefinition]:
+    """剔除数学上无解的 FIELD_COMPARE(EQ)：若一侧有限 ENUM 全部取值均违反另一侧单字段规则，整列判等必无解。"""
+    enum_by_field: Dict[str, List[str]] = {}
+    constraints_by_field: Dict[str, List[RuleDefinition]] = {}
+    for rule in all_table_rules:
+        constraints_by_field.setdefault(rule.field, []).append(rule)
+        if rule.operator == "ENUM" and rule.params.get("values"):
+            vals = [str(v) for v in rule.params["values"]]
+            if rule.field not in enum_by_field or len(vals) < len(enum_by_field[rule.field]):
+                enum_by_field[rule.field] = vals
+    kept: List[RuleDefinition] = []
+    for rule in bound_rules:
+        if rule.operator == "FIELD_COMPARE" and (rule.params or {}).get("operator") == "EQ":
+            right = (rule.params or {}).get("right_field")
+            unsat = False
+            for src, dst in ((rule.field, right), (right, rule.field)):
+                vals = enum_by_field.get(src)
+                if not vals or not dst:
+                    continue
+                dst_rules = [
+                    dr
+                    for dr in constraints_by_field.get(dst, [])
+                    if dr.operator in {"ENUM", "NOT_IN", "LENGTH", "LENGTH_MAX", "REGEXP"}
+                ]
+                if dst_rules and all(
+                    any(violates_single_field_rule(dr.operator, dr.params or {}, v) is True for dr in dst_rules)
+                    for v in vals
+                ):
+                    unsat = True
+                    break
+            if unsat:
+                continue
+        kept.append(rule)
+    return kept
+
+
 def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus=None, events: Optional[List[tuple]] = None):
     _, field_code_sets = load_published_code_sets(session, specs)
     # 确定性派生先行：在调用 AI 之前先机械产出必填 / 列宽上限 / 固定值 / 已发布码表 ENUM，
@@ -278,7 +318,8 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
                 "显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。"
                 "COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。"
                 "数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；"
-                "跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE）。",
+                "跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names 且同数据类型，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE；"
+                "仅限直接按整列值比较的同语义字段，若原文要求与另一字段的第N位/子串/编码含义一致，禁止用 FIELD_COMPARE）。",
                 payload,
                 lambda args: bind_rules(spec, args.get("rules", [])),
                 bus=bus,
@@ -304,13 +345,14 @@ def _rules_stage(session, run, specs, llm, plans=None, concurrency: int = 4, bus
         for rules, trace in field_results:
             bound_rules.extend(rules)
             batch_traces.append(trace)
+        table_det_rules = [r for r in deterministic_rules if r.table_code == spec.table_code]
+        bound_rules = _drop_unsatisfiable_field_compare_eq(table_det_rules + bound_rules, bound_rules)
         key_counts = {key: 1 for key in det_keys}
         for rule in bound_rules:
             key_counts[rule.rule_key] = key_counts.get(rule.rule_key, 0) + 1
             if key_counts[rule.rule_key] > 1:
                 rule.rule_key = f"{rule.rule_key}_{key_counts[rule.rule_key]}"
                 rule.rule_hash = calculate_rule_hash(rule, spec.source_sha256)
-        table_det_rules = [r for r in deterministic_rules if r.table_code == spec.table_code]
         if not bound_rules and not table_det_rules and gaps:
             raise WorkflowError(
                 f"{spec.table_code} 的 {len(gaps)} 个字段全部未能绑定规则，"
@@ -629,6 +671,59 @@ def _deterministic_generator_item(
     return None
 
 
+def _partition_coupled_chunks(ai_fields: List[Any], table_rules: List[RuleDefinition], batch_size: int) -> List[List[Any]]:
+    """按跨字段约束连通分量分组打包，确保 FIELD_COMPARE / COND_REQUIRED 关联字段绝不被拆到不同批次。"""
+    if len(ai_fields) <= batch_size:
+        return [ai_fields] if ai_fields else []
+    field_by_name = {f.name: f for f in ai_fields}
+    order_index = {f.name: idx for idx, f in enumerate(ai_fields)}
+    adj: Dict[str, set] = {f.name: set() for f in ai_fields}
+    for rule in table_rules:
+        if rule.field not in adj:
+            continue
+        peer = None
+        if rule.operator == "FIELD_COMPARE":
+            peer = (rule.params or {}).get("right_field")
+        elif rule.operator == "COND_REQUIRED":
+            peer = (rule.params or {}).get("if_field")
+        if peer and peer in adj and peer != rule.field:
+            adj[rule.field].add(peer)
+            adj[peer].add(rule.field)
+
+    visited = set()
+    components: List[List[Any]] = []
+    for f in ai_fields:
+        if f.name in visited:
+            continue
+        stack = [f.name]
+        comp_names = []
+        visited.add(f.name)
+        while stack:
+            cur = stack.pop()
+            comp_names.append(cur)
+            for nxt in adj[cur]:
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+        comp_names.sort(key=lambda n: order_index[n])
+        components.append([field_by_name[n] for n in comp_names])
+
+    chunks: List[List[Any]] = []
+    current: List[Any] = []
+    for comp in components:
+        if current and len(current) + len(comp) > batch_size:
+            chunks.append(current)
+            current = []
+        if len(comp) >= batch_size:
+            # 单个强连通分量超过 batch_size 时整组作为一个批次联合求解，绝不硬拆破坏一致性
+            chunks.append(comp)
+        else:
+            current.extend(comp)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _data_stage(
     session,
     run,
@@ -702,7 +797,7 @@ def _data_stage(
                 if case.get("table_code") == spec.table_code and case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
             ]
 
-        chunks = [ai_fields[i : i + _GENERATOR_BATCH_SIZE] for i in range(0, len(ai_fields), _GENERATOR_BATCH_SIZE)]
+        chunks = _partition_coupled_chunks(ai_fields, table_rules, _GENERATOR_BATCH_SIZE)
         for chunk in chunks:
             chunk_names = [f.name for f in chunk]
             chunk_name_set = set(chunk_names)
@@ -719,6 +814,7 @@ def _data_stage(
             }
             payload: Dict[str, Any] = {
                 **spec_payload(spec),
+                "target_fields": chunk_names,
                 "fields": [f.model_dump() for f in chunk],
                 "deterministic_golden_values": det_golden_preview,
                 "approved_rules": rule_views,
@@ -733,11 +829,15 @@ def _data_stage(
                 payload["oracle_false_positive_feedback"] = heal_feedback_cases
 
             def validate_batch(args, _chunk_names=chunk_names, _chunk_name_set=chunk_name_set, _chunk_by_name=chunk_by_name):
-                items = args.get("generators", [])
-                returned_fields = [item.get("field") for item in items if isinstance(item, dict)]
-                if set(returned_fields) != _chunk_name_set or len(items) != len(_chunk_names):
+                raw_items = [item for item in (args.get("generators") or []) if isinstance(item, dict)]
+                # 模型常顺手返回整表所有字段的生成器；严格过滤到本次 target_fields 范围，确定性字段不被覆盖
+                items = [item for item in raw_items if item.get("field") in _chunk_name_set]
+                returned_fields = [item.get("field") for item in items]
+                missing = [name for name in _chunk_names if name not in set(returned_fields)]
+                if missing or len(returned_fields) != len(_chunk_names):
                     raise RuleValidationError(
-                        f"Generator response must cover requested fields {_chunk_names} exactly once, got {returned_fields}"
+                        f"Generator response must cover target_fields {_chunk_names} exactly once "
+                        f"(missing={missing}, matched={returned_fields})"
                     )
                 validated_items: Dict[str, Dict[str, Any]] = {}
                 for item in items:
@@ -771,10 +871,13 @@ def _data_stage(
                 return validated_items
 
             instruction = (
-                "为输入的全部关联/约束字段联合赋予黄金合规生成器，确保所有字段同时满足 approved_rules 和 required_reference_values，"
+                f"【严格范围】本次仅需为 target_fields（{chunk_names}）输出黄金合规生成器，严禁重复输出 deterministic_golden_values 中已确定的字段。"
+                "确保所有目标字段与 deterministic_golden_values、approved_rules、required_reference_values 同时满足，"
                 "并且跨字段比较（FIELD_COMPARE）与条件必填（COND_REQUIRED）彼此自洽、零违规。"
+                "重要：当字段参与 FIELD_COMPARE（尤其 EQ 相等或大小比较）或 COND_REQUIRED 且 golden_count > 1 时，"
+                "请对参与比较的关联字段统一使用 FIXED 生成器（而非多值 ENUM/SEQUENCE），避免多条黄金样本交叉组合失配。"
                 "FIXED 使用 params.value；ENUM 使用 params.values；SEQUENCE 使用 params.start/step。"
-                "若提供 published_code_sets/published_code_set，对应字段的 ENUM values 只能取其白名单子集。"
+                "若提供 published_code_sets/published_code_set，对应字段的 ENUM values 只能取其白名单子集（或使用 FIXED 填其中一个白名单合法码值）。"
             )
             if heal_feedback_cases:
                 instruction += "注意：上轮 Oracle 审计发现黄金样本触发了误报（见 oracle_false_positive_feedback），请重点修正导致误报的字段取值。"
@@ -813,6 +916,42 @@ def _data_stage(
     for table_code, overrides in golden_overrides.items():
         if table_code in golden_records:
             golden_records[table_code].update(overrides)
+            for field_name, val in overrides.items():
+                if val is not None:
+                    fixed = GeneratorBinding(field=field_name, generator="FIXED", params={"value": val})
+                    generators[table_code] = [fixed if g.field == field_name else g for g in generators[table_code]]
+    # 跨表外键黄金值确定性对齐：多表并发造数后，自动将子表外键字段与主表对应字段对齐（支持异名外键与链式外键）
+    fk_rules = [rule for rule in active_rules if rule.operator == "FOREIGN_KEY"]
+    if fk_rules:
+        spec_by_code = {spec.table_code: spec for spec in specs}
+        for _ in range(max(1, len(specs))):
+            changed = False
+            for rule in fk_rules:
+                ref_table = (rule.params or {}).get("references_table")
+                ref_field = (rule.params or {}).get("references_field") or rule.field
+                if ref_table not in golden_records or rule.table_code not in golden_records:
+                    continue
+                parent_val = golden_records[ref_table].get(ref_field)
+                if parent_val is None:
+                    continue
+                child_spec = spec_by_code.get(rule.table_code)
+                if not child_spec or not any(f.name == rule.field for f in child_spec.fields):
+                    continue
+                if golden_records[rule.table_code].get(rule.field) != parent_val:
+                    golden_records[rule.table_code][rule.field] = parent_val
+                    changed = True
+                parent_gen = next((g for g in generators[ref_table] if g.field == ref_field), None)
+                aligned_gen = (
+                    parent_gen.model_copy(update={"field": rule.field})
+                    if parent_gen is not None
+                    else GeneratorBinding(field=rule.field, generator="FIXED", params={"value": parent_val})
+                )
+                generators[rule.table_code] = [
+                    aligned_gen if g.field == rule.field else g
+                    for g in generators[rule.table_code]
+                ]
+            if not changed:
+                break
     for spec in specs:
         session.add(
             GeneratorDefinitionModel(

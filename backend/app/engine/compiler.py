@@ -3,6 +3,102 @@ from typing import Any, Dict, Optional, Tuple
 from app.infra.domain import RuleDefinition, SpecDocument
 from app.infra.sql import quote_identifier
 
+_BRACKET_LITERAL_ESCAPES = set(r".+/()_*?,;:@#$!~=%")
+
+
+def normalize_oracle_regexp(pattern: str) -> str:
+    r"""将正则字符类 [...] 规范化为 Oracle POSIX REGEXP_LIKE 兼容写法（同时保持 Python re 语义完全等价）。
+
+    Oracle POSIX 字符类内反斜杠不作转义：
+    - `\-` 会被解析为从 `\` 到后续字符的非法范围（ORA-12728），需将 `-` 移至字符类末尾；
+    - `\d`/`\s`/`\w` 在 [...] 内会被当成字面反斜杠和字母，需展开为 `0-9`/` `/`A-Za-z0-9_`；
+    - `\.` / `\+` 等多余转义在 [...] 内会多匹配反斜杠本身，需去反斜杠。
+    """
+    if not pattern or "[" not in pattern:
+        return pattern
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if ch != "[":
+            out.append(ch)
+            i += 1
+            continue
+        # 进入字符类 [...]
+        j = i + 1
+        negated = False
+        if j < n and pattern[j] == "^":
+            negated = True
+            j += 1
+        leading_rbracket = False
+        if j < n and pattern[j] == "]":
+            leading_rbracket = True
+            j += 1
+        body = []
+        trailing_hyphen = False
+        closed = False
+        while j < n:
+            c = pattern[j]
+            # 保留 POSIX 具名字符类 [:...:] 原样不拆
+            if c == "[" and j + 1 < n and pattern[j + 1] in (":", ".", "="):
+                delim = pattern[j + 1]
+                end = pattern.find(f"{delim}]", j + 2)
+                if end != -1:
+                    body.append(pattern[j : end + 2])
+                    j = end + 2
+                    continue
+            if c == "]":
+                closed = True
+                j += 1
+                break
+            if c == "\\" and j + 1 < n:
+                nxt = pattern[j + 1]
+                if nxt == "-":
+                    trailing_hyphen = True
+                    j += 2
+                    continue
+                if nxt == "d":
+                    body.append("0-9")
+                    j += 2
+                    continue
+                if nxt == "w":
+                    body.append("A-Za-z0-9_")
+                    j += 2
+                    continue
+                if nxt == "s":
+                    body.append(" ")
+                    j += 2
+                    continue
+                if nxt in _BRACKET_LITERAL_ESCAPES:
+                    body.append(nxt)
+                    j += 2
+                    continue
+                body.append(pattern[j : j + 2])
+                j += 2
+                continue
+            body.append(c)
+            j += 1
+        if not closed:
+            out.append(pattern[i:])
+            break
+        rebuilt = "["
+        if negated:
+            rebuilt += "^"
+        if leading_rbracket:
+            rebuilt += "]"
+        rebuilt += "".join(body)
+        if trailing_hyphen:
+            rebuilt += "-"
+        rebuilt += "]"
+        out.append(rebuilt)
+        i = j
+    return "".join(out)
+
 
 def _blank_fold(field: str, dialect: str) -> str:
     """把制表/换行折成空格再 TRIM。
@@ -77,31 +173,42 @@ def compile_where(
         return f"({null_guard}{field} {operator} ({', '.join(names)}))", params
     if rule.operator == "COND_REQUIRED":
         condition_field = f"t.{quote_identifier(rule.params['if_field'], dialect)}"
+        raw_values = list(rule.params["if_values"])
+        has_blank = any(value is None or str(value) == "" for value in raw_values)
+        non_blank_values = [value for value in raw_values if value is not None and str(value) != ""]
         condition_values = []
-        for index, value in enumerate(rule.params["if_values"]):
+        for index, value in enumerate(non_blank_values):
             key = f"if_value_{index}"
             params[key] = value
             condition_values.append(f":{key}")
         is_eq = rule.params["if_operator"] == "EQ"
+        # Oracle 中空串 '' 等价于 NULL，col <> '' 或 col NOT IN ('', NULL) 恒为 UNKNOWN（永远不命中）。
+        # 含空值哨兵时改为显式 NOT missing_text / missing_text 谓词，兼容 VARCHAR2 与 NUMBER 列。
+        if not condition_values:
+            condition = missing_text(condition_field, dialect) if is_eq else f"NOT {missing_text(condition_field, dialect)}"
+            return f"({condition} AND {missing_text(field, dialect)})", params
         if len(condition_values) == 1:
-            condition_operator = "=" if is_eq else "<>"
-            condition = f"{condition_field} {condition_operator} {condition_values[0]}"
+            cmp_expr = f"{condition_field} {'=' if is_eq else '<>'} {condition_values[0]}"
         else:
-            condition_operator = "IN" if is_eq else "NOT IN"
-            condition = f"{condition_field} {condition_operator} ({', '.join(condition_values)})"
-        return (
-            f"({condition_field} IS NOT NULL AND {condition} "
-            f"AND {missing_text(field, dialect)})",
-            params,
-        )
+            cmp_expr = f"{condition_field} {'IN' if is_eq else 'NOT IN'} ({', '.join(condition_values)})"
+        if has_blank:
+            if is_eq:
+                cond_expr = f"({missing_text(condition_field, dialect)} OR {cmp_expr})"
+            else:
+                cond_expr = f"NOT {missing_text(condition_field, dialect)} AND {cmp_expr}"
+        else:
+            cond_expr = f"{condition_field} IS NOT NULL AND {cmp_expr}"
+        return f"({cond_expr} AND {missing_text(field, dialect)})", params
     if rule.operator in {"LENGTH", "LENGTH_MAX"}:
         params["expected_length"] = int(rule.params["length"])
         comparison = "<>" if rule.operator == "LENGTH" else ">"
         return f"({field} IS NOT NULL AND LENGTH({field}) {comparison} :expected_length)", params
     if rule.operator == "REGEXP":
-        params["expected_pattern"] = rule.params["pattern"]
+        raw_pattern = rule.params["pattern"]
         if dialect == "oracle":
+            params["expected_pattern"] = normalize_oracle_regexp(raw_pattern)
             return f"({field} IS NOT NULL AND NOT REGEXP_LIKE({field}, :expected_pattern))", params
+        params["expected_pattern"] = raw_pattern
         return f"({field} IS NOT NULL AND {field} NOT REGEXP :expected_pattern)", params
     if rule.operator == "FOREIGN_KEY":
         reference_code = rule.params["references_table"]

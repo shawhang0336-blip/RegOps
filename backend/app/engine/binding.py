@@ -1,5 +1,6 @@
 import hashlib
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from app.infra.domain import (
@@ -13,6 +14,7 @@ from app.infra.domain import (
     calculate_rule_hash,
     field_map,
 )
+from app.engine.compiler import normalize_oracle_regexp
 from app.engine.rules import RuleValidationError, validate_rule
 
 
@@ -73,7 +75,9 @@ def bind_rules(
                 f"算子 {operator} 不允许由模型生成。长度类请用 LENGTH_MAX（列宽是上限），"
                 "需要「必须正好 N 位」请用 REGEXP 写死格式。"
             )
-        params = item.get("params", {})
+        params = dict(item.get("params", {}))
+        if operator == "REGEXP" and isinstance(params.get("pattern"), str):
+            params["pattern"] = normalize_oracle_regexp(params["pattern"])
         if operator == "FOREIGN_KEY":
             ref_table = params.get("references_table")
             ref_field = params.get("references_field")
@@ -114,7 +118,7 @@ def bind_rules(
 
 
 def _as_number(value: Any) -> Any:
-    """把 JSON 里写成字符串的数字收敛成数值。
+    """把 JSON 里写成字符串的数字收敛成数值（严格半角 ASCII，拦截全角数字如 '１００' 引发 Oracle ORA-01722）。
 
     实测出现过 SEQUENCE 的 start/step 都写成 "1000.00" / "100.00"，
     于是 index=1 时 `"1000.00" + 1 * "100.00"` 走成了字符串拼接，
@@ -123,12 +127,18 @@ def _as_number(value: Any) -> Any:
     """
     if isinstance(value, bool):
         raise ValueError("布尔值不是数字")
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"非有限数值：{value!r}")
         return value
     text = str(value).strip().replace(",", "")
-    if re.fullmatch(r"[+-]?\d+", text):
+    if not text.isascii():
+        raise ValueError(f"包含非 ASCII 字符（如全角数字）：{value!r}")
+    if re.fullmatch(r"[+-]?[0-9]+", text):
         return int(text)
-    if re.fullmatch(r"[+-]?\d+\.\d+", text):
+    if re.fullmatch(r"[+-]?[0-9]+\.[0-9]+", text):
         return float(text)
     raise ValueError(f"不是数字：{value!r}")
 
@@ -228,16 +238,22 @@ def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any
     if operator == "NOT_IN":
         return not _is_blank(value) and str(value) in {str(v) for v in params.get("values", [])}
     if operator in {"LENGTH", "LENGTH_MAX"}:
-        if value is None or params.get("length") is None:
+        if params.get("length") is None:
             return None
+        # Oracle 中空串 '' 等价于 NULL，而 LENGTH/LENGTH_MAX 规则带 IS NOT NULL 守卫，空值不触发
+        if value is None or value == "":
+            return False
         size = len(str(value))
         if operator == "LENGTH":
             return size != int(params["length"])
         return size > int(params["length"])
     if operator == "REGEXP":
         pattern = params.get("pattern")
-        if not pattern or value is None:
+        if not pattern:
             return None
+        # Oracle 中空串 '' 等价于 NULL，REGEXP 带 IS NOT NULL 守卫，空串/None 永远不会触发 REGEXP
+        if value is None or value == "":
+            return False
         try:
             # Oracle 的 REGEXP_LIKE 是「包含匹配」，用 search 对齐
             return re.search(pattern, str(value)) is None
@@ -245,19 +261,28 @@ def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any
             return None
     if operator == "NUM_RANGE":
         if value is None or str(value).strip() == "":
-            return None
+            return False
         try:
-            number = float(str(value).replace(",", ""))
-        except (TypeError, ValueError):
+            text_val = str(value).strip().replace(",", "")
+            if not text_val.isascii():
+                return None
+            number = Decimal(text_val)
+        except (TypeError, ValueError, InvalidOperation):
             return None
         min_value = params.get("min")
         max_value = params.get("max")
         if min_value is not None:
-            bound = float(min_value)
+            try:
+                bound = Decimal(str(min_value).strip().replace(",", ""))
+            except (TypeError, ValueError, InvalidOperation):
+                return None
             if number < bound or (not params.get("min_inclusive", True) and number == bound):
                 return True
         if max_value is not None:
-            bound = float(max_value)
+            try:
+                bound = Decimal(str(max_value).strip().replace(",", ""))
+            except (TypeError, ValueError, InvalidOperation):
+                return None
             if number > bound or (not params.get("max_inclusive", True) and number == bound):
                 return True
         return False
@@ -277,16 +302,20 @@ _COMPARE_RELATIONS = {
 def violates_field_compare(operator: str, left: Any, right: Any) -> Optional[bool]:
     """预判两列取值是否打破 field OP right_field 的断言。
 
-    能转数值就按数值比（与生产 NUMBER 列一致），转不了按字符串序
-    （与沙箱/生产字符列的字典序比较一致）。任一侧缺失或关系未知返回 None。
+    能转数值就按高精度 Decimal 比（与生产 Oracle NUMBER(22,2) 一致，避免 float64 精度丢失），
+    转不了按字符串序（与沙箱/生产字符列的字典序比较一致）。任一侧缺失或关系未知返回 None。
     """
     relation = _COMPARE_RELATIONS.get(operator)
     if relation is None or left is None or right is None:
         return None
     try:
-        left_value = float(str(left).replace(",", ""))
-        right_value = float(str(right).replace(",", ""))
-    except (TypeError, ValueError):
+        l_txt = str(left).strip().replace(",", "")
+        r_txt = str(right).strip().replace(",", "")
+        if not (l_txt.isascii() and r_txt.isascii()):
+            raise ValueError("non-ascii")
+        left_value: Any = Decimal(l_txt)
+        right_value: Any = Decimal(r_txt)
+    except (TypeError, ValueError, InvalidOperation):
         left_value, right_value = str(left), str(right)
     try:
         return not relation(left_value, right_value)
@@ -295,17 +324,25 @@ def violates_field_compare(operator: str, left: Any, right: Any) -> Optional[boo
 
 
 def violates_cond_required(params: Dict[str, Any], record: Dict[str, Any], target_field: str) -> Optional[bool]:
-    """预判记录是否触发 COND_REQUIRED（条件成立且目标字段缺失）。"""
+    """预判记录是否触发 COND_REQUIRED（条件成立且目标字段缺失，与 Oracle 空串/NULL 语义一致）。"""
     if_field = params.get("if_field")
     if_op = params.get("if_operator")
     if_values = params.get("if_values") or []
     if not if_field or if_op not in {"EQ", "NE"} or not if_values:
         return None
     cond_val = record.get(if_field)
-    if cond_val is None:
-        return False
-    str_values = {str(v) for v in if_values}
-    matched = (str(cond_val) in str_values) if if_op == "EQ" else (str(cond_val) not in str_values)
+    has_blank = any(v is None or str(v) == "" for v in if_values)
+    non_blank = {str(v) for v in if_values if v is not None and str(v) != ""}
+    cond_blank = _is_blank(cond_val)
+    if if_op == "EQ":
+        matched = (has_blank and cond_blank) or (not cond_blank and str(cond_val) in non_blank)
+    else:
+        if has_blank and not non_blank:
+            matched = not cond_blank
+        elif has_blank:
+            matched = (not cond_blank) and (str(cond_val) not in non_blank)
+        else:
+            matched = (not cond_blank) and (str(cond_val) not in non_blank)
     return bool(matched and _is_blank(record.get(target_field)))
 
 
@@ -334,7 +371,7 @@ def find_golden_rule_violations(
 
     violations: List[Dict[str, Any]] = []
     seen = set()
-    for rec in sample_records:
+    for row_idx, rec in enumerate(sample_records):
         for rule in table_rules:
             if rule.rule_key in seen:
                 continue
@@ -346,20 +383,27 @@ def find_golden_rule_violations(
                 val = rec.get(rule.field)
                 if violates_single_field_rule(op, params, val) is True:
                     broken = True
-                    detail = f"{rule.field}={val!r} 违反 {op}({params})"
+                    if op == "ENUM" and isinstance(params.get("values"), list) and len(params["values"]) > 12:
+                        vals = params["values"]
+                        params_view = f"共 {len(vals)} 项，示例 {vals[:8]}"
+                    else:
+                        params_view = str(params)
+                    detail = f"{rule.field}={val!r} 违反 {op}({params_view})"
             elif op == "FIELD_COMPARE":
                 right_field = params.get("right_field")
                 left_val = rec.get(rule.field)
                 right_val = rec.get(right_field) if right_field else None
                 if violates_field_compare(params.get("operator"), left_val, right_val) is True:
                     broken = True
-                    detail = f"{rule.field}={left_val!r} 与 {right_field}={right_val!r} 不满足 {params.get('operator')}"
+                    multi_hint = "（第 %d 条黄金样本失配，请将关联双方改为一致的 FIXED 生成器）" % (row_idx + 1) if row_idx > 0 else ""
+                    detail = f"{rule.field}={left_val!r} 与 {right_field}={right_val!r} 不满足 {params.get('operator')}{multi_hint}"
             elif op == "COND_REQUIRED":
                 if violates_cond_required(params, rec, rule.field) is True:
                     broken = True
+                    multi_hint = f"（第 {row_idx + 1} 条黄金样本失配，请将条件字段改为 FIXED）" if row_idx > 0 else ""
                     detail = (
                         f"当 {params.get('if_field')}={rec.get(params.get('if_field'))!r} 时 "
-                        f"{rule.field} 不能为空"
+                        f"{rule.field} 不能为空{multi_hint}"
                     )
             if broken:
                 seen.add(rule.rule_key)
@@ -408,15 +452,15 @@ def bind_audit_cases(
         case_ids.add(case.case_id)
         if any(field not in field_map(spec) for field in case.overrides):
             raise RuleValidationError("Audit override is outside the field whitelist")
-        # 沙箱数值列是原生 NUMBER：塞非数字会在入库时 ORA-01722 挂掉整批，绑定阶段就拦下
+        # 沙箱数值列是原生 NUMBER：塞非数字或全角数字（如 '１００'）会在入库时 ORA-01722 挂掉整批，绑定阶段就拦下
         for override_field, override_value in case.overrides.items():
             if override_field in numeric_fields and override_value is not None:
                 try:
-                    float(str(override_value).replace(",", ""))
+                    _as_number(override_value)
                 except (TypeError, ValueError) as exc:
                     raise RuleValidationError(
-                        f"用例 {case.case_id} 把数值字段 {override_field} 变异成非数字 {override_value!r}，"
-                        "沙箱数值列无法入库。数值字段的违规请用越界数值（如 0、负数、超大数）。"
+                        f"用例 {case.case_id} 把数值字段 {override_field} 变异成非法数值 {override_value!r}（{exc}），"
+                        "沙箱原生 NUMBER 列无法入库。数值字段的违规请使用半角 ASCII 越界数值（如 0、-1、1.5、超大数）。"
                     ) from exc
         if any(rule_key not in active_rule_keys for rule_key in case.expected_rule_keys):
             raise RuleValidationError("Audit expectation references an inactive rule")
@@ -445,12 +489,24 @@ def bind_audit_cases(
                     f"要测字段缺失请显式写成 \"{field}\": null。"
                 )
             if field in case.overrides:
-                verdict = violates_single_field_rule(operator, params, case.overrides[field])
+                check_val = case.overrides[field]
+                if field in numeric_fields and operator == "REGEXP" and check_val is not None and check_val != "":
+                    # Oracle NUMBER 列会去除前导零与尾随 .00（如 "00100" / "100.00" 入库后都是 100），
+                    # 必须按 Oracle 规范化后的数字文本预判 REGEXP_LIKE，防止假阳性反例导致漏报
+                    try:
+                        dec = Decimal(str(check_val).strip().replace(",", "")).normalize()
+                        norm_str = format(dec, "f")
+                        if "." in norm_str:
+                            norm_str = norm_str.rstrip("0").rstrip(".")
+                        check_val = norm_str or "0"
+                    except InvalidOperation:
+                        pass
+                verdict = violates_single_field_rule(operator, params, check_val)
                 if verdict is False:
                     raise RuleValidationError(
                         f"用例 {case.case_id} 声称会触发 {rule_key}"
-                        f"（{operator} {params}），但取值 {case.overrides[field]!r} 并不违规，"
-                        "这条用例跑到 Oracle 也不会命中，白白消耗一轮审计。请给出真正越界或缺失的值。"
+                        f"（{operator} {params}），但取值 {case.overrides[field]!r}（Oracle 实际评估值 {check_val!r}）并不违规，"
+                        "这条用例跑到 Oracle 也不会命中，白白消耗一轮审计。请给出真正越界或非空违规的值。"
                     )
             if operator == "FIELD_COMPARE":
                 right_field = params.get("right_field")

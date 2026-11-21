@@ -150,8 +150,8 @@ def code_set_values_adjudicator(
                 continue
             field_name = candidate.get("field")
             target_cs = None
-            if isinstance(published_map, dict) and field_name in published_map:
-                target_cs = published_map[field_name]
+            if isinstance(published_map, dict):
+                target_cs = published_map.get(field_name)
             elif isinstance(published, dict):
                 target_cs = published
             if not isinstance(target_cs, dict) or not target_cs.get("values"):

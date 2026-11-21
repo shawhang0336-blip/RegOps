@@ -75,7 +75,8 @@ def _num_range_breach_values(params: Dict[str, Any], field: Optional[FieldSpec])
     if min_val is not None:
         try:
             d_min = Decimal(str(min_val))
-            candidate = d_min if not min_inc else (d_min - step)
+            eff_step = step if abs(d_min) < Decimal("1e12") else max(step, (abs(d_min) / Decimal("100")).to_integral_value())
+            candidate = d_min if not min_inc else (d_min - eff_step)
             val = _format_number_like(candidate, keep_int)
             if violates_single_field_rule("NUM_RANGE", params, val) is True:
                 results.append(("LOW", val))
@@ -85,7 +86,8 @@ def _num_range_breach_values(params: Dict[str, Any], field: Optional[FieldSpec])
     if max_val is not None:
         try:
             d_max = Decimal(str(max_val))
-            candidate = d_max if not max_inc else (d_max + step)
+            eff_step = step if abs(d_max) < Decimal("1e12") else max(step, (abs(d_max) / Decimal("100")).to_integral_value())
+            candidate = d_max if not max_inc else (d_max + eff_step)
             val = _format_number_like(candidate, keep_int)
             if violates_single_field_rule("NUM_RANGE", params, val) is True:
                 results.append(("HIGH", val))
@@ -174,10 +176,13 @@ def _cond_required_trigger_value(
     if_values: List[Any],
     golden_if_value: Any,
 ) -> Any:
-    str_values = {str(v) for v in if_values}
+    non_blank = [v for v in if_values if v is not None and str(v) != ""]
+    str_values = {str(v) for v in non_blank}
     if if_operator == "EQ":
-        return if_values[0]
-    # NE: 需要一个非空且不在 if_values 里的取值
+        if non_blank:
+            return non_blank[0]
+        return None
+    # NE: 需要一个非空且不在 non_blank 里的取值（空串/None 哨兵表示「条件字段非空时触发」）
     if golden_if_value is not None and str(golden_if_value).strip() and str(golden_if_value) not in str_values:
         return golden_if_value
     return _pick_invalid_enum_value(if_field, str_values)
@@ -311,9 +316,9 @@ def build_regexp_fallback_mutation(
         return None
     field = field_map(spec).get(rule.field)
     if _is_numeric_field(field):
-        candidates = ("-999999999", "0", "999999999999")
+        candidates = ("1.5", "-1.5", "-999999999", "0", "999999999999")
     else:
-        candidates = ("INVALID_FMT_@@@", "###BAD###", "Z", "00000000000000000000000000")
+        candidates = ("INVALID_FMT_@@@", "###BAD###", "   ", "Z", "00000000000000000000000000")
     for candidate in candidates:
         if violates_single_field_rule("REGEXP", rule.params or {}, candidate) is True:
             return AuditCaseBinding(
