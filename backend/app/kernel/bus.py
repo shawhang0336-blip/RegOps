@@ -9,6 +9,7 @@
    且对旁观订阅者（Observer/Subscriber）做严格的异常隔离，绝不影响主流程状态机推进。
 """
 
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -40,6 +41,91 @@ LIFECYCLE_TOPICS = (
 )
 
 MAX_BUS_HISTORY = 2000
+
+
+class Subscription:
+    """有界流式订阅句柄：配合 `bus.stream(...)` 使用，防止高频事件撑爆内存。
+
+    - `overflow="drop"`（默认）：队列满时丢弃新帧并累加 `dropped` 计数，绝不阻塞主流程；
+    - `overflow="block"`：队列满时阻塞等待（可配 `block_timeout`）施加反压，尽量不丢帧。
+    """
+
+    def __init__(
+        self,
+        bus: "Bus",
+        topic: str,
+        *,
+        maxsize: int = 256,
+        overflow: str = "drop",
+        block_timeout: Optional[float] = None,
+    ) -> None:
+        if maxsize < 1:
+            raise ValueError("Subscription.maxsize 必须 >= 1")
+        if overflow not in {"drop", "block"}:
+            raise ValueError(f"未知 overflow 策略：{overflow}（仅支持 'drop' 或 'block'）")
+        self._bus = bus
+        self._topic = topic
+        self._overflow = overflow
+        self._block_timeout = block_timeout
+        self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._lock = threading.Lock()
+        self._closed = False
+        self._bus.subscribe(topic, self._push)
+
+    def _push(self, envelope: Dict[str, Any]) -> None:
+        if self._closed:
+            return
+        if self._overflow == "block":
+            try:
+                self._queue.put(envelope, block=True, timeout=self._block_timeout)
+                return
+            except queue.Full:
+                with self._lock:
+                    self._dropped += 1
+                return
+        try:
+            self._queue.put_nowait(envelope)
+        except queue.Full:
+            with self._lock:
+                self._dropped += 1
+
+    def get(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """取出下一条事件；超时无事件返回 None。"""
+        try:
+            return self._queue.get(block=True, timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def get_nowait(self) -> Optional[Dict[str, Any]]:
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    @property
+    def dropped(self) -> int:
+        with self._lock:
+            return self._dropped
+
+    @property
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._bus.unsubscribe(self._topic, self._push)
+
+    def __enter__(self) -> "Subscription":
+        return self
+
+    def __exit__(self, *_exc_info: Any) -> None:
+        self.close()
 
 
 class Bus:
@@ -97,6 +183,23 @@ class Bus:
             if fn in handlers:
                 handlers.remove(fn)
         return self
+
+    def stream(
+        self,
+        topic: str = "*",
+        *,
+        maxsize: int = 256,
+        overflow: str = "drop",
+        block_timeout: Optional[float] = None,
+    ) -> Subscription:
+        """创建有界队列流式订阅（支持 `drop` 丢帧计数与 `block` 反压），推荐配合 `with` 自动退订。"""
+        return Subscription(
+            self,
+            topic,
+            maxsize=maxsize,
+            overflow=overflow,
+            block_timeout=block_timeout,
+        )
 
     def fire(self, topic: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """向外广播一条生命周期事件。旁观者抛出的任何异常均被吞掉隔离，绝不阻断主流程。"""
@@ -160,11 +263,16 @@ class Bus:
             adjudicators = list(self._adjudicators)
 
         for fn in adjudicators:
-            reason = fn(tool_name, args, payload)
+            adjudicator_name = getattr(fn, "__name__", "anonymous")
+            try:
+                reason = fn(tool_name, args, payload)
+            except Exception as exc:  # noqa: BLE001
+                # fail-closed：裁决器自身异常一律按拦截处理并留痕，绝不静默放行
+                reason = f"门禁裁决器 {adjudicator_name} 执行异常（fail-closed 已拦截）：{type(exc).__name__}: {exc}"
             if reason:
                 record: Dict[str, Any] = {
                     "tool": tool_name,
-                    "adjudicator": getattr(fn, "__name__", "anonymous"),
+                    "adjudicator": adjudicator_name,
                     "reason": reason,
                     "args": args,
                 }

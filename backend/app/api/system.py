@@ -65,21 +65,24 @@ async def stream_bus_events(
     topic_set = _parse_topics(topics)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    dropped_frames = 0
 
     def _on_event(envelope: Dict[str, Any]) -> None:
         if not _matches_event(envelope, run_id=run_id, document_id=document_id, topic_set=topic_set):
             return
 
         def _enqueue() -> None:
+            nonlocal dropped_frames
             if queue.full():
                 try:
                     queue.get_nowait()
+                    dropped_frames += 1
                 except asyncio.QueueEmpty:
                     pass
             try:
                 queue.put_nowait(envelope)
             except asyncio.QueueFull:
-                pass
+                dropped_frames += 1
 
         try:
             loop.call_soon_threadsafe(_enqueue)
@@ -101,6 +104,10 @@ async def stream_bus_events(
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
                 continue
+            if dropped_frames:
+                reported = dropped_frames
+                dropped_frames = 0
+                yield f": dropped={reported}\n\n"
             yield _format_sse(envelope)
     finally:
         active_bus.unsubscribe("*", _on_event)

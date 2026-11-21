@@ -1178,6 +1178,65 @@ def test_kernel_outcome_park_multi_interrupt_and_scheduler_resume():
     assert kernel.verify_chain(session, run2) is True
 
 
+def test_kernel_bus_fail_closed_check_and_bounded_stream_subscription():
+    """验证 Bus 三协议完备性：check 裁决器异常 fail-closed 拦截留痕 + stream 有界队列 drop 丢帧计数与 block 反压。"""
+    import threading
+    import time
+
+    bus = kernel.Bus()
+    rejected_seen: list = []
+    bus.subscribe("tool.rejected", lambda e: rejected_seen.append(e))
+
+    # 1) check 裁决器自身抛异常 -> fail-closed 拦截、记入 drain_rejections、广播 tool.rejected
+    def buggy_adjudicator(_tool, _args, _payload):
+        raise RuntimeError("adjudicator crashed unexpectedly")
+
+    bus.add_adjudicator(buggy_adjudicator)
+    reason = bus.check("write_op", {"x": 1}, {})
+    assert reason is not None
+    assert "fail-closed" in reason
+    assert "buggy_adjudicator" in reason
+    assert len(rejected_seen) == 1
+    drained = bus.drain_rejections()
+    assert len(drained) == 1
+    assert drained[0]["adjudicator"] == "buggy_adjudicator"
+
+    # 2) stream(overflow="drop") 有界队列防爆 + 精确 dropped 计数 + with 退订防泄漏
+    drop_bus = kernel.Bus()
+    with drop_bus.stream("token.delta", maxsize=2, overflow="drop") as sub:
+        for i in range(5):
+            drop_bus.fire("token.delta", {"idx": i})
+        assert sub.qsize == 2
+        assert sub.dropped == 3
+        assert sub.get_nowait()["idx"] == 0
+        assert sub.get_nowait()["idx"] == 1
+        assert sub.get_nowait() is None
+    assert sub.closed is True
+    # 关闭后不再接收新事件
+    drop_bus.fire("token.delta", {"idx": 99})
+    assert sub.qsize == 0
+
+    # 3) stream(overflow="block") 满载反压不丢帧
+    block_bus = kernel.Bus()
+    received_indices: list = []
+    with block_bus.stream("stream.chunk", maxsize=1, overflow="block", block_timeout=1.0) as sub:
+        def _consumer():
+            time.sleep(0.03)
+            for _ in range(3):
+                item = sub.get(timeout=1.0)
+                if item is not None:
+                    received_indices.append(item["idx"])
+
+        t = threading.Thread(target=_consumer)
+        t.start()
+        for i in range(3):
+            block_bus.fire("stream.chunk", {"idx": i})
+        t.join(timeout=2.0)
+        assert sub.dropped == 0
+    assert received_indices == [0, 1, 2]
+
+
+
 
 
 

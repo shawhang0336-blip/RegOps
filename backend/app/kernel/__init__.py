@@ -9,7 +9,7 @@
 6. Scheduler (`scheduler.py`)：真 BSP 波次调度引擎（`Send` 动态扇出 + `Goto` + `Interrupt` + `execute_wave`）。
 """
 
-from .bus import LIFECYCLE_TOPICS, MAX_BUS_HISTORY, Adjudicator, Bus, Subscriber, global_bus
+from .bus import LIFECYCLE_TOPICS, MAX_BUS_HISTORY, Adjudicator, Bus, Subscriber, Subscription, global_bus
 from .event_log import (
     GENESIS_HASH,
     RunState,
@@ -113,6 +113,7 @@ __all__ = [
     "StateReducer",
     "StepResult",
     "Subscriber",
+    "Subscription",
     "TraceSpan",
     "WaveExecutionError",
     "WorkflowPlan",
