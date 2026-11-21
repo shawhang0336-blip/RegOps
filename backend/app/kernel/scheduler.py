@@ -14,7 +14,11 @@
 import contextvars
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import (
+    CancelledError as FuturesCancelledError,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
@@ -53,6 +57,19 @@ class NodeTimeoutError(TimeoutError):
         super().__init__(f"节点 {node} 执行超时（上限 {timeout}s）")
         self.node = node
         self.timeout = timeout
+
+
+class WaveExecutionError(RuntimeError):
+    """同一并发波次内有多个任务同时失败时抛出的汇总异常，完整保留全部 `(label, error)` 而不吞错。"""
+
+    def __init__(self, errors: Sequence[Tuple[str, BaseException]]) -> None:
+        self.errors: List[Tuple[str, BaseException]] = list(errors)
+        self.failed_labels: List[str] = [label for label, _ in self.errors]
+        self.first_error: BaseException = self.errors[0][1]
+        summary = "；".join(f"[{label}] {type(err).__name__}: {err}" for label, err in self.errors)
+        super().__init__(
+            f"并发波次出现 {len(self.errors)} 项失败（{', '.join(self.failed_labels)}）：{summary}"
+        )
 
 
 @dataclass(frozen=True)
@@ -182,23 +199,34 @@ def execute_wave(
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(_guarded_worker, item) for item in items]
             ordered: List[R] = []
-            first_exc: Optional[BaseException] = None
+            failures: List[Tuple[str, BaseException]] = []
+            priority_exc: Optional[BaseException] = None
             for idx, future in enumerate(futures):
+                label = item_labels[idx] if idx < len(item_labels) else str(idx)
                 try:
                     ordered.append(future.result())
                     if cancellation is not None and getattr(cancellation, "is_cancelled", False):
                         for pending in futures[idx + 1 :]:
                             pending.cancel()
+                except FuturesCancelledError:
+                    # 队列中被取消的后续任务，不视为新的业务失败
+                    continue
                 except BaseException as exc:
-                    if first_exc is None:
-                        first_exc = exc
-                        if isinstance(exc, (RunCancelledError, BudgetExceededError)):
+                    if isinstance(exc, (RunCancelledError, BudgetExceededError)):
+                        if priority_exc is None:
+                            priority_exc = exc
                             for pending in futures[idx + 1 :]:
                                 pending.cancel()
-            if first_exc is not None:
+                    else:
+                        failures.append((label, exc))
+            if priority_exc is not None or failures:
                 if partial_results_out is not None and ordered:
                     partial_results_out.extend(ordered)
-                raise first_exc
+                if priority_exc is not None:
+                    raise priority_exc
+                if len(failures) == 1:
+                    raise failures[0][1]
+                raise WaveExecutionError(failures)
             results = ordered
 
     barrier_meta: Dict[str, Any] = {"merged_count": len(results), "labels": item_labels}
@@ -328,15 +356,34 @@ class Scheduler:
                 ctx.check_budget()
                 _sleep_cancelable(delay, ctx.cancellation)
 
-    def drive(self, ctx: RunContext, max_steps: int = 64, max_workers: Optional[int] = None) -> List[StepResult]:
-        """按 BSP 超步波次执行到人工中断门或终态，返回全部执行轨迹。"""
+    def drive(
+        self,
+        ctx: RunContext,
+        max_steps: int = 64,
+        max_workers: Optional[int] = None,
+        initial_input: Any = None,
+    ) -> List[StepResult]:
+        """按 BSP 超步波次执行到人工中断门或终态，返回全部执行轨迹。
+
+        自动沿边向下一波节点喂入 `input`：
+        - 入口首波：传入 `initial_input`；
+        - `Send` 动态副本：传入各自 `Send.input`；
+        - `Goto` 跳转目标：传入 `Outcome.control`（若为空则取 `Outcome.output`）；
+        - 单前驱静态边：直接传入前驱 `Outcome.output`；
+        - 多前驱静态合流：传入 `{前驱节点名: output}` 字典；
+        - 模板（`Send` 波次）前驱：传入该模板所有并发实例 `output` 组成的有序列表。
+        """
         executed: List[StepResult] = []
         cursor = ctx.state.current_node
         pending_wave: Optional[List[Send]] = (
-            [Send(ctx.state.pending_target, None)] if ctx.state.pending_target else None
+            [Send(ctx.state.pending_target, initial_input)] if ctx.state.pending_target else None
         )
         last_when: Optional[str] = None
         is_send_wave = False
+        last_wave_nodes: List[str] = []
+        last_wave_whens: Dict[str, str] = {}
+        last_wave_outputs: List[Tuple[str, Any]] = []
+        last_wave_was_send = False
         wave_width = max(1, int(max_workers or ctx.concurrency or 4))
 
         for wave_index in range(1, max_steps + 1):
@@ -344,8 +391,31 @@ class Scheduler:
             ctx.check_budget()
 
             if pending_wave is None:
-                ready_nodes = self._next_ready(cursor, ctx, when=last_when)
-                pending_wave = [Send(name, None) for name in ready_nodes]
+                if not last_wave_nodes:
+                    ready_nodes = self._next_ready(cursor, ctx, when=last_when)
+                    pending_wave = [Send(name, initial_input) for name in ready_nodes]
+                else:
+                    preds_by_dst: Dict[str, List[str]] = {}
+                    for src_node in dict.fromkeys(last_wave_nodes):
+                        for dst in self._next_ready(src_node, ctx, when=last_wave_whens.get(src_node)):
+                            bucket = preds_by_dst.setdefault(dst, [])
+                            if src_node not in bucket:
+                                bucket.append(src_node)
+                    output_by_node: Dict[str, Any] = {}
+                    for src_node, out_val in last_wave_outputs:
+                        output_by_node[src_node] = out_val
+                    next_tasks: List[Send] = []
+                    for dst, preds in preds_by_dst.items():
+                        if last_wave_was_send and len(preds) == 1:
+                            edge_input: Any = [
+                                out_val for src_node, out_val in last_wave_outputs if src_node == preds[0]
+                            ]
+                        elif len(preds) > 1:
+                            edge_input = {p: output_by_node.get(p) for p in preds}
+                        else:
+                            edge_input = output_by_node.get(preds[0])
+                        next_tasks.append(Send(dst, edge_input))
+                    pending_wave = next_tasks
                 is_send_wave = False
             wave = [task for task in pending_wave if task.node in self.bodies]
             current_is_send_wave = is_send_wave
@@ -462,6 +532,12 @@ class Scheduler:
                     )
                 )
 
+            # 记录本波次产物快照，供下一波静态边自动按前驱形态喂入 input
+            last_wave_nodes = [task.node for task, *_ in wave_outcomes]
+            last_wave_whens = {task.node: outcome.when for task, outcome, *_ in wave_outcomes}
+            last_wave_outputs = [(task.node, outcome.output) for task, outcome, *_ in wave_outcomes]
+            last_wave_was_send = current_is_send_wave
+
             # 1) 一等 Interrupt：立即挂起并提交
             if interrupt_hit is not None:
                 if hasattr(ctx.bus, "fire"):
@@ -482,7 +558,7 @@ class Scheduler:
                 pending_wave = next_sends
                 is_send_wave = True
                 cursor = wave[-1].node
-            # 3) 运行时跳转 Goto：落 GO_REDIRECT 并重入目标节点
+            # 3) 运行时跳转 Goto：落 GO_REDIRECT 并把 control/output 喂给重入目标节点
             elif goto_outcome is not None:
                 from_node, out = goto_outcome
                 if out.goto not in self._node_names:
@@ -493,7 +569,8 @@ class Scheduler:
                 ctx.refresh_state()
                 if hasattr(ctx.bus, "fire"):
                     ctx.bus.fire("node.redirect", {"run_id": ctx.run.id, "from": from_node, **goto_payload})
-                pending_wave = [Send(out.goto, None)]
+                goto_input = out.control if out.control else out.output
+                pending_wave = [Send(out.goto, goto_input)]
                 cursor = out.goto
             else:
                 cursor = wave[-1].node

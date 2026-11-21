@@ -66,7 +66,16 @@ from .run import (
     run_registry,
     submit_run,
 )
-from .scheduler import NodeBody, NodeTimeoutError, Outcome, Scheduler, Send, StepResult, execute_wave
+from .scheduler import (
+    NodeBody,
+    NodeTimeoutError,
+    Outcome,
+    Scheduler,
+    Send,
+    StepResult,
+    WaveExecutionError,
+    execute_wave,
+)
 
 __all__ = [
     "Adjudicator",
@@ -101,6 +110,7 @@ __all__ = [
     "StepResult",
     "Subscriber",
     "TraceSpan",
+    "WaveExecutionError",
     "WorkflowPlan",
     "add_number",
     "answer_interrupt",

@@ -843,6 +843,141 @@ def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
     assert executed_items == [1]
 
 
+def test_kernel_wave_multi_error_aggregation_and_edge_input_delivery():
+    """验证同波多报错全量汇总（WaveExecutionError 不吞错）+ 6 种前驱/Goto/Send 沿边自动喂入 input。"""
+    import pytest
+
+    # 1) 同波多错汇总：3 张表并发，T1 成功（进入 partial_results_out），T2/T3 同时报错 -> 抛 WaveExecutionError 保留两项错误
+    partial: list = []
+
+    def multi_fail_worker(label: str) -> str:
+        if label == "T2":
+            raise ValueError("bad field on T2")
+        if label == "T3":
+            raise RuntimeError("timeout on T3")
+        return f"ok:{label}"
+
+    with pytest.raises(kernel.WaveExecutionError) as exc_info:
+        kernel.execute_wave(
+            ["T1", "T2", "T3"],
+            multi_fail_worker,
+            labels=["T1", "T2", "T3"],
+            max_workers=3,
+            partial_results_out=partial,
+        )
+    assert partial == ["ok:T1"]
+    assert exc_info.value.failed_labels == ["T2", "T3"]
+    assert len(exc_info.value.errors) == 2
+    assert isinstance(exc_info.value.errors[0][1], ValueError)
+    assert isinstance(exc_info.value.errors[1][1], RuntimeError)
+    assert "T2" in str(exc_info.value) and "T3" in str(exc_info.value)
+
+    # 2) 单错仍原样抛出原始异常（不额外包装）
+    with pytest.raises(ValueError, match="bad field on T2"):
+        kernel.execute_wave(["T1", "T2"], multi_fail_worker, labels=["T1", "T2"], max_workers=2)
+
+    # 3) 沿边数据自动喂入 input：入口 initial_input -> 单前驱 -> 静态多前驱 dict -> Send 动态 payload -> 模板前驱 list -> Goto control
+    session = make_session()
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="finish", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+    plan = kernel.WorkflowPlan(
+        name="edge_input_demo",
+        nodes=(
+            kernel.PlanNode("start", "入口", "stage"),
+            kernel.PlanNode("prep", "预处理", "stage"),
+            kernel.PlanNode("branch_a", "静态分支A", "stage"),
+            kernel.PlanNode("branch_b", "静态分支B", "stage"),
+            kernel.PlanNode("merge", "多前驱汇合", "stage"),
+            kernel.PlanNode("worker", "Send模板", "stage"),
+            kernel.PlanNode("collect", "模板汇合", "stage"),
+            kernel.PlanNode("finish", "终点", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "prep", "always"),
+            kernel.PlanEdge("prep", "branch_a", "always"),
+            kernel.PlanEdge("prep", "branch_b", "always"),
+            kernel.PlanEdge("branch_a", "merge", "always"),
+            kernel.PlanEdge("branch_b", "merge", "always"),
+            kernel.PlanEdge("merge", "worker", "always"),
+            kernel.PlanEdge("worker", "collect", "always"),
+            kernel.PlanEdge("collect", "finish", "always"),
+        ),
+        entry="start",
+    )
+
+    received: dict = {}
+
+    def body_prep(inp, _c):
+        received["prep"] = inp
+        return kernel.Outcome(output={"seed": inp["task"], "v": 10})
+
+    def body_branch_a(inp, _c):
+        received["branch_a"] = inp
+        return kernel.Outcome(output=inp["v"] + 1)
+
+    def body_branch_b(inp, _c):
+        received["branch_b"] = inp
+        return kernel.Outcome(output=inp["v"] + 2)
+
+    def body_merge(inp, _c):
+        received["merge"] = inp
+        # 收到 {"branch_a": 11, "branch_b": 12} -> 动态 Send 两个副本
+        return kernel.Outcome(
+            sends=[
+                kernel.Send("worker", {"k": "a", "val": inp["branch_a"]}, label="a"),
+                kernel.Send("worker", {"k": "b", "val": inp["branch_b"]}, label="b"),
+            ]
+        )
+
+    def body_worker(inp, _c):
+        return kernel.Outcome(output=f"{inp['k']}:{inp['val'] * 2}")
+
+    def body_collect(inp, c):
+        received.setdefault("collect_calls", []).append(inp)
+        # 第一次收到 Send 模板列表 -> 演示 Goto 传递 control 作为重入 input
+        if len(received["collect_calls"]) == 1:
+            return kernel.Outcome(goto="collect", control={"retry_items": inp, "round": 2})
+        return kernel.Outcome(events=[("DONE", "finish", {"final": inp})])
+
+    run = kernel.create_run(session, "edge-input-spec", initial_node="start")
+    ctx = kernel.RunContext(
+        session=session,
+        run=run,
+        settings=object(),
+        state=proj(session, run),
+        projector=proj,
+        concurrency=2,
+    )
+    kernel.Scheduler(
+        plan,
+        {
+            "prep": body_prep,
+            "branch_a": body_branch_a,
+            "branch_b": body_branch_b,
+            "merge": body_merge,
+            "worker": body_worker,
+            "collect": body_collect,
+        },
+    ).drive(ctx, initial_input={"task": "hello"})
+
+    assert received["prep"] == {"task": "hello"}
+    assert received["branch_a"] == {"seed": "hello", "v": 10}
+    assert received["branch_b"] == {"seed": "hello", "v": 10}
+    assert received["merge"] == {"branch_a": 11, "branch_b": 12}
+    assert received["collect_calls"][0] == ["a:22", "b:24"]
+    assert received["collect_calls"][1] == {"retry_items": ["a:22", "b:24"], "round": 2}
+    assert proj(session, run).status == "COMPLETED"
+    assert proj(session, run).result_json == {"final": {"retry_items": ["a:22", "b:24"], "round": 2}}
+
+
+
 
 
 
