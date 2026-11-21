@@ -30,12 +30,12 @@ backend/app/
 │   └── asset_models.py          #    资产表（文档 / 原始块 / 元数据 / 码表 / 审批 / 产物 / 系统设置）
 │
 ├── kernel/                      # 层 1：ProdAgent 六大核心微内核（仅依赖 infra，零业务依赖）
-│   ├── plan.py                  #    静态只读工作流蓝图（PlanNode / PlanEdge / WorkflowPlan）
-│   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播 + 预算检查钩子）
-│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 状态折叠引擎
+│   ├── plan.py                  #    静态只读工作流蓝图（PlanNode / PlanEdge / RetryPolicy / timeout / WorkflowPlan）
+│   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播 + node.retry + 预算检查钩子）
+│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 状态折叠引擎 + 零成本 Trace/Span 瀑布折叠
 │   ├── interrupt.py             #    一等人工中断协议（Interrupt / answer_interrupt / record_interrupt_answer）
-│   ├── run.py                   #    Run 控制面（RunContext / ChannelSpec / BudgetGuard / CancellationToken / RunRegistry / 全生命周期原语）
-│   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / execute_wave 屏障归并）
+│   ├── run.py                   #    Run 控制面（RunContext / ChannelSpec / AmbiguousWriteError / BudgetGuard / CancellationToken / 生命周期原语）
+│   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / 节点级 Retry+Timeout / 屏障冲突校验）
 │
 ├── policy/                      # 层 2：RegOps 领域策略层（仅依赖 infra + kernel，以插件方式装配到 kernel）
 │   ├── regops_plan.py           #    18 节点真 BSP 装配流水线拓扑（含单表 Send Worker/Join 与三路自愈回边）与状态折叠
@@ -94,7 +94,7 @@ backend/app/
 └── api/                         # 层 7：HTTP 接口层（v1 与 v2 统一收口）
     ├── deps.py                  #    公共 Session 依赖（db_session）、spawn_run_driver 与视图序列化
     ├── system.py                #    /api/health / /api/events/stream（SSE） / /api/blobs/* / /api/business/preview
-    ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / bus-events）
+    ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / trace 耗时瀑布 / bus-events）
     └── v2/                      #    /api/v2/* 工作台资产与生成路由
         ├── documents.py
         ├── metadata.py

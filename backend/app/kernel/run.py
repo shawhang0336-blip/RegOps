@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -60,10 +60,38 @@ def append_list(old: Any, new: Any) -> list:
     return base + [new]
 
 
+def add_number(old: Any, new: Any) -> Any:
+    """数值累加型 Reducer：适用于并发波次汇总计数或耗费指标（满足结合律与交换律）。"""
+    return (old or 0) + (new or 0)
+
+
+_MULTI_WRITER_REDUCERS = (merge_dict, append_list, add_number)
+
+
+class AmbiguousWriteError(ValueError):
+    """同一 BSP 并发波次中，多个任务写入同一个非并发安全通道（如 last_value）时抛出的冲突异常。"""
+
+    def __init__(self, channel: str, writers: Sequence[str]) -> None:
+        self.channel = channel
+        self.writers = list(writers)
+        super().__init__(
+            f"并发波次通道写冲突：通道 '{channel}' 不允许同波多写（写入方：{', '.join(self.writers)}），"
+            "请改用 merge_dict / append_list / add_number 等归约通道，或显式声明 allow_multi=True。"
+        )
+
+
 @dataclass(frozen=True)
 class ChannelSpec:
     name: str
     reducer: Reducer = last_value
+    allow_multi: Optional[bool] = None
+
+    @property
+    def allows_multi_writer(self) -> bool:
+        """是否允许同一 BSP 波次中多个并发任务同时写入本通道。"""
+        if self.allow_multi is not None:
+            return self.allow_multi
+        return self.reducer in _MULTI_WRITER_REDUCERS
 
 
 @dataclass
@@ -128,6 +156,32 @@ class RunContext:
             self.shared[key] = spec.reducer(self.shared.get(key), value)
         else:
             self.shared[key] = value
+
+    def check_wave_writes(self, writes: Sequence[Tuple[str, Dict[str, Any]]]) -> None:
+        """原子校验同一 BSP 并发波次的共享通道写集：禁止多个任务同波写非并发安全通道。"""
+        if len(writes) <= 1:
+            return
+        writers_by_key: Dict[str, List[str]] = {}
+        for writer, delta in writes:
+            if not delta:
+                continue
+            for key in delta:
+                writers_by_key.setdefault(key, []).append(writer)
+        for key, writers in writers_by_key.items():
+            if len(writers) <= 1:
+                continue
+            spec = self.channels.get(key)
+            if spec is None or not spec.allows_multi_writer:
+                raise AmbiguousWriteError(key, writers)
+
+    def apply_wave_writes(self, writes: Sequence[Tuple[str, Dict[str, Any]]]) -> None:
+        """先做同波次冲突校验，通过后再按确定性波次顺序通过 Reducer 归并写入。"""
+        self.check_wave_writes(writes)
+        for _writer, delta in writes:
+            if not delta:
+                continue
+            for key, value in delta.items():
+                self.put(key, value)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.shared.get(key, default)
@@ -352,6 +406,10 @@ class CancellationToken:
     def raise_if_cancelled(self) -> None:
         if self._event.is_set():
             raise RunCancelledError(self.reason)
+
+    def wait(self, timeout: float) -> bool:
+        """等待指定秒数或直到收到取消信号；若因取消提前唤醒返回 True。"""
+        return self._event.wait(max(0.0, float(timeout)))
 
 
 class RunRegistry:

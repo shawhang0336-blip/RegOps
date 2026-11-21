@@ -17,7 +17,7 @@ from app.kernel.event_log import (
     register_default_reducer,
 )
 from app.kernel.interrupt import make_interrupt_payload, pending_interrupt_with
-from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan
+from app.kernel.plan import PlanEdge, PlanNode, RetryPolicy, WorkflowPlan
 from app.infra.models import EventModel, RunModel
 
 # 条件标签语义（执行器按此查边）：
@@ -45,7 +45,12 @@ DEFAULT_NODES: Tuple[PlanNode, ...] = (
     PlanNode("audit_case_binder", "审计用例派发", "stage"),
     PlanNode("audit_table_worker", "单表变异用例并行", "stage"),
     PlanNode("audit_join", "用例波次汇聚", "stage"),
-    PlanNode("oracle_executor", "Oracle 沙箱审计", "stage"),
+    PlanNode(
+        "oracle_executor",
+        "Oracle 沙箱审计",
+        "stage",
+        retry=RetryPolicy(max_attempts=2, base_delay=0.3, retry_on=(ConnectionError, TimeoutError)),
+    ),
     PlanNode("test_confirmation", "测试结果确认", "gate"),
     PlanNode("export", "产物导出", "terminal"),
     PlanNode("failed", "失败", "terminal"),

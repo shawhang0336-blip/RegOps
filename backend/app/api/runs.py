@@ -38,8 +38,9 @@ from app.infra.config import get_settings
 from app.infra.errors import WorkflowError
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.bus import global_bus
+from app.kernel.event_log import project_trace
 from app.policy.regops_channels import resolve_event_tables
-from app.policy.regops_plan import project, project_many
+from app.policy.regops_plan import DEFAULT_PLAN, project, project_many
 
 router = APIRouter(tags=["runs"])
 
@@ -425,6 +426,15 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return replay_generic_run(session, run)
+
+
+@router.get("/api/runs/{run_id}/trace")
+def trace_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
+    """从同一份 EventLog 零成本折叠单次 Run 的节点/分片耗时瀑布与重试统计。"""
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return project_trace(session, run, plan=DEFAULT_PLAN).as_dict()
 
 
 @router.get("/api/runs/{run_id}/bus-events")

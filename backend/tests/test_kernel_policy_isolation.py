@@ -439,3 +439,271 @@ def test_kernel_true_bsp_send_fanout_and_budget_guard_circuit_breaker():
     assert ("max_total_tokens", 120, 100) in budget_breaches
 
 
+def test_kernel_ambiguous_write_guard_and_add_number_reducer():
+    """验证 BSP 屏障的 AmbiguousWriteError 并发写冲突守卫与 add_number 累加 Reducer。"""
+    import pytest
+
+    session = make_session()
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="join", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+    plan = kernel.WorkflowPlan(
+        name="ambiguous_write_demo",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("fanout", "派发", "stage"),
+            kernel.PlanNode("worker", "并发节点", "stage"),
+            kernel.PlanNode("join", "汇总", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "fanout", "always"),
+            kernel.PlanEdge("fanout", "worker", "always"),
+            kernel.PlanEdge("worker", "join", "always"),
+        ),
+        entry="start",
+    )
+
+    # 1) 同波次并发写 last_value 通道 -> 立即触发 AmbiguousWriteError，且不污染事件账本与 shared
+    run1 = kernel.create_run(session, "aw-spec-1", initial_node="start")
+    ctx1 = kernel.RunContext(
+        session=session,
+        run=run1,
+        settings=object(),
+        state=proj(session, run1),
+        channels={"phase": kernel.ChannelSpec("phase", kernel.last_value)},
+        projector=proj,
+    )
+
+    def fanout_body(_inp, _c):
+        return kernel.Outcome(
+            sends=[
+                kernel.Send("worker", {"n": 10}, label="w1"),
+                kernel.Send("worker", {"n": 20}, label="w2"),
+            ]
+        )
+
+    def conflict_worker(inp, _c):
+        return kernel.Outcome(
+            shared={"phase": f"from-{inp['n']}"},
+            events=[("WORKER_STEP", "worker", {"n": inp["n"]})],
+        )
+
+    with pytest.raises(kernel.AmbiguousWriteError) as exc_info:
+        kernel.Scheduler(
+            plan,
+            {"fanout": fanout_body, "worker": conflict_worker, "join": lambda _i, _c: kernel.Outcome()},
+        ).drive(ctx1)
+    assert exc_info.value.channel == "phase"
+    assert exc_info.value.writers == ["w1", "w2"]
+    assert "phase" not in ctx1.shared
+    # 冲突在落账前被拦下，WORKER_STEP 未写入 EventLog
+    trace_conflict = kernel.project_trace(session, run1, plan=plan)
+    assert all("WORKER_STEP" not in s.kinds for s in trace_conflict.spans)
+
+    # 2) 使用 add_number / merge_dict / append_list / 显式 allow_multi=True 通道 -> 并发归约成功
+    run2 = kernel.create_run(session, "aw-spec-2", initial_node="start")
+    ctx2 = kernel.RunContext(
+        session=session,
+        run=run2,
+        settings=object(),
+        state=proj(session, run2),
+        channels={
+            "total": kernel.ChannelSpec("total", kernel.add_number),
+            "last_seen": kernel.ChannelSpec("last_seen", kernel.last_value, allow_multi=True),
+        },
+        projector=proj,
+    )
+
+    def safe_worker(inp, _c):
+        return kernel.Outcome(
+            shared={"total": inp["n"], "last_seen": inp["n"]},
+            events=[("WORKER_STEP", "worker", {"n": inp["n"], "label": f"shard-{inp['n']}"})],
+        )
+
+    def join_body(_inp, c):
+        return kernel.Outcome(events=[("DONE", "join", {"total": c.get("total"), "last_seen": c.get("last_seen")})])
+
+    steps = kernel.Scheduler(
+        plan,
+        {"fanout": fanout_body, "worker": safe_worker, "join": join_body},
+    ).drive(ctx2)
+    assert [s.node for s in steps] == ["fanout", "worker", "worker", "join"]
+    assert ctx2.get("total") == 30
+    assert ctx2.get("last_seen") == 20
+    assert proj(session, run2).status == "COMPLETED"
+
+
+def test_kernel_node_retry_policy_timeout_and_eventlog_trace():
+    """验证节点级声明式 RetryPolicy / timeout、取消永不重试，以及从 EventLog 零成本折叠 Trace/Span。"""
+    import time
+    import pytest
+
+    session = make_session()
+    bus = kernel.Bus()
+    retries_seen: list = []
+    exits_seen: list = []
+    bus.subscribe("node.retry", lambda e: retries_seen.append((e["node"], e["attempt"], e["max_attempts"])))
+    bus.subscribe("node.exit", lambda e: exits_seen.append((e["node"], e["attempts"], e["duration_ms"])))
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="done", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+    plan = kernel.WorkflowPlan(
+        name="resilience_trace_demo",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode(
+                "flaky",
+                "抖动节点",
+                "stage",
+                retry=kernel.RetryPolicy(max_attempts=3, base_delay=0.005, factor=1.5, retry_on=(ConnectionError,)),
+            ),
+            kernel.PlanNode(
+                "timed",
+                "超时自愈节点",
+                "stage",
+                timeout=0.04,
+                retry=kernel.RetryPolicy(max_attempts=2, base_delay=0.005, retry_on=(TimeoutError,)),
+            ),
+            kernel.PlanNode("done", "完成", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "flaky", "always"),
+            kernel.PlanEdge("flaky", "timed", "always"),
+            kernel.PlanEdge("timed", "done", "always"),
+        ),
+        entry="start",
+    )
+
+    flaky_calls = {"n": 0}
+    timed_calls = {"n": 0}
+
+    def body_flaky(_inp, _c):
+        flaky_calls["n"] += 1
+        if flaky_calls["n"] < 3:
+            raise ConnectionError(f"blip #{flaky_calls['n']}")
+        return kernel.Outcome(events=[("FLAKY_OK", "flaky", {"elapsed_seconds": 0.12})])
+
+    def body_timed(_inp, _c):
+        timed_calls["n"] += 1
+        if timed_calls["n"] == 1:
+            time.sleep(0.15)
+        return kernel.Outcome(events=[("DONE", "done", {"ok": True, "duration_ms": 15})])
+
+    run = kernel.create_run(session, "resilience-spec", initial_node="start", bus=bus)
+    ctx = kernel.RunContext(
+        session=session,
+        run=run,
+        settings=object(),
+        state=proj(session, run),
+        bus=bus,
+        projector=proj,
+    )
+
+    steps = kernel.Scheduler(plan, {"flaky": body_flaky, "timed": body_timed}).drive(ctx)
+    assert [s.node for s in steps] == ["flaky", "timed"]
+    assert steps[0].attempts == 3
+    assert steps[1].attempts == 2
+    assert steps[0].duration_ms >= 0
+    assert retries_seen == [("flaky", 1, 3), ("flaky", 2, 3), ("timed", 1, 2)]
+    assert any(node == "flaky" and attempts == 3 for node, attempts, _ in exits_seen)
+    assert proj(session, run).status == "COMPLETED"
+    assert kernel.verify_chain(session, run) is True
+
+    # 从同一份 EventLog 折叠 Trace 视图（含重试统计、节点汇总、中文标签与文本瀑布）
+    trace = kernel.project_trace(session, run, plan=plan)
+    assert trace.run_id == run.id
+    assert trace.status == "ok"
+    assert trace.retry_count == 3
+    assert trace.by_node["flaky"]["retries"] == 2
+    assert trace.by_node["flaky"]["label"] == "抖动节点"
+    assert trace.by_node["flaky"]["total_duration_ms"] == 120
+    assert trace.by_node["timed"]["retries"] == 1
+    rendered = kernel.render_trace(trace)
+    assert "抖动节点" in rendered and "retries=2" in rendered
+
+    # 非匹配异常（ValueError）不触发重试；取消异常永不重试
+    non_match_calls = {"n": 0}
+    run_err = kernel.create_run(session, "err-spec", initial_node="start")
+    ctx_err = kernel.RunContext(session=session, run=run_err, settings=object(), state=proj(session, run_err), projector=proj)
+
+    def body_bad(_inp, _c):
+        non_match_calls["n"] += 1
+        raise ValueError("not retryable")
+
+    with pytest.raises(ValueError, match="not retryable"):
+        kernel.Scheduler(plan, {"flaky": body_bad, "timed": body_timed}).drive(ctx_err)
+    assert non_match_calls["n"] == 1
+
+    # timeout 超限且未配置重试时直接抛 NodeTimeoutError
+    strict_plan = kernel.WorkflowPlan(
+        name="strict_timeout",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("slow", "慢节点", "stage", timeout=0.03),
+            kernel.PlanNode("end", "终点", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "slow", "always"),
+            kernel.PlanEdge("slow", "end", "always"),
+        ),
+        entry="start",
+    )
+    run_to = kernel.create_run(session, "to-spec", initial_node="start")
+    ctx_to = kernel.RunContext(session=session, run=run_to, settings=object(), state=proj(session, run_to), projector=proj)
+    with pytest.raises(kernel.NodeTimeoutError):
+        kernel.Scheduler(strict_plan, {"slow": lambda _i, _c: (time.sleep(0.15), kernel.Outcome())[1]}).drive(ctx_to)
+
+
+def test_runs_trace_api_projects_regops_eventlog_without_extra_tables():
+    """验证 /api/runs/{run_id}/trace 直接从 RegOps EventLog 折叠耗时瀑布与分片维度。"""
+    from app.api.runs import trace_run
+
+    session = make_session()
+    run = kernel.create_run(session, "regops-trace-spec", initial_node="created")
+    kernel.append_event(
+        session,
+        run,
+        "AI_TOOL_ASSIGNED",
+        "rule_table_worker",
+        {"table_code": "T01", "elapsed_seconds": 1.25},
+    )
+    kernel.append_event(
+        session,
+        run,
+        "TABLE_RULES_BOUND",
+        "rule_table_worker",
+        {"table_code": "T01", "rule_count": 4},
+    )
+    kernel.append_event(
+        session,
+        run,
+        "AUDIT_COMPLETED",
+        "oracle_executor",
+        {"result": {"all_passed": True}},
+    )
+    session.commit()
+
+    payload = trace_run(run.id, session=session)
+    assert payload["run_id"] == run.id
+    assert payload["event_count"] == 4
+    worker_spans = [s for s in payload["spans"] if s["node"] == "rule_table_worker" and s["shard"] == "T01"]
+    assert len(worker_spans) == 1
+    assert worker_spans[0]["label"] == "单表规则并行绑定"
+    assert worker_spans[0]["duration_ms"] == 1250
+    assert payload["by_node"]["oracle_executor"]["label"] == "Oracle 沙箱审计"
+
+
+
+

@@ -25,6 +25,7 @@ LIFECYCLE_TOPICS = (
     "run.failed",
     "run.cancelled",
     "node.enter",
+    "node.retry",
     "node.exit",
     "node.redirect",
     "node.error",

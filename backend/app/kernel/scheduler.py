@@ -1,16 +1,18 @@
-"""Scheduler：ProdAgent 真 BSP 波次执行引擎微内核（Wave + Send + Goto + Interrupt）。
+"""Scheduler：ProdAgent 真 BSP 波次执行引擎微内核（Wave + Send + Goto + Interrupt + Retry/Timeout）。
 
 职责边界：
-- 不认识任何具体业务阶段——只读 Plan、算就绪波次（Ready Set）、并发跑 Wave、在屏障统一归并落账；
-- 完整支持 ProdAgent 三大控制原语：
-  1. `Send(node, input)`：运行时动态扇出（同波次并发执行，屏障按确定性顺序通过 Channel Reducer 合并产物）；
+- 不认识任何具体业务阶段——只读 Plan、算就绪波次（Ready Set）、并发跑 Wave、在屏障统一校验并归并落账；
+- 完整支持 ProdAgent 核心控制与弹性原语：
+  1. `Send(node, input)`：运行时动态扇出（同波次并发执行，屏障先做 `AmbiguousWriteError` 冲突检测再按确定性顺序归约）；
   2. `goto`：运行时跳转/自愈回边（落 `GO_REDIRECT` 后重入目标节点）；
   3. `Interrupt`：一等人工中断指令（屏障落账中断事件、广播 `run.interrupted` 并立刻挂起）；
+  4. 节点级声明式 `timeout` 与 `RetryPolicy`（指数退避、广播 `node.retry`、屏障落账 `NODE_RETRY`、支持取消唤醒）；
 - 同步提供可复用的内核级波次执行原语 `execute_wave`，统一托管 `wave.fanout` / `wave.barrier`、
   并发池、取消检查（`CancellationToken`）与预算熔断检查（`BudgetGuard`）。
 """
 
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
@@ -18,13 +20,30 @@ from .bus import global_bus
 from .event_log import append_event
 from .interrupt import Interrupt
 from .plan import WorkflowPlan
-from .run import RunContext
+from .run import AmbiguousWriteError, BudgetExceededError, RunCancelledError, RunContext
 
 T = TypeVar("T")
 R = TypeVar("R")
 
 # Node body 的统一契约：body(input, ctx) -> Outcome
 NodeBody = Callable[[Any, RunContext], "Outcome"]
+
+_NON_RETRYABLE_ERRORS = (
+    RunCancelledError,
+    BudgetExceededError,
+    AmbiguousWriteError,
+    KeyboardInterrupt,
+    SystemExit,
+)
+
+
+class NodeTimeoutError(TimeoutError):
+    """节点执行超出 `PlanNode.timeout` 声明上限时抛出的内核超时异常。"""
+
+    def __init__(self, node: str, timeout: float) -> None:
+        super().__init__(f"节点 {node} 执行超时（上限 {timeout}s）")
+        self.node = node
+        self.timeout = timeout
 
 
 @dataclass(frozen=True)
@@ -60,6 +79,38 @@ class StepResult:
     outcome: Outcome
     input: Any = None
     label: Optional[str] = None
+    attempts: int = 1
+    duration_ms: int = 0
+
+
+def _invoke_body_with_timeout(
+    body: NodeBody,
+    task_input: Any,
+    ctx: RunContext,
+    timeout: Optional[float],
+    node_name: str,
+) -> Outcome:
+    if timeout is None:
+        return body(task_input, ctx)
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(body, task_input, ctx)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise NodeTimeoutError(node_name, timeout) from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _sleep_cancelable(delay: float, cancellation: Any) -> None:
+    if delay <= 0:
+        return
+    if cancellation is not None and hasattr(cancellation, "wait"):
+        if cancellation.wait(delay):
+            cancellation.raise_if_cancelled()
+        return
+    time.sleep(delay)
 
 
 def execute_wave(
@@ -182,8 +233,13 @@ class Scheduler:
         ready = self._next_ready(node, ctx, when=when)
         return ready[0] if ready else None
 
-    def _run_task(self, task: Send, ctx: RunContext) -> Tuple[Send, Outcome]:
+    def _run_task(self, task: Send, ctx: RunContext) -> Tuple[Send, Outcome, List[tuple], int, int]:
         body = self.bodies[task.node]
+        plan_node = self.plan.node(task.node)
+        policy = plan_node.retry
+        max_attempts = policy.max_attempts if policy is not None else 1
+        started = time.monotonic()
+
         if hasattr(ctx.bus, "fire"):
             enter_meta: Dict[str, Any] = {
                 "run_id": ctx.run.id,
@@ -193,8 +249,42 @@ class Scheduler:
             if task.label:
                 enter_meta["label"] = task.label
             ctx.bus.fire("node.enter", enter_meta)
-        outcome = body(task.input, ctx)
-        return task, outcome
+
+        retry_events: List[tuple] = []
+        attempt = 0
+        while True:
+            attempt += 1
+            ctx.check_cancelled()
+            try:
+                outcome = _invoke_body_with_timeout(body, task.input, ctx, plan_node.timeout, task.node)
+                duration_ms = max(0, round((time.monotonic() - started) * 1000))
+                return task, outcome, retry_events, attempt, duration_ms
+            except BaseException as exc:
+                if (
+                    isinstance(exc, _NON_RETRYABLE_ERRORS)
+                    or policy is None
+                    or attempt >= max_attempts
+                    or not policy.matches(exc)
+                ):
+                    raise
+                delay = policy.delay_for(attempt - 1)
+                retry_payload: Dict[str, Any] = {
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_seconds": round(delay, 4),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                if task.label:
+                    retry_payload["label"] = task.label
+                retry_events.append(("NODE_RETRY", task.node, retry_payload))
+                if hasattr(ctx.bus, "fire"):
+                    ctx.bus.fire(
+                        "node.retry",
+                        {"run_id": ctx.run.id, "node": task.node, **retry_payload},
+                    )
+                ctx.check_cancelled()
+                ctx.check_budget()
+                _sleep_cancelable(delay, ctx.cancellation)
 
     def drive(self, ctx: RunContext, max_steps: int = 64, max_workers: Optional[int] = None) -> List[StepResult]:
         """按 BSP 超步波次执行到人工中断门或终态，返回全部执行轨迹。"""
@@ -229,7 +319,7 @@ class Scheduler:
                 wave_outcomes = [self._run_task(wave[0], ctx)]
             else:
                 ctx.current_node = wave[0].node
-                partial_outcomes: List[Tuple[Send, Outcome]] = []
+                partial_outcomes: List[Tuple[Send, Outcome, List[tuple], int, int]] = []
                 try:
                     wave_outcomes = execute_wave(
                         wave,
@@ -245,8 +335,11 @@ class Scheduler:
                     )
                 except BaseException:
                     if partial_outcomes:
-                        for task, outcome in partial_outcomes:
-                            for kind, ev_node, payload in outcome.events:
+                        ctx.check_wave_writes(
+                            [(task.label or task.node, outcome.shared) for task, outcome, _, _, _ in partial_outcomes]
+                        )
+                        for task, outcome, retry_events, _, _ in partial_outcomes:
+                            for kind, ev_node, payload in [*retry_events, *outcome.events]:
                                 append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
                             for key, value in outcome.shared.items():
                                 ctx.put(key, value)
@@ -255,7 +348,11 @@ class Scheduler:
                         ctx.session.commit()
                     raise
 
-            # ── BSP 屏障：主线程按确定性顺序统一落账、归并 Channel、折叠状态 ──
+            # ── BSP 屏障：先原子检查同波次通道并发写冲突，再按确定性顺序落账与归并 Channel ──
+            ctx.check_wave_writes(
+                [(task.label or task.node, outcome.shared) for task, outcome, _, _, _ in wave_outcomes]
+            )
+
             bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
             barrier_node = wave[-1].node
             for rej in bus_rejections:
@@ -265,9 +362,9 @@ class Scheduler:
             goto_outcome: Optional[Tuple[str, Outcome]] = None
             next_sends: List[Send] = []
 
-            for task, outcome in wave_outcomes:
+            for task, outcome, retry_events, _, _ in wave_outcomes:
                 ctx.current_node = task.node
-                for kind, ev_node, payload in outcome.events:
+                for kind, ev_node, payload in [*retry_events, *outcome.events]:
                     append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
                 if outcome.interrupt is not None and interrupt_hit is None:
                     interrupt_hit = outcome.interrupt
@@ -292,7 +389,7 @@ class Scheduler:
             ctx.session.flush()
             ctx.refresh_state()
 
-            for task, outcome in wave_outcomes:
+            for task, outcome, _, attempts, duration_ms in wave_outcomes:
                 if hasattr(ctx.bus, "fire"):
                     exit_meta: Dict[str, Any] = {
                         "run_id": ctx.run.id,
@@ -301,12 +398,23 @@ class Scheduler:
                         "goto": outcome.goto,
                         "sends": len(outcome.sends),
                         "interrupted": outcome.interrupt is not None,
+                        "attempts": attempts,
+                        "duration_ms": duration_ms,
                         "status": ctx.state.status,
                     }
                     if task.label:
                         exit_meta["label"] = task.label
                     ctx.bus.fire("node.exit", exit_meta)
-                executed.append(StepResult(task.node, outcome, input=task.input, label=task.label))
+                executed.append(
+                    StepResult(
+                        task.node,
+                        outcome,
+                        input=task.input,
+                        label=task.label,
+                        attempts=attempts,
+                        duration_ms=duration_ms,
+                    )
+                )
 
             # 1) 一等 Interrupt：立即挂起并提交
             if interrupt_hit is not None:
