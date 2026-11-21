@@ -622,16 +622,30 @@ def _back_bodies(specs, settings):
             ("VALIDATION_SQL", sql_uri),
             ("AUDIT_REPORT", report_uri),
         ]:
-            ctx.session.add(
-                ArtifactModel(
-                    id=str(uuid.uuid4()),
-                    run_id=run.id,
-                    artifact_type=artifact_type,
-                    blob_uri=uri,
-                    sha256=uri.removeprefix("blob://"),
-                    version=attempt,
+            # 按 (run_id, artifact_type, version) 幂等更新，防止节点瞬时重试时重复写入同版本产物行
+            existing_artifact = (
+                ctx.session.query(ArtifactModel)
+                .filter(
+                    ArtifactModel.run_id == run.id,
+                    ArtifactModel.artifact_type == artifact_type,
+                    ArtifactModel.version == attempt,
                 )
+                .first()
             )
+            if existing_artifact is not None:
+                existing_artifact.blob_uri = uri
+                existing_artifact.sha256 = uri.removeprefix("blob://")
+            else:
+                ctx.session.add(
+                    ArtifactModel(
+                        id=str(uuid.uuid4()),
+                        run_id=run.id,
+                        artifact_type=artifact_type,
+                        blob_uri=uri,
+                        sha256=uri.removeprefix("blob://"),
+                        version=attempt,
+                    )
+                )
         ctx.session.flush()
 
         shared = {"report": report, "result": result, "attempt": attempt, "first_attempt": first_attempt}

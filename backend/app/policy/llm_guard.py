@@ -11,6 +11,7 @@
 
 from contextlib import contextmanager
 import contextvars
+import random
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -124,11 +125,25 @@ def _fail_context(tool_name: str, payload: Dict[str, Any], error_kind: str, retr
     return context
 
 
-def _backoff_wait(steps: Tuple[float, ...], attempt: int) -> None:
+def _backoff_wait(
+    steps: Tuple[float, ...],
+    attempt: int,
+    *,
+    cancellation: Any = None,
+    jitter: float = 0.2,
+) -> None:
+    """带随机抖动（防惊群）且可被 CancellationToken 瞬间唤醒的退避等待。"""
     index = min(max(attempt - 1, 0), len(steps) - 1)
-    delay = steps[index] if steps else 0
-    if delay:
-        time.sleep(delay)
+    delay = float(steps[index]) if steps else 0.0
+    if delay <= 0:
+        return
+    if jitter > 0:
+        delay = max(0.0, delay * random.uniform(1.0 - jitter, 1.0 + jitter))
+    if cancellation is not None and hasattr(cancellation, "wait"):
+        if cancellation.wait(delay):
+            cancellation.raise_if_cancelled()
+        return
+    time.sleep(delay)
 
 
 def _classify_runtime_error(exc: RuntimeError) -> str:
@@ -237,13 +252,13 @@ def call_llm_validated(
             last_kind, last_error = "timeout", str(exc)
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used)
+            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
         except (httpx.HTTPError, TimeoutError, ConnectionError) as exc:
             transient_used += 1
             last_kind, last_error = "transport", f"{type(exc).__name__}: {exc}"
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used)
+            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
         except RuntimeError as exc:
             kind = _classify_runtime_error(exc)
             transient_used += 1
@@ -256,7 +271,7 @@ def call_llm_validated(
                 feedback = _NO_TOOL_CALL_HINT
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used)
+            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
         except (ValueError, KeyError, TypeError) as exc:
             validation_used += 1
             rejection = str(exc)

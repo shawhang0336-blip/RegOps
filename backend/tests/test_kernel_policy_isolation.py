@@ -705,5 +705,144 @@ def test_runs_trace_api_projects_regops_eventlog_without_extra_tables():
     assert payload["by_node"]["oracle_executor"]["label"] == "Oracle 沙箱审计"
 
 
+def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
+    """验证弹性四板斧补齐项：Jitter 防惊群、call_id vs idempotency_key 双 ID 隔离、退避与波次取消即时唤醒。"""
+    import threading
+    import time
+    import pytest
+    from app.policy.llm_guard import _backoff_wait
+
+    # 1) RetryPolicy 指数退避 + Jitter 边界校验
+    no_jitter = kernel.RetryPolicy(max_attempts=3, base_delay=0.1, factor=2.0, jitter=0.0)
+    assert no_jitter.delay_for(0) == pytest.approx(0.1)
+    assert no_jitter.delay_for(1) == pytest.approx(0.2)
+    with_jitter = kernel.RetryPolicy(max_attempts=3, base_delay=1.0, factor=2.0, jitter=0.2, max_delay=2.1)
+    samples = [with_jitter.delay_for(1) for _ in range(30)]
+    assert all(1.6 <= d <= 2.1 for d in samples)
+    assert len(set(round(d, 6) for d in samples)) > 1
+
+    # 2) llm_guard._backoff_wait 在长退避期间收到取消信号立即唤醒并抛 RunCancelledError（不傻等 10s）
+    cancel_tok = kernel.CancellationToken()
+    threading.Timer(0.03, lambda: cancel_tok.cancel("stop during backoff")).start()
+    t0 = time.monotonic()
+    with pytest.raises(kernel.RunCancelledError, match="stop during backoff"):
+        _backoff_wait((10.0,), 1, cancellation=cancel_tok, jitter=0.0)
+    assert time.monotonic() - t0 < 1.0
+
+    # 3) 双 ID（call_id 每次尝试递增变化；idempotency_key 跨重试恒定、且并发 Send Worker 之间严格隔离）
+    session = make_session()
+    bus = kernel.Bus()
+    retry_bus_events: list = []
+    bus.subscribe("node.retry", lambda e: retry_bus_events.append((e["call_id"], e["idempotency_key"])))
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="join", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+    plan = kernel.WorkflowPlan(
+        name="dual_id_demo",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("fanout", "派发", "stage"),
+            kernel.PlanNode(
+                "worker",
+                "幂等并发表",
+                "stage",
+                timeout=1.0,
+                retry=kernel.RetryPolicy(max_attempts=3, base_delay=0.005, jitter=0.0, retry_on=(ConnectionError,)),
+            ),
+            kernel.PlanNode("join", "汇合", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "fanout", "always"),
+            kernel.PlanEdge("fanout", "worker", "always"),
+            kernel.PlanEdge("worker", "join", "always"),
+        ),
+        entry="start",
+    )
+
+    seen_attempts: dict = {}
+    side_effect_ledger: dict = {}
+    lock = threading.Lock()
+
+    def body_fanout(_inp, _c):
+        return kernel.Outcome(
+            sends=[
+                kernel.Send("worker", "T1", label="T1"),
+                kernel.Send("worker", "T2", label="T2"),
+            ]
+        )
+
+    def body_worker(tcode, c: kernel.RunContext):
+        assert c.call_id is not None and c.idempotency_key is not None
+        with lock:
+            rec = seen_attempts.setdefault(tcode, [])
+            rec.append((c.call_id, c.idempotency_key))
+            # 模拟按稳定业务幂等键登记副作用（重试时同键去重，不会写入两次）
+            side_effect_ledger.setdefault(c.idempotency_key, []).append(c.call_id)
+            attempt_n = len(rec)
+        if tcode == "T1" and attempt_n == 1:
+            raise ConnectionError("transient network drop on T1")
+        return kernel.Outcome(shared={"done": {tcode: c.idempotency_key}})
+
+    def body_join(_inp, c):
+        return kernel.Outcome(events=[("DONE", "join", {"done": c.get("done")})])
+
+    run = kernel.create_run(session, "dual-id-spec", initial_node="start", bus=bus)
+    ctx = kernel.RunContext(
+        session=session,
+        run=run,
+        settings=object(),
+        state=proj(session, run),
+        channels={"done": kernel.ChannelSpec("done", kernel.merge_dict)},
+        bus=bus,
+        projector=proj,
+        concurrency=2,
+    )
+    steps = kernel.Scheduler(
+        plan, {"fanout": body_fanout, "worker": body_worker, "join": body_join}
+    ).drive(ctx)
+
+    # T1 重试 2 次：call_id 严格不同，idempotency_key 严格相同；T1 与 T2 幂等键彼此隔离
+    assert len(seen_attempts["T1"]) == 2
+    t1_c1, t1_k1 = seen_attempts["T1"][0]
+    t1_c2, t1_k2 = seen_attempts["T1"][1]
+    t2_c1, t2_k1 = seen_attempts["T2"][0]
+    assert t1_c1 != t1_c2
+    assert t1_k1 == t1_k2
+    assert t1_k1 != t2_k1
+    assert len({t1_c1, t1_c2, t2_c1}) == 3
+    assert retry_bus_events == [(t1_c1, t1_k1)]
+    worker_steps = [s for s in steps if s.node == "worker"]
+    assert {s.label: s.idempotency_key for s in worker_steps} == {"T1": t1_k1, "T2": t2_k1}
+    assert {s.label: s.call_id for s in worker_steps} == {"T1": t1_c2, "T2": t2_c1}
+
+    # 4) execute_wave 收到取消时立即撤销尚未开始排队的后续 future
+    wave_cancel = kernel.CancellationToken()
+    executed_items: list = []
+
+    def wave_worker(item: int) -> int:
+        executed_items.append(item)
+        if item == 1:
+            wave_cancel.cancel("stop wave")
+            wave_cancel.raise_if_cancelled()
+        time.sleep(0.05)
+        return item
+
+    with pytest.raises(kernel.RunCancelledError, match="stop wave"):
+        kernel.execute_wave(
+            [1, 2, 3, 4, 5, 6],
+            wave_worker,
+            max_workers=1,
+            cancellation=wave_cancel,
+        )
+    assert executed_items == [1]
+
+
+
 
 

@@ -11,6 +11,8 @@
   并发池、取消检查（`CancellationToken`）与预算熔断检查（`BudgetGuard`）。
 """
 
+import contextvars
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -20,7 +22,14 @@ from .bus import global_bus
 from .event_log import append_event
 from .interrupt import Interrupt
 from .plan import WorkflowPlan
-from .run import AmbiguousWriteError, BudgetExceededError, RunCancelledError, RunContext
+from .run import (
+    AmbiguousWriteError,
+    BudgetExceededError,
+    InvocationContext,
+    RunCancelledError,
+    RunContext,
+    invocation_scope,
+)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -81,6 +90,8 @@ class StepResult:
     label: Optional[str] = None
     attempts: int = 1
     duration_ms: int = 0
+    call_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 def _invoke_body_with_timeout(
@@ -92,8 +103,9 @@ def _invoke_body_with_timeout(
 ) -> Outcome:
     if timeout is None:
         return body(task_input, ctx)
+    captured = contextvars.copy_context()
     pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(body, task_input, ctx)
+    future = pool.submit(captured.run, body, task_input, ctx)
     try:
         return future.result(timeout=timeout)
     except FuturesTimeoutError as exc:
@@ -171,12 +183,18 @@ def execute_wave(
             futures = [executor.submit(_guarded_worker, item) for item in items]
             ordered: List[R] = []
             first_exc: Optional[BaseException] = None
-            for future in futures:
+            for idx, future in enumerate(futures):
                 try:
                     ordered.append(future.result())
+                    if cancellation is not None and getattr(cancellation, "is_cancelled", False):
+                        for pending in futures[idx + 1 :]:
+                            pending.cancel()
                 except BaseException as exc:
                     if first_exc is None:
                         first_exc = exc
+                        if isinstance(exc, (RunCancelledError, BudgetExceededError)):
+                            for pending in futures[idx + 1 :]:
+                                pending.cancel()
             if first_exc is not None:
                 if partial_results_out is not None and ordered:
                     partial_results_out.extend(ordered)
@@ -201,9 +219,16 @@ class Scheduler:
         self.plan = plan
         self.bodies = bodies
         self._node_names = {node.name for node in plan.nodes}
+        self._call_seq = 0
+        self._call_lock = threading.Lock()
         unknown = set(bodies) - self._node_names
         if unknown:
             raise ValueError(f"Node body 不在 Plan 中：{sorted(unknown)}")
+
+    def _next_call_id(self, run_id: str) -> str:
+        with self._call_lock:
+            self._call_seq += 1
+            return f"{run_id}:c{self._call_seq}"
 
     def _next_ready(self, node: str, ctx: RunContext, when: Optional[str] = None) -> List[str]:
         """从当前游标 + 条件标签计算下一波次的所有就绪节点（支持单后继与静态多边扇出）。"""
@@ -233,32 +258,47 @@ class Scheduler:
         ready = self._next_ready(node, ctx, when=when)
         return ready[0] if ready else None
 
-    def _run_task(self, task: Send, ctx: RunContext) -> Tuple[Send, Outcome, List[tuple], int, int]:
+    def _run_task(
+        self,
+        task: Send,
+        ctx: RunContext,
+        wave_index: int = 0,
+    ) -> Tuple[Send, Outcome, List[tuple], int, int, str, str]:
         body = self.bodies[task.node]
         plan_node = self.plan.node(task.node)
         policy = plan_node.retry
         max_attempts = policy.max_attempts if policy is not None else 1
+        idempotency_key = f"{ctx.run.id}:w{wave_index}:{task.node}:{task.label or '_'}"
         started = time.monotonic()
-
-        if hasattr(ctx.bus, "fire"):
-            enter_meta: Dict[str, Any] = {
-                "run_id": ctx.run.id,
-                "node": task.node,
-                "attempt": ctx.state.attempt,
-            }
-            if task.label:
-                enter_meta["label"] = task.label
-            ctx.bus.fire("node.enter", enter_meta)
 
         retry_events: List[tuple] = []
         attempt = 0
         while True:
             attempt += 1
+            call_id = self._next_call_id(ctx.run.id)
+            if attempt == 1 and hasattr(ctx.bus, "fire"):
+                enter_meta: Dict[str, Any] = {
+                    "run_id": ctx.run.id,
+                    "node": task.node,
+                    "attempt": ctx.state.attempt,
+                    "call_id": call_id,
+                    "idempotency_key": idempotency_key,
+                }
+                if task.label:
+                    enter_meta["label"] = task.label
+                ctx.bus.fire("node.enter", enter_meta)
             ctx.check_cancelled()
+            inv = InvocationContext(
+                call_id=call_id,
+                idempotency_key=idempotency_key,
+                attempt=attempt,
+                wave=wave_index,
+            )
             try:
-                outcome = _invoke_body_with_timeout(body, task.input, ctx, plan_node.timeout, task.node)
+                with invocation_scope(inv):
+                    outcome = _invoke_body_with_timeout(body, task.input, ctx, plan_node.timeout, task.node)
                 duration_ms = max(0, round((time.monotonic() - started) * 1000))
-                return task, outcome, retry_events, attempt, duration_ms
+                return task, outcome, retry_events, attempt, duration_ms, call_id, idempotency_key
             except BaseException as exc:
                 if (
                     isinstance(exc, _NON_RETRYABLE_ERRORS)
@@ -272,6 +312,8 @@ class Scheduler:
                     "attempt": attempt,
                     "max_attempts": max_attempts,
                     "delay_seconds": round(delay, 4),
+                    "call_id": call_id,
+                    "idempotency_key": idempotency_key,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 if task.label:
@@ -297,7 +339,7 @@ class Scheduler:
         is_send_wave = False
         wave_width = max(1, int(max_workers or ctx.concurrency or 4))
 
-        for _ in range(max_steps):
+        for wave_index in range(1, max_steps + 1):
             ctx.check_cancelled()
             ctx.check_budget()
 
@@ -316,14 +358,14 @@ class Scheduler:
             # 波次并发执行：普通单步直跑零开销；Send 扇出波次或多节点波次统一经 execute_wave（广播 wave.fanout/barrier）
             if len(wave) == 1 and not current_is_send_wave:
                 ctx.current_node = wave[0].node
-                wave_outcomes = [self._run_task(wave[0], ctx)]
+                wave_outcomes = [self._run_task(wave[0], ctx, wave_index=wave_index)]
             else:
                 ctx.current_node = wave[0].node
-                partial_outcomes: List[Tuple[Send, Outcome, List[tuple], int, int]] = []
+                partial_outcomes: List[Tuple[Send, Outcome, List[tuple], int, int, str, str]] = []
                 try:
                     wave_outcomes = execute_wave(
                         wave,
-                        lambda task: self._run_task(task, ctx),
+                        lambda task: self._run_task(task, ctx, wave_index=wave_index),
                         bus=ctx.bus,
                         run_id=ctx.run.id,
                         stage=wave[0].node,
@@ -336,9 +378,9 @@ class Scheduler:
                 except BaseException:
                     if partial_outcomes:
                         ctx.check_wave_writes(
-                            [(task.label or task.node, outcome.shared) for task, outcome, _, _, _ in partial_outcomes]
+                            [(task.label or task.node, outcome.shared) for task, outcome, *_ in partial_outcomes]
                         )
-                        for task, outcome, retry_events, _, _ in partial_outcomes:
+                        for task, outcome, retry_events, *_ in partial_outcomes:
                             for kind, ev_node, payload in [*retry_events, *outcome.events]:
                                 append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
                             for key, value in outcome.shared.items():
@@ -350,7 +392,7 @@ class Scheduler:
 
             # ── BSP 屏障：先原子检查同波次通道并发写冲突，再按确定性顺序落账与归并 Channel ──
             ctx.check_wave_writes(
-                [(task.label or task.node, outcome.shared) for task, outcome, _, _, _ in wave_outcomes]
+                [(task.label or task.node, outcome.shared) for task, outcome, *_ in wave_outcomes]
             )
 
             bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
@@ -362,7 +404,7 @@ class Scheduler:
             goto_outcome: Optional[Tuple[str, Outcome]] = None
             next_sends: List[Send] = []
 
-            for task, outcome, retry_events, _, _ in wave_outcomes:
+            for task, outcome, retry_events, *_ in wave_outcomes:
                 ctx.current_node = task.node
                 for kind, ev_node, payload in [*retry_events, *outcome.events]:
                     append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
@@ -389,7 +431,7 @@ class Scheduler:
             ctx.session.flush()
             ctx.refresh_state()
 
-            for task, outcome, _, attempts, duration_ms in wave_outcomes:
+            for task, outcome, _, attempts, duration_ms, call_id, idempotency_key in wave_outcomes:
                 if hasattr(ctx.bus, "fire"):
                     exit_meta: Dict[str, Any] = {
                         "run_id": ctx.run.id,
@@ -400,6 +442,8 @@ class Scheduler:
                         "interrupted": outcome.interrupt is not None,
                         "attempts": attempts,
                         "duration_ms": duration_ms,
+                        "call_id": call_id,
+                        "idempotency_key": idempotency_key,
                         "status": ctx.state.status,
                     }
                     if task.label:
@@ -413,6 +457,8 @@ class Scheduler:
                         label=task.label,
                         attempts=attempts,
                         duration_ms=duration_ms,
+                        call_id=call_id,
+                        idempotency_key=idempotency_key,
                     )
                 )
 

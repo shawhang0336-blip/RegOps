@@ -6,6 +6,7 @@
 - 机制层不定义任何业务节点名（业务拓扑位于 app/policy/regops_plan.py）。
 """
 
+import random
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -16,6 +17,7 @@ class RetryPolicy:
 
     - `max_attempts`：含首次执行在内的最大尝试次数；
     - `base_delay` / `factor` / `max_delay`：第 n 次失败（从 0 起）等待 `base_delay * factor**n` 秒；
+    - `jitter`：随机抖动比例（默认 `0.2`，即在 `[1-jitter, 1+jitter]` 区间内错峰退避，防止并发波次惊群效应）；
     - `retry_on`：允许重试的异常类型元组或谓词函数；取消（`RunCancelledError`）、预算熔断（`BudgetExceededError`）
       与通道并发写冲突（`AmbiguousWriteError`）永不重试。
     """
@@ -24,6 +26,7 @@ class RetryPolicy:
     base_delay: float = 0.05
     factor: float = 2.0
     max_delay: Optional[float] = None
+    jitter: float = 0.2
     retry_on: Union[Tuple[Type[BaseException], ...], Callable[[BaseException], bool]] = (Exception,)
 
     def __post_init__(self) -> None:
@@ -35,11 +38,21 @@ class RetryPolicy:
             raise ValueError("RetryPolicy.factor 必须 >= 1")
         if self.max_delay is not None and self.max_delay < 0:
             raise ValueError("RetryPolicy.max_delay 不能为负数")
+        if self.jitter < 0 or self.jitter > 1:
+            raise ValueError("RetryPolicy.jitter 必须在 [0, 1] 之间")
 
-    def delay_for(self, failed_attempt: int) -> float:
+    def delay_for(
+        self,
+        failed_attempt: int,
+        *,
+        rng: Optional[Callable[[float, float], float]] = None,
+    ) -> float:
         delay = self.base_delay * (self.factor ** max(0, failed_attempt))
+        if self.jitter > 0 and delay > 0:
+            sampler = rng or random.uniform
+            delay = max(0.0, delay * sampler(1.0 - self.jitter, 1.0 + self.jitter))
         if self.max_delay is not None:
-            return min(delay, self.max_delay)
+            delay = min(delay, self.max_delay)
         return delay
 
     def matches(self, exc: BaseException) -> bool:

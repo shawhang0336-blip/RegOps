@@ -12,11 +12,13 @@
   统一所有 Run 类型的创世、失败落账、取消、重启恢复、后台推进、钩子删除与哈希链回放。
 """
 
+from contextlib import contextmanager
+import contextvars
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -111,6 +113,35 @@ class Identity:
         return payload
 
 
+@dataclass(frozen=True)
+class InvocationContext:
+    """单次节点尝试的执行标识（严格区分两大方向相反的 ID，线程/并发安全）：
+
+    - `call_id`：每次尝试全局递增且唯一，用于串起调用日志、Bus 事件与 Trace，**绝不能拿来业务去重**；
+    - `idempotency_key`：同一逻辑任务在跨重试期间保持恒定，供有副作用的操作登记去重。
+    """
+
+    call_id: str
+    idempotency_key: str
+    attempt: int = 1
+    wave: int = 0
+
+
+_CURRENT_INVOCATION: contextvars.ContextVar[Optional[InvocationContext]] = contextvars.ContextVar(
+    "kernel_current_invocation", default=None
+)
+
+
+@contextmanager
+def invocation_scope(invocation: InvocationContext) -> Iterator[InvocationContext]:
+    """将当前节点尝试的 `call_id` 与 `idempotency_key` 绑定到当前协程/线程上下文。"""
+    token = _CURRENT_INVOCATION.set(invocation)
+    try:
+        yield invocation
+    finally:
+        _CURRENT_INVOCATION.reset(token)
+
+
 @dataclass
 class RunContext:
     """单次 Run 调度的运行时容器：承载只读 state 投影、shared 通道、Identity、Bus、取消令牌与预算守卫。"""
@@ -148,6 +179,23 @@ class RunContext:
     @property
     def is_cancelled(self) -> bool:
         return bool(self.cancellation is not None and getattr(self.cancellation, "is_cancelled", False))
+
+    @property
+    def invocation(self) -> Optional[InvocationContext]:
+        """当前线程/并发分片正在执行的尝试标识（并发波次下各 Worker 彼此隔离，绝不串号）。"""
+        return _CURRENT_INVOCATION.get()
+
+    @property
+    def call_id(self) -> Optional[str]:
+        """当前单次尝试的关联 ID（每次重试都会递增变化，用于日志/Trace 关联）。"""
+        inv = _CURRENT_INVOCATION.get()
+        return inv.call_id if inv is not None else None
+
+    @property
+    def idempotency_key(self) -> Optional[str]:
+        """当前逻辑任务的稳定业务幂等键（同一任务跨重试保持不变，用于副作用去重）。"""
+        inv = _CURRENT_INVOCATION.get()
+        return inv.idempotency_key if inv is not None else None
 
     def put(self, key: str, value: Any) -> None:
         """通过 Channel Reducer 往共享通道写一个命名产物。"""
