@@ -6,6 +6,19 @@
 3. `regops_channels.py`：16 个命名数据通道（DEFAULT_CHANNELS）与 EventLog + BlobStore 断点折叠恢复（recover_channels）。
 """
 
+from .ingestion_plan import (
+    ACTIVE_INGESTION_STATUSES,
+    fold_ingestion_event,
+    project_ingestion,
+    project_ingestion_many,
+)
+from .llm_guard import (
+    call_llm_validated,
+    current_cancellation,
+    current_llm_bus,
+    llm_execution_scope,
+    submit_with_context,
+)
 from .regops_bus import (
     REGOPS_ADJUDICATORS,
     code_set_values_adjudicator,

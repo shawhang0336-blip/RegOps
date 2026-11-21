@@ -1,6 +1,6 @@
 import { IMPORT_STAGES, formatDuration } from './documentHelpers.js'
 
-export default function ImportProgressPanel({ progress, onClose }) {
+export default function ImportProgressPanel({ progress, onClose, onCancel, cancelling = false }) {
   if (!progress) return null
 
   const stages = progress.stages?.length
@@ -9,6 +9,7 @@ export default function ImportProgressPanel({ progress, onClose }) {
 
   const stage = Number(progress.stage || 0)
   const counters = progress.counters || {}
+  const budget = progress.budget_usage || null
   const status = String(progress.status || 'WORKING').toUpperCase()
   const working = status === 'WORKING'
   const failed = status === 'FAILED'
@@ -40,6 +41,16 @@ export default function ImportProgressPanel({ progress, onClose }) {
         </div>
         <div className="import-progress-meta">
           {progress.elapsed > 0 && <span className="import-timer">{formatDuration(progress.elapsed)}</span>}
+          {working && onCancel && (
+            <button
+              type="button"
+              className="button danger secondary sm"
+              disabled={cancelling}
+              onClick={onCancel}
+            >
+              {cancelling ? '正在中止...' : '中止解析'}
+            </button>
+          )}
           {!working && <button type="button" className="button-link" onClick={onClose}>关闭</button>}
         </div>
       </header>
@@ -55,6 +66,11 @@ export default function ImportProgressPanel({ progress, onClose }) {
           {counters.tables ? <span>{counters.tables} 张报表</span> : null}
           {counters.fields ? <span>{counters.fields} 个字段</span> : null}
           {counters.code_sets ? <span>{counters.code_sets} 张码表</span> : null}
+          {budget && budget.llm_calls > 0 ? (
+            <span>
+              AI {budget.llm_calls} 次 · {(budget.total_tokens || 0).toLocaleString()} tok
+            </span>
+          ) : null}
         </div>
       </div>
 

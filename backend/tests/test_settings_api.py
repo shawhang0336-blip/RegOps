@@ -49,3 +49,16 @@ def test_save_setting_rejects_env_managed_keys_and_persists_budget():
     assert updated["max_retries"] == 5
     assert updated["max_llm_concurrency"] == 6
     assert updated["max_rules_per_table"] == DEFAULT_BUDGET["max_rules_per_table"]
+    assert updated["max_llm_calls"] == DEFAULT_BUDGET["max_llm_calls"]
+    assert updated["max_total_tokens"] == DEFAULT_BUDGET["max_total_tokens"]
+    assert updated["max_elapsed_seconds"] == DEFAULT_BUDGET["max_elapsed_seconds"]
+
+    # BudgetGuard 阈值支持设为 0（仅统计不熔断）
+    settings_api.save_setting(
+        "execution_budget",
+        settings_api.SettingRequest(value={"max_llm_calls": 0, "max_total_tokens": 500000}),
+        session=session,
+    )
+    updated2 = get_budget(session)
+    assert updated2["max_llm_calls"] == 0
+    assert updated2["max_total_tokens"] == 500000

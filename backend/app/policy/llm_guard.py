@@ -9,14 +9,49 @@
   4. 鉴权/配置/不可用等不可恢复 RuntimeError（如 `LLM_API_KEY is required`、`offline unavailable`、`HTTP 400/401/403`）：快速失败不空耗重试预算。
 """
 
+from contextlib import contextmanager
+import contextvars
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
 from app.infra.errors import WorkflowError
 from app.infra.llm import LlmTimeoutError
 from app.policy.regops_bus import default_bus
+
+_ACTIVE_BUS: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_bus", default=None)
+_ACTIVE_CANCEL: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_cancel", default=None)
+
+
+def current_llm_bus() -> Optional[Any]:
+    """返回当前上下文作用域挂载的 Run 级 Bus（如在 Step 1 / Step 2 Run 中运行）。"""
+    return _ACTIVE_BUS.get()
+
+
+def current_cancellation() -> Optional[Any]:
+    """返回当前上下文作用域挂载的 CancellationToken（供并发 worker 协作式检查取消）。"""
+    return _ACTIVE_CANCEL.get()
+
+
+@contextmanager
+def llm_execution_scope(*, bus: Any = None, cancellation: Any = None) -> Iterator[None]:
+    """把 Run 级 Bus（含 BudgetGuard）与 CancellationToken 透传到所有深层 call_llm_validated 调用。"""
+    bus_token = _ACTIVE_BUS.set(bus) if bus is not None else None
+    cancel_token = _ACTIVE_CANCEL.set(cancellation) if cancellation is not None else None
+    try:
+        yield
+    finally:
+        if cancel_token is not None:
+            _ACTIVE_CANCEL.reset(cancel_token)
+        if bus_token is not None:
+            _ACTIVE_BUS.reset(bus_token)
+
+
+def submit_with_context(executor: Any, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """向线程池提交任务时显式复制当前 contextvars，确保 worker 继承 Bus/BudgetGuard/CancellationToken。"""
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
 
 STAGE_BY_TOOL = {
     "inspect_document_structure": "document_overview",
@@ -133,11 +168,14 @@ def call_llm_validated(
     transient_used = 0
     validation_used = 0
     wait_steps = DEFAULT_BACKOFF_SECONDS if backoff is None else backoff
-    bus = bus if bus is not None else default_bus()
+    bus = bus if bus is not None else (_ACTIVE_BUS.get() or default_bus())
+    cancellation = _ACTIVE_CANCEL.get()
     validate_fn = validator if validator is not None else (lambda args: args)
 
     max_total = max(1, transient_attempts) + max(1, validation_attempts)
     for attempt in range(1, max_total + 1):
+        if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
+            cancellation.raise_if_cancelled()
         if hasattr(bus, "check_budget"):
             bus.check_budget()
         attempt_timeout = timeout

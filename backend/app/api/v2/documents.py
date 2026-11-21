@@ -13,6 +13,13 @@ from app.assets.code_sets.service import (
     extract_code_sets_for_block,
     extract_parallel_for_blocks,
 )
+from app.engine.ingestion_run import (
+    cancel_document_run,
+    document_progress_view,
+    list_document_runs,
+    start_document_extract_run,
+    start_document_prepare_run,
+)
 from app.infra.asset_models import (
     DocumentArchitectureModel,
     FieldCodeReferenceModel,
@@ -23,6 +30,7 @@ from app.infra.asset_models import (
 )
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
+from app.infra.errors import WorkflowError
 from app.infra.task_runner import task_runner
 from app.ingestion.extractors import extract_document
 from app.ingestion.import_progress import ensure as progress_ensure
@@ -46,6 +54,10 @@ FILE_TYPES = {"pdf": "pdf", "docx": "docx", "xlsx": "xlsx"}
 class ParallelExtractRequest(BaseModel):
     block_ids: List[str]
     targets: Optional[List[str]] = None
+
+
+class CancelDocumentRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
@@ -236,24 +248,26 @@ def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool 
 
 @router.post("", status_code=201)
 async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """保存文件后立即返回，结构检查与切块交给统一后台 TaskRunner。"""
+    """保存文件后立即返回，结构检查与切块交由统一的 Step 1 Ingestion Run（kernel.run）驱动。"""
     content = await file.read()
     document = ingest_uploaded_file(file.filename, content, prepare=False)
     already_ready = document.status in {"UPLOADED", "EXTRACTED", "EXTRACTION_PARTIAL", "STRUCTURE_REVIEWED"} and document.block_count
     if already_ready:
         return {**document_summary(document), "processing": False}
-    progress_start(document.id, document.file_name)
-    progress_update(
-        document.id,
-        stage=1,
-        status="WORKING",
-        detail="文件已保存，准备检查文档结构",
-        counters={"bytes": len(content)},
-        log=f"已保存 {document.file_name}（{len(content) // 1024} KB）",
-    )
     settings = get_settings()
-    task_runner().submit(f"doc:prepare:{document.id}", prepare_document_work, document.id, settings)
-    return {**document_summary(document), "processing": True}
+    run_id = start_document_prepare_run(
+        document.id,
+        document.file_name,
+        settings,
+        reimport_deleted=False,
+        initial_bytes=len(content),
+        session_factory=SessionLocal,
+        runner=task_runner(),
+        inspect_overview_fn=inspect_document_overview,
+        reextract_blocks_fn=reextract_document_blocks,
+        store_blocks_fn=store_initial_blocks,
+    )
+    return {**document_summary(document), "processing": True, "run_id": run_id}
 
 
 @router.get("")
@@ -319,80 +333,36 @@ def document_detail(document_id: str, session: Session = Depends(db_session)) ->
 
 @router.get("/{document_id}/progress")
 def document_progress(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """前端进度视图：既给进程内阶段，也给库里的真实计数。"""
+    """前端进度视图：优先实时内存态，重启后从不可变 EventLog 折叠态无损还原。"""
+    try:
+        return document_progress_view(session, document_id)
+    except WorkflowError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{document_id}/runs")
+def document_runs(document_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    """查看指定文档历次 Step 1 Ingestion Run 审计记录（含 BudgetGuard 成本与哈希链校验）。"""
     document = session.get(SourceDocumentModel, document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    block_total = (
-        session.query(RawBlockModel)
-        .filter(RawBlockModel.document_id == document_id)
-        .count()
-    )
-    table_total = (
-        session.query(TableMetadataModel)
-        .filter(TableMetadataModel.document_id == document_id)
-        .count()
-    )
-    field_total = (
-        session.query(FieldMetadataModel)
-        .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
-        .filter(TableMetadataModel.document_id == document_id)
-        .count()
-    )
-    code_set_total = len(
-        {
-            row.code_set_id
-            for row in session.query(FieldCodeReferenceModel)
-            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-            .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
-            .filter(TableMetadataModel.document_id == document_id)
-            .all()
-        }
-    )
-    summary = document_summary(document)
+    items = list_document_runs(session, document_id)
+    return {"document_id": document_id, "count": len(items), "runs": items}
 
-    snapshot = progress_snapshot(document_id)
-    counters = {
-        "blocks": block_total,
-        "tables": table_total,
-        "fields": field_total,
-        "code_sets": code_set_total,
-    }
-    if snapshot:
-        for key, value in snapshot.get("counters", {}).items():
-            if key in {"blocks", "tables", "fields", "code_sets"}:
-                continue
-            counters[key] = value
-        return {
-            "document_id": document_id,
-            "file_name": snapshot["file_name"],
-            "status": snapshot["status"],
-            "stage": snapshot["stage"],
-            "detail": snapshot["detail"],
-            "counters": counters,
-            "logs": snapshot["logs"],
-            "stages": snapshot["stages"],
-            "elapsed": snapshot["elapsed"],
-            "idle": snapshot["idle"],
-            "started_at": snapshot["started_at_iso"],
-            "document_status": summary["status"],
-            "processing": snapshot["status"] == "WORKING",
-        }
-    return {
-        "document_id": document_id,
-        "file_name": summary["file_name"],
-        "status": "IDLE",
-        "stage": 0,
-        "detail": "",
-        "counters": counters,
-        "logs": [],
-        "stages": [],
-        "elapsed": 0,
-        "idle": 0,
-        "started_at": "",
-        "document_status": summary["status"],
-        "processing": False,
-    }
+
+@router.post("/{document_id}/cancel")
+def cancel_document(
+    document_id: str,
+    request: Optional[CancelDocumentRequest] = None,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    """协作式中止正在运行的 Step 1 文档解析任务（经由 kernel.run 取消令牌）。"""
+    reason = (request.reason.strip() if request and request.reason else "") or "文档解析已由操作员中止"
+    try:
+        return cancel_document_run(session, document_id, reason=reason)
+    except WorkflowError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.post("/{document_id}/prepare", status_code=202)
@@ -401,23 +371,20 @@ def prepare_document(document_id: str, session: Session = Depends(db_session)) -
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
     file_name = document.file_name
-    progress_ensure(document_id, file_name)
-    progress_update(
-        document_id,
-        stage=1,
-        status="WORKING",
-        detail="重新检查文档结构",
-        log="收到“重新检查并解析”请求",
-    )
     settings = get_settings()
-    task_runner().submit(
-        f"doc:prepare:{document_id}",
-        prepare_document_work,
+    run_id = start_document_prepare_run(
         document_id,
+        file_name,
         settings,
+        session=session,
         reimport_deleted=True,
+        session_factory=SessionLocal,
+        runner=task_runner(),
+        inspect_overview_fn=inspect_document_overview,
+        reextract_blocks_fn=reextract_document_blocks,
+        store_blocks_fn=store_initial_blocks,
     )
-    return {"status": "PREPARING", "document_id": document_id}
+    return {"status": "PREPARING", "document_id": document_id, "run_id": run_id}
 
 
 @router.post("/{document_id}/reextract")
@@ -519,26 +486,23 @@ def extract_document_parallel(
     file_name = document.file_name
     document.status = "EXTRACTING"
     session.commit()
-    progress_ensure(document_id, file_name)
-    progress_update(
+    run_id = start_document_extract_run(
         document_id,
-        stage=4,
-        status="WORKING",
-        detail=f"准备解析 {len(request.block_ids)} 个内容块",
-        counters={"blocks_total": len(request.block_ids), "blocks_done": 0},
-        log=f"收到解析请求：{len(request.block_ids)} 个内容块",
-    )
-    task_runner().submit(
-        f"doc:extract:{document_id}",
-        _run_extraction,
-        document_id,
+        file_name,
         list(request.block_ids),
         request.targets,
         needs_analysis,
+        get_settings(),
+        session=session,
+        session_factory=SessionLocal,
+        runner=task_runner(),
+        analyze_structure_fn=analyze_document_structure,
+        extract_parallel_fn=extract_parallel_for_blocks,
     )
     return {
         "status": "EXTRACTING",
         "document_id": document_id,
+        "run_id": run_id,
         "block_count": len(request.block_ids),
     }
 

@@ -129,7 +129,7 @@ export default function RunsPage() {
   useEventStream({
     enabled: runIsActive,
     runId: active?.id || '',
-    topics: 'node.enter,node.exit,node.redirect,node.error,wave.barrier,tool.rejected,run.interrupted,run.completed,run.failed,event.appended',
+    topics: 'node.enter,node.exit,node.redirect,node.error,wave.barrier,tool.rejected,budget.exceeded,run.interrupted,run.cancelled,run.completed,run.failed,event.appended',
     fallbackIntervalMs: 5000,
     onEvent: refreshActiveRun,
     onFallbackTick: refreshActiveRun,
@@ -194,6 +194,36 @@ export default function RunsPage() {
       const body = await api(`/api/runs/${active.id}/retry`, { method: 'POST', body: JSON.stringify({}) })
       setNotice('已重新处理失败项，正在刷新验证结果。')
       await load(body.id)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function cancelActiveRun() {
+    if (!active) return
+    const confirmed = await confirm({
+      title: `中止运行中的批次「${batchTitle(active)}」？`,
+      message: `当前执行节点：${active.current_node || 'created'}`,
+      details: '系统会向内核取消令牌投递中止信号，在下一个安全点停止 LLM 调用并保留检查点。中止后可随时从断点继续执行，也可直接删除该批次。',
+      confirmLabel: '确认中止',
+      tone: 'danger',
+    })
+    if (!confirmed) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await api(`/api/runs/${active.id}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: '由操作员在控制台主动中止' }),
+      })
+      setNotice(
+        res.cancelled
+          ? '批次已中止并保留检查点，可随时点击“从断点继续执行”恢复。'
+          : '已向内核投递协作式取消令牌，等待当前子任务安全收尾后停止。',
+      )
+      await load(active.id)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -309,6 +339,12 @@ export default function RunsPage() {
   const hasAuditReport = Boolean(active?.result?.audit_report_blob)
   const errorDetails = active?.result?.error_details || null
   const errorMessage = active?.result?.error || ''
+  const isCancelled = Boolean(active?.result?.cancelled)
+  const isBudgetTripped = errorDetails?.error_kind === 'budget'
+  const budgetUsage = active?.result?.budget_usage || errorDetails?.budget_snapshot || null
+  const budgetSpeedup = budgetUsage && budgetUsage.elapsed_seconds > 0 && budgetUsage.total_llm_seconds > 0
+    ? (budgetUsage.total_llm_seconds / budgetUsage.elapsed_seconds).toFixed(1)
+    : null
 
   const outcome = !active ? null : active.status === 'WAITING_APPROVAL'
     ? {
@@ -322,11 +358,21 @@ export default function RunsPage() {
       ? { tone: 'danger', title: '规则在审计后发生过修改', description: '当前报告属于旧规则版本，请返回第二步重新生成并验证。' }
       : active.status === 'FAILED'
         ? {
-            tone: 'danger',
-            title: hasAuditReport ? '本次沙箱验证发现未通过规则' : `执行在节点 ${active.current_node || 'unknown'} 中断`,
-            description: hasAuditReport
-              ? '可点击下方“AI 靶向自愈修复并重验”由 Scheduler 触发 GO_REDIRECT 只重绑失败规则，或回第二步手动微调参数。'
-              : `${errorDetails?.suggestion || errorMessage || '运行中途因超时或服务重启中断'}。点击“从断点继续执行”将通过 RUN_RESUMED 从上一个已完成节点原地续跑，不重跑已完成阶段。`,
+            tone: isCancelled ? 'attention' : 'danger',
+            title: isCancelled
+              ? `批次已在节点 ${active.current_node || 'unknown'} 主动中止`
+              : isBudgetTripped
+                ? `已触达内核预算上限（${errorDetails?.metric || 'budget'}），BudgetGuard 已自动熔断`
+                : hasAuditReport
+                  ? '本次沙箱验证发现未通过规则'
+                  : `执行在节点 ${active.current_node || 'unknown'} 中断`,
+            description: isCancelled
+              ? `${errorMessage || '操作员已取消本次执行'}。EventLog 检查点已保留，点击“从断点继续执行”可原地续跑，也可直接删除批次。`
+              : isBudgetTripped
+                ? `${errorMessage} 可前往“系统设置”放宽预算阈值后点击“从断点继续执行”，已完成阶段无需重跑。`
+                : hasAuditReport
+                  ? '可点击下方“AI 靶向自愈修复并重验”由 Scheduler 触发 GO_REDIRECT 只重绑失败规则，或回第二步手动微调参数。'
+                  : `${errorDetails?.suggestion || errorMessage || '运行中途因超时或服务重启中断'}。点击“从断点继续执行”将通过 RUN_RESUMED 从上一个已完成节点原地续跑，不重跑已完成阶段。`,
           }
         : active.status === 'WAITING_TEST_APPROVAL'
           ? {
@@ -363,6 +409,11 @@ export default function RunsPage() {
         actions={
           <div className="actions">
             {runIsActive && <span className="live-stream-pill">实时推送中</span>}
+            {runIsActive && (
+              <button type="button" className="button danger secondary" disabled={busy} onClick={cancelActiveRun}>
+                中止执行
+              </button>
+            )}
             {runs.length > 1 && (
               <button type="button" className="button secondary" disabled={busy} onClick={() => setShowCleanup(true)}>
                 清理历史批次
@@ -457,7 +508,26 @@ export default function RunsPage() {
             <DetailSkeleton blocks={5} />
           ) : !active ? <div className="empty">请选择一个验证批次。</div> : (
             <>
-              {outcome && <div className={`run-outcome ${outcome.tone}`}><strong>{outcome.title}</strong><p>{outcome.description}</p></div>}
+              {outcome && (
+                <div className={`run-outcome ${outcome.tone}`}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+                    <div>
+                      <strong>{outcome.title}</strong>
+                      <p>{outcome.description}</p>
+                    </div>
+                    {runIsActive && (
+                      <button type="button" className="button danger secondary sm" disabled={busy} onClick={cancelActiveRun}>
+                        中止执行
+                      </button>
+                    )}
+                    {isBudgetTripped && (
+                      <button type="button" className="button secondary sm" onClick={() => navigate('/settings')}>
+                        调整预算上限
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="validation-flow" aria-label="第三步验证流程">
                 <span className={testData.length ? 'done' : 'current'}>01 AI 生成测试数据</span>
@@ -589,10 +659,11 @@ export default function RunsPage() {
                 )}
               </section>
 
-              <details className="run-section technical-run-details" open={busRejectEvents.length > 0 || goRedirectEvents.length > 0 || resumeEvents.length > 0}>
+              <details className="run-section technical-run-details" open={busRejectEvents.length > 0 || goRedirectEvents.length > 0 || resumeEvents.length > 0 || isBudgetTripped || isCancelled}>
                 <summary>
                   ProdAgent 内核轨迹 · 当前节点 <code>{active.current_node || 'created'}</code>
                   {' · '}EventLog ({runEvents.length})
+                  {budgetUsage ? ` · AI ${budgetUsage.llm_calls ?? 0} 次 / ${(budgetUsage.total_tokens ?? 0).toLocaleString()} tok` : ''}
                   {' · '}Bus 门禁拦截 ({busRejectEvents.length})
                   {' · '}自愈回边 ({goRedirectEvents.length})
                   {replay && ` · ${replay.chain_valid ? '哈希链完整' : '哈希链异常'}`}
@@ -616,6 +687,57 @@ export default function RunsPage() {
                     <strong>{backfillEvents.reduce((acc, ev) => acc + (ev.payload?.total || 0), 0)} 条</strong>
                   </div>
                 </div>
+
+                {budgetUsage && (
+                  <div className="action-callout" style={{ marginBottom: 12 }}>
+                    <div style={{ width: '100%' }}>
+                      <strong>
+                        BudgetGuard 资源消耗统计
+                        {budgetSpeedup && Number(budgetSpeedup) >= 1.1 ? ` · BSP 并发加速 ${budgetSpeedup}x` : ''}
+                      </strong>
+                      <div className="audit-metrics" style={{ marginTop: 8, marginBottom: 8 }}>
+                        <div>
+                          <span>AI 调用次数</span>
+                          <strong>
+                            {budgetUsage.llm_calls ?? 0}
+                            {budgetUsage.limits?.max_llm_calls ? ` / ${budgetUsage.limits.max_llm_calls}` : ' 次'}
+                          </strong>
+                        </div>
+                        <div>
+                          <span>累计 Token 消耗</span>
+                          <strong>
+                            {(budgetUsage.total_tokens ?? 0).toLocaleString()}
+                            {budgetUsage.limits?.max_total_tokens ? ` / ${Number(budgetUsage.limits.max_total_tokens).toLocaleString()}` : ''}
+                          </strong>
+                          <small>
+                            输入 {(budgetUsage.prompt_tokens ?? 0).toLocaleString()} · 输出 {(budgetUsage.completion_tokens ?? 0).toLocaleString()}
+                          </small>
+                        </div>
+                        <div>
+                          <span>AI 累计 / 墙钟耗时</span>
+                          <strong>
+                            {budgetUsage.total_llm_seconds ?? 0}s / {budgetUsage.elapsed_seconds ?? 0}s
+                          </strong>
+                          {budgetUsage.limits?.max_elapsed_seconds && (
+                            <small>熔断上限 {budgetUsage.limits.max_elapsed_seconds}s</small>
+                          )}
+                        </div>
+                        <div>
+                          <span>调度步数 / 门禁拦截</span>
+                          <strong>{budgetUsage.steps ?? 0} 步 / {budgetUsage.tool_rejections ?? 0} 次</strong>
+                        </div>
+                      </div>
+                      {budgetUsage.by_tool && Object.keys(budgetUsage.by_tool).length > 0 && (
+                        <small className="muted-text">
+                          按工具分布：
+                          {Object.entries(budgetUsage.by_tool)
+                            .map(([tool, count]) => `${tool} ×${count}`)
+                            .join(' · ')}
+                        </small>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {busRejectEvents.length > 0 && (
                   <div className="action-callout" style={{ marginBottom: 12 }}>

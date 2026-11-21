@@ -73,19 +73,32 @@ class BudgetExceededError(RuntimeError):
 class BudgetGuard:
     """线程安全的横切成本观测与熔断器：挂载到 Run 级 Bus 上自动记账并执行阈值检查。"""
 
-    def __init__(self, limits: Optional[BudgetLimits] = None, *, run_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        limits: Optional[BudgetLimits] = None,
+        *,
+        run_id: Optional[str] = None,
+        seed: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.limits = limits or BudgetLimits()
         self.run_id = run_id
         self._lock = threading.Lock()
         self._started_at = time.monotonic()
-        self._llm_calls = 0
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
-        self._total_llm_seconds = 0.0
-        self._steps = 0
-        self._tool_rejections = 0
-        self._by_tool: Dict[str, int] = {}
+        prior = seed if isinstance(seed, dict) else {}
+        self._elapsed_offset = max(0.0, float(prior.get("elapsed_seconds") or 0.0))
+        self._llm_calls = max(0, int(prior.get("llm_calls") or 0))
+        self._prompt_tokens = max(0, int(prior.get("prompt_tokens") or 0))
+        self._completion_tokens = max(0, int(prior.get("completion_tokens") or 0))
+        self._total_tokens = max(0, int(prior.get("total_tokens") or 0))
+        self._total_llm_seconds = max(0.0, float(prior.get("total_llm_seconds") or 0.0))
+        self._steps = max(0, int(prior.get("steps") or 0))
+        self._tool_rejections = max(0, int(prior.get("tool_rejections") or 0))
+        prior_tools = prior.get("by_tool")
+        self._by_tool: Dict[str, int] = (
+            {str(k): int(v) for k, v in prior_tools.items()}
+            if isinstance(prior_tools, dict)
+            else {}
+        )
         self._bus: Optional[Bus] = None
 
     def attach(self, bus: Bus) -> "BudgetGuard":
@@ -124,7 +137,7 @@ class BudgetGuard:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            elapsed = round(time.monotonic() - self._started_at, 2)
+            elapsed = round(self._elapsed_offset + (time.monotonic() - self._started_at), 2)
             return {
                 "llm_calls": self._llm_calls,
                 "prompt_tokens": self._prompt_tokens,

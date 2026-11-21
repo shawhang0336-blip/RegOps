@@ -13,6 +13,7 @@ from app.api.v2 import documents as documents_v2
 from app.api.v2 import generation as generation_v2
 from app.api.v2 import metadata as metadata_v2
 from app.api.v2 import settings as settings_v2
+from app.engine.ingestion_run import recover_interrupted_ingestion_runs
 from app.engine.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
 from app.infra.db import init_db
@@ -20,8 +21,9 @@ from app.infra.task_runner import task_runner
 
 
 def _mark_interrupted_runs() -> None:
-    """进程重启后把仍在运行态的批次记为失败（统一委托至 kernel.run.recover_interrupted_runs）。"""
+    """进程重启后把仍在运行态的 Step 1 / Step 2 批次统一记为失败（基于 kernel.run）。"""
     recover_interrupted_generic_runs()
+    recover_interrupted_ingestion_runs()
 
 
 @asynccontextmanager

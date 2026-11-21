@@ -1242,6 +1242,140 @@ def test_regops_budget_guard_tracks_usage_and_trips_on_exceeded_limit():
         call_llm_validated(llm, "assign_rules", "instr", {}, bus=bus)
     assert llm.calls == 2
 
+    # 跨 Interrupt 断点恢复时通过 seed 无损续接累计消耗（不含人工等待时长）
+    resumed_bus = default_bus()
+    resumed_guard = BudgetGuard(BudgetLimits(max_llm_calls=5), run_id="budget-test", seed=snap).attach(resumed_bus)
+    call_llm_validated(llm, "assign_generators", "instr", {}, bus=resumed_bus)
+    resumed_snap = resumed_guard.snapshot()
+    assert resumed_snap["llm_calls"] == 3
+    assert resumed_snap["total_tokens"] == 420
+    assert resumed_snap["by_tool"]["assign_rules"] == 2
+    assert resumed_snap["by_tool"]["assign_generators"] == 1
+
+
+def test_bsp_send_partial_wave_checkpoint_and_per_table_incremental_resume(monkeypatch, tmp_path):
+    """P3 回归：多表真 BSP Send 波次中表 1 成功、表 2 失败时，表 1 检查点先落 EventLog；断点续跑时表 1 零重跑，仅补跑表 2。"""
+    from app.engine.oracle import GenericOracleExecutor
+    from app.engine.workflow import drive, retry_generic_run, start_generic_run
+    from app.infra.models import EventModel, SpecificationModel
+    from app.policy.regops_plan import project
+
+    monkeypatch.setattr(
+        GenericOracleExecutor,
+        "prepare_assets",
+        lambda self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs: {
+            "attempt": attempt,
+            "physical_tables": {spec.table_code: f"STAGING_{spec.table_code}_{attempt}" for spec in specs},
+            "target_tables": {spec.table_code: f"TARGET_{spec.table_code}_{attempt}" for spec in specs},
+            "code_set_tables": {},
+            "code_set_versions": {},
+            "code_set_record_counts": {},
+            "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])},
+        },
+    )
+
+    session = make_session()
+    spec_id = str(uuid.uuid4())
+    spec_doc = SpecificationModel(
+        id=spec_id,
+        version="V1",
+        table_code="DUAL_RESUME",
+        source_name="dual-resume-test",
+        source_sha256="dual_sha_" + uuid.uuid4().hex[:8],
+        content_json={
+            "selection_confirmed": True,
+            "tables": [
+                {
+                    "version": "V1",
+                    "table_code": "T1",
+                    "table_name": "表一",
+                    "source_name": "dual-resume-test",
+                    "section": "1.1",
+                    "source_sha256": "sha_t1",
+                    "terms_text": "",
+                    "dictionary_text": "CODE_A 必须为4位字母",
+                    "fields": [{"name": "CODE_A", "content": "编码A", "data_type": "VARCHAR2", "length": 16, "check_text": "必须为4位字母", "evidence_page": "1"}],
+                },
+                {
+                    "version": "V1",
+                    "table_code": "T2",
+                    "table_name": "表二",
+                    "source_name": "dual-resume-test",
+                    "section": "1.2",
+                    "source_sha256": "sha_t2",
+                    "terms_text": "",
+                    "dictionary_text": "CODE_B 必须为4位数字",
+                    "fields": [{"name": "CODE_B", "content": "编码B", "data_type": "VARCHAR2", "length": 16, "check_text": "必须为4位数字", "evidence_page": "2"}],
+                },
+            ],
+        },
+    )
+    session.add(spec_doc)
+    session.commit()
+
+    fail_t2 = True
+    rule_calls = {"T1": 0, "T2": 0}
+
+    class PartialFailDualLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            trace = {"provider": "test", "model": "test", "elapsed_seconds": 0.1, "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70}}
+            if tool_name == "assign_rules":
+                if "tables" in payload:  # cross-table FK
+                    return {"rules": [], "golden_overrides": {}}, trace
+                tcode = payload.get("table_code")
+                rule_calls[tcode] = rule_calls.get(tcode, 0) + 1
+                if tcode == "T2" and fail_t2:
+                    # 不可恢复错误直接穿透，触发同波次 T1 成功、T2 失败的部分波次中断
+                    raise RuntimeError("LLM HTTP 401 simulated T2 failure")
+                field_name = payload["target_field"]
+                pattern = "^[A-Z]{4}$" if tcode == "T1" else "^[0-9]{4}$"
+                return {
+                    "rules": [
+                        {
+                            "rule_key": f"{tcode}_{field_name}_FMT",
+                            "field": field_name,
+                            "operator": "REGEXP",
+                            "params": {"pattern": pattern},
+                            "source": "AI_EXPANDED",
+                            "rationale": "格式约束",
+                        }
+                    ]
+                }, trace
+            return {}, trace
+
+    settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
+    llm = PartialFailDualLlm()
+    run = start_generic_run(session, spec_id, settings, llm=llm)
+    assert project(session, run).status == "FAILED"
+    assert rule_calls["T1"] == 1
+    assert rule_calls["T2"] == 1
+
+    # 关键断言 1：T1 已通过 partial_outcomes 在主线程持久化 TABLE_RULES_BOUND 检查点
+    table_bound_events = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == "TABLE_RULES_BOUND")
+        .all()
+    )
+    assert [e.payload_json["table_code"] for e in table_bound_events] == ["T1"]
+
+    # 恢复后重跑：T2 故障解除，断点续跑绝不重调 T1！
+    fail_t2 = False
+    retry_generic_run(session, run, settings, defer_continuation=True)
+    drive(session, run, settings, llm=llm)
+
+    assert project(session, run).status == "WAITING_APPROVAL"
+    assert rule_calls["T1"] == 1, f"T1 应直接复用检查点，不应重复调用 LLM：{rule_calls}"
+    assert rule_calls["T2"] == 2
+    final_bound_tables = sorted(
+        e.payload_json["table_code"]
+        for e in session.query(EventModel)
+        .filter(EventModel.run_id == run.id, EventModel.kind == "TABLE_RULES_BOUND")
+        .all()
+    )
+    assert final_bound_tables == ["T1", "T2"]
+
+
+
 
 
 

@@ -144,6 +144,7 @@ def fail_run(
     error_details: Optional[Dict[str, Any]] = None,
     resume_from_node: Optional[str] = None,
     resume_when: Optional[str] = None,
+    extra_result: Optional[Dict[str, Any]] = None,
     bus: Any = None,
     commit: bool = True,
 ) -> EventModel:
@@ -158,6 +159,8 @@ def fail_run(
     result_payload: Dict[str, Any] = {"error": error}
     if error_details is not None:
         result_payload["error_details"] = error_details
+    if extra_result:
+        result_payload.update(extra_result)
     event_payload: Dict[str, Any] = {"node": node, "result": result_payload}
     if resume_from_node is not None:
         event_payload["resume_from_node"] = resume_from_node
@@ -183,15 +186,19 @@ def record_run_cancelled(
     *,
     resume_from_node: Optional[str] = None,
     resume_when: Optional[str] = None,
+    extra_result: Optional[Dict[str, Any]] = None,
     bus: Any = None,
     commit: bool = True,
 ) -> EventModel:
     """落账受控取消事件 RUN_CANCELLED 并广播 run.cancelled，保留检查点以支持后续断点续跑。"""
     active_bus = bus if bus is not None else global_bus()
+    result_payload: Dict[str, Any] = {"error": reason, "cancelled": True}
+    if extra_result:
+        result_payload.update(extra_result)
     event_payload: Dict[str, Any] = {
         "node": node,
         "reason": reason,
-        "result": {"error": reason, "cancelled": True},
+        "result": result_payload,
     }
     if resume_from_node is not None:
         event_payload["resume_from_node"] = resume_from_node
@@ -262,20 +269,21 @@ def recover_interrupted_runs(
     session: Session,
     active_statuses: Iterable[str],
     *,
+    runs: Optional[Iterable[RunModel]] = None,
     projector_many: Optional[Callable[[Session, Iterable[RunModel]], Dict[str, RunState]]] = None,
     reason: str = "Run interrupted by process restart",
     bus: Any = None,
     commit: bool = True,
 ) -> List[str]:
     """进程重启中断恢复原语：将遗留在运行态的批次统一落账为失败，等待人工断点续跑。"""
-    runs = session.query(RunModel).all()
-    if not runs:
+    target_runs = list(runs) if runs is not None else session.query(RunModel).all()
+    if not target_runs:
         return []
     project_fn = projector_many or project_many_with
-    states = project_fn(session, runs)
+    states = project_fn(session, target_runs)
     active = set(active_statuses)
     recovered: List[str] = []
-    for run in runs:
+    for run in target_runs:
         state = states[run.id]
         if state.status not in active:
             continue

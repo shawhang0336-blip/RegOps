@@ -73,8 +73,13 @@ def execute_wave(
     max_workers: int = 4,
     cancellation: Any = None,
     budget_guard: Any = None,
+    partial_results_out: Optional[List[R]] = None,
 ) -> List[R]:
-    """内核级 BSP 波次执行原语：波前门禁 → `wave.fanout` → 并发执行 → `wave.barrier`（保序返回）。"""
+    """内核级 BSP 波次执行原语：波前门禁 → `wave.fanout` → 并发执行 → `wave.barrier`（保序返回）。
+
+    若传入 `partial_results_out` 且并发波次中部分子任务失败，会先把已成功的结果按确定性顺序回填，
+    供 Scheduler 在主线程屏障先行持久化已完成分片的检查点，再向上抛出首个异常。
+    """
     if not items:
         return []
     if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
@@ -102,11 +107,30 @@ def execute_wave(
 
     worker_count = max(1, min(int(max_workers or 1), len(items)))
     if worker_count == 1 or len(items) == 1:
-        results = [_guarded_worker(item) for item in items]
+        results: List[R] = []
+        for item in items:
+            try:
+                results.append(_guarded_worker(item))
+            except BaseException:
+                if partial_results_out is not None and results:
+                    partial_results_out.extend(results)
+                raise
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(_guarded_worker, item) for item in items]
-            results = [future.result() for future in futures]
+            ordered: List[R] = []
+            first_exc: Optional[BaseException] = None
+            for future in futures:
+                try:
+                    ordered.append(future.result())
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+            if first_exc is not None:
+                if partial_results_out is not None and ordered:
+                    partial_results_out.extend(ordered)
+                raise first_exc
+            results = ordered
 
     barrier_meta: Dict[str, Any] = {"merged_count": len(results), "labels": item_labels}
     if run_id:
@@ -180,6 +204,7 @@ class Scheduler:
             [Send(ctx.state.pending_target, None)] if ctx.state.pending_target else None
         )
         last_when: Optional[str] = None
+        is_send_wave = False
         wave_width = max(1, int(max_workers or ctx.concurrency or 4))
 
         for _ in range(max_steps):
@@ -189,29 +214,46 @@ class Scheduler:
             if pending_wave is None:
                 ready_nodes = self._next_ready(cursor, ctx, when=last_when)
                 pending_wave = [Send(name, None) for name in ready_nodes]
+                is_send_wave = False
             wave = [task for task in pending_wave if task.node in self.bodies]
+            current_is_send_wave = is_send_wave
             pending_wave = None
+            is_send_wave = False
             last_when = None
             if not wave:
                 break
 
-            # 波次并发执行（单任务直跑零线程开销；多任务通过 execute_wave 真 BSP 并发）
-            if len(wave) == 1:
+            # 波次并发执行：普通单步直跑零开销；Send 扇出波次或多节点波次统一经 execute_wave（广播 wave.fanout/barrier）
+            if len(wave) == 1 and not current_is_send_wave:
                 ctx.current_node = wave[0].node
                 wave_outcomes = [self._run_task(wave[0], ctx)]
             else:
                 ctx.current_node = wave[0].node
-                wave_outcomes = execute_wave(
-                    wave,
-                    lambda task: self._run_task(task, ctx),
-                    bus=ctx.bus,
-                    run_id=ctx.run.id,
-                    stage=wave[0].node,
-                    labels=[task.label or task.node for task in wave],
-                    max_workers=wave_width,
-                    cancellation=ctx.cancellation,
-                    budget_guard=ctx.budget_guard,
-                )
+                partial_outcomes: List[Tuple[Send, Outcome]] = []
+                try:
+                    wave_outcomes = execute_wave(
+                        wave,
+                        lambda task: self._run_task(task, ctx),
+                        bus=ctx.bus,
+                        run_id=ctx.run.id,
+                        stage=wave[0].node,
+                        labels=[task.label or task.node for task in wave],
+                        max_workers=wave_width,
+                        cancellation=ctx.cancellation,
+                        budget_guard=ctx.budget_guard,
+                        partial_results_out=partial_outcomes,
+                    )
+                except BaseException:
+                    if partial_outcomes:
+                        for task, outcome in partial_outcomes:
+                            for kind, ev_node, payload in outcome.events:
+                                append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
+                            for key, value in outcome.shared.items():
+                                ctx.put(key, value)
+                        ctx.session.flush()
+                        ctx.refresh_state()
+                        ctx.session.commit()
+                    raise
 
             # ── BSP 屏障：主线程按确定性顺序统一落账、归并 Channel、折叠状态 ──
             bus_rejections = ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
@@ -284,6 +326,7 @@ class Scheduler:
             # 2) 动态扇出 Send：进入下一 BSP 波次
             if next_sends:
                 pending_wave = next_sends
+                is_send_wave = True
                 cursor = wave[-1].node
             # 3) 运行时跳转 Goto：落 GO_REDIRECT 并重入目标节点
             elif goto_outcome is not None:

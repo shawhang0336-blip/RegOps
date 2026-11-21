@@ -2,8 +2,10 @@
 
 每个节点严格遵守 `body(input, ctx: RunContext) -> Outcome` 契约：
 - 只负责本阶段逻辑，绝不直接调用下游节点；
-- 所有跨节点产物写入 `Outcome.shared`（经 Channel Reducer 合并），所有事实事件写入 `Outcome.events`；
-- 遇到人工确权/测试确认通过中断事件挂起；遇到 Oracle 审计缺失命中通过 `Outcome.goto` 交回 Scheduler 调度自愈。
+- 多表规则绑定、黄金造数、变异用例三大阶段均采用**真 BSP `Send` 动态扇出 → 单表并行 Worker（零 DB 写操作）→ 主线程 Join 屏障汇聚**，
+  每张表独立落盘增量检查点（`TABLE_RULES_BOUND` / `TABLE_GENERATORS_ASSIGNED` / `TABLE_AUDIT_CASES_ASSIGNED`），
+  单表失败中断后再次续跑自动复用已完成表，绝不重跑已付费成果；
+- 遇到人工确权/测试确认通过一等 `Interrupt` 挂起；遇到 Oracle 审计缺失命中通过 `Outcome.goto` 交回 Scheduler 调度自愈。
 """
 
 import uuid
@@ -18,28 +20,33 @@ from app.assets.code_sets.oracle import (
 )
 from app.engine.binding import GeneratorBinding, SchemaBinding
 from app.engine.compiler import compile_rule_query
-from app.infra.domain import RuleDefinition, canonical_json
 from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
-from app.engine.workflow.runtime import _latest_payload, _pending_rules
-from app.engine.workflow.stages import (
-    _audit_stage,
+from app.engine.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
+from app.engine.workflow.runtime import _emit, _latest_payload, _pending_rules, _upsert_rule
+from app.engine.workflow.stage_audit import bind_table_audit_worker, join_table_audit_barrier
+from app.engine.workflow.stage_data import (
     _backfill_fixed_value_rules,
     _backfill_length_rules,
     _backfill_required_rules,
-    _data_stage,
+    bind_table_data_worker,
+    join_table_data_barrier,
+)
+from app.engine.workflow.stage_plan_schema import _plan_stage, _schema_stage
+from app.engine.workflow.stage_rules import (
     _ensure_oracle_assets,
-    _plan_stage,
     _rebind_failed_rules,
-    _rules_stage,
-    _schema_stage,
+    bind_table_rules_worker,
+    join_table_rules_barrier,
+    prepare_deterministic_rule_index,
 )
 from app.infra.asset_models import ArtifactModel
+from app.infra.domain import RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.models import RuleModel
 from app.kernel.blob_store import LocalBlobStore
 from app.kernel.channel import RunContext
 from app.kernel.interrupt import Interrupt
-from app.kernel.scheduler import Outcome
+from app.kernel.scheduler import Outcome, Send
 from app.policy.regops_plan import (
     self_heal_cases_target,
     self_heal_data_target,
@@ -57,15 +64,22 @@ def _is_mechanically_derived_rule(rule_key: str, rule_map: Dict[str, RuleDefinit
 
 
 def _front_bodies(specs, llm, budget, concurrency, settings):
-    """前半段节点 body：只做本节点的事，事件与产物统一放入 Outcome 交由 Scheduler 屏障落账。"""
+    """前半段节点 body：规划 → 表结构 → 真 BSP Send 规则扇出/汇聚 → Oracle 资产预建 & 人工确权门。"""
+    spec_by_code = {spec.table_code: spec for spec in specs}
 
     def body_generation_planner(_input, ctx: RunContext) -> Outcome:
         events: List[tuple] = []
-        # 无预算时不走规划阶段（保持原有语义：生成计划是可选阶段）
         plans = (
             _plan_stage(
-                ctx.session, ctx.run, specs, ctx.llm, ctx.budget, ctx.concurrency,
-                bus=ctx.bus, events=events,
+                ctx.session,
+                ctx.run,
+                specs,
+                ctx.llm,
+                ctx.budget,
+                ctx.concurrency,
+                bus=ctx.bus,
+                events=events,
+                cancellation=ctx.cancellation,
             )
             if ctx.get("use_plan")
             else None
@@ -76,8 +90,14 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         events: List[tuple] = []
         blobs = LocalBlobStore(ctx.settings.blob_dir)
         schema_payload = _schema_stage(
-            ctx.session, ctx.run, specs, ctx.llm, ctx.concurrency,
-            bus=ctx.bus, events=events, blob_store=blobs,
+            ctx.session,
+            ctx.run,
+            specs,
+            ctx.llm,
+            ctx.concurrency,
+            bus=ctx.bus,
+            events=events,
+            blob_store=blobs,
         )
         return Outcome(shared={"schema_payload": schema_payload}, events=events)
 
@@ -88,8 +108,13 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
             # 自愈或人工重试回边：只靶向重绑缺失命中的失败规则，绝不全表重新提取
             origin = ctx.get("approval_origin") or "self_heal"
             revised = _rebind_failed_rules(
-                ctx.session, ctx.run, specs, ctx.llm, self_heal_report,
-                bus=ctx.bus, events=events,
+                ctx.session,
+                ctx.run,
+                specs,
+                ctx.llm,
+                self_heal_report,
+                bus=ctx.bus,
+                events=events,
             )
             if origin == "human_retry" and not revised:
                 raise WorkflowError("No failed active rules could be revised")
@@ -118,15 +143,100 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
             return Outcome(
                 shared={"pending_count": pending_count, "approval_origin": origin},
                 events=events,
+                when="direct",
             )
 
-        plans = ctx.get("plans")
-        pending_count, golden_overrides = _rules_stage(
-            ctx.session, ctx.run, specs, ctx.llm, plans,
-            concurrency=ctx.concurrency, bus=ctx.bus, events=events,
+        _, field_code_sets = load_published_code_sets(ctx.session, specs)
+        deterministic_rules = _policy_derive_deterministic_rules(
+            ctx.session,
+            ctx.run,
+            specs,
+            _upsert_rule,
+            _emit,
+            field_code_sets=field_code_sets,
+            events=events,
         )
-        # pending 只写入 Channel；人工门事件在 asset builder 之后才落，
-        # 保证即使有待确认规则，Oracle 资产也先建好（与既有语义一致）
+        det_index = prepare_deterministic_rule_index(deterministic_rules)
+        done_tables = ctx.get("table_rules_done") or {}
+        missing_specs = [spec for spec in specs if spec.table_code not in done_tables]
+        wave_ctx = {
+            "field_code_sets": field_code_sets,
+            "det_index": det_index,
+            "outer_workers": max(1, min(ctx.concurrency, len(missing_specs) or 1)),
+        }
+        if not missing_specs:
+            return Outcome(
+                shared={"rule_wave_ctx": wave_ctx, "approval_origin": "rule_binder"},
+                events=events,
+                when="skip_fanout",
+            )
+        events.append(
+            (
+                "BSP_FANOUT",
+                "rule_binder",
+                {
+                    "stage": "rule_binder",
+                    "table_codes": [spec.table_code for spec in missing_specs],
+                    "reused_tables": sorted(done_tables),
+                },
+            )
+        )
+        return Outcome(
+            shared={"rule_wave_ctx": wave_ctx, "approval_origin": "rule_binder"},
+            events=events,
+            sends=[Send("rule_table_worker", spec.table_code, label=spec.table_code) for spec in missing_specs],
+            when="fanout",
+        )
+
+    def body_rule_table_worker(table_code: str, ctx: RunContext) -> Outcome:
+        """纯单表规则绑定并发 Worker（零 DB 写操作；结果由 Scheduler 屏障落账并增量归约）。"""
+        spec = spec_by_code[table_code]
+        wave_ctx = ctx.get("rule_wave_ctx") or {}
+        rules, trace = bind_table_rules_worker(
+            spec,
+            llm=ctx.llm,
+            plans=ctx.get("plans"),
+            field_code_sets=wave_ctx.get("field_code_sets") or {},
+            det_index=wave_ctx.get("det_index") or prepare_deterministic_rule_index([]),
+            concurrency=ctx.concurrency,
+            outer_workers=int(wave_ctx.get("outer_workers") or 1),
+            bus=ctx.bus,
+        )
+        serialized_rules = [rule.model_dump() for rule in rules]
+        gaps = trace.get("gaps") or []
+        return Outcome(
+            shared={
+                "table_rules_done": {
+                    table_code: {"rules": serialized_rules, "gaps": gaps},
+                }
+            },
+            events=[
+                ("AI_TOOL_ASSIGNED", "rule_binder", {"table_code": table_code, **trace}),
+                (
+                    "TABLE_RULES_BOUND",
+                    "rule_table_worker",
+                    {
+                        "table_code": table_code,
+                        "rule_count": len(serialized_rules),
+                        "rules": serialized_rules,
+                        "gaps": gaps,
+                    },
+                ),
+            ],
+        )
+
+    def body_rule_join(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        table_results = ctx.get("table_rules_done") or {}
+        pending_count, golden_overrides = join_table_rules_barrier(
+            ctx.session,
+            ctx.run,
+            specs,
+            ctx.llm,
+            table_results,
+            bus=ctx.bus,
+            events=events,
+        )
         return Outcome(
             shared={
                 "pending_count": pending_count,
@@ -142,12 +252,26 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         generated_rules = [
             RuleDefinition.model_validate(row.definition_json)
             for row in ctx.session.query(RuleModel)
-            .filter(RuleModel.run_id == ctx.run.id, RuleModel.status != "SUPERSEDED").all()
+            .filter(RuleModel.run_id == ctx.run.id, RuleModel.status != "SUPERSEDED")
+            .all()
         ]
         assets = _ensure_oracle_assets(
-            ctx.session, ctx.run, specs, schema_payload, generated_rules, ctx.settings,
-            events=events, attempt=ctx.state.attempt + 1,
+            ctx.session,
+            ctx.run,
+            specs,
+            schema_payload,
+            generated_rules,
+            ctx.settings,
+            events=events,
+            attempt=ctx.state.attempt + 1,
         )
+        if ctx.budget_guard is not None and hasattr(ctx.budget_guard, "snapshot"):
+            budget_snap = ctx.budget_guard.snapshot()
+            for kind, _ev_node, ev_payload in reversed(events):
+                if kind == "ORACLE_ASSETS_PREPARED" and isinstance(ev_payload, dict):
+                    if isinstance(ev_payload.get("result"), dict):
+                        ev_payload["result"]["budget_usage"] = budget_snap
+                    break
         pending_count = len(_pending_rules(ctx.session, ctx.run.id))
         origin = ctx.get("approval_origin") or "rule_binder"
         interrupt_cmd = None
@@ -185,19 +309,19 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         "generation_planner": body_generation_planner,
         "schema_mapper": body_schema_mapper,
         "rule_binder": body_rule_binder,
+        "rule_table_worker": body_rule_table_worker,
+        "rule_join": body_rule_join,
         "oracle_asset_builder": body_oracle_asset_builder,
     }
 
 
 def _back_bodies(specs, settings):
-    """后半段节点 body：产物与事件全部通过 Outcome 返回，节点之间不直接调用下游。"""
+    """后半段节点 body：真 BSP Send 造数扇出/汇聚 → 真 BSP Send 变异用例扇出/汇聚 → Oracle 沙箱审计与确定性归因自愈。"""
+    spec_by_code = {spec.table_code: spec for spec in specs}
 
     def body_data_generator_binder(_input, ctx: RunContext) -> Outcome:
         events: List[tuple] = []
-        blobs = LocalBlobStore(ctx.settings.blob_dir)
         schema_payload = ctx.get("schema_payload")
-        golden_overrides = ctx.get("golden_overrides") or {}
-        plans = ctx.get("plans") or {}
         heal_data_report = ctx.shared.pop("heal_data_report", None)
         rows = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "APPROVED").all()
         rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
@@ -205,35 +329,202 @@ def _back_bodies(specs, settings):
         rules = _backfill_length_rules(ctx.session, ctx.run, specs, rules, events=events)
         rules = _backfill_fixed_value_rules(ctx.session, ctx.run, specs, rules, events=events)
         prepared_assets = _ensure_oracle_assets(
-            ctx.session, ctx.run, specs, schema_payload, rules, ctx.settings,
-            events=events, attempt=ctx.state.attempt + 1,
+            ctx.session,
+            ctx.run,
+            specs,
+            schema_payload,
+            rules,
+            ctx.settings,
+            events=events,
+            attempt=ctx.state.attempt + 1,
         )
-        golden_records, generator_payload = _data_stage(
-            ctx.session, ctx.run, specs, ctx.llm, rules,
-            golden_overrides, plans, concurrency=ctx.concurrency,
-            bus=ctx.bus, events=events, blob_store=blobs,
-            heal_report=heal_data_report,
+        _, field_code_sets = load_published_code_sets(ctx.session, specs)
+
+        done_tables = dict(ctx.get("table_generators_done") or {})
+        if heal_data_report is not None:
+            affected = {
+                c.get("table_code")
+                for c in heal_data_report.get("cases", [])
+                if c.get("case_kind") == "GOLDEN" and c.get("unexpected_rules") and c.get("table_code")
+            }
+            for tcode in affected or {s.table_code for s in specs}:
+                done_tables.pop(tcode, None)
+                if isinstance(ctx.shared.get("table_generators_done"), dict):
+                    ctx.shared["table_generators_done"].pop(tcode, None)
+                if isinstance(ctx.shared.get("table_audit_cases_done"), dict):
+                    ctx.shared["table_audit_cases_done"].pop(tcode, None)
+
+        missing_specs = [spec for spec in specs if spec.table_code not in done_tables]
+        wave_ctx = {
+            "field_code_sets": field_code_sets,
+            "heal_report": heal_data_report,
+        }
+        shared_base = {
+            "rules": rules,
+            "prepared_assets": prepared_assets,
+            "data_wave_ctx": wave_ctx,
+        }
+        if not missing_specs:
+            return Outcome(shared=shared_base, events=events, when="skip_fanout")
+
+        events.append(
+            (
+                "BSP_FANOUT",
+                "data_generator_binder",
+                {
+                    "stage": "data_generator_binder",
+                    "table_codes": [spec.table_code for spec in missing_specs],
+                    "reused_tables": sorted(done_tables),
+                },
+            )
         )
         return Outcome(
-            shared={
-                "rules": rules,
-                "prepared_assets": prepared_assets,
-                "golden_records": golden_records,
-                "generator_payload": generator_payload,
-            },
+            shared=shared_base,
+            events=events,
+            sends=[Send("data_table_worker", spec.table_code, label=spec.table_code) for spec in missing_specs],
+            when="fanout",
+        )
+
+    def body_data_table_worker(table_code: str, ctx: RunContext) -> Outcome:
+        """纯单表黄金造数并发 Worker（零 DB 写操作；支持单表级增量续跑）。"""
+        spec = spec_by_code[table_code]
+        wave_ctx = ctx.get("data_wave_ctx") or {}
+        generators, trace = bind_table_data_worker(
+            spec,
+            llm=ctx.llm,
+            active_rules=ctx.get("rules") or [],
+            golden_overrides=ctx.get("golden_overrides") or {},
+            field_code_sets=wave_ctx.get("field_code_sets") or {},
+            plans=ctx.get("plans") or {},
+            bus=ctx.bus,
+            heal_report=wave_ctx.get("heal_report"),
+        )
+        serialized = [item.model_dump() for item in generators]
+        return Outcome(
+            shared={"table_generators_done": {table_code: serialized}},
+            events=[
+                ("AI_TOOL_ASSIGNED", "data_generator_binder", {"table_code": table_code, **trace}),
+                (
+                    "TABLE_GENERATORS_ASSIGNED",
+                    "data_table_worker",
+                    {"table_code": table_code, "generators": serialized},
+                ),
+            ],
+        )
+
+    def body_data_join(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
+        golden_records, generator_payload = join_table_data_barrier(
+            ctx.session,
+            ctx.run,
+            specs,
+            ctx.get("rules") or [],
+            ctx.get("golden_overrides") or {},
+            ctx.get("table_generators_done") or {},
+            plans=ctx.get("plans") or {},
+            events=events,
+            blob_store=blobs,
+        )
+        return Outcome(
+            shared={"golden_records": golden_records, "generator_payload": generator_payload},
             events=events,
         )
 
     def body_audit_case_binder(_input, ctx: RunContext) -> Outcome:
         events: List[tuple] = []
-        blobs = LocalBlobStore(ctx.settings.blob_dir)
-        plans = ctx.get("plans") or {}
         heal_cases_report = ctx.shared.pop("heal_cases_report", None)
-        audit_cases = _audit_stage(
-            ctx.session, ctx.run, specs, ctx.llm, ctx.get("rules"),
-            ctx.get("golden_records"), plans, concurrency=ctx.concurrency,
-            bus=ctx.bus, events=events, blob_store=blobs,
-            heal_report=heal_cases_report,
+        _, field_code_sets = load_published_code_sets(ctx.session, specs)
+
+        done_tables = dict(ctx.get("table_audit_cases_done") or {})
+        if heal_cases_report is not None:
+            affected = {
+                c.get("table_code")
+                for c in heal_cases_report.get("cases", [])
+                if c.get("missing_rules") and c.get("table_code")
+            }
+            for tcode in affected or {s.table_code for s in specs}:
+                done_tables.pop(tcode, None)
+                if isinstance(ctx.shared.get("table_audit_cases_done"), dict):
+                    ctx.shared["table_audit_cases_done"].pop(tcode, None)
+
+        missing_specs = [spec for spec in specs if spec.table_code not in done_tables]
+        wave_ctx = {
+            "field_code_sets": field_code_sets,
+            "heal_report": heal_cases_report,
+            "outer_workers": max(1, min(ctx.concurrency, len(missing_specs) or 1)),
+        }
+        if not missing_specs:
+            return Outcome(shared={"audit_wave_ctx": wave_ctx}, events=events, when="skip_fanout")
+
+        events.append(
+            (
+                "BSP_FANOUT",
+                "audit_case_binder",
+                {
+                    "stage": "audit_case_binder",
+                    "table_codes": [spec.table_code for spec in missing_specs],
+                    "reused_tables": sorted(done_tables),
+                },
+            )
+        )
+        return Outcome(
+            shared={"audit_wave_ctx": wave_ctx},
+            events=events,
+            sends=[Send("audit_table_worker", spec.table_code, label=spec.table_code) for spec in missing_specs],
+            when="fanout",
+        )
+
+    def body_audit_table_worker(table_code: str, ctx: RunContext) -> Outcome:
+        """纯单表审计变异用例并发 Worker（零 DB 写操作；支持单表级增量续跑）。"""
+        spec = spec_by_code[table_code]
+        wave_ctx = ctx.get("audit_wave_ctx") or {}
+        golden_records = ctx.get("golden_records") or {}
+        case_items, trace = bind_table_audit_worker(
+            spec,
+            llm=ctx.llm,
+            active_rules=ctx.get("rules") or [],
+            golden_record=golden_records[table_code],
+            field_code_sets=wave_ctx.get("field_code_sets") or {},
+            plans=ctx.get("plans") or {},
+            concurrency=ctx.concurrency,
+            outer_workers=int(wave_ctx.get("outer_workers") or 1),
+            bus=ctx.bus,
+            heal_report=wave_ctx.get("heal_report"),
+        )
+        serialized_cases = [item.model_dump() for item in case_items]
+        gaps = trace.get("gaps") or []
+        return Outcome(
+            shared={
+                "table_audit_cases_done": {
+                    table_code: {"cases": serialized_cases, "gaps": gaps},
+                }
+            },
+            events=[
+                ("AI_TOOL_ASSIGNED", "audit_case_binder", {"table_code": table_code, **trace}),
+                (
+                    "TABLE_AUDIT_CASES_ASSIGNED",
+                    "audit_table_worker",
+                    {
+                        "table_code": table_code,
+                        "case_count": len(serialized_cases),
+                        "cases": serialized_cases,
+                        "gaps": gaps,
+                    },
+                ),
+            ],
+        )
+
+    def body_audit_join(_input, ctx: RunContext) -> Outcome:
+        events: List[tuple] = []
+        blobs = LocalBlobStore(ctx.settings.blob_dir)
+        audit_cases = join_table_audit_barrier(
+            ctx.session,
+            ctx.run,
+            specs,
+            ctx.get("table_audit_cases_done") or {},
+            events=events,
+            blob_store=blobs,
         )
         return Outcome(shared={"audit_cases": audit_cases}, events=events)
 
@@ -266,18 +557,33 @@ def _back_bodies(specs, settings):
             {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
         )
         report = GenericOracleExecutor(ctx.settings.oracle_sandbox_url).execute(
-            run.id, attempt, specs, typed_schemas, golden_records, audit_cases, rules,
-            golden_counts, golden_generators,
-            code_sets=code_sets, prepared_assets=prepared_assets, code_set_bindings=code_set_bindings,
+            run.id,
+            attempt,
+            specs,
+            typed_schemas,
+            golden_records,
+            audit_cases,
+            rules,
+            golden_counts,
+            golden_generators,
+            code_sets=code_sets,
+            prepared_assets=prepared_assets,
+            code_set_bindings=code_set_bindings,
         )
 
         events = [("AUDIT_STARTED", "oracle_executor", {"attempt": attempt})]
         if report.get("uncovered_rules"):
-            events.append(("RULE_COVERAGE_GAP", "oracle_executor", {
-                "coverage_rate": report.get("coverage_rate"),
-                "uncovered_rules": report["uncovered_rules"],
-                "note": "这些规则没有任何变异用例命中过，等于没被验证；审计通过不代表它们对",
-            }))
+            events.append(
+                (
+                    "RULE_COVERAGE_GAP",
+                    "oracle_executor",
+                    {
+                        "coverage_rate": report.get("coverage_rate"),
+                        "uncovered_rules": report["uncovered_rules"],
+                        "note": "这些规则没有任何变异用例命中过，等于没被验证；审计通过不代表它们对",
+                    },
+                )
+            )
 
         blobs = LocalBlobStore(ctx.settings.blob_dir)
         ddl_uri = blobs.put(
@@ -311,27 +617,32 @@ def _back_bodies(specs, settings):
         if ctx.budget_guard is not None and hasattr(ctx.budget_guard, "snapshot"):
             result["budget_usage"] = ctx.budget_guard.snapshot()
         for artifact_type, uri in [
-            ("MYSQL_DDL", ddl_uri), ("ORACLE_DDL", oracle_ddl_uri),
-            ("VALIDATION_SQL", sql_uri), ("AUDIT_REPORT", report_uri),
+            ("MYSQL_DDL", ddl_uri),
+            ("ORACLE_DDL", oracle_ddl_uri),
+            ("VALIDATION_SQL", sql_uri),
+            ("AUDIT_REPORT", report_uri),
         ]:
-            ctx.session.add(ArtifactModel(
-                id=str(uuid.uuid4()), run_id=run.id, artifact_type=artifact_type,
-                blob_uri=uri, sha256=uri.removeprefix("blob://"), version=attempt,
-            ))
+            ctx.session.add(
+                ArtifactModel(
+                    id=str(uuid.uuid4()),
+                    run_id=run.id,
+                    artifact_type=artifact_type,
+                    blob_uri=uri,
+                    sha256=uri.removeprefix("blob://"),
+                    version=attempt,
+                )
+            )
         ctx.session.flush()
 
         shared = {"report": report, "result": result, "attempt": attempt, "first_attempt": first_attempt}
         cases = report.get("cases", [])
         golden_fp_cases = [
-            case for case in cases
-            if case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
+            case for case in cases if case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
         ]
         missing_rule_keys = sorted(
             {rule_key for case in cases for rule_key in case.get("missing_rules", [])}
         )
         if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
-            # 确定性归因分流（Root-Cause Router）：
-            # 1) 黄金样本触发误报：优先回 data_generator_binder 修正测试数据，绝不削弱规则；
             if golden_fp_cases and not missing_rule_keys:
                 return Outcome(
                     shared={
@@ -349,8 +660,6 @@ def _back_bodies(specs, settings):
                         "attempt": attempt,
                     },
                 )
-            # 2) 变异样本漏报：若全部漏报规则均属机械派生确定性规则（规则本身无误），先回 audit_case_binder 重建反例；
-            #    否则回 rule_binder 执行靶向 _rebind_failed_rules。
             if missing_rule_keys:
                 rule_map = {rule.rule_key: rule for rule in (rules or [])}
                 all_mechanical = all(_is_mechanically_derived_rule(k, rule_map) for k in missing_rule_keys)
@@ -389,10 +698,13 @@ def _back_bodies(specs, settings):
                     },
                 )
 
-        events.append((
-            "AUDIT_COMPLETED" if report["all_passed"] else "AUDIT_REJECTED",
-            "oracle_executor", {"result": result, "node": "oracle_executor"},
-        ))
+        events.append(
+            (
+                "AUDIT_COMPLETED" if report["all_passed"] else "AUDIT_REJECTED",
+                "oracle_executor",
+                {"result": result, "node": "oracle_executor"},
+            )
+        )
         if report["all_passed"]:
             return Outcome(
                 shared=shared,
@@ -415,6 +727,10 @@ def _back_bodies(specs, settings):
 
     return {
         "data_generator_binder": body_data_generator_binder,
+        "data_table_worker": body_data_table_worker,
+        "data_join": body_data_join,
         "audit_case_binder": body_audit_case_binder,
+        "audit_table_worker": body_audit_table_worker,
+        "audit_join": body_audit_join,
         "oracle_executor": body_oracle_executor,
     }

@@ -73,6 +73,20 @@ _REGOPS_RUN_TABLES = (
 )
 
 
+_STAGE_NODE_ALIAS = {
+    "rule_table_worker": "rule_binder",
+    "rule_join": "rule_binder",
+    "data_table_worker": "data_generator_binder",
+    "data_join": "data_generator_binder",
+    "audit_table_worker": "audit_case_binder",
+    "audit_join": "audit_case_binder",
+}
+
+
+def _display_stage_node(node: str) -> str:
+    return _STAGE_NODE_ALIAS.get(node, node)
+
+
 def _create_run(session: Session, spec_id: str, settings: Settings, operator: str = "UNSPECIFIED_OPERATOR") -> RunModel:
     _specs(session, spec_id)  # 校验 spec 存在且已确认；非法则抛 WorkflowError
     specification = session.get(SpecificationModel, spec_id)
@@ -131,7 +145,9 @@ def drive(
     try:
         scheduler.drive(ctx)
     except RunCancelledError as exc:
-        cancelled_node = ctx.current_node or ctx.state.current_node or "created"
+        raw_node = ctx.current_node or ctx.state.current_node or "created"
+        cancelled_node = _display_stage_node(raw_node)
+        budget_snap = ctx.budget_guard.snapshot() if ctx.budget_guard is not None else None
         kernel_record_run_cancelled(
             session,
             run,
@@ -139,19 +155,26 @@ def drive(
             reason=exc.reason,
             resume_from_node=ctx.state.resume_from_node,
             resume_when=ctx.state.resume_when,
+            extra_result={"budget_usage": budget_snap} if budget_snap is not None else None,
             bus=ctx.bus,
             commit=True,
         )
     except Exception as exc:
-        failed_node = ctx.current_node or ctx.state.current_node or "created"
+        raw_node = ctx.current_node or ctx.state.current_node or "created"
+        failed_node = _display_stage_node(raw_node)
+        budget_snap = ctx.budget_guard.snapshot() if ctx.budget_guard is not None else None
+        details = _error_details(exc, failed_node)
+        if raw_node != failed_node:
+            details["worker_node"] = raw_node
         kernel_fail_run(
             session,
             run,
             node=failed_node,
             error=f"{type(exc).__name__}: {exc}",
-            error_details=_error_details(exc, failed_node),
+            error_details=details,
             resume_from_node=ctx.state.resume_from_node,
             resume_when=ctx.state.resume_when,
+            extra_result={"budget_usage": budget_snap} if budget_snap is not None else None,
             bus=ctx.bus,
             commit=True,
         )
@@ -438,11 +461,21 @@ def cancel_generic_run(
 
 
 def recover_interrupted_generic_runs(session: Optional[Session] = None) -> List[str]:
-    """进程重启中断恢复入口：委托 `kernel.run.recover_interrupted_runs`。"""
+    """进程重启中断恢复入口：仅回收 Step 2 规则验证 Run（关联 SpecificationModel）。"""
+    def _run(db: Session) -> List[str]:
+        gen_runs = (
+            db.query(RunModel)
+            .join(SpecificationModel, RunModel.spec_id == SpecificationModel.id)
+            .all()
+        )
+        return kernel_recover_interrupted_runs(
+            db, ACTIVE_RUN_STATUSES, runs=gen_runs, projector_many=project_many
+        )
+
     if session is not None:
-        return kernel_recover_interrupted_runs(session, ACTIVE_RUN_STATUSES, projector_many=project_many)
+        return _run(session)
     with SessionLocal() as own_session:
-        return kernel_recover_interrupted_runs(own_session, ACTIVE_RUN_STATUSES, projector_many=project_many)
+        return _run(own_session)
 
 
 def active_generic_runs() -> List[str]:
@@ -560,8 +593,13 @@ def _spec_table_codes(session: Session, run: RunModel) -> Tuple[str, ...]:
 
 
 def history_cleanup_plan(session: Session):
-    """每组报表保留最新批次和最近一次通过验证的批次，运行中批次永不清理。"""
-    runs = session.query(RunModel).order_by(RunModel.created_at.desc()).all()
+    """每组报表保留最新批次和最近一次通过验证的批次，运行中批次永不清理（仅限 Step 2 验证批次）。"""
+    runs = (
+        session.query(RunModel)
+        .join(SpecificationModel, RunModel.spec_id == SpecificationModel.id)
+        .order_by(RunModel.created_at.desc())
+        .all()
+    )
     states = project_many(session, runs)
     groups: Dict[tuple, List[RunModel]] = {}
     for run in runs:

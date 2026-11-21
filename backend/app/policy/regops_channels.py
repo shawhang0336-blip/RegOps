@@ -25,6 +25,13 @@ DEFAULT_CHANNELS: Dict[str, ChannelSpec] = {
     "generator_payload": ChannelSpec("generator_payload", merge_dict),
     "golden_records": ChannelSpec("golden_records", merge_dict),
     "audit_cases": ChannelSpec("audit_cases", merge_dict),
+    # 单表级 BSP Send 增量检查点通道（merge_dict 屏障归约，失败续跑只重跑未完成表）
+    "table_rules_done": ChannelSpec("table_rules_done", merge_dict),
+    "table_generators_done": ChannelSpec("table_generators_done", merge_dict),
+    "table_audit_cases_done": ChannelSpec("table_audit_cases_done", merge_dict),
+    "rule_wave_ctx": ChannelSpec("rule_wave_ctx", last_value),
+    "data_wave_ctx": ChannelSpec("data_wave_ctx", last_value),
+    "audit_wave_ctx": ChannelSpec("audit_wave_ctx", last_value),
     "use_plan": ChannelSpec("use_plan", last_value),
     "pending_count": ChannelSpec("pending_count", last_value),
     "rules": ChannelSpec("rules", last_value),
@@ -53,6 +60,9 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
         "plans": {},
         "schema_payload": {},
         "golden_overrides": {},
+        "table_rules_done": {},
+        "table_generators_done": {},
+        "table_audit_cases_done": {},
     }
     events = (
         session.query(EventModel)
@@ -68,6 +78,13 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
             shared["use_plan"] = True
         elif kind == "SCHEMA_ASSIGNED":
             shared["schema_payload"] = merge_dict(shared.get("schema_payload"), resolve_event_tables(payload, blob_store))
+        elif kind == "TABLE_RULES_BOUND":
+            tcode = payload.get("table_code")
+            if tcode:
+                shared["table_rules_done"] = merge_dict(
+                    shared.get("table_rules_done"),
+                    {tcode: {"rules": payload.get("rules") or [], "gaps": payload.get("gaps") or []}},
+                )
         elif kind == "CROSS_RULES_ASSIGNED":
             shared["golden_overrides"] = merge_dict(
                 shared.get("golden_overrides"), payload.get("golden_overrides") or {}
@@ -76,9 +93,19 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
             shared["pending_count"] = int(payload.get("pending_count") or 0)
             shared["approval_origin"] = payload.get("origin") or "rule_binder"
             shared.pop("self_heal_report", None)
+        elif kind == "REAUDIT_REQUESTED":
+            shared["table_generators_done"] = {}
+            shared["table_audit_cases_done"] = {}
         elif kind == "ORACLE_ASSETS_PREPARED":
             if payload.get("assets") is not None:
                 shared["prepared_assets"] = payload["assets"]
+        elif kind == "TABLE_GENERATORS_ASSIGNED":
+            tcode = payload.get("table_code")
+            if tcode:
+                shared["table_generators_done"] = merge_dict(
+                    shared.get("table_generators_done"),
+                    {tcode: payload.get("generators") or []},
+                )
         elif kind == "GENERATORS_ASSIGNED":
             tables = resolve_event_tables(payload, blob_store)
             shared["generator_payload"] = merge_dict(shared.get("generator_payload"), tables)
@@ -89,6 +116,13 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
             }
             shared["golden_records"] = merge_dict(shared.get("golden_records"), golden)
             shared.pop("heal_data_report", None)
+        elif kind == "TABLE_AUDIT_CASES_ASSIGNED":
+            tcode = payload.get("table_code")
+            if tcode:
+                shared["table_audit_cases_done"] = merge_dict(
+                    shared.get("table_audit_cases_done"),
+                    {tcode: {"cases": payload.get("cases") or [], "gaps": payload.get("gaps") or []}},
+                )
         elif kind == "AUDIT_CASES_ASSIGNED":
             tables = resolve_event_tables(payload, blob_store)
             typed_cases = {}
@@ -110,10 +144,34 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
                     loaded_report = json.loads(blob_store.get(report_uri).decode("utf-8"))
                     if target_node == "data_generator_binder":
                         shared["heal_data_report"] = loaded_report
+                        affected = {
+                            c.get("table_code")
+                            for c in loaded_report.get("cases", [])
+                            if c.get("case_kind") == "GOLDEN" and c.get("unexpected_rules") and c.get("table_code")
+                        }
+                        if affected:
+                            for tcode in affected:
+                                shared["table_generators_done"].pop(tcode, None)
+                                shared["table_audit_cases_done"].pop(tcode, None)
+                        else:
+                            shared["table_generators_done"] = {}
+                            shared["table_audit_cases_done"] = {}
                     elif target_node == "audit_case_binder":
                         shared["heal_cases_report"] = loaded_report
+                        affected = {
+                            c.get("table_code")
+                            for c in loaded_report.get("cases", [])
+                            if c.get("missing_rules") and c.get("table_code")
+                        }
+                        if affected:
+                            for tcode in affected:
+                                shared["table_audit_cases_done"].pop(tcode, None)
+                        else:
+                            shared["table_audit_cases_done"] = {}
                     else:
                         shared["self_heal_report"] = loaded_report
+                        shared["table_generators_done"] = {}
+                        shared["table_audit_cases_done"] = {}
                 except Exception:
                     pass
 
@@ -147,7 +205,12 @@ def build_context(
     state = project(session, run)
     shared = recover_channels(session, run, settings)
     bus = default_bus()
-    budget_guard = BudgetGuard(BudgetLimits.from_dict(budget), run_id=run.id).attach(bus)
+    prior_usage = (state.result_json or {}).get("budget_usage") if isinstance(state.result_json, dict) else None
+    budget_guard = BudgetGuard(
+        BudgetLimits.from_dict(budget),
+        run_id=run.id,
+        seed=prior_usage if isinstance(prior_usage, dict) else None,
+    ).attach(bus)
     return RunContext(
         session=session,
         run=run,

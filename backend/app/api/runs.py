@@ -90,7 +90,14 @@ def create_run(request: RunRequest, session: Session = Depends(db_session)) -> D
 
 @router.get("/api/runs")
 def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
-    runs = session.query(RunModel).order_by(RunModel.created_at.desc()).limit(50).all()
+    # 仅列出 Step 2 规则验证批次（关联 SpecificationModel），与 Step 1 文档导入 Run 隔离
+    runs = (
+        session.query(RunModel)
+        .join(SpecificationModel, RunModel.spec_id == SpecificationModel.id)
+        .order_by(RunModel.created_at.desc())
+        .limit(50)
+        .all()
+    )
     if not runs:
         return []
     states = project_many(session, runs)

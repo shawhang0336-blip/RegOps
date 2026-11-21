@@ -281,3 +281,98 @@ def test_extraction_exception_does_not_leave_running_state(monkeypatch):
         session=session,
     )
     assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
+
+
+def test_ingestion_run_persists_eventlog_budget_cancel_recovery_and_isolates_from_generation_runs(monkeypatch):
+    """P2 回归：Step 1 文档解析纳入 kernel.run，支持 EventLog 重启还原、BudgetGuard 记账、取消/回收，且不污染 Step 2 批次列表。"""
+    from app.api.runs import list_runs
+    from app.engine.ingestion_run import (
+        cancel_document_run,
+        list_document_runs,
+        recover_interrupted_ingestion_runs,
+    )
+    from app.ingestion.import_progress import forget as progress_forget
+    from app.kernel.run import create_run as kernel_create_run
+    from app.policy.llm_guard import call_llm_validated
+
+    session = make_session()
+    monkeypatch.setattr(documents, "SessionLocal", lambda: session)
+    document, block, table = make_document(session)
+    monkeypatch.setattr(documents, "analyze_document_structure", lambda *args: None)
+
+    class UsageLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            return {"fields": []}, {
+                "provider": "test",
+                "model": "test",
+                "elapsed_seconds": 0.25,
+                "usage": {"prompt_tokens": 200, "completion_tokens": 50, "total_tokens": 250},
+            }
+
+    def fake_extract_parallel(block_ids, settings, targets, on_progress=None):
+        # 通过 llm_execution_scope 自动接入 Run 级 BudgetGuard
+        call_llm_validated(UsageLlm(), "assign_metadata", "instr", {})
+        if on_progress:
+            on_progress(1, 1, 1)
+        return {"table_ids": [table.id], "code_set_ids": [], "errors": [], "resolved_reference_count": 0}
+
+    monkeypatch.setattr(documents, "extract_parallel_for_blocks", fake_extract_parallel)
+    inline_runner = TaskRunner(inline=True)
+    monkeypatch.setattr(documents, "task_runner", lambda: inline_runner)
+
+    res = documents.extract_document_parallel(
+        document.id,
+        documents.ParallelExtractRequest(block_ids=[block.id]),
+        session=session,
+    )
+    assert res["run_id"]
+
+    # 1. Ingestion Run 完整落入 EventLog，含哈希链与 BudgetGuard 消耗统计
+    doc_runs = list_document_runs(session, document.id)
+    assert len(doc_runs) == 1
+    assert doc_runs[0]["id"] == res["run_id"]
+    assert doc_runs[0]["status"] == "COMPLETED"
+    assert doc_runs[0]["chain_valid"] is True
+    assert doc_runs[0]["budget_usage"]["llm_calls"] == 1
+    assert doc_runs[0]["budget_usage"]["total_tokens"] == 250
+
+    # 2. 模拟进程重启清空内存 import_progress -> GET /progress 从 EventLog 无损还原
+    progress_forget(document.id)
+    prog = documents.document_progress(document.id, session=session)
+    assert prog["run_id"] == res["run_id"]
+    assert prog["status"] == "DONE"
+    assert prog["stage"] == 4
+    assert prog["budget_usage"]["total_tokens"] == 250
+    assert len(prog["logs"]) >= 1
+
+    # 3. 隔离性：Step 1 Ingestion Run 不得混入 Step 2 验证批次列表
+    assert list_runs(session=session) == []
+
+    # 4. 取消 + 重启僵尸回收
+    hung = kernel_create_run(
+        session,
+        document.id,
+        initial_node="extract",
+        initial_payload={"run_kind": "INGESTION", "document_id": document.id, "file_name": document.file_name, "phase": "extract", "stage": 4},
+    )
+    doc_row = session.get(SourceDocumentModel, document.id)
+    doc_row.status = "EXTRACTING"
+    session.commit()
+    cancel_res = cancel_document_run(session, document.id, reason="测试取消")
+    assert cancel_res["cancelled"] is True
+    assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
+
+    crashed = kernel_create_run(
+        session,
+        document.id,
+        initial_node="prepare",
+        initial_payload={"run_kind": "INGESTION", "document_id": document.id, "file_name": document.file_name, "phase": "prepare", "stage": 2},
+    )
+    doc_row = session.get(SourceDocumentModel, document.id)
+    doc_row.status = "EXTRACTING"
+    session.commit()
+    recovered = recover_interrupted_ingestion_runs(session)
+    assert crashed.id in recovered
+    assert hung.id not in recovered
+    assert session.get(SourceDocumentModel, document.id).status == "EXTRACTION_FAILED"
+

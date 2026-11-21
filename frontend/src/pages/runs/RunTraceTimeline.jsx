@@ -20,6 +20,7 @@ function summarizeLedgerEvent(ev) {
   if (ev.kind === 'RULES_BOUND') return `绑定规则，待确认 ${p.pending_count ?? 0} 条`
   if (ev.kind === 'BSP_FANOUT') return `并发扇出 ${(p.table_codes || []).length} 张表`
   if (ev.kind === 'ORACLE_AUDITED') return p.result?.audit_summary?.all_passed ? 'Oracle 沙箱验证全部通过' : 'Oracle 沙箱验证完成（含未通过项）'
+  if (ev.kind === 'RUN_CANCELLED') return `已人工中止：${p.reason || p.result?.error || 'Run cancelled'}`
   if (ev.kind === 'RUN_FAILED') return p.result?.error || p.error || '执行中断'
   if (ev.kind === 'RUN_COMPLETED') return '流程抵达终态，产出就绪'
   if (p.reason) return String(p.reason)
@@ -29,6 +30,8 @@ function summarizeLedgerEvent(ev) {
 }
 
 function summarizeBusEvent(ev) {
+  if (ev.topic === 'budget.exceeded') return `预算熔断：${ev.metric} = ${ev.used}（上限 ${ev.limit}）`
+  if (ev.topic === 'run.cancelled') return `运行已中止：${ev.reason || 'operator cancelled'}`
   if (ev.reason) return `${ev.tool ? `${ev.tool} · ` : ''}${ev.reason}`
   if (ev.kind) return `落账 ${ev.kind}`
   if (ev.target) return `跳转 → ${ev.target}`

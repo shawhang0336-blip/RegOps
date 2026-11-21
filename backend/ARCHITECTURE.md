@@ -40,10 +40,11 @@ backend/app/
 │   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / execute_wave 屏障归并）
 │
 ├── policy/                      # 层 2：RegOps 领域策略层（仅依赖 infra + kernel，以插件方式装配到 kernel）
-│   ├── regops_plan.py           #    12 节点装配流水线拓扑（DEFAULT_PLAN，含规则/造数/用例三路自愈回边）与状态折叠
+│   ├── regops_plan.py           #    18 节点真 BSP 装配流水线拓扑（含单表 Send Worker/Join 与三路自愈回边）与状态折叠
+│   ├── ingestion_plan.py        #    Step 1 文档导入与解析 Run 的事件折叠策略（重启可从 EventLog 无损还原）
 │   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）
-│   ├── regops_channels.py       #    18 个命名数据通道与 EventLog + BlobStore 断点折叠恢复
-│   └── llm_guard.py             #    跨三阶段统一受控模型调用守卫（退避重试 + Bus 门禁 + 校验回喂）
+│   ├── regops_channels.py       #    24 个命名数据通道（含单表增量检查点）与 EventLog + BlobStore 断点折叠恢复
+│   └── llm_guard.py             #    跨三阶段统一受控模型调用守卫（退避重试 + Bus 门禁 + 作用域 Budget/Cancel 透传）
 │
 ├── ingestion/                   # 层 3：监管文档接入与结构解析（阶段一）
 │   ├── extractors.py            #    PDF / Word / Excel 原始块提取
@@ -67,7 +68,8 @@ backend/app/
 │       ├── readiness.py         #      码表就绪度评估与自动发布
 │       └── oracle.py            #      已发布码表加载与 Oracle 沙箱码表 DDL 编译
 │
-├── engine/                      # 层 5：规则装配、造数与 Oracle 沙箱执行（阶段二）
+├── engine/                      # 层 5：规则装配、造数、文档 Run 控制面与 Oracle 沙箱执行
+│   ├── ingestion_run.py         #    Step 1 文档导入/解析统一 Run 控制面（基于 kernel.run + BudgetGuard + 取消/重启回收）
 │   ├── rules.py                 #    单条规则校验与样本违规判定
 │   ├── compiler.py              #    规则 → Oracle / MySQL 校验 SQL 编译器
 │   ├── binding.py               #    确定性 Schema 编译 + Rule / Generator / 黄金自洽门禁 / AuditCase 校验
@@ -75,10 +77,14 @@ backend/app/
 │   ├── rule_backfill.py         #    前置四类确定性规则派生（必填 / 列宽上限 / 固定值 / 已发布码表 ENUM）
 │   ├── oracle.py                #    OracleSandbox 物理表管理 + GenericOracleExecutor 真跑审计
 │   └── workflow/                #    阶段二编排流水线
-│       ├── runtime.py           #      _call_validated（委托 llm_guard）与 _fanout（BSP 并发扇出）
-│       ├── stages.py            #      规划 / 确定性 Schema / 前置派生+语义规则 / 资产 / 混合造数 / 确定性优先变异 / 靶向重绑
-│       ├── nodes.py             #      7 个 ProdAgent NodeBody（含误报修数据 / 漏报分流修用例或修规则的双路径自愈）
-│       └── entrypoints.py       #      RegOps Run 生命周期唯一业务门面（基于 kernel.run 装配 start/submit/approve/confirm/retry/reaudit/cancel/delete/cleanup）
+│       ├── runtime.py           #      _call_validated（委托 llm_guard）与 _fanout（委托 kernel.scheduler.execute_wave）
+│       ├── stage_plan_schema.py #      预算规划与确定性 Schema 编译
+│       ├── stage_rules.py       #      单表规则 BSP Worker、跨表外键汇聚、Oracle 资产预建、去重与靶向自愈
+│       ├── stage_data.py        #      单表黄金造数 BSP Worker、跨表外键对齐与确定性规则回填
+│       ├── stage_audit.py       #      单表审计变异 BSP Worker 与用例屏障汇聚
+│       ├── stages.py            #      向后兼容聚合重导出门面
+│       ├── nodes.py             #      13 个 ProdAgent NodeBody（真 BSP Send 扇出/Join 增量续跑 + 三路确定性归因自愈）
+│       └── entrypoints.py       #      RegOps Run 生命周期唯一业务门面（基于 kernel.run 装配全量操作）
 │
 ├── delivery/                    # 层 6：生产交付与业务库只读校验（阶段三）
 │   ├── production.py            #    生产校验包结构定义与只读 SQL 组装

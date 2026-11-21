@@ -87,6 +87,29 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
     onFallbackTick: syncDigestProgress,
   })
 
+  async function cancelCurrentDocumentRun() {
+    const docId = importProgress?.document_id || detail?.id
+    if (!docId) return
+    const confirmed = await confirm({
+      title: '中止当前文档解析？',
+      message: `文件：${importProgress?.file_name || detail?.file_name || docId}`,
+      details: '系统会向微内核投递取消令牌，在当前块完成后立即停止后续 AI 调用，已保存的资产不会丢失。',
+      confirmLabel: '确认中止',
+      tone: 'danger',
+    })
+    if (!confirmed) return
+    setError('')
+    try {
+      await v2(`/documents/${docId}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: '由操作员在文档工作台主动中止' }),
+      })
+      setNotice('已发送中止指令，正在安全收尾。')
+    } catch (err) {
+      setError(friendlyError(err.message))
+    }
+  }
+
   async function selectDocument(id) {
     const doc = await v2(`/documents/${id}`)
     setDetail(doc)
@@ -480,7 +503,11 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
             </div>
           </section>
         )}
-        <ImportProgressPanel progress={importProgress?.status === 'DONE' && !showUpload ? null : importProgress} onClose={() => setImportProgress(null)} />
+        <ImportProgressPanel
+          progress={importProgress?.status === 'DONE' && !showUpload ? null : importProgress}
+          onClose={() => setImportProgress(null)}
+          onCancel={cancelCurrentDocumentRun}
+        />
       </>
     )
   }
@@ -517,7 +544,11 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
         />
       </label>
 
-      <ImportProgressPanel progress={importProgress} onClose={() => setImportProgress(null)} />
+      <ImportProgressPanel
+        progress={importProgress}
+        onClose={() => setImportProgress(null)}
+        onCancel={cancelCurrentDocumentRun}
+      />
 
       <section className="workspace-grid document-layout">
         <div className="panel list-panel">

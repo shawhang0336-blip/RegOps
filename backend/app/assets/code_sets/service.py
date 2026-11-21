@@ -53,7 +53,9 @@ from app.assets.code_sets.parser import (
     validate_code_set_draft,
 )
 from app.infra.llm import RealDesignLlm
-from app.policy.llm_guard import call_llm_validated
+from app.kernel.budget import BudgetExceededError
+from app.kernel.run import RunCancelledError
+from app.policy.llm_guard import call_llm_validated, current_cancellation, submit_with_context
 from app.infra.asset_models import (
     CodeSetModel,
     CodeSetValidationModel,
@@ -481,7 +483,13 @@ def extract_parallel_for_blocks(
     from app.assets.metadata_service import extract_metadata_for_block
     from app.ingestion.segment_service import analyze_block_segments, merge_metadata_tables
 
+    def _check_cancel() -> None:
+        token = current_cancellation()
+        if token is not None and hasattr(token, "raise_if_cancelled"):
+            token.raise_if_cancelled()
+
     def _run_metadata_one(bid: str) -> str:
+        _check_cancel()
         with SessionLocal() as s:
             blk = s.get(RawBlockModel, bid)
             has_structured = bool(
@@ -492,7 +500,10 @@ def extract_parallel_for_blocks(
         if has_structured:
             return extract_metadata_for_block(bid, settings, auto_link=False)
         seg_ids = analyze_block_segments(bid, settings)
-        seg_tables = [extract_metadata_for_block(sid, settings, auto_link=False) for sid in seg_ids]
+        seg_tables = []
+        for sid in seg_ids:
+            _check_cancel()
+            seg_tables.append(extract_metadata_for_block(sid, settings, auto_link=False))
         if len(seg_tables) > 1:
             with SessionLocal() as merge_session:
                 return merge_metadata_tables(merge_session, bid, seg_tables)
@@ -501,6 +512,7 @@ def extract_parallel_for_blocks(
         raise ValueError(f"No table metadata produced for block {bid}")
 
     def _run_code_set_one(bid: str) -> List[str]:
+        _check_cancel()
         return extract_code_sets_for_block(bid, settings, auto_link=False, review_with_ai="adaptive")
 
     table_ids: List[str] = []
@@ -510,14 +522,16 @@ def extract_parallel_for_blocks(
     with ThreadPoolExecutor(max_workers=min(4, max(1, len(metadata_block_ids)))) as meta_executor, ThreadPoolExecutor(
         max_workers=min(4, max(1, len(code_set_block_ids)))
     ) as cs_executor:
-        meta_futures = {bid: meta_executor.submit(_run_metadata_one, bid) for bid in metadata_block_ids}
-        cs_futures = {bid: cs_executor.submit(_run_code_set_one, bid) for bid in code_set_block_ids}
+        meta_futures = {bid: submit_with_context(meta_executor, _run_metadata_one, bid) for bid in metadata_block_ids}
+        cs_futures = {bid: submit_with_context(cs_executor, _run_code_set_one, bid) for bid in code_set_block_ids}
 
         for bid, future in cs_futures.items():
             try:
                 for cid in future.result():
                     if cid not in code_set_ids:
                         code_set_ids.append(cid)
+            except (RunCancelledError, BudgetExceededError):
+                raise
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "code_sets", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -526,6 +540,8 @@ def extract_parallel_for_blocks(
                 table_id = future.result()
                 if table_id:
                     table_ids.append(table_id)
+            except (RunCancelledError, BudgetExceededError):
+                raise
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "metadata", "error": f"{type(exc).__name__}: {exc}"})
             if callable(on_progress):

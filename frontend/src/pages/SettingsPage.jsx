@@ -39,6 +39,25 @@ const BUDGET_META = {
     label: 'AI 同时处理任务数',
     desc: '同一阶段允许并行处理的 AI 任务数量',
     unit: '个',
+    min: 1,
+  },
+  max_llm_calls: {
+    label: '单批次 AI 调用上限',
+    desc: '内核 BudgetGuard 熔断保护；超过后自动停止并保留检查点（0 表示仅统计不熔断）',
+    unit: '次 / 批次',
+    min: 0,
+  },
+  max_total_tokens: {
+    label: '单批次 Token 上限',
+    desc: '累计输入+输出 Token 超过上限后自动熔断，防止异常循环空烧费用（0 表示不限制）',
+    unit: 'Tokens',
+    min: 0,
+  },
+  max_elapsed_seconds: {
+    label: '单批次最长计算耗时',
+    desc: '不含人工确认等待时间；纯计算耗时超过上限后自动熔断（0 表示不限制）',
+    unit: '秒',
+    min: 0,
   },
 }
 
@@ -210,7 +229,7 @@ export default function SettingsPage() {
                 </span>
                 <input
                   type="number"
-                  min="1"
+                  min={meta.min ?? 1}
                   value={value}
                   onChange={(event) => setBudget({ ...budget, [key]: event.target.value })}
                 />
