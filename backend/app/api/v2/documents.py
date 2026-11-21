@@ -13,6 +13,7 @@ from app.assets.code_sets.service import (
     extract_code_sets_for_block,
     extract_parallel_for_blocks,
 )
+from app.assets.version_diff import diff_documents
 from app.engine.ingestion_run import (
     cancel_document_run,
     document_progress_view,
@@ -289,6 +290,19 @@ def delete_document(document_id: str, session: Session = Depends(db_session)) ->
     document.status = "DELETED"
     session.commit()
     return {"id": document.id, "status": document.status, "assets_preserved": True}
+
+
+@router.get("/diff")
+def compare_documents(
+    base_id: str,
+    target_id: str,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    """跨版本监管制度文档差异对比与影响面分析（返回受影响表清单用于增量重生成）。"""
+    try:
+        return diff_documents(session, base_id, target_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/{document_id}")

@@ -61,6 +61,7 @@ backend/app/
 │   ├── metadata_mutations.py    #    字段编辑、表删除、版本发布与 CSV/XLSX 批量类型导入
 │   ├── metadata_service.py      #    确定性优先 + 疑难字段 AI 辅助提取服务
 │   ├── readiness.py             #    表资产就绪度检查
+│   ├── version_diff.py          #    跨版本监管制度文档差异对比与影响面分级（返回增量受影响表清单）
 │   └── code_sets/               #    码表子域
 │       ├── parser.py            #      纯函数码值文本解析（内联枚举 / 固定值 / 条件句 / 名称归一化）
 │       ├── linking.py           #      字段-码表自动对齐、序号分配、状态刷新与阻断检查
@@ -70,10 +71,11 @@ backend/app/
 │
 ├── engine/                      # 层 5：规则装配、造数、文档 Run 控制面与 Oracle 沙箱执行
 │   ├── ingestion_run.py         #    Step 1 文档导入/解析统一 Run 控制面（基于 kernel.run + BudgetGuard + 取消/重启回收）
-│   ├── rules.py                 #    单条规则校验与样本违规判定
-│   ├── compiler.py              #    规则 → Oracle / MySQL 校验 SQL 编译器
+│   ├── run_diff.py              #    跨验证批次规则与编译后 Oracle SQL 差异对比引擎
+│   ├── rules.py                 #    13 类监管算子确定性校验（含 ARITHMETIC_BALANCE / COND_VALUE / UNIQUE_KEY）
+│   ├── compiler.py              #    规则 → Oracle / MySQL 原生校验 SQL 编译器
 │   ├── binding.py               #    确定性 Schema 编译 + Rule / Generator / 黄金自洽门禁 / AuditCase 校验
-│   ├── mutations.py             #    确定性审计变异引擎（黄金基线 + 9 类非正则算子反例构造 + 正则兜底）
+│   ├── mutations.py             #    确定性审计变异引擎（黄金基线 + 12 类非正则算子反例构造 + 正则兜底）
 │   ├── rule_backfill.py         #    前置四类确定性规则派生（必填 / 列宽上限 / 固定值 / 已发布码表 ENUM）
 │   ├── oracle.py                #    OracleSandbox 物理表管理 + GenericOracleExecutor 真跑审计
 │   └── workflow/                #    阶段二编排流水线

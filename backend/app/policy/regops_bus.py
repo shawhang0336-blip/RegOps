@@ -19,6 +19,7 @@ _FIELD_ARG_KEYS = (
     "if_field",
     "then_field",
     "right_field",
+    "target_field",
     "references_field",
     "lhs_field",
     "rhs_field",
@@ -57,6 +58,23 @@ def field_whitelist_adjudicator(
                         f"字段幻觉拦截：参数 `{key}='{value}'` 不在字段白名单 "
                         f"{sorted(allowed_set)} 中"
                     )
+            # 复杂监管算子字段列表槽位检查：ARITHMETIC_BALANCE.terms[].field / UNIQUE_KEY.key_fields[]
+            terms = scope.get("terms")
+            if isinstance(terms, list):
+                for term in terms:
+                    if isinstance(term, dict) and term.get("field") is not None and term.get("field") not in allowed_set:
+                        return (
+                            f"字段幻觉拦截：算术项 `terms.field='{term.get('field')}'` "
+                            f"不在字段白名单 {sorted(allowed_set)} 中"
+                        )
+            key_fields = scope.get("key_fields")
+            if isinstance(key_fields, list):
+                for kf in key_fields:
+                    if kf is not None and kf not in allowed_set:
+                        return (
+                            f"字段幻觉拦截：唯一键字段 `key_fields` 包含不在白名单中的 `{kf}` "
+                            f"{sorted(allowed_set)}"
+                        )
 
     for case in args.get("cases") or []:
         if not isinstance(case, dict):

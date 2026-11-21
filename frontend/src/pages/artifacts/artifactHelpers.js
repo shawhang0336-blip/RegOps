@@ -21,12 +21,15 @@ export const RULE_ORDER = [
   'REQUIRED',
   'ENUM',
   'COND_REQUIRED',
+  'COND_VALUE',
   'LENGTH',
   'LENGTH_MAX',
   'REGEXP',
   'NOT_IN',
   'NUM_RANGE',
   'FIELD_COMPARE',
+  'ARITHMETIC_BALANCE',
+  'UNIQUE_KEY',
   'FOREIGN_KEY',
 ]
 
@@ -57,7 +60,12 @@ export function ruleStatusLabel(status) {
 }
 
 export function formatValue(value) {
-  if (Array.isArray(value)) return value.join('、')
+  if (Array.isArray(value)) {
+    if (value.every((item) => item && typeof item === 'object' && 'field' in item)) {
+      return value.map((item) => `${item.coef ?? 1}×${item.field}`).join(' + ')
+    }
+    return value.map((item) => (item !== null && typeof item === 'object' ? JSON.stringify(item) : String(item))).join('、')
+  }
   if (value !== null && typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }

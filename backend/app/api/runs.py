@@ -18,6 +18,7 @@ from app.api.deps import (
     spawn_run_driver,
 )
 from app.engine.oracle import OracleSandbox
+from app.engine.run_diff import diff_runs
 from app.engine.workflow import (
     active_generic_runs,
     approve_generic_rules,
@@ -154,6 +155,19 @@ def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
 @router.post("/api/runs/history/cleanup")
 def history_cleanup(session: Session = Depends(db_session)) -> Dict:
     return cleanup_history_runs(session, get_settings())
+
+
+@router.get("/api/runs/diff")
+def compare_runs(
+    base_run_id: str = Query(min_length=1),
+    target_run_id: str = Query(min_length=1),
+    session: Session = Depends(db_session),
+) -> Dict:
+    """对比两次验证批次的有效规则集合与编译后 Oracle SQL 差异。"""
+    try:
+        return diff_runs(session, base_run_id, target_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/api/runs/{run_id}")

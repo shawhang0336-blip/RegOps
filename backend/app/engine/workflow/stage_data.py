@@ -33,7 +33,37 @@ from app.infra.llm import spec_payload
 from app.kernel.blob_store import LocalBlobStore
 
 _GENERATOR_BATCH_SIZE = 12
-_SEMANTIC_GENERATOR_OPERATORS = {"REGEXP", "NUM_RANGE", "FIELD_COMPARE", "COND_REQUIRED", "FOREIGN_KEY"}
+_SEMANTIC_GENERATOR_OPERATORS = {
+    "REGEXP",
+    "NUM_RANGE",
+    "FIELD_COMPARE",
+    "COND_REQUIRED",
+    "COND_VALUE",
+    "ARITHMETIC_BALANCE",
+    "UNIQUE_KEY",
+    "FOREIGN_KEY",
+}
+
+
+def _rule_related_fields(rule: RuleDefinition) -> List[str]:
+    """返回单条规则涉及的所有字段名（用于耦合分组与黄金自洽门禁检查）。"""
+    params = rule.params or {}
+    names = [rule.field]
+    if rule.operator == "FIELD_COMPARE" and params.get("right_field"):
+        names.append(params["right_field"])
+    elif rule.operator in {"COND_REQUIRED", "COND_VALUE"} and params.get("if_field"):
+        names.append(params["if_field"])
+    elif rule.operator == "ARITHMETIC_BALANCE":
+        for term in params.get("terms") or []:
+            if isinstance(term, dict) and term.get("field"):
+                names.append(term["field"])
+        if params.get("target_field"):
+            names.append(params["target_field"])
+    elif rule.operator == "UNIQUE_KEY":
+        for kf in params.get("key_fields") or []:
+            if kf:
+                names.append(kf)
+    return list(dict.fromkeys(names))
 
 
 def _next_asset_version(session, model, run_id, table_code) -> int:
@@ -50,16 +80,12 @@ def _coupled_field_names(
     table_rules: List[RuleDefinition],
     heal_report: Optional[Dict[str, Any]] = None,
 ) -> set:
-    """识别需要 AI 联合语义赋值的字段（正则、数值区间、跨字段比较、条件必填、外键或误报自愈字段）。"""
+    """识别需要 AI 联合语义赋值的字段（正则、数值区间、跨字段比较、算术平衡、条件约束、唯一键、外键或误报自愈字段）。"""
     coupled = set()
     rule_by_key = {rule.rule_key: rule for rule in table_rules}
     for rule in table_rules:
         if rule.operator in _SEMANTIC_GENERATOR_OPERATORS:
-            coupled.add(rule.field)
-            if rule.operator == "FIELD_COMPARE" and rule.params.get("right_field"):
-                coupled.add(rule.params["right_field"])
-            if rule.operator == "COND_REQUIRED" and rule.params.get("if_field"):
-                coupled.add(rule.params["if_field"])
+            coupled.update(_rule_related_fields(rule))
     if heal_report:
         for case in heal_report.get("cases", []):
             if case.get("table_code") != spec.table_code or case.get("case_kind") != "GOLDEN":
@@ -67,11 +93,7 @@ def _coupled_field_names(
             for rule_key in case.get("unexpected_rules") or []:
                 rule = rule_by_key.get(rule_key)
                 if rule:
-                    coupled.add(rule.field)
-                    if rule.params.get("right_field"):
-                        coupled.add(rule.params["right_field"])
-                    if rule.params.get("if_field"):
-                        coupled.add(rule.params["if_field"])
+                    coupled.update(_rule_related_fields(rule))
     return coupled
 
 
@@ -159,16 +181,13 @@ def _partition_coupled_chunks(
     order_index = {f.name: idx for idx, f in enumerate(ai_fields)}
     adj: Dict[str, set] = {f.name: set() for f in ai_fields}
     for rule in table_rules:
-        if rule.field not in adj:
+        related = [name for name in _rule_related_fields(rule) if name in adj]
+        if len(related) < 2:
             continue
-        peer = None
-        if rule.operator == "FIELD_COMPARE":
-            peer = (rule.params or {}).get("right_field")
-        elif rule.operator == "COND_REQUIRED":
-            peer = (rule.params or {}).get("if_field")
-        if peer and peer in adj and peer != rule.field:
-            adj[rule.field].add(peer)
-            adj[peer].add(rule.field)
+        anchor = related[0]
+        for peer in related[1:]:
+            adj[anchor].add(peer)
+            adj[peer].add(anchor)
 
     visited = set()
     components: List[List[Any]] = []
@@ -329,11 +348,7 @@ def bind_table_data_worker(
             covered_fields = set(merged_map)
             checkable_rules = []
             for rule in table_rules:
-                needed = {rule.field}
-                if rule.operator == "FIELD_COMPARE" and rule.params.get("right_field"):
-                    needed.add(rule.params["right_field"])
-                if rule.operator == "COND_REQUIRED" and rule.params.get("if_field"):
-                    needed.add(rule.params["if_field"])
+                needed = set(_rule_related_fields(rule))
                 if needed.issubset(covered_fields):
                     checkable_rules.append(rule)
             sample_rec = materialize_golden_record(spec, merged_bindings, 0)
@@ -350,9 +365,9 @@ def bind_table_data_worker(
         instruction = (
             f"【严格范围】本次仅需为 target_fields（{chunk_names}）输出黄金合规生成器，严禁重复输出 deterministic_golden_values 中已确定的字段。"
             "确保所有目标字段与 deterministic_golden_values、approved_rules、required_reference_values 同时满足，"
-            "并且跨字段比较（FIELD_COMPARE）与条件必填（COND_REQUIRED）彼此自洽、零违规。"
-            "重要：当字段参与 FIELD_COMPARE（尤其 EQ 相等或大小比较）或 COND_REQUIRED 且 golden_count > 1 时，"
-            "请对参与比较的关联字段统一使用 FIXED 生成器（而非多值 ENUM/SEQUENCE），避免多条黄金样本交叉组合失配。"
+            "并且跨字段比较（FIELD_COMPARE）、算术平衡（ARITHMETIC_BALANCE）与条件约束（COND_REQUIRED/COND_VALUE）彼此自洽、零违规。"
+            "重要：当字段参与 FIELD_COMPARE / ARITHMETIC_BALANCE / COND_REQUIRED / COND_VALUE 且 golden_count > 1 时，"
+            "请对参与关联的字段统一使用 FIXED 生成器避免交叉失配；若字段参与 UNIQUE_KEY 且 golden_count > 1，请对其使用 SEQUENCE 生成器确保每条黄金样本唯一。"
             "FIXED 使用 params.value；ENUM 使用 params.values；SEQUENCE 使用 params.start/step。"
             "若提供 published_code_sets/published_code_set，对应字段的 ENUM values 只能取其白名单子集（或使用 FIXED 填其中一个白名单合法码值）。"
         )

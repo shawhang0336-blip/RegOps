@@ -150,10 +150,14 @@ def bind_table_rules_worker(
             "assign_rules",
             f"【严格范围】本次仅处理目标字段 `{field.name}`（即 target_field），返回的每条规则的 field 必须等于 `{field.name}`，严禁为 field_names 中的其他字段生成规则（field_names 仅用于填写 if_field / right_field）。"
             "deterministic_rules 中的必填、列宽上限、固定值和已发布码表白名单规则已由系统确定性派生并生效，严禁重复输出。"
-            "请一次返回该目标字段剩余所有需要语义理解的规则（如 COND_REQUIRED 条件必填、REGEXP 精确格式/定长编码、"
+            "请一次返回该目标字段剩余所有需要语义理解的规则（如 COND_REQUIRED 条件必填、COND_VALUE 条件必空/条件值域约束、"
+            "ARITHMETIC_BALANCE 行内算术平衡勾稽、UNIQUE_KEY 单列/联合唯一键查重、REGEXP 精确格式/定长编码、"
             "NUM_RANGE 数值上下限、FIELD_COMPARE 跨字段比较、NOT_IN 禁用取值或额外业务子集 ENUM）；同一语义只给一条最准确规则，不要输出多个变体；没有则返回空数组。"
             "显性原文与推断拓展必须分开。若提供 published_code_set，ENUM 参数只能取其 values 白名单。"
-            "COND_REQUIRED 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。"
+            "COND_REQUIRED / COND_VALUE 的 if_field 必须严格取自输入 field_names 列表，不得使用简称或臆造字段名。"
+            "COND_VALUE 用于「当某条件成立时目标字段必须为空（then_operator: MUST_BE_NULL）或只能取特定子集/区间（then_operator: ENUM|NOT_IN|NUM_RANGE，配 then_values 或 min/max）」。"
+            "ARITHMETIC_BALANCE 用于金额/余额平衡公式（如期末=期初+收入-支出、总计=分项1+分项2），params: {terms: [{field, coef}], operator: EQ|GE|LE|GT|LT, target_field 或 target_value, tolerance(可选), null_as_zero(可选)}，所有涉及字段必须为 NUMBER。"
+            "UNIQUE_KEY 用于表内唯一键/联合主键不重复，params: {key_fields: [字段列表]}，仅当原文明确要求唯一/不可重复时生成。"
             "数值上下限用 NUM_RANGE（params: min/max/min_inclusive/max_inclusive）；"
             "跨字段比较用 FIELD_COMPARE（params: right_field 必须取自 field_names 且同数据类型，operator 取 LT/LE/GT/GE/EQ/NE，表示左字段必须满足的关系，如到期日>=起息日写 GE；"
             "仅限直接按整列值比较的同语义字段，若原文要求与另一字段的第N位/子串/编码含义一致，禁止用 FIELD_COMPARE）。",

@@ -25,6 +25,16 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
       if (Array.isArray(payload.if_values)) {
         payload.if_values = payload.if_values.map((item) => String(item).trim()).filter(Boolean)
       }
+      if (Array.isArray(payload.then_values)) {
+        payload.then_values = payload.then_values.map((item) => String(item).trim()).filter(Boolean)
+      }
+      if (Array.isArray(payload.key_fields)) {
+        payload.key_fields = payload.key_fields.map((item) => String(item).trim()).filter(Boolean)
+      }
+      if (typeof payload._terms_json === 'string') {
+        payload.terms = JSON.parse(payload._terms_json)
+        delete payload._terms_json
+      }
       await v2(`/artifacts/rules/${rule.row_id}`, {
         method: 'PATCH',
         body: JSON.stringify({ params: payload, reason }),
@@ -132,6 +142,72 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
           <label><span>引用表</span><input value={params.references_table ?? ''} onChange={(e) => set('references_table', e.target.value)} /></label>
           <label><span>引用字段</span><input value={params.references_field ?? ''} onChange={(e) => set('references_field', e.target.value)} /></label>
         </>
+      )}
+
+      {operator === 'COND_VALUE' && (
+        <>
+          <label><span>条件字段</span><input value={params.if_field ?? ''} onChange={(e) => set('if_field', e.target.value)} /></label>
+          <label>
+            <span>条件</span>
+            <select value={params.if_operator ?? 'EQ'} onChange={(e) => set('if_operator', e.target.value)}>
+              <option value="EQ">等于（EQ）</option>
+              <option value="NE">不等于（NE）</option>
+            </select>
+          </label>
+          <label>
+            <span>条件取值（每行一个）</span>
+            <textarea rows={3} value={(params.if_values || []).join('\n')} onChange={(e) => set('if_values', e.target.value.split('\n'))} />
+          </label>
+          <label>
+            <span>目标约束类型</span>
+            <select value={params.then_operator ?? 'MUST_BE_NULL'} onChange={(e) => set('then_operator', e.target.value)}>
+              <option value="MUST_BE_NULL">必须为空（互斥）</option>
+              <option value="ENUM">允许枚举子集（ENUM）</option>
+              <option value="NOT_IN">禁止取值（NOT_IN）</option>
+              <option value="NUM_RANGE">数值区间（NUM_RANGE）</option>
+            </select>
+          </label>
+          {(params.then_operator === 'ENUM' || params.then_operator === 'NOT_IN') && (
+            <label>
+              <span>目标取值列表（每行一个）</span>
+              <textarea rows={3} value={(params.then_values || params.values || []).join('\n')} onChange={(e) => set('then_values', e.target.value.split('\n'))} />
+            </label>
+          )}
+          {params.then_operator === 'NUM_RANGE' && (
+            <>
+              <label><span>下限</span><input type="number" value={params.min ?? ''} onChange={(e) => set('min', e.target.value === '' ? null : Number(e.target.value))} /></label>
+              <label><span>上限</span><input type="number" value={params.max ?? ''} onChange={(e) => set('max', e.target.value === '' ? null : Number(e.target.value))} /></label>
+            </>
+          )}
+        </>
+      )}
+
+      {operator === 'ARITHMETIC_BALANCE' && (
+        <>
+          <label>
+            <span>比较关系</span>
+            <select value={params.operator ?? 'EQ'} onChange={(e) => set('operator', e.target.value)}>
+              <option value="EQ">等于（=）</option>
+              <option value="GE">大于等于（≥）</option>
+              <option value="LE">小于等于（≤）</option>
+              <option value="GT">大于（&gt;）</option>
+              <option value="LT">小于（&lt;）</option>
+            </select>
+          </label>
+          <label><span>右值字段（target_field，可留空）</span><input value={params.target_field ?? ''} onChange={(e) => set('target_field', e.target.value || null)} /></label>
+          <label><span>允许误差容限（tolerance）</span><input type="number" step="0.0001" min="0" value={params.tolerance ?? 0.0001} onChange={(e) => set('tolerance', Number(e.target.value))} /></label>
+          <label>
+            <span>算术项列表（JSON）</span>
+            <textarea rows={4} value={params._terms_json ?? JSON.stringify(params.terms || [], null, 2)} onChange={(e) => set('_terms_json', e.target.value)} />
+          </label>
+        </>
+      )}
+
+      {operator === 'UNIQUE_KEY' && (
+        <label>
+          <span>唯一键字段（每行一个，支持联合主键）</span>
+          <textarea rows={3} value={(params.key_fields || [rule.field]).join('\n')} onChange={(e) => set('key_fields', e.target.value.split('\n'))} />
+        </label>
       )}
 
       {operator !== 'REQUIRED' && (

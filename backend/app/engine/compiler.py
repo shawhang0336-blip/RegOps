@@ -121,6 +121,35 @@ def missing_text(field: str, dialect: str) -> str:
     return f"({field} IS NULL OR {folded} = '')"
 
 
+def _compile_condition_predicate(
+    params: Dict[str, Any],
+    rule_params: Dict[str, Any],
+    dialect: str,
+) -> str:
+    """编译条件前提谓词（COND_REQUIRED / COND_VALUE 共享），兼容 Oracle 空串即 NULL 语义。"""
+    condition_field = f"t.{quote_identifier(rule_params['if_field'], dialect)}"
+    raw_values = list(rule_params["if_values"])
+    has_blank = any(value is None or str(value) == "" for value in raw_values)
+    non_blank_values = [value for value in raw_values if value is not None and str(value) != ""]
+    condition_values = []
+    for index, value in enumerate(non_blank_values):
+        key = f"if_value_{index}"
+        params[key] = value
+        condition_values.append(f":{key}")
+    is_eq = rule_params["if_operator"] == "EQ"
+    if not condition_values:
+        return missing_text(condition_field, dialect) if is_eq else f"NOT {missing_text(condition_field, dialect)}"
+    if len(condition_values) == 1:
+        cmp_expr = f"{condition_field} {'=' if is_eq else '<>'} {condition_values[0]}"
+    else:
+        cmp_expr = f"{condition_field} {'IN' if is_eq else 'NOT IN'} ({', '.join(condition_values)})"
+    if has_blank:
+        if is_eq:
+            return f"({missing_text(condition_field, dialect)} OR {cmp_expr})"
+        return f"(NOT {missing_text(condition_field, dialect)} AND {cmp_expr})"
+    return f"({condition_field} IS NOT NULL AND {cmp_expr})"
+
+
 def compile_where(
     rule: RuleDefinition,
     dialect: str = "mysql",
@@ -172,33 +201,90 @@ def compile_where(
             names.append(f":{key}")
         return f"({null_guard}{field} {operator} ({', '.join(names)}))", params
     if rule.operator == "COND_REQUIRED":
-        condition_field = f"t.{quote_identifier(rule.params['if_field'], dialect)}"
-        raw_values = list(rule.params["if_values"])
-        has_blank = any(value is None or str(value) == "" for value in raw_values)
-        non_blank_values = [value for value in raw_values if value is not None and str(value) != ""]
-        condition_values = []
-        for index, value in enumerate(non_blank_values):
-            key = f"if_value_{index}"
-            params[key] = value
-            condition_values.append(f":{key}")
-        is_eq = rule.params["if_operator"] == "EQ"
-        # Oracle 中空串 '' 等价于 NULL，col <> '' 或 col NOT IN ('', NULL) 恒为 UNKNOWN（永远不命中）。
-        # 含空值哨兵时改为显式 NOT missing_text / missing_text 谓词，兼容 VARCHAR2 与 NUMBER 列。
-        if not condition_values:
-            condition = missing_text(condition_field, dialect) if is_eq else f"NOT {missing_text(condition_field, dialect)}"
-            return f"({condition} AND {missing_text(field, dialect)})", params
-        if len(condition_values) == 1:
-            cmp_expr = f"{condition_field} {'=' if is_eq else '<>'} {condition_values[0]}"
-        else:
-            cmp_expr = f"{condition_field} {'IN' if is_eq else 'NOT IN'} ({', '.join(condition_values)})"
-        if has_blank:
-            if is_eq:
-                cond_expr = f"({missing_text(condition_field, dialect)} OR {cmp_expr})"
-            else:
-                cond_expr = f"NOT {missing_text(condition_field, dialect)} AND {cmp_expr}"
-        else:
-            cond_expr = f"{condition_field} IS NOT NULL AND {cmp_expr}"
+        cond_expr = _compile_condition_predicate(params, rule.params, dialect)
         return f"({cond_expr} AND {missing_text(field, dialect)})", params
+    if rule.operator == "COND_VALUE":
+        cond_expr = _compile_condition_predicate(params, rule.params, dialect)
+        then_op = rule.params["then_operator"]
+        if then_op == "MUST_BE_NULL":
+            return f"({cond_expr} AND NOT {missing_text(field, dialect)})", params
+        if then_op in {"ENUM", "NOT_IN"}:
+            then_vals = list(rule.params.get("then_values") or rule.params.get("values") or [])
+            names = []
+            for idx, val in enumerate(then_vals):
+                key = f"then_val_{idx}"
+                params[key] = val
+                names.append(f":{key}")
+            if then_op == "ENUM":
+                return f"({cond_expr} AND {field} IS NOT NULL AND {field} NOT IN ({', '.join(names)}))", params
+            return f"({cond_expr} AND {field} IS NOT NULL AND {field} IN ({', '.join(names)}))", params
+        if then_op == "NUM_RANGE":
+            bounds = []
+            min_v = rule.params.get("min")
+            max_v = rule.params.get("max")
+            if min_v is not None:
+                params["then_min"] = float(min_v)
+                bounds.append(f"{field} {'<' if rule.params.get('min_inclusive', True) else '<='} :then_min")
+            if max_v is not None:
+                params["then_max"] = float(max_v)
+                bounds.append(f"{field} {'>' if rule.params.get('max_inclusive', True) else '>='} :then_max")
+            return f"({cond_expr} AND {field} IS NOT NULL AND ({' OR '.join(bounds)}))", params
+        raise ValueError(f"Unsupported COND_VALUE then_operator: {then_op}")
+    if rule.operator == "ARITHMETIC_BALANCE":
+        terms = list(rule.params["terms"])
+        null_as_zero = bool(rule.params.get("null_as_zero", False))
+        balance_op = rule.params.get("operator", "EQ")
+        tol = float(rule.params["tolerance"]) if rule.params.get("tolerance") is not None else (0.0001 if balance_op == "EQ" else 0.0)
+        guards = []
+        lhs_parts = []
+        for idx, term in enumerate(terms):
+            col = f"t.{quote_identifier(term['field'], dialect)}"
+            coef = float(term.get("coef", 1))
+            coef_key = f"bal_coef_{idx}"
+            params[coef_key] = coef
+            if null_as_zero:
+                lhs_parts.append(f"(COALESCE({col}, 0) * :{coef_key})")
+            else:
+                guards.append(f"{col} IS NOT NULL")
+                lhs_parts.append(f"({col} * :{coef_key})")
+        lhs_expr = " + ".join(lhs_parts)
+        target_field = rule.params.get("target_field")
+        if target_field is not None:
+            rhs_col = f"t.{quote_identifier(target_field, dialect)}"
+            guards.append(f"{rhs_col} IS NOT NULL")
+            rhs_expr = rhs_col
+        else:
+            params["bal_target"] = float(rule.params["target_value"])
+            rhs_expr = ":bal_target"
+        params["bal_tol"] = tol
+        if balance_op == "EQ":
+            breach = f"ABS(({lhs_expr}) - ({rhs_expr})) > :bal_tol"
+        elif balance_op == "GE":
+            breach = f"({lhs_expr}) < (({rhs_expr}) - :bal_tol)"
+        elif balance_op == "LE":
+            breach = f"({lhs_expr}) > (({rhs_expr}) + :bal_tol)"
+        elif balance_op == "GT":
+            breach = f"({lhs_expr}) <= (({rhs_expr}) + :bal_tol)"
+        elif balance_op == "LT":
+            breach = f"({lhs_expr}) >= (({rhs_expr}) - :bal_tol)"
+        else:
+            raise ValueError(f"Unsupported ARITHMETIC_BALANCE operator: {balance_op}")
+        guard_expr = (" AND ".join(dict.fromkeys(guards)) + " AND ") if guards else ""
+        return f"({guard_expr}{breach})", params
+    if rule.operator == "UNIQUE_KEY":
+        key_fields = list(dict.fromkeys(rule.params.get("key_fields") or [rule.field]))
+        table = (physical_tables or {}).get(rule.table_code, rule.table_code)
+        table_ident = quote_identifier(table, dialect)
+        rec_col = quote_identifier("record_id", dialect)
+        not_null_guards = " AND ".join(f"t.{quote_identifier(kf, dialect)} IS NOT NULL" for kf in key_fields)
+        join_conds = " AND ".join(
+            f"d.{quote_identifier(kf, dialect)} = t.{quote_identifier(kf, dialect)}" for kf in key_fields
+        )
+        return (
+            f"({not_null_guards} AND EXISTS "
+            f"(SELECT 1 FROM {table_ident} d WHERE {join_conds} AND d.{rec_col} <> t.{rec_col}))",
+            params,
+        )
     if rule.operator in {"LENGTH", "LENGTH_MAX"}:
         params["expected_length"] = int(rule.params["length"])
         comparison = "<>" if rule.operator == "LENGTH" else ">"

@@ -38,12 +38,15 @@ _OPERATOR_LABELS = {
     "ENUM": "枚举",
     "NOT_IN": "排除",
     "COND_REQUIRED": "条件必填",
+    "COND_VALUE": "条件取值/互斥",
     "LENGTH": "定长",
     "LENGTH_MAX": "最大长度",
     "REGEXP": "格式",
     "FOREIGN_KEY": "外键",
     "NUM_RANGE": "数值区间",
     "FIELD_COMPARE": "跨字段比较",
+    "ARITHMETIC_BALANCE": "算术平衡/勾稽",
+    "UNIQUE_KEY": "唯一键查重",
 }
 
 

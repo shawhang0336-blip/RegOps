@@ -307,10 +307,37 @@ class GenericOracleExecutor:
             target_tables = prepared_assets["target_tables"]
             code_set_tables = prepared_assets["code_set_tables"]
         records: Dict[str, List[Dict[str, Any]]] = {}
+        from app.engine.mutations import make_distinct_key_value
+
         for spec in specs:
             records[spec.table_code] = []
-            for case in audit_cases[spec.table_code]:
+            spec_fields = {f.name: f for f in spec.fields}
+            unique_rules = [
+                r for r in rules if r.table_code == spec.table_code and r.operator == "UNIQUE_KEY"
+            ]
+            gen_by_field = (
+                {g.field: g for g in golden_generators[spec.table_code]}
+                if golden_generators and spec.table_code in golden_generators
+                else {}
+            )
+            for row_idx, case in enumerate(audit_cases[spec.table_code]):
+                is_golden = "GOLDEN" in case.case_id.upper()
                 record = copy.deepcopy(golden_records[spec.table_code])
+                # 表含 UNIQUE_KEY 规则时：非黄金且未显式覆盖唯一键的普通变异行自动分配独立主键，
+                # 避免与其他单字段变异行继承同一黄金主键而污染 GOLDEN_BASELINE（DUP 变异行显式覆写不受影响）。
+                if unique_rules and not is_golden:
+                    for u_rule in unique_rules:
+                        key_fields = list(dict.fromkeys((u_rule.params or {}).get("key_fields") or [u_rule.field]))
+                        if any(kf in case.overrides for kf in key_fields):
+                            continue
+                        primary_kf = key_fields[0]
+                        gen = gen_by_field.get(primary_kf)
+                        if gen is not None and gen.generator == "SEQUENCE":
+                            record[primary_kf] = materialize_golden_record(spec, [gen], row_idx + 1)[primary_kf]
+                        else:
+                            record[primary_kf] = make_distinct_key_value(
+                                record.get(primary_kf), spec_fields.get(primary_kf), row_idx + 1
+                            )
                 record.update(case.overrides)
                 record["record_id"] = case.case_id
                 records[spec.table_code].append(fit_sandbox_values(spec, record))

@@ -323,8 +323,7 @@ def violates_field_compare(operator: str, left: Any, right: Any) -> Optional[boo
         return None
 
 
-def violates_cond_required(params: Dict[str, Any], record: Dict[str, Any], target_field: str) -> Optional[bool]:
-    """预判记录是否触发 COND_REQUIRED（条件成立且目标字段缺失，与 Oracle 空串/NULL 语义一致）。"""
+def _matches_condition(params: Dict[str, Any], record: Dict[str, Any]) -> Optional[bool]:
     if_field = params.get("if_field")
     if_op = params.get("if_operator")
     if_values = params.get("if_values") or []
@@ -335,15 +334,97 @@ def violates_cond_required(params: Dict[str, Any], record: Dict[str, Any], targe
     non_blank = {str(v) for v in if_values if v is not None and str(v) != ""}
     cond_blank = _is_blank(cond_val)
     if if_op == "EQ":
-        matched = (has_blank and cond_blank) or (not cond_blank and str(cond_val) in non_blank)
-    else:
-        if has_blank and not non_blank:
-            matched = not cond_blank
-        elif has_blank:
-            matched = (not cond_blank) and (str(cond_val) not in non_blank)
-        else:
-            matched = (not cond_blank) and (str(cond_val) not in non_blank)
+        return (has_blank and cond_blank) or (not cond_blank and str(cond_val) in non_blank)
+    if has_blank and not non_blank:
+        return not cond_blank
+    return (not cond_blank) and (str(cond_val) not in non_blank)
+
+
+def violates_cond_required(params: Dict[str, Any], record: Dict[str, Any], target_field: str) -> Optional[bool]:
+    """预判记录是否触发 COND_REQUIRED（条件成立且目标字段缺失，与 Oracle 空串/NULL 语义一致）。"""
+    matched = _matches_condition(params, record)
+    if matched is None:
+        return None
     return bool(matched and _is_blank(record.get(target_field)))
+
+
+def violates_cond_value(params: Dict[str, Any], record: Dict[str, Any], target_field: str) -> Optional[bool]:
+    """预判记录是否触发 COND_VALUE（条件成立且目标字段违反 MUST_BE_NULL / ENUM / NOT_IN / NUM_RANGE）。"""
+    matched = _matches_condition(params, record)
+    if matched is None:
+        return None
+    if not matched:
+        return False
+    val = record.get(target_field)
+    then_op = params.get("then_operator")
+    if then_op == "MUST_BE_NULL":
+        return not _is_blank(val)
+    if then_op in {"ENUM", "NOT_IN"}:
+        then_vals = params.get("then_values")
+        if then_vals is None:
+            then_vals = params.get("values") or []
+        return violates_single_field_rule(then_op, {"values": then_vals}, val)
+    if then_op == "NUM_RANGE":
+        return violates_single_field_rule("NUM_RANGE", params, val)
+    return None
+
+
+def _to_decimal_opt(value: Any) -> Optional[Decimal]:
+    if value is None or str(value).strip() == "":
+        return None
+    text_val = str(value).strip().replace(",", "")
+    if not text_val.isascii():
+        return None
+    try:
+        return Decimal(text_val)
+    except InvalidOperation:
+        return None
+
+
+def violates_arithmetic_balance(params: Dict[str, Any], record: Dict[str, Any]) -> Optional[bool]:
+    """高精度 Decimal 预判行内算术平衡/勾稽规则是否被违反。"""
+    terms = params.get("terms") or []
+    if not terms:
+        return None
+    null_as_zero = bool(params.get("null_as_zero", False))
+    balance_op = params.get("operator", "EQ")
+    tol_raw = params.get("tolerance")
+    tol = Decimal(str(tol_raw)) if tol_raw is not None else (Decimal("0.0001") if balance_op == "EQ" else Decimal("0"))
+    lhs = Decimal("0")
+    for term in terms:
+        field_name = term.get("field")
+        coef = _to_decimal_opt(term.get("coef", 1))
+        if not field_name or coef is None:
+            return None
+        val = _to_decimal_opt(record.get(field_name))
+        if val is None:
+            if null_as_zero:
+                val = Decimal("0")
+            else:
+                return False
+        lhs += val * coef
+    target_field = params.get("target_field")
+    if target_field is not None:
+        rhs = _to_decimal_opt(record.get(target_field))
+        if rhs is None:
+            return False
+    elif params.get("target_value") is not None:
+        rhs = _to_decimal_opt(params.get("target_value"))
+        if rhs is None:
+            return None
+    else:
+        return None
+    if balance_op == "EQ":
+        return abs(lhs - rhs) > tol
+    if balance_op == "GE":
+        return lhs < (rhs - tol)
+    if balance_op == "LE":
+        return lhs > (rhs + tol)
+    if balance_op == "GT":
+        return lhs <= (rhs + tol)
+    if balance_op == "LT":
+        return lhs >= (rhs - tol)
+    return None
 
 
 def find_golden_rule_violations(
@@ -405,6 +486,19 @@ def find_golden_rule_violations(
                         f"当 {params.get('if_field')}={rec.get(params.get('if_field'))!r} 时 "
                         f"{rule.field} 不能为空{multi_hint}"
                     )
+            elif op == "COND_VALUE":
+                if violates_cond_value(params, rec, rule.field) is True:
+                    broken = True
+                    multi_hint = f"（第 {row_idx + 1} 条黄金样本失配，请将条件关联字段改为一致的 FIXED）" if row_idx > 0 else ""
+                    detail = (
+                        f"当 {params.get('if_field')}={rec.get(params.get('if_field'))!r} 时 "
+                        f"{rule.field}={rec.get(rule.field)!r} 违反条件约束 {params.get('then_operator')}{multi_hint}"
+                    )
+            elif op == "ARITHMETIC_BALANCE":
+                if violates_arithmetic_balance(params, rec) is True:
+                    broken = True
+                    multi_hint = f"（第 {row_idx + 1} 条黄金样本失配，请将公式涉及字段统一用 FIXED）" if row_idx > 0 else ""
+                    detail = f"算术勾稽公式不满足（{params.get('operator', 'EQ')}）{multi_hint}"
             if broken:
                 seen.add(rule.rule_key)
                 violations.append(
@@ -415,6 +509,32 @@ def find_golden_rule_violations(
                         "message": f"规则 {rule.rule_key} 误报风险：{detail}",
                     }
                 )
+    # 多条黄金样本之间的 UNIQUE_KEY 重复检测
+    if len(sample_records) > 1:
+        for rule in table_rules:
+            if rule.operator != "UNIQUE_KEY" or rule.rule_key in seen:
+                continue
+            key_fields = list(dict.fromkeys((rule.params or {}).get("key_fields") or [rule.field]))
+            seen_tuples = set()
+            for rec in sample_records:
+                vals = tuple(None if _is_blank(rec.get(kf)) else str(rec.get(kf)) for kf in key_fields)
+                if any(v is None for v in vals):
+                    continue
+                if vals in seen_tuples:
+                    seen.add(rule.rule_key)
+                    violations.append(
+                        {
+                            "rule_key": rule.rule_key,
+                            "field": rule.field,
+                            "operator": "UNIQUE_KEY",
+                            "message": (
+                                f"规则 {rule.rule_key} 误报风险：多条黄金样本的唯一键 {key_fields}={vals} 发生重复，"
+                                "请将主键字段改为 SEQUENCE 生成器确保每条黄金样本唯一。"
+                            ),
+                        }
+                    )
+                    break
+                seen_tuples.add(vals)
     return violations
 
 
@@ -525,4 +645,20 @@ def bind_audit_cases(
                             f"但变异后的 {field}={left!r} 与 {right_field}={right!r} 仍满足比较关系，"
                             "跑到 Oracle 也不会命中。请给出真正打破关系的取值。"
                         )
+            if operator == "ARITHMETIC_BALANCE" and golden_record is not None:
+                merged_rec = {**golden_record, **case.overrides}
+                verdict = violates_arithmetic_balance(params, merged_rec)
+                if verdict is False:
+                    raise RuleValidationError(
+                        f"用例 {case.case_id} 声称会触发 {rule_key}（ARITHMETIC_BALANCE），"
+                        "但变异后记录仍满足算术平衡公式，跑到 Oracle 也不会命中。"
+                    )
+            if operator == "COND_VALUE" and golden_record is not None:
+                merged_rec = {**golden_record, **case.overrides}
+                verdict = violates_cond_value(params, merged_rec, field)
+                if verdict is False:
+                    raise RuleValidationError(
+                        f"用例 {case.case_id} 声称会触发 {rule_key}（COND_VALUE），"
+                        "但变异后记录并未触发该条件值域/互斥约束。"
+                    )
     return cases

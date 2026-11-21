@@ -51,12 +51,15 @@ class RuleDefinition(BaseModel):
         "ENUM",
         "NOT_IN",
         "COND_REQUIRED",
+        "COND_VALUE",
         "LENGTH",
         "LENGTH_MAX",
         "REGEXP",
         "FOREIGN_KEY",
         "NUM_RANGE",
         "FIELD_COMPARE",
+        "ARITHMETIC_BALANCE",
+        "UNIQUE_KEY",
     ]
     params: Dict[str, Any] = Field(default_factory=dict)
     source: Literal["DOC_EXPLICIT", "AI_EXPANDED"]
@@ -77,11 +80,14 @@ LLM_OPERATORS = (
     "ENUM",
     "NOT_IN",
     "COND_REQUIRED",
+    "COND_VALUE",
     "LENGTH_MAX",
     "REGEXP",
     "FOREIGN_KEY",
     "NUM_RANGE",
     "FIELD_COMPARE",
+    "ARITHMETIC_BALANCE",
+    "UNIQUE_KEY",
 )
 
 

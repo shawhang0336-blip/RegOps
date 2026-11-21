@@ -126,6 +126,99 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
             raise RuleValidationError("Unsupported condition operator")
         if not rule.params.get("if_values"):
             raise RuleValidationError("Condition values cannot be empty")
+    if rule.operator == "COND_VALUE":
+        if_field = rule.params.get("if_field")
+        if if_field not in fields:
+            raise RuleValidationError("Unknown condition field")
+        if if_field == rule.field:
+            raise RuleValidationError("COND_VALUE cannot condition a field on itself")
+        if rule.params.get("if_operator") not in {"EQ", "NE"}:
+            raise RuleValidationError("Unsupported condition operator")
+        if not rule.params.get("if_values"):
+            raise RuleValidationError("Condition values cannot be empty")
+        then_op = rule.params.get("then_operator")
+        if then_op not in {"MUST_BE_NULL", "ENUM", "NOT_IN", "NUM_RANGE"}:
+            raise RuleValidationError("COND_VALUE then_operator must be MUST_BE_NULL, ENUM, NOT_IN, or NUM_RANGE")
+        if then_op in {"ENUM", "NOT_IN"}:
+            then_vals = rule.params.get("then_values")
+            if then_vals is None:
+                then_vals = rule.params.get("values")
+            if not then_vals:
+                raise RuleValidationError(f"COND_VALUE({then_op}) requires non-empty then_values")
+        if then_op == "NUM_RANGE":
+            if (fields[rule.field].data_type or "").upper() != "NUMBER":
+                raise RuleValidationError(f"COND_VALUE(NUM_RANGE) requires numeric target field: {rule.field}")
+            min_v = rule.params.get("min")
+            max_v = rule.params.get("max")
+            if min_v is None and max_v is None:
+                raise RuleValidationError("COND_VALUE(NUM_RANGE) requires at least one of min/max")
+            try:
+                min_f = float(min_v) if min_v is not None else None
+                max_f = float(max_v) if max_v is not None else None
+            except (TypeError, ValueError) as exc:
+                raise RuleValidationError("COND_VALUE(NUM_RANGE) bounds must be numeric") from exc
+            if min_f is not None and max_f is not None and min_f > max_f:
+                raise RuleValidationError("COND_VALUE(NUM_RANGE) min cannot exceed max")
+    if rule.operator == "ARITHMETIC_BALANCE":
+        terms = rule.params.get("terms")
+        if not isinstance(terms, list) or not terms:
+            raise RuleValidationError("ARITHMETIC_BALANCE requires a non-empty terms list")
+        balance_op = rule.params.get("operator", "EQ")
+        if balance_op not in {"EQ", "GE", "LE", "GT", "LT"}:
+            raise RuleValidationError("ARITHMETIC_BALANCE operator must be EQ, GE, LE, GT, or LT")
+        term_fields = set()
+        for term in terms:
+            if not isinstance(term, dict):
+                raise RuleValidationError("Each ARITHMETIC_BALANCE term must be an object with field and coef")
+            tf = term.get("field")
+            if tf not in fields:
+                raise RuleValidationError(f"Unknown arithmetic term field: {tf}")
+            if (fields[tf].data_type or "").upper() != "NUMBER":
+                raise RuleValidationError(f"ARITHMETIC_BALANCE term field must be NUMBER: {tf}")
+            try:
+                coef = float(term.get("coef", 1))
+            except (TypeError, ValueError) as exc:
+                raise RuleValidationError(f"Invalid coef for term {tf}") from exc
+            if coef == 0:
+                raise RuleValidationError(f"ARITHMETIC_BALANCE term coef cannot be 0: {tf}")
+            term_fields.add(tf)
+        target_field = rule.params.get("target_field")
+        target_value = rule.params.get("target_value")
+        if target_field is None and target_value is None:
+            raise RuleValidationError("ARITHMETIC_BALANCE requires target_field or target_value")
+        if target_field is not None:
+            if target_field not in fields:
+                raise RuleValidationError(f"Unknown arithmetic target_field: {target_field}")
+            if (fields[target_field].data_type or "").upper() != "NUMBER":
+                raise RuleValidationError(f"ARITHMETIC_BALANCE target_field must be NUMBER: {target_field}")
+            if len(terms) == 1 and target_field in term_fields and float(terms[0].get("coef", 1)) == 1:
+                raise RuleValidationError("ARITHMETIC_BALANCE single-term 1*X vs X is trivial")
+        if target_value is not None:
+            try:
+                float(target_value)
+            except (TypeError, ValueError) as exc:
+                raise RuleValidationError("ARITHMETIC_BALANCE target_value must be numeric") from exc
+        if rule.params.get("tolerance") is not None:
+            try:
+                tol = float(rule.params["tolerance"])
+            except (TypeError, ValueError) as exc:
+                raise RuleValidationError("ARITHMETIC_BALANCE tolerance must be numeric") from exc
+            if tol < 0:
+                raise RuleValidationError("ARITHMETIC_BALANCE tolerance cannot be negative")
+        participants = set(term_fields)
+        if target_field:
+            participants.add(target_field)
+        if rule.field not in participants:
+            raise RuleValidationError("ARITHMETIC_BALANCE rule.field must participate in terms or target_field")
+    if rule.operator == "UNIQUE_KEY":
+        key_fields = rule.params.get("key_fields") or [rule.field]
+        if not isinstance(key_fields, list) or not key_fields:
+            raise RuleValidationError("UNIQUE_KEY requires non-empty key_fields")
+        for kf in key_fields:
+            if kf not in fields:
+                raise RuleValidationError(f"Unknown UNIQUE_KEY field: {kf}")
+        if rule.field not in key_fields:
+            raise RuleValidationError("UNIQUE_KEY rule.field must be included in key_fields")
     if rule.operator in {"ENUM", "NOT_IN"} and not rule.params.get("values"):
         raise RuleValidationError("Enum values cannot be empty")
     if rule.operator in {"LENGTH", "LENGTH_MAX"} and int(rule.params.get("length", 0)) <= 0:
