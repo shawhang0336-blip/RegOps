@@ -3,6 +3,7 @@
 本层为全后端最底层（严禁依赖其他任何业务或内核包）：
 - `config.py`：环境配置 `Settings` 与 `.env` 加载；
 - `db.py`：SQLAlchemy `Base`、`SessionLocal` 与表结构初始化；
+- `blob_store.py`：基于 SHA-256 内容寻址的不可变大对象本地存储（`LocalBlobStore`）；
 - `errors.py`：领域统一异常 `WorkflowError`；
 - `identity.py`：操作人身份占位符常量；
 - `domain.py`：跨层共享契约（`FieldSpec` / `SpecDocument` / `RuleDefinition` / Binding 模型 / `LLM_OPERATORS` / `field_map`）；

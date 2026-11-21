@@ -8,7 +8,7 @@
 5. 身份信息随事件落账，可追溯。
 """
 
-from app.kernel.channel import Identity, RunContext
+from app.kernel.run import Identity, RunContext
 from app.policy.regops_channels import build_context
 from app.kernel.event_log import append_event
 from app.policy.regops_plan import project

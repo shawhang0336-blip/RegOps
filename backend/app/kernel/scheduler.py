@@ -15,10 +15,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from .bus import global_bus
-from .channel import RunContext
 from .event_log import append_event
 from .interrupt import Interrupt
 from .plan import WorkflowPlan
+from .run import RunContext
 
 T = TypeVar("T")
 R = TypeVar("R")

@@ -24,11 +24,11 @@ from app.infra.asset_models import (
     SourceDocumentModel,
     TableMetadataModel,
 )
+from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
 from app.infra.domain import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.infra.identity import OPERATOR_PLACEHOLDER
 from app.infra.models import RuleModel, RunModel, SpecificationModel
-from app.kernel.blob_store import LocalBlobStore
 from app.policy.regops_plan import project
 
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])

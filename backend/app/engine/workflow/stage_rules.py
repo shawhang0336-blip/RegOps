@@ -28,11 +28,11 @@ from app.engine.workflow.runtime import (
 )
 from app.engine.workflow.stage_plan_schema import _provider_name
 from app.infra.asset_models import ArtifactModel
+from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import RuleDefinition, calculate_rule_hash, canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.llm import spec_payload
 from app.infra.models import EventModel, RuleModel, RunModel
-from app.kernel.blob_store import LocalBlobStore
 from app.policy.regops_plan import project
 
 

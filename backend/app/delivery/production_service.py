@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 from sqlalchemy.orm import Session
 
 from app.infra.asset_models import ArtifactModel
-from app.kernel.blob_store import LocalBlobStore
+from app.infra.blob_store import LocalBlobStore
 from app.assets.code_sets.oracle import (
     code_set_compile_bindings,
     compile_code_set_oracle_ddl,

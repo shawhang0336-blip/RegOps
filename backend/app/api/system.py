@@ -8,8 +8,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.delivery.business_db import BusinessDatabaseError, ReadOnlyBusinessDatabase
+from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
-from app.kernel.blob_store import LocalBlobStore
 from app.kernel.bus import Bus, global_bus
 
 router = APIRouter(tags=["system"])

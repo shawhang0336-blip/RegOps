@@ -33,12 +33,12 @@ from app.engine.workflow import (
     start_generic_run,
 )
 from app.engine.workflow.entrypoints import _regops_delete_pre_hook
+from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
 from app.infra.errors import WorkflowError
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
-from app.kernel.blob_store import LocalBlobStore
 from app.kernel.bus import global_bus
-from app.kernel.channel import resolve_event_tables
+from app.policy.regops_channels import resolve_event_tables
 from app.policy.regops_plan import project, project_many
 
 router = APIRouter(tags=["runs"])

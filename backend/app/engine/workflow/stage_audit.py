@@ -16,10 +16,10 @@ from app.engine.workflow.runtime import _call_validated, _code_set_context, _emi
 from app.engine.workflow.stage_data import _next_asset_version
 from app.engine.workflow.stage_plan_schema import _provider_name
 from app.infra.asset_models import AuditCaseDefinitionModel
+from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import AuditCaseBinding, RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.llm import spec_payload
-from app.kernel.blob_store import LocalBlobStore
 
 
 def bind_table_audit_worker(

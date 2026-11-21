@@ -1210,7 +1210,7 @@ def test_regops_centralized_run_cancel_resume_recover_and_active_guard(tmp_path)
 
 def test_regops_budget_guard_tracks_usage_and_trips_on_exceeded_limit():
     """回归：call_llm_validated 将 usage/elapsed_seconds 透传至 Bus，BudgetGuard 在超限时立即熔断。"""
-    from app.kernel.budget import BudgetExceededError, BudgetGuard, BudgetLimits
+    from app.kernel.run import BudgetExceededError, BudgetGuard, BudgetLimits
     from app.policy.regops_bus import default_bus
 
     bus = default_bus()

@@ -1,7 +1,7 @@
-"""RegOps 数据通道（Channel）规格与断点折叠恢复策略（策略层）。
+"""RegOps 数据通道（Channel）规格、大对象表载荷解析与断点折叠恢复策略（策略层）。
 
-定义 16 个命名数据通道（含 6 个 merge_dict 多表汇聚通道与 10 个 last_value 标量/控制通道），
-并提供从 EventLog + BlobStore 无损恢复全部 Channel 的 recover_channels 与 build_context。
+定义 24 个命名数据通道（含多表汇聚与单表增量检查点通道），
+并提供从 EventLog + LocalBlobStore 无损恢复全部 Channel 的 `resolve_event_tables` / `recover_channels` / `build_context`。
 """
 
 import json
@@ -9,14 +9,42 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
+from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
 from app.infra.domain import AuditCaseBinding, RuleDefinition
-from app.kernel.blob_store import LocalBlobStore
-from app.kernel.budget import BudgetGuard, BudgetLimits
-from app.kernel.channel import ChannelSpec, Identity, RunContext, last_value, merge_dict, resolve_event_tables
 from app.infra.models import EventModel, RuleModel, RunModel
+from app.kernel.run import (
+    BudgetGuard,
+    BudgetLimits,
+    ChannelSpec,
+    Identity,
+    RunContext,
+    last_value,
+    merge_dict,
+)
 from .regops_bus import default_bus
 from .regops_plan import project
+
+
+def resolve_event_tables(
+    payload: Optional[Dict[str, Any]],
+    blob_store: Optional[LocalBlobStore] = None,
+) -> Dict[str, Any]:
+    """从 RegOps 事件 payload 取出 tables 字典；若已卸载到 BlobStore（tables_blob），支持按指针透明读取。"""
+    if not isinstance(payload, dict):
+        return {}
+    tables = payload.get("tables")
+    if isinstance(tables, dict) and tables:
+        return tables
+    blob_uri = payload.get("tables_blob")
+    if blob_uri and blob_store is not None:
+        try:
+            loaded = json.loads(blob_store.get(blob_uri).decode("utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+    return tables if isinstance(tables, dict) else {}
 
 DEFAULT_CHANNELS: Dict[str, ChannelSpec] = {
     "plans": ChannelSpec("plans", merge_dict),

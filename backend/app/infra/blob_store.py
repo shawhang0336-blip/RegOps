@@ -1,6 +1,7 @@
-"""BlobStore：ProdAgent 不可变大对象存储（机制层）。
+"""BlobStore：不可变大对象内容寻址存储（基础设施层）。
 
 职责边界：
+- 位于 Layer 0（infra），与 db.py / llm.py / task_runner.py 同级，供策略层、执行引擎、交付层与 API 按需调用；
 - EventLog 只记录轻量元数据与 blob://<sha256> 指针，绝不存放大体积 JSON、DDL、SQL 或审计报告；
 - 按内容 SHA-256 寻址，天然幂等、不可篡改、支持原子写入。
 """

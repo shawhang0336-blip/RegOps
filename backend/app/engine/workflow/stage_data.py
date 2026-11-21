@@ -28,9 +28,9 @@ from app.engine.workflow.runtime import (
 )
 from app.engine.workflow.stage_plan_schema import _provider_name
 from app.infra.asset_models import GeneratorDefinitionModel
+from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import RuleDefinition, canonical_json
 from app.infra.llm import spec_payload
-from app.kernel.blob_store import LocalBlobStore
 
 _GENERATOR_BATCH_SIZE = 12
 _SEMANTIC_GENERATOR_OPERATORS = {

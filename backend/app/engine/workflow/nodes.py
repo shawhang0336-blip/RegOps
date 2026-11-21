@@ -40,12 +40,12 @@ from app.engine.workflow.stage_rules import (
     prepare_deterministic_rule_index,
 )
 from app.infra.asset_models import ArtifactModel
+from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.models import RuleModel
-from app.kernel.blob_store import LocalBlobStore
-from app.kernel.channel import RunContext
 from app.kernel.interrupt import Interrupt
+from app.kernel.run import RunContext
 from app.kernel.scheduler import Outcome, Send
 from app.policy.regops_plan import (
     self_heal_cases_target,

@@ -17,9 +17,9 @@ from app.infra.errors import WorkflowError
 from app.infra.llm import configure_llm_concurrency
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.infra.settings_store import get_budget
-from app.kernel.budget import BudgetExceededError
 from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
+from app.kernel.run import BudgetExceededError
 from app.kernel.scheduler import execute_wave
 from app.policy.llm_guard import (
     DEFAULT_BACKOFF_SECONDS as _BACKOFF_SECONDS,

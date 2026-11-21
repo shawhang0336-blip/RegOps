@@ -34,9 +34,11 @@ from app.ingestion.import_progress import finish as progress_finish
 from app.ingestion.import_progress import snapshot as progress_snapshot
 from app.ingestion.import_progress import start as progress_start
 from app.ingestion.import_progress import update as progress_update
-from app.kernel.budget import BudgetExceededError, BudgetGuard, BudgetLimits
 from app.kernel.event_log import append_event, verify_chain
 from app.kernel.run import (
+    BudgetExceededError,
+    BudgetGuard,
+    BudgetLimits,
     CancellationToken,
     RunCancelledError,
     cancel_run as kernel_cancel_run,

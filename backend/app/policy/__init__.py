@@ -28,7 +28,7 @@ from .regops_bus import (
     operator_whitelist_adjudicator,
     structure_block_adjudicator,
 )
-from .regops_channels import DEFAULT_CHANNELS, build_context, recover_channels
+from .regops_channels import DEFAULT_CHANNELS, build_context, recover_channels, resolve_event_tables
 from .regops_plan import (
     ACTIVE_RUN_STATUSES,
     DEFAULT_EDGES,
@@ -75,6 +75,7 @@ __all__ = [
     "project",
     "project_many",
     "recover_channels",
+    "resolve_event_tables",
     "self_heal_target",
     "structure_block_adjudicator",
 ]

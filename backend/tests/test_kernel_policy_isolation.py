@@ -54,11 +54,22 @@ LAYER_RANK = {
 }
 
 
+EXPECTED_KERNEL_MODULES = {
+    "__init__.py",
+    "plan.py",
+    "bus.py",
+    "event_log.py",
+    "interrupt.py",
+    "run.py",
+    "scheduler.py",
+}
+
+
 def test_kernel_has_zero_domain_or_policy_imports():
-    """AST 静态检查：app/kernel/*.py 严禁 import 任何业务层或策略层模块。"""
+    """AST 静态检查：app/kernel/ 严格收敛为六大核心模块，且严禁 import 任何业务层或策略层模块。"""
     kernel_dir = Path(kernel.__file__).resolve().parent
     py_files = sorted(kernel_dir.glob("*.py"))
-    assert len(py_files) >= 9
+    assert {p.name for p in py_files} == EXPECTED_KERNEL_MODULES
 
     violations = []
     for file_path in py_files:
