@@ -5,16 +5,12 @@ from typing import Dict, Iterable, List, Optional
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.engine.workflow import drive
+from app.engine.workflow import submit_generic_run
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.identity import OPERATOR_PLACEHOLDER
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
-from app.infra.task_runner import task_runner
-from app.kernel.event_log import append_event
-from app.policy.regops_plan import project
-
-ACTIVE_RUN_STATUSES = {"RUNNING", "AUDITING", "READY_TO_AUDIT"}
+from app.policy.regops_plan import ACTIVE_RUN_STATUSES, project
 
 
 def spawn_run_driver(
@@ -23,33 +19,13 @@ def spawn_run_driver(
     generation_budget=None,
     allowed_statuses: Iterable[str] = ("RUNNING", "READY_TO_AUDIT"),
 ) -> bool:
-    """通过全局有界 TaskRunner 在后台推进指定 Run（按 run_id 自动防重入）。"""
-    effective_settings = settings if settings is not None else get_settings()
-    allowed = set(allowed_statuses)
-
-    def _run() -> None:
-        try:
-            with SessionLocal() as session:
-                run = session.get(RunModel, run_id)
-                if run and project(session, run).status in allowed:
-                    drive(session, run, effective_settings, generation_budget=generation_budget)
-        except Exception as exc:  # noqa: BLE001
-            with SessionLocal() as session:
-                run = session.get(RunModel, run_id)
-                if run and project(session, run).status in allowed:
-                    append_event(
-                        session,
-                        run,
-                        "RUN_FAILED",
-                        "background_executor",
-                        {
-                            "node": "background_executor",
-                            "result": {"error": f"{type(exc).__name__}: {exc}"},
-                        },
-                    )
-                    session.commit()
-
-    return task_runner().submit(f"run:{run_id}", _run)
+    """兼容薄壳：统一委托至 `engine.workflow.submit_generic_run`（底层基于 `kernel.run.submit_run`）。"""
+    return submit_generic_run(
+        run_id,
+        settings=settings if settings is not None else get_settings(),
+        generation_budget=generation_budget,
+        allowed_statuses=allowed_statuses,
+    )
 
 
 def db_session():

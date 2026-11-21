@@ -17,6 +17,7 @@ from .regops_bus import (
 )
 from .regops_channels import DEFAULT_CHANNELS, build_context, recover_channels
 from .regops_plan import (
+    ACTIVE_RUN_STATUSES,
     DEFAULT_EDGES,
     DEFAULT_NODES,
     DEFAULT_PLAN,
@@ -36,6 +37,7 @@ from .regops_plan import (
 )
 
 __all__ = [
+    "ACTIVE_RUN_STATUSES",
     "DEFAULT_CHANNELS",
     "DEFAULT_EDGES",
     "DEFAULT_NODES",

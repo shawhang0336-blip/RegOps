@@ -1139,6 +1139,112 @@ def test_audit_binding_rejects_empty_string_and_canonical_number_noops_for_oracl
     assert len(bound) == 1
 
 
+def test_regops_centralized_run_cancel_resume_recover_and_active_guard(tmp_path):
+    """回归：P0 收口后，RegOps 的取消、断点续跑、启动恢复、活跃删除守卫全部经由 kernel.run 统一驱动。"""
+    from app.engine.workflow import (
+        _create_run,
+        cancel_generic_run,
+        delete_generic_run,
+        recover_interrupted_generic_runs,
+        replay_generic_run,
+        retry_generic_run,
+    )
+    from app.infra.errors import WorkflowError
+    from app.kernel.run import run_registry
+
+    session = make_session()
+    spec = _sample_spec()
+    spec_id = str(uuid.uuid4())
+    session.add(
+        SpecificationModel(
+            id=spec_id,
+            version="TEST",
+            table_code="CONFIRMED_SNAPSHOT",
+            source_name=spec.source_name,
+            source_sha256=spec.source_sha256,
+            content_json={"table_name": "confirmed", "selection_confirmed": True, "tables": [spec.model_dump()]},
+        )
+    )
+    session.commit()
+
+    settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="")
+    run = _create_run(session, spec_id, settings)
+    session.commit()
+    assert project(session, run).status == "RUNNING"
+
+    # 运行中不允许删除
+    with pytest.raises(WorkflowError, match="cannot be deleted"):
+        delete_generic_run(session, run, settings)
+
+    # 模拟进程内活跃线程：cancel_generic_run 应只投递取消令牌
+    reg = run_registry()
+    token = reg.register(run.id)
+    try:
+        sig = cancel_generic_run(session, run, reason="手工中止测试")
+        assert sig["signalled"] is True
+        assert token.is_cancelled is True
+        assert token.reason == "手工中止测试"
+    finally:
+        reg.unregister(run.id, token)
+
+    # 无活跃线程的挂起运行态：直接落账 RUN_CANCELLED -> status=FAILED(cancelled=True)，且支持断点续跑
+    res = cancel_generic_run(session, run, reason="清理卡死任务")
+    assert res["cancelled"] is True
+    assert project(session, run).status == "FAILED"
+    assert (project(session, run).result_json or {}).get("cancelled") is True
+    assert replay_generic_run(session, run)["chain_valid"] is True
+
+    # 取消后可通过 retry_generic_run 断点续跑回到 RUNNING
+    retry_generic_run(session, run, settings, defer_continuation=True)
+    assert project(session, run).status == "RUNNING"
+
+    # 模拟进程重启恢复：将 RUNNING 统一标记 FAILED，之后允许干净删除
+    recovered = recover_interrupted_generic_runs(session)
+    assert run.id in recovered
+    assert project(session, run).status == "FAILED"
+
+    deleted = delete_generic_run(session, run, settings)
+    assert deleted["deleted_id"] == run.id
+    assert session.get(RunModel, run.id) is None
+
+
+def test_regops_budget_guard_tracks_usage_and_trips_on_exceeded_limit():
+    """回归：call_llm_validated 将 usage/elapsed_seconds 透传至 Bus，BudgetGuard 在超限时立即熔断。"""
+    from app.kernel.budget import BudgetExceededError, BudgetGuard, BudgetLimits
+    from app.policy.regops_bus import default_bus
+
+    bus = default_bus()
+    guard = BudgetGuard(BudgetLimits(max_llm_calls=2), run_id="budget-test").attach(bus)
+
+    class CountingUsageLlm:
+        def __init__(self):
+            self.calls = 0
+
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            self.calls += 1
+            return {"rules": []}, {
+                "provider": "test",
+                "model": "test",
+                "elapsed_seconds": 0.4,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140},
+            }
+
+    llm = CountingUsageLlm()
+    call_llm_validated(llm, "assign_rules", "instr", {}, bus=bus)
+    call_llm_validated(llm, "assign_rules", "instr", {}, bus=bus)
+    snap = guard.snapshot()
+    assert snap["llm_calls"] == 2
+    assert snap["total_tokens"] == 280
+    assert snap["by_tool"]["assign_rules"] == 2
+
+    # 第 3 次调用前应直接被 BudgetGuard 熔断，不再真正发出模型请求
+    with pytest.raises(BudgetExceededError):
+        call_llm_validated(llm, "assign_rules", "instr", {}, bus=bus)
+    assert llm.calls == 2
+
+
+
+
 
 
 

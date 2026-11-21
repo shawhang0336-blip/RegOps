@@ -75,85 +75,6 @@ def register_default_reducer(reducer: StateReducer) -> None:
     _DEFAULT_REDUCER = reducer
 
 
-def make_interrupt_payload(
-    kind: str,
-    question: str,
-    pending_input: Dict[str, Any],
-    resume_nodes: Dict[str, str],
-    identity: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """构造一条通用 Interrupt 事件的 payload（question / resume_node / pending_input / interrupt_id）。"""
-    if kind not in resume_nodes:
-        raise ValueError(f"未知中断类型：{kind}")
-    payload: Dict[str, Any] = {
-        "question": question,
-        "resume_node": resume_nodes[kind],
-        "pending_input": pending_input,
-        "interrupt_id": uuid.uuid4().hex,
-    }
-    if identity:
-        payload.update(identity)
-    return payload
-
-
-def matching_answer(
-    session: Session,
-    run: RunModel,
-    answer_kind: str,
-    interrupt_id: str,
-    answer_fingerprint: str,
-) -> Optional[EventModel]:
-    """同一中断 + 同样的回答内容 → 认为是一次幂等重入，直接返回原回答事件。"""
-    for event in (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == answer_kind)
-        .order_by(EventModel.seq)
-        .all()
-    ):
-        payload = event.payload_json or {}
-        if payload.get("interrupt_id") == interrupt_id and payload.get("answer_fingerprint") == answer_fingerprint:
-            return event
-    return None
-
-
-def latest_interrupt(session: Session, run: RunModel, kind: str) -> Optional[EventModel]:
-    """最近一条指定类型的中断事件，不论是否已回答。用于幂等重入判定。"""
-    return (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == kind)
-        .order_by(EventModel.seq.desc())
-        .first()
-    )
-
-
-def pending_interrupt_with(
-    session: Session,
-    run: RunModel,
-    kind: str,
-    answer_kinds: Dict[str, str],
-) -> Optional[EventModel]:
-    """找最近一条尚未被回答的指定类型中断事件。"""
-    answer_kind = answer_kinds.get(kind)
-    if not answer_kind:
-        return None
-    answered_ids = {
-        (event.payload_json or {}).get("interrupt_id")
-        for event in session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == answer_kind)
-        .all()
-    }
-    for event in (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id, EventModel.kind == kind)
-        .order_by(EventModel.seq.desc())
-        .all()
-    ):
-        interrupt_id = (event.payload_json or {}).get("interrupt_id")
-        if interrupt_id and interrupt_id not in answered_ids:
-            return event
-    return None
-
-
 def fold_with(events: Iterable[EventModel], reducer: Optional[StateReducer] = None) -> RunState:
     """按 seq 顺序折叠事件流，得到当前状态。纯函数，同一批事件永远得到同一结果。"""
     active_reducer = reducer or _DEFAULT_REDUCER
@@ -300,3 +221,12 @@ def verify_chain(session: Session, run: RunModel) -> bool:
         if event.event_hash != prev_hash:
             return False
     return True
+
+
+# 兼容 re-export：中断协议已独立归位至 app.kernel.interrupt
+from .interrupt import (  # noqa: E402, F401
+    latest_interrupt,
+    make_interrupt_payload,
+    matching_answer,
+    pending_interrupt_with,
+)

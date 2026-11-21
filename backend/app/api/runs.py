@@ -1,14 +1,13 @@
 """装配运行批次路由（`/api/runs/*`）：创建、查询、清理、人工审批、测试确认、重试重审与回放。"""
 
 import json
-from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
-    ACTIVE_RUN_STATUSES,
     ApprovalRequest,
     RunRequest,
     TestConfirmationRequest,
@@ -20,123 +19,41 @@ from app.api.deps import (
 )
 from app.engine.oracle import OracleSandbox
 from app.engine.workflow import (
-    _pending_rules,
+    active_generic_runs,
     approve_generic_rules,
+    cancel_generic_run,
+    cleanup_history_runs,
     confirm_generic_test_results,
+    delete_generic_run,
+    history_cleanup_plan,
+    reaudit_generic_run,
+    replay_generic_run,
     retry_generic_run,
     start_generic_run,
 )
-from app.infra.asset_models import (
-    ArtifactModel,
-    AuditCaseDefinitionModel,
-    GenerationPlanModel,
-    GeneratorDefinitionModel,
-    SchemaDefinitionModel,
-)
+from app.engine.workflow.entrypoints import _regops_delete_pre_hook
 from app.infra.config import get_settings
 from app.infra.errors import WorkflowError
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.blob_store import LocalBlobStore
 from app.kernel.bus import global_bus
 from app.kernel.channel import resolve_event_tables
-from app.kernel.event_log import append_event, verify_chain
 from app.policy.regops_plan import project, project_many
 
 router = APIRouter(tags=["runs"])
 
 
-# ── 历史批次清理与后台续跑辅助 ───────────────────────────────────────────────
-
-
-def _history_cleanup_plan(session: Session):
-    """每组报表保留最新批次和最近一次通过验证的批次，运行中批次永不清理。"""
-    runs = session.query(RunModel).order_by(RunModel.created_at.desc()).all()
-    states = project_many(session, runs)
-    groups: Dict[tuple, List[RunModel]] = {}
-    for run in runs:
-        key = tuple(sorted(item["table_code"] for item in run_tables(session, run))) or (run.spec_id,)
-        groups.setdefault(key, []).append(run)
-    keep = set()
-    for group in groups.values():
-        ordered = sorted(group, key=lambda item: item.created_at or datetime.min, reverse=True)
-        keep.add(ordered[0].id)
-        completed = next((item for item in ordered if states[item.id].status == "COMPLETED"), None)
-        if completed:
-            keep.add(completed.id)
-        keep.update(item.id for item in ordered if states[item.id].status in ACTIVE_RUN_STATUSES)
-    deletes = [run for run in runs if run.id not in keep]
-    return runs, deletes, states
-
-
-def _collect_run_oracle_tables(session: Session, run: RunModel) -> set:
-    """从投影结果与全量历史事件中收集该批次历次 attempt 建过的所有 Oracle 沙箱表（含失败/自愈/重审批次）。"""
-    oracle_tables = set()
-
-    def _add_from_mapping(container) -> None:
-        if not isinstance(container, dict):
-            return
-        for key in (
-            "oracle_tables",
-            "oracle_target_tables",
-            "oracle_code_set_tables",
-            "physical_tables",
-            "target_tables",
-            "code_set_tables",
-        ):
-            mapping = container.get(key)
-            if isinstance(mapping, dict):
-                oracle_tables.update(str(v) for v in mapping.values() if v)
-
-    _add_from_mapping(project(session, run).result_json)
-    for event in session.query(EventModel).filter(EventModel.run_id == run.id).all():
-        payload = event.payload_json or {}
-        if not isinstance(payload, dict):
-            continue
-        _add_from_mapping(payload)
-        for nested_key in ("result", "failed_result", "assets"):
-            _add_from_mapping(payload.get(nested_key))
-    return oracle_tables
+class CancelRunRequest(BaseModel):
+    reason: str = "Run cancelled by operator"
 
 
 def _delete_run_rows(session: Session, run: RunModel):
-    oracle_tables = _collect_run_oracle_tables(session, run)
-    blob_uris = {row.blob_uri for row in session.query(ArtifactModel).filter(ArtifactModel.run_id == run.id).all()}
-    for model in (
-        RuleModel,
-        EventModel,
-        ArtifactModel,
-        GenerationPlanModel,
-        GeneratorDefinitionModel,
-        SchemaDefinitionModel,
-        AuditCaseDefinitionModel,
-    ):
-        session.query(model).filter(model.run_id == run.id).delete(synchronize_session=False)
+    """兼容辅助：委托至 engine 层统一删除前置钩子（供既有单测调用）。"""
+    ctx: Dict = {}
+    _regops_delete_pre_hook(session, run, ctx)
+    session.query(EventModel).filter(EventModel.run_id == run.id).delete(synchronize_session=False)
     session.delete(run)
-    return blob_uris, oracle_tables
-
-
-def _finish_run_deletion(
-    session: Session,
-    blob_uris: set,
-    oracle_tables: set,
-    run_ids: Optional[List[str]] = None,
-) -> List[str]:
-    settings = get_settings()
-    session.flush()
-    remaining_uris = {row[0] for row in session.query(ArtifactModel.blob_uri).distinct().all()}
-    store = LocalBlobStore(settings.blob_dir)
-    for uri in blob_uris - remaining_uris:
-        try:
-            store.delete(uri)
-        except ValueError:
-            pass
-    session.commit()
-    if (not oracle_tables and not run_ids) or not settings.oracle_sandbox_url:
-        return []
-    try:
-        return OracleSandbox(settings.oracle_sandbox_url).drop_tables(sorted(oracle_tables), run_ids=run_ids)
-    except Exception as exc:
-        return [f"沙箱表清理失败：{type(exc).__name__}"]
+    return ctx.get("blob_uris", set()), ctx.get("oracle_tables", set())
 
 
 def _latest_event_tables(events: List[EventModel], kind: str) -> Dict:
@@ -201,9 +118,16 @@ def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
     ]
 
 
+@router.get("/api/runs/active")
+def list_active_runs() -> Dict:
+    """返回当前进程内正在后台执行的活跃 Run ID 列表（来自 kernel.run.RunRegistry）。"""
+    ids = active_generic_runs()
+    return {"count": len(ids), "run_ids": ids}
+
+
 @router.get("/api/runs/history/cleanup-preview")
 def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
-    runs, deletes, states = _history_cleanup_plan(session)
+    runs, deletes, states = history_cleanup_plan(session)
     return {
         "total": len(runs),
         "keep_count": len(runs) - len(deletes),
@@ -222,16 +146,7 @@ def history_cleanup_preview(session: Session = Depends(db_session)) -> Dict:
 
 @router.post("/api/runs/history/cleanup")
 def history_cleanup(session: Session = Depends(db_session)) -> Dict:
-    _, deletes, _ = _history_cleanup_plan(session)
-    deleted_ids = [run.id for run in deletes]
-    blob_uris = set()
-    oracle_tables = set()
-    for run in deletes:
-        run_blobs, run_tables_set = _delete_run_rows(session, run)
-        blob_uris.update(run_blobs)
-        oracle_tables.update(run_tables_set)
-    warnings = _finish_run_deletion(session, blob_uris, oracle_tables, run_ids=deleted_ids)
-    return {"deleted_count": len(deleted_ids), "deleted_ids": deleted_ids, "sandbox_cleanup": warnings}
+    return cleanup_history_runs(session, get_settings())
 
 
 @router.get("/api/runs/{run_id}")
@@ -247,11 +162,11 @@ def delete_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if project(session, run).status in ACTIVE_RUN_STATUSES:
-        raise HTTPException(status_code=409, detail="Running validation batches cannot be deleted")
-    blob_uris, oracle_tables = _delete_run_rows(session, run)
-    warnings = _finish_run_deletion(session, blob_uris, oracle_tables, run_ids=[run_id])
-    return {"deleted_id": run_id, "sandbox_cleanup": warnings}
+    try:
+        return delete_generic_run(session, run, get_settings())
+    except WorkflowError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/api/runs/{run_id}/validation-detail")
@@ -451,44 +366,35 @@ def retry_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     return run_view(session, run)
 
 
+@router.post("/api/runs/{run_id}/cancel")
+def cancel_run(
+    run_id: str,
+    request: Optional[CancelRunRequest] = None,
+    session: Session = Depends(db_session),
+) -> Dict:
+    """取消运行中批次（投递取消令牌或直接落账 RUN_CANCELLED，保留检查点可断点续跑）。"""
+    run = session.get(RunModel, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    reason = (request.reason.strip() if request and request.reason else "") or "Run cancelled by operator"
+    try:
+        return cancel_generic_run(session, run, reason=reason)
+    except WorkflowError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post("/api/runs/{run_id}/reaudit")
 def reaudit_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     """人工改参后的轻量重审：规则集合保持不动，只重跑造数与 Oracle 沙箱验证。"""
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if project(session, run).status in ACTIVE_RUN_STATUSES:
-        raise HTTPException(status_code=409, detail="批次正在执行中，请等当前验证结束后再发起重审")
-    pending = _pending_rules(session, run.id)
-    if pending:
-        raise HTTPException(status_code=409, detail=f"还有 {len(pending)} 条规则待确认，请先在第二步处理完再重审")
-    approved = (
-        session.query(RuleModel)
-        .filter(RuleModel.run_id == run.id, RuleModel.status == "APPROVED")
-        .count()
-    )
-    if not approved:
-        raise HTTPException(status_code=409, detail="这个批次没有已批准的规则可验证")
-    for required_kind in ("SCHEMA_ASSIGNED", "CROSS_RULES_ASSIGNED"):
-        exists = (
-            session.query(EventModel)
-            .filter(EventModel.run_id == run.id, EventModel.kind == required_kind)
-            .first()
-        )
-        if not exists:
-            raise HTTPException(
-                status_code=409,
-                detail="该批次缺少生成上下文（未完成过规则绑定），请改用“重新生成并验证”",
-            )
-    append_event(
-        session,
-        run,
-        "REAUDIT_REQUESTED",
-        "build_audit",
-        {"reason": "保留规则与人工修改，仅重跑 AI 造数与 Oracle 沙箱验证"},
-    )
-    session.commit()
-    _spawn_run_continuation(run.id)
+    try:
+        run = reaudit_generic_run(session, run, get_settings())
+    except WorkflowError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return run_view(session, run)
 
 
@@ -497,14 +403,7 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = session.get(RunModel, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    state = project(session, run)
-    return {
-        "status": state.status,
-        "current_node": state.current_node,
-        "attempt": state.attempt,
-        "result": state.result_json,
-        "chain_valid": verify_chain(session, run),
-    }
+    return replay_generic_run(session, run)
 
 
 @router.get("/api/runs/{run_id}/bus-events")

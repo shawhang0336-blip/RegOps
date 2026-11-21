@@ -9,12 +9,22 @@
 
 from app.engine.workflow.entrypoints import (
     _create_run,
+    active_generic_runs,
     approve_generic_rules,
+    cancel_generic_run,
+    cleanup_history_runs,
+    collect_run_oracle_tables,
     confirm_generic_test_results,
     continue_generic_run,
+    delete_generic_run,
     drive,
+    history_cleanup_plan,
+    reaudit_generic_run,
+    recover_interrupted_generic_runs,
+    replay_generic_run,
     retry_generic_run,
     start_generic_run,
+    submit_generic_run,
 )
 from app.engine.workflow.nodes import _back_bodies, _front_bodies
 from app.engine.workflow.runtime import (
@@ -85,10 +95,20 @@ __all__ = [
     "_specs",
     "_upsert_rule",
     "_validate_plan",
+    "active_generic_runs",
     "approve_generic_rules",
+    "cancel_generic_run",
+    "cleanup_history_runs",
+    "collect_run_oracle_tables",
     "confirm_generic_test_results",
     "continue_generic_run",
+    "delete_generic_run",
     "drive",
+    "history_cleanup_plan",
+    "reaudit_generic_run",
+    "recover_interrupted_generic_runs",
+    "replay_generic_run",
     "retry_generic_run",
     "start_generic_run",
+    "submit_generic_run",
 ]

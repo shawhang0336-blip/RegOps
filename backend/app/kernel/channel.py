@@ -101,6 +101,24 @@ class RunContext:
     current_node: str = "created"
     pending_events: list = field(default_factory=list)
     projector: Optional[Callable[[Any, Any], RunState]] = None
+    cancellation: Any = None
+    budget_guard: Any = None
+
+    def check_cancelled(self) -> None:
+        """在节点/波次边界检查取消令牌；若已取消则抛出 RunCancelledError。"""
+        if self.cancellation is not None and hasattr(self.cancellation, "raise_if_cancelled"):
+            self.cancellation.raise_if_cancelled()
+
+    def check_budget(self) -> None:
+        """在节点/波次边界检查成本预算守卫；若超限则抛出 BudgetExceededError。"""
+        if self.budget_guard is not None and hasattr(self.budget_guard, "check"):
+            self.budget_guard.check(self.bus)
+        elif hasattr(self.bus, "check_budget"):
+            self.bus.check_budget()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return bool(self.cancellation is not None and getattr(self.cancellation, "is_cancelled", False))
 
     def put(self, key: str, value: Any) -> None:
         """通过 Channel Reducer 往共享通道写一个命名产物。"""

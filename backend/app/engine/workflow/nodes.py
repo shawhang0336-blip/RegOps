@@ -38,9 +38,9 @@ from app.infra.errors import WorkflowError
 from app.infra.models import RuleModel
 from app.kernel.blob_store import LocalBlobStore
 from app.kernel.channel import RunContext
+from app.kernel.interrupt import Interrupt
 from app.kernel.scheduler import Outcome
 from app.policy.regops_plan import (
-    interrupt_payload,
     self_heal_cases_target,
     self_heal_data_target,
     self_heal_target,
@@ -150,6 +150,7 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         )
         pending_count = len(_pending_rules(ctx.session, ctx.run.id))
         origin = ctx.get("approval_origin") or "rule_binder"
+        interrupt_cmd = None
         if pending_count:
             if origin == "self_heal":
                 question = f"Oracle 自愈修正后有 {pending_count} 条规则需要人工确认，请批准或拒绝后重新验证。"
@@ -164,16 +165,20 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
             }
             if origin == "self_heal":
                 pending_meta["attempt"] = ctx.state.attempt
-            events.append((
-                "APPROVAL_REQUIRED",
-                "human_gate",
-                interrupt_payload("APPROVAL_REQUIRED", question, pending_meta, ctx.identity.as_payload()),
-            ))
+            interrupt_cmd = Interrupt(
+                kind="APPROVAL_REQUIRED",
+                node="human_gate",
+                question=question,
+                pending_input=pending_meta,
+                resume_node="human_gate",
+                identity=ctx.identity.as_payload(),
+            )
         when = "pending_rules" if pending_count else "no_pending_rules"
         return Outcome(
             shared={"rules": generated_rules, "prepared_assets": assets, "pending_count": pending_count},
             events=events,
             when=when,
+            interrupt=interrupt_cmd,
         )
 
     return {
@@ -303,6 +308,8 @@ def _back_bodies(specs, settings):
             "active_rule_hashes": sorted(rule.rule_hash for rule in rules),
             "audit_summary": {k: v for k, v in report.items() if k not in {"cases", "physical_tables", "target_tables"}},
         }
+        if ctx.budget_guard is not None and hasattr(ctx.budget_guard, "snapshot"):
+            result["budget_usage"] = ctx.budget_guard.snapshot()
         for artifact_type, uri in [
             ("MYSQL_DDL", ddl_uri), ("ORACLE_DDL", oracle_ddl_uri),
             ("VALIDATION_SQL", sql_uri), ("AUDIT_REPORT", report_uri),
@@ -387,17 +394,23 @@ def _back_bodies(specs, settings):
             "oracle_executor", {"result": result, "node": "oracle_executor"},
         ))
         if report["all_passed"]:
-            events.append(("TEST_CONFIRMATION_REQUIRED", "test_confirmation", interrupt_payload(
-                "TEST_CONFIRMATION_REQUIRED",
-                "Oracle 沙箱验证已全部通过，请确认测试结果后导出生产包。",
-                {
-                    "audit_report_blob": report_uri,
-                    "active_rule_hashes": result["active_rule_hashes"],
-                    "attempt": attempt,
-                },
-                ctx.identity.as_payload(),
-            )))
-            return Outcome(shared=shared, events=events, when="audit_passed")
+            return Outcome(
+                shared=shared,
+                events=events,
+                when="audit_passed",
+                interrupt=Interrupt(
+                    kind="TEST_CONFIRMATION_REQUIRED",
+                    node="test_confirmation",
+                    question="Oracle 沙箱验证已全部通过，请确认测试结果后导出生产包。",
+                    pending_input={
+                        "audit_report_blob": report_uri,
+                        "active_rule_hashes": result["active_rule_hashes"],
+                        "attempt": attempt,
+                    },
+                    resume_node="test_confirmation",
+                    identity=ctx.identity.as_payload(),
+                ),
+            )
         return Outcome(shared=shared, events=events, when="audit_rejected")
 
     return {

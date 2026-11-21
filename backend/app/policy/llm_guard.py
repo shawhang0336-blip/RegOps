@@ -138,6 +138,8 @@ def call_llm_validated(
 
     max_total = max(1, transient_attempts) + max(1, validation_attempts)
     for attempt in range(1, max_total + 1):
+        if hasattr(bus, "check_budget"):
+            bus.check_budget()
         attempt_timeout = timeout
         if timeout and transient_used:
             attempt_timeout = int(min(timeout * (1 + 0.5 * transient_used), timeout * 2))
@@ -179,14 +181,17 @@ def call_llm_validated(
                 if attempt > 1:
                     trace["attempts"] = attempt
             if hasattr(bus, "fire"):
-                bus.fire(
-                    "tool.after",
-                    {
-                        "tool": tool_name,
-                        "attempts": attempt,
-                        "table_code": payload.get("table_code") or (payload.get("table") or {}).get("table_code"),
-                    },
-                )
+                after_payload: Dict[str, Any] = {
+                    "tool": tool_name,
+                    "attempts": attempt,
+                    "table_code": payload.get("table_code") or (payload.get("table") or {}).get("table_code"),
+                }
+                if isinstance(trace, dict):
+                    if trace.get("elapsed_seconds") is not None:
+                        after_payload["elapsed_seconds"] = trace.get("elapsed_seconds")
+                    if isinstance(trace.get("usage"), dict):
+                        after_payload["usage"] = trace["usage"]
+                bus.fire("tool.after", after_payload)
             return result, trace
         except LlmTimeoutError as exc:
             transient_used += 1

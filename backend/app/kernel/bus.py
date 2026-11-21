@@ -23,6 +23,7 @@ LIFECYCLE_TOPICS = (
     "run.interrupted",
     "run.completed",
     "run.failed",
+    "run.cancelled",
     "node.enter",
     "node.exit",
     "node.redirect",
@@ -32,6 +33,7 @@ LIFECYCLE_TOPICS = (
     "tool.before",
     "tool.after",
     "tool.rejected",
+    "budget.exceeded",
     "event.appended",
     "document.progress",
 )
@@ -51,6 +53,24 @@ class Bus:
         self._seq: int = 0
         self._parent: Optional["Bus"] = parent
         self._lock = threading.Lock()
+        self._budget_guard: Any = None
+
+    def attach_budget(self, guard: Any) -> "Bus":
+        """挂载横切预算守卫（BudgetGuard），供 LLM 守卫与调度器在关键节点做熔断检查。"""
+        with self._lock:
+            self._budget_guard = guard
+        return self
+
+    @property
+    def budget_guard(self) -> Any:
+        with self._lock:
+            return self._budget_guard
+
+    def check_budget(self) -> None:
+        """触发当前总线挂载的预算检查；未挂载时为空操作。"""
+        guard = self.budget_guard
+        if guard is not None and hasattr(guard, "check"):
+            guard.check(self)
 
     def add_adjudicator(self, fn: Adjudicator) -> "Bus":
         with self._lock:

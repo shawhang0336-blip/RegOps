@@ -29,12 +29,15 @@ backend/app/
 │   └── asset_models.py          #    资产表（文档 / 原始块 / 元数据 / 码表 / 审批 / 产物 / 系统设置）
 │
 ├── kernel/                      # 层 1：ProdAgent 微内核（仅依赖 infra，零业务依赖）
-│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 折叠引擎 + Interrupt
+│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 状态折叠引擎
 │   ├── blob_store.py            #    SHA-256 内容寻址不可变大对象存储
-│   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播）
+│   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播 + 预算检查钩子）
 │   ├── channel.py               #    带 Reducer（last_value / merge_dict / append_list）的共享数据通道与 RunContext
 │   ├── plan.py                  #    静态只读工作流蓝图（PlanNode / PlanEdge / WorkflowPlan）
-│   └── scheduler.py             #    零业务硬编码调度器（屏障排空 BUS_REJECTED → 落账 → 合并 Channel → 折叠）
+│   ├── interrupt.py             #    一等人工中断协议（Interrupt / answer_interrupt / record_interrupt_answer）
+│   ├── budget.py                #    挂在 Bus 上的横切成本观测与熔断守卫（BudgetGuard / BudgetLimits / BudgetExceededError）
+│   ├── run.py                   #    统一 Run 生命周期控制面（创世/提交/活跃注册表/取消/恢复/钩子删除/回放）
+│   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / execute_wave 屏障归并）
 │
 ├── policy/                      # 层 2：RegOps 领域策略层（仅依赖 infra + kernel，以插件方式装配到 kernel）
 │   ├── regops_plan.py           #    12 节点装配流水线拓扑（DEFAULT_PLAN，含规则/造数/用例三路自愈回边）与状态折叠
@@ -75,7 +78,7 @@ backend/app/
 │       ├── runtime.py           #      _call_validated（委托 llm_guard）与 _fanout（BSP 并发扇出）
 │       ├── stages.py            #      规划 / 确定性 Schema / 前置派生+语义规则 / 资产 / 混合造数 / 确定性优先变异 / 靶向重绑
 │       ├── nodes.py             #      7 个 ProdAgent NodeBody（含误报修数据 / 漏报分流修用例或修规则的双路径自愈）
-│       └── entrypoints.py       #      drive / start / approve / confirm / retry 唯一业务入口
+│       └── entrypoints.py       #      RegOps Run 生命周期唯一业务门面（基于 kernel.run 装配 start/submit/approve/confirm/retry/reaudit/cancel/delete/cleanup）
 │
 ├── delivery/                    # 层 6：生产交付与业务库只读校验（阶段三）
 │   ├── production.py            #    生产校验包结构定义与只读 SQL 组装
@@ -111,6 +114,6 @@ backend/app/
 ## 三、看代码推荐阅读顺序
 
 1. **看启动与路由**：[`app/main.py`](app/main.py) → [`app/api/runs.py`](app/api/runs.py) → [`app/api/v2/generation.py`](app/api/v2/generation.py)
-2. **看微内核机制**：[`app/kernel/plan.py`](app/kernel/plan.py) → [`app/kernel/event_log.py`](app/kernel/event_log.py) → [`app/kernel/bus.py`](app/kernel/bus.py) → [`app/kernel/channel.py`](app/kernel/channel.py) → [`app/kernel/scheduler.py`](app/kernel/scheduler.py)
+2. **看微内核机制**：[`app/kernel/plan.py`](app/kernel/plan.py) → [`app/kernel/event_log.py`](app/kernel/event_log.py) → [`app/kernel/bus.py`](app/kernel/bus.py) → [`app/kernel/channel.py`](app/kernel/channel.py) → [`app/kernel/interrupt.py`](app/kernel/interrupt.py) → [`app/kernel/budget.py`](app/kernel/budget.py) → [`app/kernel/run.py`](app/kernel/run.py) → [`app/kernel/scheduler.py`](app/kernel/scheduler.py)
 3. **看 RegOps 策略装配**：[`app/policy/regops_plan.py`](app/policy/regops_plan.py) → [`app/policy/regops_bus.py`](app/policy/regops_bus.py) → [`app/policy/regops_channels.py`](app/policy/regops_channels.py)
 4. **看阶段二流水线执行**：[`app/engine/workflow/entrypoints.py`](app/engine/workflow/entrypoints.py) → [`app/engine/workflow/nodes.py`](app/engine/workflow/nodes.py) → [`app/engine/workflow/runtime.py`](app/engine/workflow/runtime.py) → [`app/engine/workflow/stages.py`](app/engine/workflow/stages.py)

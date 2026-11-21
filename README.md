@@ -2,7 +2,7 @@
 
 面向金融监管报送场景的**确定性工具 + 受控 AI 参数赋值**工作台：从监管规范文档解析、表元数据与码表核对、规则装配与人工确权、Oracle 沙箱造数与靶向变异验证，到生产校验 SQL 部署包一键交付。
 
-架构核心遵循 **ProdAgent「机制在内，策略在外」**：微内核（`EventLog` / `BlobStore` / `Bus` / `Channel` / `WorkflowPlan` / `Scheduler`）与业务策略完全隔离，全链路以只追加哈希链事件账本作为唯一事实源，支持门禁拦截、人工中断挂起与断点续跑。
+架构核心遵循 **ProdAgent「机制在内，策略在外」**：微内核（`EventLog` / `BlobStore` / `Bus` / `Channel` / `WorkflowPlan` / `Interrupt` / `Budget` / `Run` / `Scheduler` 真 BSP `Send` 波次引擎）与业务策略完全隔离，全链路以只追加哈希链事件账本作为唯一事实源，支持门禁拦截、一等人工中断挂起、横切成本熔断、运行中取消与断点续跑。
 
 ## 目录结构
 

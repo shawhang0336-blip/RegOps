@@ -12,12 +12,11 @@ from sqlalchemy.orm import Session
 from app.kernel.event_log import (
     RunState,
     fold_with,
-    make_interrupt_payload,
-    pending_interrupt_with,
     project_many_with,
     project_with,
     register_default_reducer,
 )
+from app.kernel.interrupt import make_interrupt_payload, pending_interrupt_with
 from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan
 from app.infra.models import EventModel, RunModel
 
@@ -82,6 +81,8 @@ INTERRUPT_ANSWER_KINDS: Dict[str, str] = {
     "APPROVAL_REQUIRED": "HUMAN_DECISIONS_RECORDED",
     "TEST_CONFIRMATION_REQUIRED": "TEST_RESULTS_CONFIRMED",
 }
+
+ACTIVE_RUN_STATUSES = frozenset({"RUNNING", "AUDITING", "READY_TO_AUDIT"})
 
 
 def is_gate(name: str) -> bool:
@@ -332,6 +333,13 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             status="FAILED",
             current_node=payload.get("node", state.current_node),
             result_json=payload.get("result"),
+        )
+    if kind == "RUN_CANCELLED":
+        return replace(
+            state,
+            status="FAILED",
+            current_node=payload.get("node", state.current_node),
+            result_json=payload.get("result") or {"error": payload.get("reason", "Run cancelled"), "cancelled": True},
         )
     if kind == "RUN_RESUMED":
         resume_node = payload.get("resume_from_node") or state.resume_from_node

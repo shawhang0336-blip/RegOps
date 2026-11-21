@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.infra.config import Settings
 from app.infra.domain import AuditCaseBinding, RuleDefinition
 from app.kernel.blob_store import LocalBlobStore
+from app.kernel.budget import BudgetGuard, BudgetLimits
 from app.kernel.channel import ChannelSpec, Identity, RunContext, last_value, merge_dict, resolve_event_tables
 from app.infra.models import EventModel, RuleModel, RunModel
 from .regops_bus import default_bus
@@ -140,10 +141,13 @@ def build_context(
     approver: Optional[str] = None,
     editor: Optional[str] = None,
     attempt_base: Optional[int] = None,
+    cancellation: Any = None,
 ) -> RunContext:
     """从入口参数组装 RunContext，注入 RegOps 通道规格与门禁总线，并从事件账本自动折叠恢复 Channel 快照。"""
     state = project(session, run)
     shared = recover_channels(session, run, settings)
+    bus = default_bus()
+    budget_guard = BudgetGuard(BudgetLimits.from_dict(budget), run_id=run.id).attach(bus)
     return RunContext(
         session=session,
         run=run,
@@ -152,11 +156,13 @@ def build_context(
         identity=Identity(operator=operator, approver=approver, editor=editor),
         shared=shared,
         channels=dict(DEFAULT_CHANNELS),
-        bus=default_bus(),
+        bus=bus,
         llm=llm,
         budget=budget,
         concurrency=concurrency,
         attempt_base=attempt_base,
         current_node=state.current_node,
         projector=project,
+        cancellation=cancellation,
+        budget_guard=budget_guard,
     )

@@ -8,7 +8,6 @@
 """
 
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -18,8 +17,10 @@ from app.infra.errors import WorkflowError
 from app.infra.llm import configure_llm_concurrency
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.infra.settings_store import get_budget
+from app.kernel.budget import BudgetExceededError
 from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
+from app.kernel.scheduler import execute_wave
 from app.policy.llm_guard import (
     DEFAULT_BACKOFF_SECONDS as _BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_ATTEMPTS as _TRANSIENT_ATTEMPTS,
@@ -86,6 +87,17 @@ def _code_set_context(field_code_sets, table_code: str, field: str) -> Dict[str,
 
 
 def _error_details(exc: BaseException, fallback_stage: str) -> Dict[str, Any]:
+    if isinstance(exc, BudgetExceededError):
+        return {
+            "stage": fallback_stage,
+            "error_type": type(exc).__name__,
+            "error_kind": "budget",
+            "metric": exc.metric,
+            "used": exc.used,
+            "limit": exc.limit,
+            "budget_snapshot": exc.snapshot,
+            "suggestion": "执行已触达内核预算上限（BudgetGuard 熔断）。可在系统设置放宽预算或缩小单批表数量后重试。",
+        }
     context = getattr(exc, "context", None) or {}
     kind = context.get("error_kind") or "internal"
     return {
@@ -154,11 +166,11 @@ def _fanout(
     max_workers: int = 4,
     events: Optional[List[tuple]] = None,
     bus: Any = None,
+    cancellation: Any = None,
 ) -> List[Any]:
+    """多表 BSP 波次扇出：统一委托至微内核 `kernel.scheduler.execute_wave`。"""
     table_codes = [spec.table_code for spec in specs]
     active_bus = bus if bus is not None else global_bus()
-    if hasattr(active_bus, "fire"):
-        active_bus.fire("wave.fanout", {"run_id": run.id, "stage": stage, "table_codes": table_codes, "wave_size": len(specs)})
     _emit(
         events,
         session,
@@ -167,11 +179,16 @@ def _fanout(
         stage,
         {"stage": stage, "table_codes": table_codes},
     )
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(specs)))) as executor:
-        futures = [executor.submit(worker, spec) for spec in specs]
-        results = [future.result() for future in futures]
-    if hasattr(active_bus, "fire"):
-        active_bus.fire("wave.barrier", {"run_id": run.id, "stage": stage, "table_codes": table_codes, "merged_count": len(results)})
+    results = execute_wave(
+        specs,
+        worker,
+        bus=active_bus,
+        run_id=run.id,
+        stage=stage,
+        labels=table_codes,
+        max_workers=max_workers,
+        cancellation=cancellation,
+    )
     for spec, (_, trace) in zip(specs, results):
         _emit(
             events,

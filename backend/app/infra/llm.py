@@ -442,6 +442,7 @@ class RealDesignLlm:
             "http_status": response.status_code,
             "request_chars": len(prompt),
             "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            "usage": body.get("usage"),
             "arguments": arguments,
         }
         return arguments, trace

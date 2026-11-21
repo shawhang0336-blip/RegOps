@@ -7,37 +7,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import runs as runs_v1
 from app.api import system as system_v1
-from app.api.deps import ACTIVE_RUN_STATUSES
 from app.api.v2 import artifacts as artifacts_v2
 from app.api.v2 import code_sets as code_sets_v2
 from app.api.v2 import documents as documents_v2
 from app.api.v2 import generation as generation_v2
 from app.api.v2 import metadata as metadata_v2
 from app.api.v2 import settings as settings_v2
+from app.engine.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
-from app.infra.db import SessionLocal, init_db
-from app.infra.models import RunModel
+from app.infra.db import init_db
 from app.infra.task_runner import task_runner
-from app.kernel.event_log import append_event
-from app.policy.regops_plan import project_many
 
 
 def _mark_interrupted_runs() -> None:
-    """进程重启后把仍在运行态的批次记为失败，等待人工触发断点续跑。"""
-    with SessionLocal() as session:
-        runs = session.query(RunModel).all()
-        states = project_many(session, runs)
-        interrupted = [run for run in runs if states[run.id].status in ACTIVE_RUN_STATUSES]
-        for run in interrupted:
-            append_event(
-                session,
-                run,
-                "RUN_FAILED",
-                "startup",
-                {"node": "startup", "result": {"error": "Run interrupted by process restart"}},
-            )
-        if interrupted:
-            session.commit()
+    """进程重启后把仍在运行态的批次记为失败（统一委托至 kernel.run.recover_interrupted_runs）。"""
+    recover_interrupted_generic_runs()
 
 
 @asynccontextmanager
