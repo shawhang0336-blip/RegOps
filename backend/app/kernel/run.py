@@ -118,13 +118,16 @@ class InvocationContext:
     """单次节点尝试的执行标识（严格区分两大方向相反的 ID，线程/并发安全）：
 
     - `call_id`：每次尝试全局递增且唯一，用于串起调用日志、Bus 事件与 Trace，**绝不能拿来业务去重**；
-    - `idempotency_key`：同一逻辑任务在跨重试期间保持恒定，供有副作用的操作登记去重。
+    - `idempotency_key`：同一逻辑任务在跨重试期间保持恒定，供有副作用的操作登记去重；
+    - `has_resume_value` / `resume_value`：中断恢复重跑当前节点时，线程隔离地注入外部喂入的恢复值。
     """
 
     call_id: str
     idempotency_key: str
     attempt: int = 1
     wave: int = 0
+    has_resume_value: bool = False
+    resume_value: Any = None
 
 
 _CURRENT_INVOCATION: contextvars.ContextVar[Optional[InvocationContext]] = contextvars.ContextVar(
@@ -163,6 +166,7 @@ class RunContext:
     projector: Optional[Callable[[Any, Any], RunState]] = None
     cancellation: Any = None
     budget_guard: Any = None
+    resume_values: Dict[str, Any] = field(default_factory=dict)
 
     def check_cancelled(self) -> None:
         """在节点/波次边界检查取消令牌；若已取消则抛出 RunCancelledError。"""
@@ -196,6 +200,25 @@ class RunContext:
         """当前逻辑任务的稳定业务幂等键（同一任务跨重试保持不变，用于副作用去重）。"""
         inv = _CURRENT_INVOCATION.get()
         return inv.idempotency_key if inv is not None else None
+
+    @property
+    def resume_value(self) -> Any:
+        """当前中断恢复节点收到的外部喂入值（同波多节点同时恢复时各节点线程隔离，绝不串值）。"""
+        inv = _CURRENT_INVOCATION.get()
+        if inv is not None and inv.has_resume_value:
+            return inv.resume_value
+        if "*" in self.resume_values:
+            return self.resume_values["*"]
+        if self.resume_values:
+            return dict(self.resume_values)
+        return None
+
+    @resume_value.setter
+    def resume_value(self, value: Any) -> None:
+        if value is None:
+            self.resume_values.clear()
+        else:
+            self.resume_values["*"] = value
 
     def put(self, key: str, value: Any) -> None:
         """通过 Channel Reducer 往共享通道写一个命名产物。"""

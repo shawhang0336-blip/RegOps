@@ -18,11 +18,14 @@ from app.infra.models import EventModel, RunModel
 
 @dataclass(frozen=True)
 class Interrupt:
-    """一等人工中断指令：节点声明挂起意图，由 Scheduler 屏障统一落账并停止推进。"""
+    """一等人工中断指令：节点声明挂起意图，由 Scheduler 屏障统一落账并停止推进。
+
+    `node` 留空时，Scheduler 会在屏障处自动补齐触发挂起的当前节点名。
+    """
 
     kind: str
-    node: str
-    question: str
+    node: str = ""
+    question: str = ""
     pending_input: Dict[str, Any] = field(default_factory=dict)
     resume_node: Optional[str] = None
     identity: Optional[Dict[str, Any]] = None

@@ -1047,6 +1047,138 @@ def test_kernel_scheduler_guards_max_waves_and_graph_stalled():
     assert stall_exc.value.when_tags == {"router": "typo_branch"}
 
 
+def test_kernel_outcome_park_multi_interrupt_and_scheduler_resume():
+    """验证 HITL 落盘放手闭环：Outcome.park 自动补 node、同波多中断全落账、Scheduler.resume 线程隔离喂值重跑。"""
+    from app.infra.models import EventModel
+
+    session = make_session()
+    bus = kernel.Bus()
+    interrupted_events: list = []
+    resumed_events: list = []
+    bus.subscribe("run.interrupted", lambda e: interrupted_events.append(e))
+    bus.subscribe("run.resumed", lambda e: resumed_events.append(e))
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        payload = payload or {}
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "INPUT_REQUIRED":
+            return replace(
+                state,
+                status="WAITING_INPUT",
+                current_node=payload.get("resume_node") or state.current_node,
+                resume_from_node=payload.get("resume_node") or state.current_node,
+            )
+        if kind == "RUN_RESUMED":
+            return replace(state, status="RUNNING")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="merge", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+
+    # 1) 单节点中途 Outcome.park -> 落盘放手 -> 新建 RunContext 用 Scheduler.resume 喂裸值重跑
+    single_plan = kernel.WorkflowPlan(
+        name="single_park_resume",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("ask", "询问汇率", "stage"),
+            kernel.PlanNode("finish", "汇总结算", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "ask", "always"),
+            kernel.PlanEdge("ask", "finish", "always"),
+        ),
+        entry="start",
+    )
+    finish_seen_resume = []
+
+    def body_ask(_inp, c: kernel.RunContext):
+        if c.resume_value is None:
+            return kernel.Outcome.park("INPUT_REQUIRED", "请提供 USD 汇率", {"currency": "USD"})
+        return kernel.Outcome(output={"rate": c.resume_value["rate"], "amount": 100 * c.resume_value["rate"]})
+
+    def body_finish(inp, c: kernel.RunContext):
+        finish_seen_resume.append(c.resume_value)
+        return kernel.Outcome(events=[("DONE", "finish", inp)])
+
+    run1 = kernel.create_run(session, "park-single", initial_node="start", bus=bus)
+    ctx1 = kernel.RunContext(session=session, run=run1, settings=object(), state=proj(session, run1), bus=bus, projector=proj)
+    sch1 = kernel.Scheduler(single_plan, {"ask": body_ask, "finish": body_finish})
+    sch1.drive(ctx1)
+    assert proj(session, run1).status == "WAITING_INPUT"
+    assert interrupted_events[-1]["node"] == "ask"
+    assert interrupted_events[-1]["interrupts"][0]["node"] == "ask"
+
+    # 模拟进程重启后重建全新 RunContext，通过 Scheduler.resume 喂入外部值重跑 ask
+    ctx1_rebuilt = kernel.RunContext(session=session, run=run1, settings=object(), state=proj(session, run1), bus=bus, projector=proj)
+    sch1.resume(ctx1_rebuilt, resume_value={"rate": 7.25})
+    assert proj(session, run1).status == "COMPLETED"
+    assert proj(session, run1).result_json == {"rate": 7.25, "amount": 725.0}
+    # resume_value 只对被恢复的首波生效，不污染下游 finish 节点
+    assert finish_seen_resume == [None]
+    assert len(resumed_events) == 1
+    assert kernel.verify_chain(session, run1) is True
+
+    # 2) 同波双节点并发挂起 -> 两条中断工单全部落账 -> Scheduler.resume 传 {node: value} 并发线程隔离重跑并汇合
+    multi_plan = kernel.WorkflowPlan(
+        name="multi_park_resume",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("branch_a", "审批A", "stage"),
+            kernel.PlanNode("branch_b", "审批B", "stage"),
+            kernel.PlanNode("merge", "终态汇总", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "branch_a", "always"),
+            kernel.PlanEdge("start", "branch_b", "always"),
+            kernel.PlanEdge("branch_a", "merge", "always"),
+            kernel.PlanEdge("branch_b", "merge", "always"),
+        ),
+        entry="start",
+    )
+
+    def body_branch_a(_inp, c: kernel.RunContext):
+        if c.resume_value is None:
+            return kernel.Outcome.park("INPUT_REQUIRED", "A 需要审批", {"branch": "A"})
+        return kernel.Outcome(output=f"A:{c.resume_value}")
+
+    def body_branch_b(_inp, c: kernel.RunContext):
+        if c.resume_value is None:
+            return kernel.Outcome.park("INPUT_REQUIRED", "B 需要审批", {"branch": "B"})
+        return kernel.Outcome(output=f"B:{c.resume_value}")
+
+    def body_merge(inp, c: kernel.RunContext):
+        assert c.resume_value is None
+        return kernel.Outcome(events=[("DONE", "merge", inp)])
+
+    run2 = kernel.create_run(session, "park-multi", initial_node="start", bus=bus)
+    ctx2 = kernel.RunContext(
+        session=session, run=run2, settings=object(), state=proj(session, run2), bus=bus, projector=proj, concurrency=2
+    )
+    sch2 = kernel.Scheduler(
+        multi_plan, {"branch_a": body_branch_a, "branch_b": body_branch_b, "merge": body_merge}
+    )
+    sch2.drive(ctx2)
+    intr_rows = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run2.id, EventModel.kind == "INPUT_REQUIRED")
+        .order_by(EventModel.seq)
+        .all()
+    )
+    assert [row.node for row in intr_rows] == ["branch_a", "branch_b"]
+    assert [i["node"] for i in interrupted_events[-1]["interrupts"]] == ["branch_a", "branch_b"]
+
+    ctx2_rebuilt = kernel.RunContext(
+        session=session, run=run2, settings=object(), state=proj(session, run2), bus=bus, projector=proj, concurrency=2
+    )
+    sch2.resume(ctx2_rebuilt, resume_value={"branch_a": "PASS_A", "branch_b": "PASS_B"})
+    assert proj(session, run2).status == "COMPLETED"
+    assert proj(session, run2).result_json == {"branch_a": "A:PASS_A", "branch_b": "B:PASS_B"}
+    assert kernel.verify_chain(session, run2) is True
+
+
+
 
 
 

@@ -121,6 +121,35 @@ class Outcome:
         self.events.append((kind, node, payload))
         return self
 
+    @classmethod
+    def park(
+        cls,
+        kind: str,
+        question: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        node: str = "",
+        resume_node: Optional[str] = None,
+        identity: Optional[Dict[str, Any]] = None,
+        events: Optional[Sequence[tuple]] = None,
+        shared: Optional[Dict[str, Any]] = None,
+        when: str = "always",
+    ) -> "Outcome":
+        """快捷构造人工/外部中断挂起结果：`node` 留空时由 Scheduler 在屏障处自动补齐。"""
+        return cls(
+            shared=dict(shared or {}),
+            events=list(events or ()),
+            when=when,
+            interrupt=Interrupt(
+                kind=kind,
+                node=node,
+                question=question,
+                pending_input=dict(payload or {}),
+                resume_node=resume_node,
+                identity=identity,
+            ),
+        )
+
 
 @dataclass
 class StepResult:
@@ -314,6 +343,9 @@ class Scheduler:
         task: Send,
         ctx: RunContext,
         wave_index: int = 0,
+        *,
+        has_resume_value: bool = False,
+        resume_value: Any = None,
     ) -> Tuple[Send, Outcome, List[tuple], int, int, str, str]:
         body = self.bodies[task.node]
         plan_node = self.plan.node(task.node)
@@ -344,6 +376,8 @@ class Scheduler:
                 idempotency_key=idempotency_key,
                 attempt=attempt,
                 wave=wave_index,
+                has_resume_value=has_resume_value,
+                resume_value=resume_value,
             )
             try:
                 with invocation_scope(inv):
@@ -415,12 +449,82 @@ class Scheduler:
             next_tasks.append(Send(dst, edge_input))
         return next_tasks
 
+    def resume(
+        self,
+        ctx: RunContext,
+        resume_value: Any = None,
+        *,
+        resume_nodes: Optional[Sequence[str]] = None,
+        max_steps: int = 64,
+        max_workers: Optional[int] = None,
+        record_event: bool = True,
+        answer_kind: str = "RUN_RESUMED",
+        answer_payload: Optional[Dict[str, Any]] = None,
+    ) -> List[StepResult]:
+        """从人工/外部中断恢复执行：可选落账 `RUN_RESUMED` 事实，按节点喂入 `ctx.resume_value` 并驱动续跑。
+
+        同时支持两种 HITL 范式：
+        1. **单节点/同波多节点 `Outcome.park` 喂值重跑**：把挂起节点重装入首波，并线程隔离地注入 `ctx.resume_value`
+           （单节点传裸值，多节点传 `{node_name: value}` 字典）；
+        2. **显式 Gate 节点分离推进**（如 RegOps `human_gate`）：若挂起门节点无 body，则按 `Plan` 后继边继续推进。
+        """
+        inferred_dict_nodes = False
+        if resume_nodes is not None:
+            targets = list(resume_nodes)
+        elif (
+            isinstance(resume_value, dict)
+            and resume_value
+            and all(isinstance(k, str) and k in self.bodies for k in resume_value)
+        ):
+            targets = list(resume_value.keys())
+            inferred_dict_nodes = True
+        else:
+            candidate = ctx.state.pending_target or ctx.state.resume_from_node or ctx.state.current_node
+            targets = [candidate] if candidate in self.bodies else []
+
+        resume_map: Dict[str, Any] = {}
+        if len(targets) > 1:
+            if isinstance(resume_value, dict):
+                resume_map = {name: resume_value.get(name) for name in targets}
+            else:
+                resume_map = {name: resume_value for name in targets}
+        elif len(targets) == 1:
+            only = targets[0]
+            if inferred_dict_nodes:
+                resume_map = {only: resume_value[only]}
+            else:
+                resume_map = {only: resume_value}
+
+        if record_event:
+            event_node = targets[0] if targets else (ctx.state.current_node or self.plan.entry)
+            payload: Dict[str, Any] = {
+                "resume_nodes": targets,
+                "has_resume_value": resume_value is not None,
+            }
+            if answer_payload:
+                payload.update(answer_payload)
+            append_event(ctx.session, ctx.run, answer_kind, event_node, payload, bus=ctx.bus)
+            ctx.session.flush()
+            ctx.refresh_state()
+
+        initial_wave = [Send(name, None) for name in targets] if targets else None
+        return self.drive(
+            ctx,
+            max_steps=max_steps,
+            max_workers=max_workers,
+            initial_wave=initial_wave,
+            resume_values=resume_map or None,
+        )
+
     def drive(
         self,
         ctx: RunContext,
         max_steps: int = 64,
         max_workers: Optional[int] = None,
         initial_input: Any = None,
+        *,
+        initial_wave: Optional[Sequence[Send]] = None,
+        resume_values: Optional[Dict[str, Any]] = None,
     ) -> List[StepResult]:
         """按 BSP 超步波次执行到人工中断门或终态，返回全部执行轨迹。
 
@@ -434,9 +538,13 @@ class Scheduler:
         """
         executed: List[StepResult] = []
         cursor = ctx.state.current_node
-        pending_wave: Optional[List[Send]] = (
-            [Send(ctx.state.pending_target, initial_input)] if ctx.state.pending_target else None
-        )
+        if initial_wave is not None:
+            pending_wave: Optional[List[Send]] = list(initial_wave)
+        elif ctx.state.pending_target:
+            pending_wave = [Send(ctx.state.pending_target, initial_input)]
+        else:
+            pending_wave = None
+        wave1_resume_values: Dict[str, Any] = dict(resume_values or {})
         last_when: Optional[str] = None
         is_send_wave = False
         last_wave_nodes: List[str] = []
@@ -487,17 +595,29 @@ class Scheduler:
             if not wave:
                 break
 
+            active_resume = wave1_resume_values if wave_index == 1 else {}
+
+            def _exec_task(task: Send) -> Tuple[Send, Outcome, List[tuple], int, int, str, str]:
+                has_rv = task.node in active_resume
+                return self._run_task(
+                    task,
+                    ctx,
+                    wave_index=wave_index,
+                    has_resume_value=has_rv,
+                    resume_value=active_resume.get(task.node) if has_rv else None,
+                )
+
             # 波次并发执行：普通单步直跑零开销；Send 扇出波次或多节点波次统一经 execute_wave（广播 wave.fanout/barrier）
             if len(wave) == 1 and not current_is_send_wave:
                 ctx.current_node = wave[0].node
-                wave_outcomes = [self._run_task(wave[0], ctx, wave_index=wave_index)]
+                wave_outcomes = [_exec_task(wave[0])]
             else:
                 ctx.current_node = wave[0].node
                 partial_outcomes: List[Tuple[Send, Outcome, List[tuple], int, int, str, str]] = []
                 try:
                     wave_outcomes = execute_wave(
                         wave,
-                        lambda task: self._run_task(task, ctx, wave_index=wave_index),
+                        _exec_task,
                         bus=ctx.bus,
                         run_id=ctx.run.id,
                         stage=wave[0].node,
@@ -532,7 +652,7 @@ class Scheduler:
             for rej in bus_rejections:
                 append_event(ctx.session, ctx.run, "BUS_REJECTED", barrier_node, rej, bus=ctx.bus)
 
-            interrupt_hit: Optional[Interrupt] = None
+            interrupts_hit: List[Interrupt] = []
             goto_outcome: Optional[Tuple[str, Outcome]] = None
             next_sends: List[Send] = []
 
@@ -540,14 +660,24 @@ class Scheduler:
                 ctx.current_node = task.node
                 for kind, ev_node, payload in [*retry_events, *outcome.events]:
                     append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
-                if outcome.interrupt is not None and interrupt_hit is None:
-                    interrupt_hit = outcome.interrupt
+                if outcome.interrupt is not None:
+                    intr = outcome.interrupt
+                    if not intr.node:
+                        intr = Interrupt(
+                            kind=intr.kind,
+                            node=task.node,
+                            question=intr.question,
+                            pending_input=dict(intr.pending_input),
+                            resume_node=intr.resume_node or task.node,
+                            identity=intr.identity,
+                        )
+                    interrupts_hit.append(intr)
                     append_event(
                         ctx.session,
                         ctx.run,
-                        outcome.interrupt.kind,
-                        outcome.interrupt.node,
-                        outcome.interrupt.to_payload(),
+                        intr.kind,
+                        intr.node,
+                        intr.to_payload(),
                         bus=ctx.bus,
                     )
                 for key, value in outcome.shared.items():
@@ -600,15 +730,23 @@ class Scheduler:
             last_wave_outputs = [(task.node, outcome.output) for task, outcome, *_ in wave_outcomes]
             last_wave_was_send = current_is_send_wave
 
-            # 1) 一等 Interrupt：立即挂起并提交
-            if interrupt_hit is not None:
+            # 1) 一等 Interrupt：同波全部工单落账后立即挂起并提交（落盘放手）
+            if interrupts_hit:
                 if hasattr(ctx.bus, "fire"):
                     ctx.bus.fire(
                         "run.interrupted",
                         {
                             "run_id": ctx.run.id,
-                            "node": interrupt_hit.node,
-                            "interrupt_kind": interrupt_hit.kind,
+                            "node": interrupts_hit[0].node,
+                            "interrupt_kind": interrupts_hit[0].kind,
+                            "interrupts": [
+                                {
+                                    "node": item.node,
+                                    "kind": item.kind,
+                                    "resume_node": item.resume_node or item.node,
+                                }
+                                for item in interrupts_hit
+                            ],
                             "status": ctx.state.status,
                         },
                     )
