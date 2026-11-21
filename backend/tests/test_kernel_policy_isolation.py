@@ -977,6 +977,77 @@ def test_kernel_wave_multi_error_aggregation_and_edge_input_delivery():
     assert proj(session, run).result_json == {"final": {"retry_items": ["a:22", "b:24"], "round": 2}}
 
 
+def test_kernel_scheduler_guards_max_waves_and_graph_stalled():
+    """验证调度器两项止损兜底：无限 Goto 环跑满 max_steps 抛 MaxWavesExceededError；断链 when 抛 GraphStalledError。"""
+    import pytest
+
+    session = make_session()
+
+    def reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="end", result_json=payload)
+        return state
+
+    proj = lambda s, r: kernel.project_with(s, r, reducer=reducer)
+
+    # 1) 无限 Goto 死循环 -> 跑满 max_steps=4 明确抛出 MaxWavesExceededError 熔断
+    loop_plan = kernel.WorkflowPlan(
+        name="infinite_loop_guard",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("looper", "自环节点", "stage"),
+            kernel.PlanNode("end", "终点", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "looper", "always"),
+            kernel.PlanEdge("looper", "end", "done"),
+        ),
+        entry="start",
+    )
+    run_loop = kernel.create_run(session, "loop-spec", initial_node="start")
+    ctx_loop = kernel.RunContext(
+        session=session, run=run_loop, settings=object(), state=proj(session, run_loop), projector=proj
+    )
+    with pytest.raises(kernel.MaxWavesExceededError) as loop_exc:
+        kernel.Scheduler(
+            loop_plan,
+            {"looper": lambda _i, _c: kernel.Outcome(goto="looper", control={"reason": "spin"})},
+        ).drive(ctx_loop, max_steps=4)
+    assert loop_exc.value.max_steps == 4
+    assert loop_exc.value.pending_nodes == ["looper"]
+
+    # 2) 条件边断链（when="typo_branch" 找不到任何匹配边，且非终态/非门控）-> 抛出 GraphStalledError 并点名卡死节点
+    stall_plan = kernel.WorkflowPlan(
+        name="stall_guard",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("router", "路由", "stage"),
+            kernel.PlanNode("ok_end", "成功终态", "terminal"),
+            kernel.PlanNode("err_end", "失败终态", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "router", "always"),
+            kernel.PlanEdge("router", "ok_end", "ok"),
+            kernel.PlanEdge("router", "err_end", "err"),
+        ),
+        entry="start",
+    )
+    run_stall = kernel.create_run(session, "stall-spec", initial_node="start")
+    ctx_stall = kernel.RunContext(
+        session=session, run=run_stall, settings=object(), state=proj(session, run_stall), projector=proj
+    )
+    with pytest.raises(kernel.GraphStalledError) as stall_exc:
+        kernel.Scheduler(
+            stall_plan,
+            {"router": lambda _i, _c: kernel.Outcome(when="typo_branch")},
+        ).drive(ctx_stall)
+    assert stall_exc.value.stalled_nodes == ["router"]
+    assert stall_exc.value.when_tags == {"router": "typo_branch"}
+
+
+
 
 
 

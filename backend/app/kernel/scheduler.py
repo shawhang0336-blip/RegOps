@@ -72,6 +72,29 @@ class WaveExecutionError(RuntimeError):
         )
 
 
+class GraphStalledError(RuntimeError):
+    """静态工作流图卡死（非终态/非门控节点算不出任何匹配出边）时抛出的内核异常。"""
+
+    def __init__(self, stalled_nodes: Sequence[str], when_tags: Dict[str, Optional[str]]) -> None:
+        self.stalled_nodes = list(stalled_nodes)
+        self.when_tags = dict(when_tags)
+        detail = "，".join(f"{node}(when={self.when_tags.get(node)!r})" for node in self.stalled_nodes)
+        super().__init__(f"工作流图卡死，以下阶段节点没有可匹配的出边：{detail}")
+
+
+class MaxWavesExceededError(RuntimeError):
+    """波次循环达到 `max_steps` 安全阀仍未进入终态或人工门时抛出的防空转熔断异常。"""
+
+    def __init__(self, max_steps: int, cursor: str, pending_nodes: Sequence[str]) -> None:
+        self.max_steps = max_steps
+        self.cursor = cursor
+        self.pending_nodes = list(pending_nodes)
+        super().__init__(
+            f"工作流调度超过最大波次上限（max_steps={max_steps}，当前游标={cursor}，"
+            f"待执行节点={self.pending_nodes}），内核已熔断防止死循环空转。"
+        )
+
+
 @dataclass(frozen=True)
 class Send:
     """动态扇出指令：向目标节点派发一条带独立 input 的并发任务，在下一 BSP 波次并行执行。"""
@@ -356,6 +379,42 @@ class Scheduler:
                 ctx.check_budget()
                 _sleep_cancelable(delay, ctx.cancellation)
 
+    def _build_static_wave(
+        self,
+        cursor: str,
+        ctx: RunContext,
+        last_when: Optional[str],
+        initial_input: Any,
+        last_wave_nodes: List[str],
+        last_wave_whens: Dict[str, str],
+        last_wave_outputs: List[Tuple[str, Any]],
+        last_wave_was_send: bool,
+    ) -> List[Send]:
+        if not last_wave_nodes:
+            ready_nodes = self._next_ready(cursor, ctx, when=last_when)
+            return [Send(name, initial_input) for name in ready_nodes]
+        preds_by_dst: Dict[str, List[str]] = {}
+        for src_node in dict.fromkeys(last_wave_nodes):
+            for dst in self._next_ready(src_node, ctx, when=last_wave_whens.get(src_node)):
+                bucket = preds_by_dst.setdefault(dst, [])
+                if src_node not in bucket:
+                    bucket.append(src_node)
+        output_by_node: Dict[str, Any] = {}
+        for src_node, out_val in last_wave_outputs:
+            output_by_node[src_node] = out_val
+        next_tasks: List[Send] = []
+        for dst, preds in preds_by_dst.items():
+            if last_wave_was_send and len(preds) == 1:
+                edge_input: Any = [
+                    out_val for src_node, out_val in last_wave_outputs if src_node == preds[0]
+                ]
+            elif len(preds) > 1:
+                edge_input = {p: output_by_node.get(p) for p in preds}
+            else:
+                edge_input = output_by_node.get(preds[0])
+            next_tasks.append(Send(dst, edge_input))
+        return next_tasks
+
     def drive(
         self,
         ctx: RunContext,
@@ -391,32 +450,35 @@ class Scheduler:
             ctx.check_budget()
 
             if pending_wave is None:
-                if not last_wave_nodes:
-                    ready_nodes = self._next_ready(cursor, ctx, when=last_when)
-                    pending_wave = [Send(name, initial_input) for name in ready_nodes]
-                else:
-                    preds_by_dst: Dict[str, List[str]] = {}
-                    for src_node in dict.fromkeys(last_wave_nodes):
-                        for dst in self._next_ready(src_node, ctx, when=last_wave_whens.get(src_node)):
-                            bucket = preds_by_dst.setdefault(dst, [])
-                            if src_node not in bucket:
-                                bucket.append(src_node)
-                    output_by_node: Dict[str, Any] = {}
-                    for src_node, out_val in last_wave_outputs:
-                        output_by_node[src_node] = out_val
-                    next_tasks: List[Send] = []
-                    for dst, preds in preds_by_dst.items():
-                        if last_wave_was_send and len(preds) == 1:
-                            edge_input: Any = [
-                                out_val for src_node, out_val in last_wave_outputs if src_node == preds[0]
-                            ]
-                        elif len(preds) > 1:
-                            edge_input = {p: output_by_node.get(p) for p in preds}
-                        else:
-                            edge_input = output_by_node.get(preds[0])
-                        next_tasks.append(Send(dst, edge_input))
-                    pending_wave = next_tasks
+                pending_wave = self._build_static_wave(
+                    cursor,
+                    ctx,
+                    last_when,
+                    initial_input,
+                    last_wave_nodes,
+                    last_wave_whens,
+                    last_wave_outputs,
+                    last_wave_was_send,
+                )
                 is_send_wave = False
+            if not pending_wave:
+                if (
+                    ctx.state.status not in {"COMPLETED", "FAILED"}
+                    and not ctx.state.status.startswith("WAITING_")
+                ):
+                    active_sources = list(dict.fromkeys(last_wave_nodes)) if last_wave_nodes else [cursor]
+                    stalled = [
+                        name
+                        for name in active_sources
+                        if name in self._node_names and self.plan.node(name).kind == "stage"
+                    ]
+                    if stalled:
+                        when_map = {
+                            name: (last_wave_whens.get(name) if last_wave_nodes else (last_when or ctx.state.when))
+                            for name in stalled
+                        }
+                        raise GraphStalledError(stalled, when_map)
+                break
             wave = [task for task in pending_wave if task.node in self.bodies]
             current_is_send_wave = is_send_wave
             pending_wave = None
@@ -589,6 +651,27 @@ class Scheduler:
                 ctx.session.commit()
                 ctx.check_cancelled()
             ctx.check_budget()
+        else:
+            # 跑满 max_steps 仍未到达终态或挂起态：检查是否还有待执行波次，若是则防空转熔断
+            if not ctx.state.status.startswith("WAITING_") and ctx.state.status not in {"COMPLETED", "FAILED"}:
+                remaining_wave = (
+                    pending_wave
+                    if pending_wave is not None
+                    else self._build_static_wave(
+                        cursor,
+                        ctx,
+                        last_when,
+                        initial_input,
+                        last_wave_nodes,
+                        last_wave_whens,
+                        last_wave_outputs,
+                        last_wave_was_send,
+                    )
+                )
+                runnable = [task.node for task in remaining_wave if task.node in self.bodies]
+                if runnable:
+                    ctx.session.commit()
+                    raise MaxWavesExceededError(max_steps, cursor, runnable)
 
         if hasattr(ctx.bus, "fire") and ctx.state.status.startswith("WAITING_"):
             ctx.bus.fire("run.interrupted", {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})

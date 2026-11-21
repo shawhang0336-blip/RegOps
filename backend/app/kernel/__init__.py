@@ -67,6 +67,8 @@ from .run import (
     submit_run,
 )
 from .scheduler import (
+    GraphStalledError,
+    MaxWavesExceededError,
     NodeBody,
     NodeTimeoutError,
     Outcome,
@@ -87,11 +89,13 @@ __all__ = [
     "CancellationToken",
     "ChannelSpec",
     "GENESIS_HASH",
+    "GraphStalledError",
     "Identity",
     "Interrupt",
     "InvocationContext",
     "LIFECYCLE_TOPICS",
     "MAX_BUS_HISTORY",
+    "MaxWavesExceededError",
     "NodeBody",
     "NodeTimeoutError",
     "Outcome",
