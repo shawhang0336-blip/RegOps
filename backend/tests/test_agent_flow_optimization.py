@@ -901,7 +901,7 @@ def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbi
     from app.assets.code_sets.linking import ensure_field_reference
     from app.assets.metadata_service import _deterministic_field_draft
     from app.infra.db_tables import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
-    from app.ingestion.spec_parser import lookup_term_definition
+    from app.ingestion.parsers.pdf_parser import lookup_term_definition
 
     flattened = "金融机构标识码 国家外汇管理局签发的12位标识码。 发生日期 账户收支余发生变动日期。 币种 币种代码，见币种代码表。"
     assert lookup_term_definition(flattened, "发生日期") == "账户收支余发生变动日期。"

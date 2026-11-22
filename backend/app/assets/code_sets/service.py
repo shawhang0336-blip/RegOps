@@ -66,7 +66,7 @@ from app.infra.db_tables import (
 )
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.ingestion.catalog import _extract_code_pairs_from_section
+from app.ingestion.parsers.pdf_catalog import extract_code_pairs_from_section
 
 
 def code_set_summary(session: Session, row: CodeSetModel, metrics: Optional[Tuple[int, int, int]] = None) -> Dict[str, Any]:
@@ -404,7 +404,7 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
         if not created_ids and (block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} or content.get("candidate_role") == "CODE_SET"):
             title = content.get("table_name") or block.source_locator.get("title") or block.source_locator.get("section") or f"码值表_{block.ordinal + 1}"
             code_id = content.get("table_code") or re.sub(r"[^A-Z0-9_]", "_", f"CS_{block.id[:8]}".upper())
-            pairs = _extract_code_pairs_from_section(block.raw_content, str(block.source_locator.get("section", "")), title)
+            pairs = extract_code_pairs_from_section(block.raw_content, str(block.source_locator.get("section", "")), title)
             valid_vals = _clean_value_drafts(pairs)
             if not valid_vals:
                 try:
@@ -479,8 +479,9 @@ def extract_parallel_for_blocks(
                 if is_cs_only or b.content_json.get("inline_code_sets") or b.content_json.get("code_set_spec"):
                     code_set_block_ids.append(bid)
 
+    from app.assets.metadata_mutations import merge_metadata_tables
     from app.assets.metadata_service import extract_metadata_for_block
-    from app.ingestion.segment_service import analyze_block_segments, merge_metadata_tables
+    from app.ingestion.structure_service import analyze_block_segments
 
     def _check_cancel() -> None:
         token = current_cancellation()

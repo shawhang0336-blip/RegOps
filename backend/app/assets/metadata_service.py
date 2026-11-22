@@ -64,7 +64,7 @@ from app.infra.db_tables import (
 )
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.ingestion.spec_parser import (
+from app.ingestion.parsers.pdf_parser import (
     _parse_type_from_entry,
     extract_code_reference_from_text,
     extract_inline_enum_values,

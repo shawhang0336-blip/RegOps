@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.ingestion.spec_parser import (
+from app.ingestion.parsers.pdf_parser import (
     SpecParseError,
     _between,
     _extract_pdf_text,
@@ -342,7 +342,7 @@ def parse_document_catalog(pdf_path: str) -> List[Dict[str, Any]]:
     raise SpecParseError("No table candidates were discovered in document")
 
 
-def _extract_code_pairs_from_section(section_text: str, section_id: str, title: str) -> List[Dict[str, str]]:
+def extract_code_pairs_from_section(section_text: str, section_id: str, title: str) -> List[Dict[str, str]]:
     """Deterministically parse code-value rows from Chapter 9 or Appendix sections."""
     values: List[Dict[str, str]] = []
     seen = set()
@@ -425,7 +425,7 @@ def parse_document_code_sets(pdf_path: str) -> List[Dict[str, Any]]:
             if not sec_body:
                 continue
             page = max(1, full_text[: ch9_start + m.start()].count("\f") + 1 - 12)
-            values = _extract_code_pairs_from_section(sec_body, sec_id, title)
+            values = extract_code_pairs_from_section(sec_body, sec_id, title)
             if not values and "门户网发布" in sec_body:
                 continue
             code_sets.append(
@@ -456,7 +456,7 @@ def parse_document_code_sets(pdf_path: str) -> List[Dict[str, Any]]:
             next_start = app_headings[idx + 1].start() if idx + 1 < len(app_headings) else len(app_text)
             sec_body = app_text[m.end() : next_start].strip()
             page = max(1, full_text[: app_start + m.start()].count("\f") + 1)
-            values = _extract_code_pairs_from_section(sec_body, cn_num, title)
+            values = extract_code_pairs_from_section(sec_body, cn_num, title)
             code_sets.append(
                 {
                     "code": f"FAL_2025_APP_{cn_num_map[cn_num]}",

@@ -215,8 +215,8 @@ def start_document_prepare_run(
         def _default_store_blocks(doc_id: str) -> None:
             from pathlib import Path
             from app.assets.code_sets.service import auto_link_all_references, extract_code_sets_for_block
-            from app.ingestion.extractors import extract_document
-            from app.ingestion.spec_quality import inspect_block
+            from app.ingestion.parsers.extractors import extract_document
+            from app.ingestion.parsers.quality import inspect_block
 
             with sf() as s:
                 doc = s.get(SourceDocumentModel, doc_id)

@@ -41,19 +41,19 @@ backend/app/
 │   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）与 default_bus
 │   └── regops_channels.py       #    24 个命名数据通道（含单表增量检查点）与 EventLog + BlobStore 单次查询断点恢复
 │
-├── ingestion/                   # 层 3：监管文档接入与结构解析（阶段一）
-│   ├── extractors.py            #    PDF / Word / Excel 原始块提取
-│   ├── catalog.py               #    文档目录与章节识别
-│   ├── spec_parser.py           #    数据字典表结构与字段解析
-│   ├── spec_quality.py          #    原始块解析质量体检
-│   ├── structure_service.py     #    AI 辅助文档体系切块
-│   ├── segment_service.py       #    父子层级段落切分
+├── ingestion/                   # 层 3：监管文档接入与结构解析（阶段一：纯解析子包 + 落库/AI 服务）
+│   ├── parsers/                 #    纯文件拆箱、PDF 解析与确定性体检（零 DB、零 LLM）
+│   │   ├── extractors.py        #      PDF / Word / Excel 统一抽块入口与全文摘要 survey
+│   │   ├── pdf_catalog.py       #      PDF 章节目录与附录公共码表扫描
+│   │   ├── pdf_parser.py        #      PDF pdftotext 提取、表格折行重排与字段精拆
+│   │   └── quality.py           #      切块后零 AI 确定性硬伤体检
+│   ├── structure_service.py     #    AI 辅助文档体检、跨页合并/切块与单块内语义细分
 │   └── import_progress.py       #    文档解析实时进度与 document.progress 总线广播
 │
 ├── assets/                      # 层 4：元数据资产与码表中心
 │   ├── metadata_domain.py       #    元数据草稿 Pydantic 契约
 │   ├── metadata_views.py        #    原文证据降级核查、工作台视图序列化与 metadata_to_spec
-│   ├── metadata_mutations.py    #    字段编辑、表删除、版本发布与 CSV/XLSX 批量类型导入
+│   ├── metadata_mutations.py    #    字段编辑、表删除、子块表合并、版本发布与 CSV/XLSX 批量类型导入
 │   ├── metadata_service.py      #    确定性优先 + 疑难字段 AI 辅助提取服务
 │   ├── readiness.py             #    表资产就绪度检查
 │   ├── version_diff.py          #    跨版本监管制度文档差异对比与影响面分级（返回增量受影响表清单）

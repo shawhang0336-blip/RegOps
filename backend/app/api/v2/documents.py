@@ -33,13 +33,13 @@ from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.errors import WorkflowError
 from app.infra.task_runner import task_runner
-from app.ingestion.extractors import extract_document
+from app.ingestion.parsers.extractors import extract_document
 from app.ingestion.import_progress import ensure as progress_ensure
 from app.ingestion.import_progress import finish as progress_finish
 from app.ingestion.import_progress import snapshot as progress_snapshot
 from app.ingestion.import_progress import start as progress_start
 from app.ingestion.import_progress import update as progress_update
-from app.ingestion.spec_quality import inspect_block
+from app.ingestion.parsers.quality import inspect_block
 from app.ingestion.structure_service import (
     analyze_document_structure,
     inspect_document_overview,

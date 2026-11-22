@@ -1510,6 +1510,38 @@ def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
     assert budget["max_retries"] == 5
 
 
+def test_ingestion_clean_structure_and_pure_parsers_boundary():
+    """验证 Layer 3 ingestion 归类红线：
+    1. 根目录收敛为 parsers/ 纯解析子包 + structure_service.py + import_progress.py；
+    2. parsers/*.py 严格零依赖 DB / LLM / kernel / policy（保持纯离线可测）。
+    """
+    import app.ingestion as ingestion_pkg
+
+    ingestion_dir = Path(ingestion_pkg.__file__).resolve().parent
+    actual_entries = {p.name for p in ingestion_dir.iterdir() if p.name != "__pycache__"}
+    assert actual_entries == {"__init__.py", "import_progress.py", "parsers", "structure_service.py"}
+
+    parsers_dir = ingestion_dir / "parsers"
+    actual_parsers = {p.name for p in parsers_dir.glob("*.py")}
+    assert actual_parsers == {"__init__.py", "extractors.py", "pdf_catalog.py", "pdf_parser.py", "quality.py"}
+
+    forbidden = ("app.infra.db", "app.infra.db_tables", "app.infra.llm", "app.kernel", "app.policy")
+    violations = []
+    for py_file in sorted(parsers_dir.glob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                mods = [node.module]
+            for mod in mods:
+                if any(mod == bad or mod.startswith(bad + ".") for bad in forbidden):
+                    violations.append(f"{py_file.name}: {mod}")
+    assert violations == [], f"ingestion/parsers 必须保持纯解析零 DB/LLM 依赖：{violations}"
+
+
+
 
 
 

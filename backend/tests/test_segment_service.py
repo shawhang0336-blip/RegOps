@@ -1,7 +1,8 @@
 import uuid
 
+from app.assets.metadata_mutations import merge_metadata_tables
 from app.infra.db_tables import RawBlockModel, TableMetadataModel
-from app.ingestion.segment_service import _split_segments, analyze_block_segments, merge_metadata_tables
+from app.ingestion.structure_service import _split_segments, analyze_block_segments
 from .test_metadata_service import make_metadata
 from .helpers import make_session
 
@@ -35,7 +36,7 @@ def make_parent(session):
 
 def test_block_segments_are_hierarchical_and_keep_parent_evidence(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.ingestion.segment_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     parent = make_parent(session)
     ids = analyze_block_segments(parent.id, __import__('app.infra.config', fromlist=['Settings']).Settings(), SegmentFixtureLlm())
     assert len(ids) == 4

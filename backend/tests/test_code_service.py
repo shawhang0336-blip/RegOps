@@ -25,7 +25,7 @@ from app.assets.code_sets.service import (
     refresh_reference_status,
 )
 from app.infra.config import Settings
-from app.ingestion.extractors import extract_xlsx
+from app.ingestion.parsers.extractors import extract_xlsx
 from app.assets.metadata_service import publish_table
 from .test_metadata_service import make_metadata
 from .helpers import make_session

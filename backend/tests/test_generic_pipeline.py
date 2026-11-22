@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from app.ingestion.catalog import parse_document_catalog
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog
 from app.infra.config import Settings, get_settings
 from app.engine.binding import bind_generators, bind_rules, bind_schema
 from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl

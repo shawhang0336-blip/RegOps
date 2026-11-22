@@ -1,9 +1,9 @@
 from docx import Document
 from openpyxl import Workbook
 
-from app.ingestion.catalog import parse_document_catalog
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog
 from app.infra.config import get_settings
-from app.ingestion.extractors import extract_docx, extract_xlsx
+from app.ingestion.parsers.extractors import extract_docx, extract_xlsx
 
 
 def test_docx_tables_become_raw_blocks(tmp_path):

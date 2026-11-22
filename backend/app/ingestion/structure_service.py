@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.ingestion.extractors import extract_document, survey_document
+from app.ingestion.parsers.extractors import extract_document, survey_document
 from app.infra.llm import RealDesignLlm
 from app.infra.llm.guard import call_llm_validated, current_llm_bus, submit_with_context
 from app.policy.regops_bus import default_bus
@@ -515,3 +515,107 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
             session.commit()
             architecture_id = architecture.id
         return architecture_id
+
+
+def _split_segments(raw_content: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    segments = args.get("segments", [])
+    if not segments:
+        raise ValueError("No semantic segments returned")
+    results = []
+    cursor = 0
+    markers = set()
+    for segment in segments:
+        marker = segment["start_marker"].strip()
+        if not marker:
+            raise ValueError("Empty segment marker")
+        if marker in markers:
+            raise ValueError("Duplicate segment marker")
+        markers.add(marker)
+        start = raw_content.find(marker, cursor)
+        if start < 0:
+            raise ValueError(f"Segment marker not found: {marker}")
+        if start < cursor:
+            raise ValueError("Segment markers are out of order")
+        if start > cursor and not results:
+            prefix = raw_content[:start].strip()
+            if prefix:
+                results.append({"segment_type": "NARRATIVE", "title": "块前说明", "content": prefix, "requires_human": False, "warnings": []})
+        results.append({**segment, "content": raw_content[start:], "_start": start})
+        cursor = start
+    final = []
+    for index, segment in enumerate(results):
+        start = segment.pop("_start")
+        end = results[index + 1]["_start"] if index + 1 < len(results) else len(raw_content)
+        content = raw_content[start:end].strip()
+        if content:
+            final.append({**segment, "content": content})
+    return final
+
+
+def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[str]:
+    """对保留下来的混装大块做块内细分（术语 / XML / 数据字典 / 码值 / 主键），拆出子块并保留父块证据链。"""
+    with SessionLocal() as session:
+        parent = session.get(RawBlockModel, block_id)
+        if not parent or parent.content_json.get("superseded"):
+            raise ValueError("Active parent block not found")
+        if parent.content_json.get("segmented"):
+            return parent.content_json["segment_ids"]
+        llm = llm or RealDesignLlm(settings)
+        try:
+            args, trace = llm.assign(
+                "assign_block_segments",
+                "分析保留块内部结构，按术语、XML、数据字典、码值、主键和说明给出 start_marker/end_marker，供程序切块。标记需要人工确认的部分，不得虚构字段。",
+                {"source_locator": parent.source_locator, "content": parent.content_json, "raw_content": parent.raw_content},
+            )
+            segments = _split_segments(parent.raw_content, args)
+        except Exception as exc:
+            trace = {"error": f"{type(exc).__name__}: {exc}"}
+            segments = [
+                {
+                    "segment_type": "NARRATIVE",
+                    "title": "块内结构需人工确认",
+                    "content": parent.raw_content,
+                    "requires_human": True,
+                    "warnings": [trace["error"]],
+                }
+            ]
+        parent_spec = parent.content_json.get("spec")
+        segment_ids = []
+        for index, segment in enumerate(segments):
+            raw = segment["content"]
+            segment_id = str(uuid.uuid4())
+            segment_ids.append(segment_id)
+            session.add(
+                RawBlockModel(
+                    id=segment_id,
+                    document_id=parent.document_id,
+                    ordinal=parent.ordinal * 1000 + index,
+                    block_type=segment["segment_type"],
+                    raw_content=raw,
+                    source_locator={**parent.source_locator, "parent_block_id": parent.id, "segment_index": index, "title": segment["title"]},
+                    content_json={
+                        "parent_block_id": parent.id,
+                        "parent_spec": parent_spec,
+                        "segment_type": segment["segment_type"],
+                        "column_mapping": parent.content_json.get("column_mapping", {}),
+                        "human_required": segment["requires_human"],
+                        "structure_warnings": segment["warnings"],
+                        "superseded": segment["segment_type"] == "IGNORE",
+                    },
+                    raw_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                )
+            )
+        parent.content_json = {**parent.content_json, "segmented": True, "segment_ids": segment_ids, "superseded": True}
+        parent_document = session.get(SourceDocumentModel, parent.document_id)
+        parent_document.block_count = len(segments)
+        architecture = DocumentArchitectureModel(
+            id=str(uuid.uuid4()),
+            document_id=parent.document_id,
+            status="BLOCK_SEGMENTED",
+            plan_json={"parent_block_id": parent.id, "segments": [{"id": segment_id, "type": segment["segment_type"], "title": segment["title"]} for segment_id, segment in zip(segment_ids, segments)]},
+            warnings_json=[warning for segment in segments for warning in segment["warnings"]],
+            trace_json=trace,
+        )
+        session.add(architecture)
+        session.commit()
+        return segment_ids

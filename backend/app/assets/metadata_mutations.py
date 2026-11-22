@@ -23,6 +23,7 @@ from app.infra.db_tables import (
     FieldMetadataModel,
     MetadataRevisionModel,
     MetadataValidationModel,
+    RawBlockModel,
     TableMetadataModel,
 )
 
@@ -381,3 +382,57 @@ def apply_field_type_import(
         "details": updated,
         "dry_run": dry_run,
     }
+
+
+def merge_metadata_tables(session: Session, parent_id: str, table_ids: List[str]) -> str:
+    """将父块切分后各子块提取出的表元数据合并为一张主表，优先保留 DATA_DICTIONARY 字段定义。"""
+    tables = session.query(TableMetadataModel).filter(TableMetadataModel.id.in_(table_ids)).all()
+    if not tables:
+        raise ValueError("No metadata tables to merge")
+    priority = {"NARRATIVE": 0, "TERMINOLOGY": 1, "XML_FORMAT": 2, "CODE_VALUES": 2, "PRIMARY_KEY": 2, "DATA_DICTIONARY": 3}
+    blocks = {
+        block.id: block
+        for block in session.query(RawBlockModel).filter(RawBlockModel.id.in_([table.block_id for table in tables])).all()
+    }
+    tables.sort(key=lambda table: priority.get(blocks[table.block_id].block_type, 0))
+    canonical = tables[-1]
+    merged = {}
+    for table in tables:
+        block = blocks[table.block_id]
+        fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).order_by(FieldMetadataModel.sort_order).all()
+        for field in fields:
+            values = {
+                key: getattr(field, key)
+                for key in [
+                    "field_cn",
+                    "field_en",
+                    "field_definition",
+                    "check_text_raw",
+                    "data_type",
+                    "length",
+                    "decimal_places",
+                    "required",
+                    "code_reference_text",
+                    "confidence",
+                    "ai_value_json",
+                ]
+            }
+            values["evidence_json"] = {
+                **field.evidence_json,
+                "segments": (field.evidence_json.get("segments") or []) + [{"block_id": block.id, "segment_type": block.block_type}],
+            }
+            merged[field.field_en.upper()] = values
+    for field in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == canonical.id).all():
+        session.delete(field)
+    session.flush()
+    for index, values in enumerate(merged.values()):
+        session.add(FieldMetadataModel(id=str(uuid.uuid4()), table_id=canonical.id, sort_order=index, **values))
+    for table in tables:
+        if table.id != canonical.id:
+            table.status = "MERGED"
+            session.query(MetadataValidationModel).filter(MetadataValidationModel.table_id == table.id).update({"table_id": canonical.id})
+            session.query(MetadataRevisionModel).filter(MetadataRevisionModel.table_id == table.id).update({"table_id": canonical.id})
+    canonical.block_id = parent_id
+    canonical.status = "NEEDS_REVIEW" if any(table.status == "NEEDS_REVIEW" for table in tables) else "AI_SELF_VALIDATED"
+    session.flush()
+    return canonical.id

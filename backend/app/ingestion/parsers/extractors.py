@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from docx import Document
 from openpyxl import load_workbook
 
-from app.ingestion.catalog import parse_document_catalog, parse_document_code_sets
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
 from app.infra.contracts import canonical_json
 
 CODE_HEADER_VAL_ALIASES = {
@@ -207,7 +207,7 @@ def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
 
 def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
     if file_type == "pdf":
-        from app.ingestion.spec_parser import _extract_pdf_text
+        from app.ingestion.parsers.pdf_parser import _extract_pdf_text
 
         text = _extract_pdf_text(path)
         headings = []
