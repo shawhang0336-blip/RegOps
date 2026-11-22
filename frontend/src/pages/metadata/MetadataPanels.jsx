@@ -112,12 +112,17 @@ export function AddFieldForm({ newField, busy, onChange, onSubmit }) {
         <span>数据类型</span>
         <select
           value={newField.data_type}
-          onChange={(e) => onChange({ ...newField, data_type: e.target.value })}
+          onChange={(e) => {
+            const nextType = e.target.value
+            onChange({
+              ...newField,
+              data_type: nextType,
+              decimal_places: nextType === 'NUMBER' ? newField.decimal_places : 0,
+            })
+          }}
         >
-          <option value="VARCHAR">VARCHAR</option>
-          <option value="NUMBER">NUMBER</option>
-          <option value="DATE">DATE</option>
-          <option value="CHAR">CHAR</option>
+          <option value="VARCHAR">文本 (VARCHAR)</option>
+          <option value="NUMBER">数值 (NUMBER)</option>
         </select>
       </label>
       <label>
@@ -129,6 +134,17 @@ export function AddFieldForm({ newField, busy, onChange, onSubmit }) {
           onChange={(e) => onChange({ ...newField, length: e.target.value })}
         />
       </label>
+      {newField.data_type === 'NUMBER' && (
+        <label>
+          <span>小数位数</span>
+          <input
+            type="number"
+            min="0"
+            value={newField.decimal_places}
+            onChange={(e) => onChange({ ...newField, decimal_places: e.target.value })}
+          />
+        </label>
+      )}
       <label>
         <span>字段定义</span>
         <input

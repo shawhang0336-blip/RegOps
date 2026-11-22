@@ -17,9 +17,11 @@ export default function PreparationWorkspace() {
   const [codeFilter, setCodeFilter] = useState('all')
 
   useEffect(() => {
+    let cancelled = false
     v2('/documents').then((list) => {
-      if (!documentId && list[0]) changeDocument(list[0].id)
+      if (!cancelled && !documentId && list[0]) changeDocument(list[0].id)
     }).catch(() => {})
+    return () => { cancelled = true }
   }, [documentId])
 
   useEffect(() => {
@@ -39,7 +41,8 @@ export default function PreparationWorkspace() {
 
   function changeDocument(nextDocumentId) {
     const next = new URLSearchParams(params)
-    next.set('document_id', nextDocumentId)
+    if (nextDocumentId) next.set('document_id', nextDocumentId)
+    else next.delete('document_id')
     next.delete('table')
     next.delete('set')
     setParams(next)
@@ -84,7 +87,14 @@ export default function PreparationWorkspace() {
         title="规范解析与核对"
         description="导入文件后，只需处理有问题的报表和码表；已就绪的内容可以直接进入第二步生成。"
       />
-      <DocumentsPage embedded importOnly autoParse onShowAssets={changeView} onSelectDocument={changeDocument} />
+      <DocumentsPage
+        embedded
+        importOnly
+        autoParse
+        selectedDocumentId={documentId}
+        onShowAssets={changeView}
+        onSelectDocument={changeDocument}
+      />
 
       {documentId && (
         <section className="preparation-overview" aria-label="第一步核对进度">

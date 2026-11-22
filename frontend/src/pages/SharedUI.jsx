@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { formatTime, parseBackendDate } from '../utils/dateTime.js'
+
+export { formatTime, parseBackendDate }
 
 export const STATUS_META = {
   PUBLISHED: { label: '已发布', tone: 'green' },
@@ -151,23 +154,6 @@ export function StatusBadge({ status, children, tone }) {
   return <span className={`badge badge-${finalTone}`}>{children ?? meta.label}</span>
 }
 
-export function formatTime(iso) {
-  if (!iso) return '—'
-  try {
-    const d = new Date(iso)
-    if (Number.isNaN(d.getTime())) return iso
-    return d.toLocaleString('zh-CN', {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    })
-  } catch {
-    return iso
-  }
-}
-
 export function SourceLocatorTag({ locator }) {
   if (!locator || typeof locator !== 'object') return <span className="muted-text">—</span>
   const tags = []
@@ -251,7 +237,7 @@ export function RevisionDiffView({ revision }) {
           <div className="revision-kv-grid">
             <div><span>解析表名</span><strong>{draft.table_name || '—'} ({draft.table_code || '—'})</strong></div>
             <div><span>提取字段数</span><strong>{Array.isArray(draft.fields) ? `${draft.fields.length} 个字段` : '—'}</strong></div>
-            <div><span>调用模型</span><strong>{trace.model || trace.provider || 'GLM'}</strong></div>
+            <div><span>调用模型</span><strong>{trace.model || trace.provider || 'AI 模型'}</strong></div>
             <div><span>并发批次</span><strong>{trace.batch_count ? `${trace.batch_count} 批` : '单批'}</strong></div>
           </div>
           {draft.table_definition && <p className="revision-note">表定义：{draft.table_definition}</p>}
@@ -264,7 +250,7 @@ export function RevisionDiffView({ revision }) {
       return (
         <div className="revision-summary-box">
           {issues.length === 0 ? (
-            <div className="validation-pass-banner">GLM 独立复核全部字段通过，初稿与复核稿完全一致。</div>
+            <div className="validation-pass-banner">AI 独立复核全部字段通过，初稿与复核稿完全一致。</div>
           ) : (
             <div className="issue-card-list">
               {issues.map((issue, idx) => (
@@ -405,6 +391,17 @@ export function DataTableModal({ artifact, onClose }) {
   const [filter, setFilter] = useState('')
   const [rawMode, setRawMode] = useState(false)
   const [copied, setCopied] = useState(false)
+  const copyTimerRef = useRef(null)
+
+  useEffect(() => {
+    setFilter('')
+    setRawMode(false)
+    setCopied(false)
+  }, [artifact])
+
+  useEffect(() => () => {
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
+  }, [])
 
   useEffect(() => {
     if (!artifact) return undefined
@@ -433,13 +430,22 @@ export function DataTableModal({ artifact, onClose }) {
 
   async function copyContent() {
     const text = rows ? JSON.stringify(rows, null, 2) : artifact.content || ''
+    if (!text) return
     try {
       await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
     } catch {
-      // ignore
+      const area = document.createElement('textarea')
+      area.value = text
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.appendChild(area)
+      area.select()
+      document.execCommand('copy')
+      document.body.removeChild(area)
     }
+    setCopied(true)
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = window.setTimeout(() => setCopied(false), 2000)
   }
 
   return (

@@ -19,6 +19,41 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
     setError('')
     try {
       const payload = { ...params }
+      if (rule.operator === 'LENGTH' || rule.operator === 'LENGTH_MAX') {
+        const rawLen = payload.length
+        const numLen = Number(rawLen)
+        if (rawLen === '' || rawLen === null || rawLen === undefined || !Number.isInteger(numLen) || numLen <= 0) {
+          throw new Error('长度必须是大于 0 的整数。')
+        }
+        payload.length = numLen
+      }
+      if (rule.operator === 'NUM_RANGE' || (rule.operator === 'COND_VALUE' && payload.then_operator === 'NUM_RANGE')) {
+        for (const boundKey of ['min', 'max']) {
+          if (payload[boundKey] === '' || payload[boundKey] === undefined) {
+            payload[boundKey] = null
+          } else if (payload[boundKey] !== null) {
+            const numVal = Number(payload[boundKey])
+            if (!Number.isFinite(numVal)) throw new Error(`${boundKey === 'min' ? '下限' : '上限'}必须是合法数值。`)
+            payload[boundKey] = numVal
+          }
+        }
+      }
+      if (rule.operator === 'ARITHMETIC_BALANCE') {
+        if (payload.tolerance !== '' && payload.tolerance !== null && payload.tolerance !== undefined) {
+          const tol = Number(payload.tolerance)
+          if (!Number.isFinite(tol) || tol < 0) throw new Error('允许误差容限必须是非负数值。')
+          payload.tolerance = tol
+        } else {
+          delete payload.tolerance
+        }
+        if (payload.target_value === '' || payload.target_value === undefined) {
+          delete payload.target_value
+        } else if (payload.target_value !== null) {
+          const tv = Number(payload.target_value)
+          if (!Number.isFinite(tv)) throw new Error('右值常量（target_value）必须是合法数值。')
+          payload.target_value = tv
+        }
+      }
       if (Array.isArray(payload.values)) {
         payload.values = payload.values.map((item) => String(item).trim()).filter(Boolean)
       }
@@ -32,7 +67,11 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
         payload.key_fields = payload.key_fields.map((item) => String(item).trim()).filter(Boolean)
       }
       if (typeof payload._terms_json === 'string') {
-        payload.terms = JSON.parse(payload._terms_json)
+        try {
+          payload.terms = JSON.parse(payload._terms_json)
+        } catch {
+          throw new Error('算术项列表 JSON 格式有误，请检查括号与引号。')
+        }
         delete payload._terms_json
       }
       await v2(`/artifacts/rules/${rule.row_id}`, {
@@ -57,7 +96,7 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
       {(operator === 'LENGTH' || operator === 'LENGTH_MAX') && (
         <label>
           <span>{operator === 'LENGTH' ? '定长' : '最大长度'}（字符数）</span>
-          <input type="number" min="1" value={params.length ?? ''} onChange={(e) => set('length', Number(e.target.value))} />
+          <input type="number" min="1" value={params.length ?? ''} onChange={(e) => set('length', e.target.value)} />
         </label>
       )}
 
@@ -160,7 +199,26 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
           </label>
           <label>
             <span>目标约束类型</span>
-            <select value={params.then_operator ?? 'MUST_BE_NULL'} onChange={(e) => set('then_operator', e.target.value)}>
+            <select
+              value={params.then_operator ?? 'MUST_BE_NULL'}
+              onChange={(e) => {
+                const nextOp = e.target.value
+                const next = { ...params, then_operator: nextOp }
+                if (nextOp === 'MUST_BE_NULL') {
+                  delete next.then_values
+                  delete next.values
+                  delete next.min
+                  delete next.max
+                } else if (nextOp === 'NUM_RANGE') {
+                  delete next.then_values
+                  delete next.values
+                } else {
+                  delete next.min
+                  delete next.max
+                }
+                setParams(next)
+              }}
+            >
               <option value="MUST_BE_NULL">必须为空（互斥）</option>
               <option value="ENUM">允许枚举子集（ENUM）</option>
               <option value="NOT_IN">禁止取值（NOT_IN）</option>
@@ -175,8 +233,8 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
           )}
           {params.then_operator === 'NUM_RANGE' && (
             <>
-              <label><span>下限</span><input type="number" value={params.min ?? ''} onChange={(e) => set('min', e.target.value === '' ? null : Number(e.target.value))} /></label>
-              <label><span>上限</span><input type="number" value={params.max ?? ''} onChange={(e) => set('max', e.target.value === '' ? null : Number(e.target.value))} /></label>
+              <label><span>下限</span><input type="number" value={params.min ?? ''} onChange={(e) => set('min', e.target.value)} /></label>
+              <label><span>上限</span><input type="number" value={params.max ?? ''} onChange={(e) => set('max', e.target.value)} /></label>
             </>
           )}
         </>
@@ -195,7 +253,8 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
             </select>
           </label>
           <label><span>右值字段（target_field，可留空）</span><input value={params.target_field ?? ''} onChange={(e) => set('target_field', e.target.value || null)} /></label>
-          <label><span>允许误差容限（tolerance）</span><input type="number" step="0.0001" min="0" value={params.tolerance ?? 0.0001} onChange={(e) => set('tolerance', Number(e.target.value))} /></label>
+          <label><span>右值常量（target_value，可留空）</span><input type="number" step="any" value={params.target_value ?? ''} onChange={(e) => set('target_value', e.target.value)} /></label>
+          <label><span>允许误差容限（tolerance）</span><input type="number" step="0.0001" min="0" value={params.tolerance ?? 0.0001} onChange={(e) => set('tolerance', e.target.value)} /></label>
           <label>
             <span>算术项列表（JSON）</span>
             <textarea rows={4} value={params._terms_json ?? JSON.stringify(params.terms || [], null, 2)} onChange={(e) => set('_terms_json', e.target.value)} />
@@ -227,8 +286,27 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
   )
 }
 
-export default function RuleDrawer({ rule, index, total, onPrevious, onNext, onClose, onSaved, onNotice }) {
+export default function RuleDrawer({
+  rule,
+  index,
+  total,
+  canEdit = true,
+  editDisabledReason = '',
+  onPrevious,
+  onNext,
+  onClose,
+  onSaved,
+  onNotice,
+}) {
   const [editing, setEditing] = useState(false)
+  const effectiveCanEdit = canEdit && rule.status !== 'SUPERSEDED'
+  const disabledHint = rule.status === 'SUPERSEDED'
+    ? '已被替代（SUPERSEDED）的历史规则不可修改'
+    : (editDisabledReason || '当前批次正在执行中，暂不可修改规则参数')
+
+  useEffect(() => {
+    if (!effectiveCanEdit && editing) setEditing(false)
+  }, [effectiveCanEdit, editing])
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow
@@ -267,7 +345,15 @@ export default function RuleDrawer({ rule, index, total, onPrevious, onNext, onC
         <div className="rule-drawer-navigation">
           {onPrevious && <button type="button" className="button secondary sm" onClick={onPrevious}>上一条</button>}
           {onNext && <button type="button" className="button secondary sm" onClick={onNext}>下一条</button>}
-          <button type="button" className="button primary sm" onClick={() => setEditing(!editing)}>{editing ? '返回详情' : '编辑参数'}</button>
+          <button
+            type="button"
+            className="button primary sm"
+            disabled={!effectiveCanEdit}
+            title={!effectiveCanEdit ? disabledHint : ''}
+            onClick={() => setEditing(!editing)}
+          >
+            {editing ? '返回详情' : '编辑参数'}
+          </button>
         </div>
 
         <div className="rule-drawer-body">

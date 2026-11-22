@@ -61,14 +61,21 @@ export function useEventStream({
     let closed = false
     let debounceTimer = null
     let fallbackTimer = null
+    let currentFallbackMs = null
     let sseHealthy = false
 
     const startFallback = (ms) => {
-      if (fallbackTimer) window.clearInterval(fallbackTimer)
-      if (!ms || !onFallbackRef.current) return
+      const normalized = ms || 0
+      if (currentFallbackMs === normalized && (fallbackTimer || normalized === 0)) return
+      if (fallbackTimer) {
+        window.clearInterval(fallbackTimer)
+        fallbackTimer = null
+      }
+      currentFallbackMs = normalized
+      if (!normalized || !onFallbackRef.current) return
       fallbackTimer = window.setInterval(() => {
         if (!closed) onFallbackRef.current?.()
-      }, ms)
+      }, normalized)
     }
 
     const dispatch = (payload, topic) => {
@@ -138,9 +145,13 @@ export function useEventStream({
 export function watchDocumentProgress(
   documentId,
   onUpdate,
-  { interval = 1500, timeout = 20 * 60 * 1000 } = {},
+  { interval = 1500, timeout = 20 * 60 * 1000, signal } = {},
 ) {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(null)
+      return
+    }
     const startedAt = Date.now()
     let finished = false
     let fetching = false
@@ -149,17 +160,24 @@ export function watchDocumentProgress(
     let pollTimer = null
     let timeoutTimer = null
 
+    const onAbort = () => cleanup(latest)
+
     const cleanup = (result) => {
       if (finished) return
       finished = true
       if (pollTimer) window.clearInterval(pollTimer)
       if (timeoutTimer) window.clearTimeout(timeoutTimer)
       if (source) source.close()
+      if (signal) signal.removeEventListener('abort', onAbort)
       resolve(result)
     }
 
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+
     const pull = async () => {
-      if (finished || fetching) return
+      if (finished || fetching || signal?.aborted) return
       if (Date.now() - startedAt >= timeout) {
         cleanup(latest)
         return
@@ -167,7 +185,7 @@ export function watchDocumentProgress(
       fetching = true
       try {
         const next = await v2(`/documents/${documentId}/progress`).catch(() => null)
-        if (next && !finished) {
+        if (next && !finished && !signal?.aborted) {
           latest = next
           onUpdate?.(next)
           if (!next.processing) {

@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 const FeedbackContext = createContext(null)
 
@@ -8,10 +8,20 @@ export function FeedbackProvider({ children }) {
   const [toasts, setToasts] = useState([])
   const [dialog, setDialog] = useState(null)
   const resolverRef = useRef(null)
+  const toastTimersRef = useRef(new Map())
+
+  const clearToastTimer = useCallback((id) => {
+    const timer = toastTimersRef.current.get(id)
+    if (timer) {
+      window.clearTimeout(timer)
+      toastTimersRef.current.delete(id)
+    }
+  }, [])
 
   const dismissToast = useCallback((id) => {
+    clearToastTimer(id)
     setToasts((prev) => prev.filter((item) => item.id !== id))
-  }, [])
+  }, [clearToastTimer])
 
   const pushToast = useCallback((message, { tone = 'success', title = '', duration = 4200 } = {}) => {
     const text = typeof message === 'string' ? message : JSON.stringify(message)
@@ -19,16 +29,25 @@ export function FeedbackProvider({ children }) {
     const id = nextToastId++
     setToasts((prev) => {
       // 避免短时间内同一条文案重复刷屏
-      const deduped = prev.filter((item) => !(item.text === text && item.tone === tone))
-      return [...deduped.slice(-3), { id, tone, title, text }]
+      const deduped = prev.filter((item) => {
+        const dup = item.text === text && item.tone === tone
+        if (dup) clearToastTimer(item.id)
+        return !dup
+      })
+      const kept = deduped.slice(-3)
+      const dropped = deduped.slice(0, Math.max(0, deduped.length - 3))
+      dropped.forEach((item) => clearToastTimer(item.id))
+      return [...kept, { id, tone, title, text }]
     })
     if (duration > 0) {
-      window.setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        toastTimersRef.current.delete(id)
         setToasts((prev) => prev.filter((item) => item.id !== id))
       }, duration)
+      toastTimersRef.current.set(id, timer)
     }
     return id
-  }, [])
+  }, [clearToastTimer])
 
   const notify = useCallback(
     (message, title = '已完成') => pushToast(message, { tone: 'success', title, duration: 4200 }),
@@ -42,6 +61,12 @@ export function FeedbackProvider({ children }) {
 
   const confirm = useCallback((options) => {
     const normalized = typeof options === 'string' ? { message: options } : (options || {})
+    // 若已有前序确认弹窗尚未关闭，先以 false 结算旧 Promise，避免调用方永久挂起
+    if (resolverRef.current) {
+      const staleResolve = resolverRef.current
+      resolverRef.current = null
+      staleResolve(false)
+    }
     return new Promise((resolve) => {
       resolverRef.current = resolve
       setDialog({
@@ -62,6 +87,16 @@ export function FeedbackProvider({ children }) {
     resolve?.(Boolean(accepted))
   }, [])
 
+  useEffect(() => () => {
+    toastTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    toastTimersRef.current.clear()
+    if (resolverRef.current) {
+      const staleResolve = resolverRef.current
+      resolverRef.current = null
+      staleResolve(false)
+    }
+  }, [])
+
   useEffect(() => {
     if (!dialog) return undefined
     const previousOverflow = document.body.style.overflow
@@ -79,8 +114,13 @@ export function FeedbackProvider({ children }) {
     }
   }, [dialog, closeDialog])
 
+  const contextValue = useMemo(
+    () => ({ notify, notifyError, pushToast, dismissToast, confirm }),
+    [notify, notifyError, pushToast, dismissToast, confirm],
+  )
+
   return (
-    <FeedbackContext.Provider value={{ notify, notifyError, pushToast, dismissToast, confirm }}>
+    <FeedbackContext.Provider value={contextValue}>
       {children}
 
       {toasts.length > 0 && (

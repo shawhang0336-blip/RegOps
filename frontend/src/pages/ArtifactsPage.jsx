@@ -85,7 +85,19 @@ export default function ArtifactsPage() {
 
   async function refreshSummary() {
     const data = await v2('/artifacts').catch(() => null)
-    if (data) setTables(data.tables || [])
+    if (data) {
+      const nextTables = data.tables || []
+      setTables(nextTables)
+      const validIds = new Set(nextTables.map((row) => row.id))
+      setSelected((prev) => prev.filter((id) => validIds.has(id)))
+    }
+  }
+
+  function openMetadataTable(tableId, documentId = '') {
+    const resolvedDocId = documentId || tables.find((row) => row.id === tableId)?.document_id || ''
+    const qs = new URLSearchParams({ view: 'fields', table: tableId })
+    if (resolvedDocId) qs.set('document_id', resolvedDocId)
+    navigate(`/documents?${qs.toString()}`)
   }
 
   async function refreshOverview() {
@@ -449,7 +461,7 @@ export default function ArtifactsPage() {
                             {available === false && (
                               <>
                                 <small className="danger-text" title={reason}>{reason || '存在未处理的生成阻断项'}</small>
-                                <button type="button" className="button-link" onClick={() => navigate(`/metadata?table=${row.id}`)}>
+                                <button type="button" className="button-link" onClick={() => openMetadataTable(row.id, row.document_id)}>
                                   定位问题
                                 </button>
                               </>
@@ -563,7 +575,7 @@ export default function ArtifactsPage() {
                 <div className="current-blocker">
                   <strong>当前不可重新生成</strong>
                   <span>{currentBlockReason}</span>
-                  <button type="button" className="button-link" onClick={() => navigate(`/metadata?table=${detail.table.id}`)}>去处理</button>
+                  <button type="button" className="button-link" onClick={() => openMetadataTable(detail.table.id)}>去处理</button>
                 </div>
               )}
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { v2 } from '../api.js'
+import { downloadFile, v2 } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
@@ -22,6 +22,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   const [detailLoading, setDetailLoading] = useState(false)
   const [baselineFields, setBaselineFields] = useState({})
   const requestRef = useRef(0)
+  const loadRequestRef = useRef(0)
   const [unresolvedRefs, setUnresolvedRefs] = useState([])
   const [codeSets, setCodeSets] = useState([])
   const [editingFieldId, setEditingFieldId] = useState(null)
@@ -46,6 +47,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   const [notice, setNotice] = useState('')
 
   async function load(preferredId) {
+    const loadId = ++loadRequestRef.current
     const documentId = params.get('document_id')
     const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     if (embedded && !documentId) {
@@ -60,6 +62,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       v2(`/code-sets${scopeQuery}`).catch(() => []),
       v2(`/metadata/readiness${scopeQuery}`).catch(() => null),
     ])
+    if (loadId !== loadRequestRef.current) return
     setTables(tableList)
     setUnresolvedRefs(unresolvedList)
     setCodeSets(codeSetList)
@@ -71,8 +74,15 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     const targetId = preferredId || (tableList.some((table) => table.id === requestedId) ? requestedId : null) || (tableList.some((table) => table.id === currentId) ? currentId : null) || tableList[0]?.id
     if (targetId) {
       await select(targetId, false)
+    } else {
+      setDetail(null)
+      setSelectedId(null)
     }
   }
+
+  const documentIdParam = params.get('document_id')
+  const tableParam = params.get('table')
+  const fieldParam = params.get('field')
 
   useEffect(() => {
     setSelectedId(null)
@@ -81,7 +91,17 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     load()
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [params.get('document_id')])
+  }, [documentIdParam])
+
+  useEffect(() => {
+    if (!tableParam || !tables.length) return
+    if (!tables.some((table) => table.id === tableParam)) return
+    if (detail?.id !== tableParam) {
+      select(tableParam, false)
+    } else if (fieldParam && (detail.fields || []).some((field) => field.id === fieldParam)) {
+      setHighlightFieldId(fieldParam)
+    }
+  }, [tableParam, fieldParam, tables])
 
   useEffect(() => {
     if (!highlightFieldId) return
@@ -161,6 +181,20 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   const saveField = useCallback(
     async (field) => {
       if (!field || !detail) return
+      const parsedLength = Number(field.length)
+      const parsedDecimals = field.data_type === 'NUMBER' ? Number(field.decimal_places ?? 0) : 0
+      if (!String(field.field_cn || '').trim() || !String(field.field_en || '').trim()) {
+        setError('字段中文名称和英文列名不能为空。')
+        return
+      }
+      if (!Number.isInteger(parsedLength) || parsedLength <= 0) {
+        setError('字段长度必须是大于 0 的整数。')
+        return
+      }
+      if (!Number.isInteger(parsedDecimals) || parsedDecimals < 0 || (field.data_type === 'NUMBER' && parsedDecimals > parsedLength)) {
+        setError('小数位数必须是非负整数，且不能大于字段总长度。')
+        return
+      }
       // 只提交真正改过的项：把没动的类型一起提交会让后端把"原文声明"错标成人工口径
       const base = baselineFields[field.id] || {}
       const candidates = {
@@ -169,8 +203,8 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
         field_definition: field.field_definition,
         check_text_raw: field.check_text_raw,
         data_type: field.data_type,
-        length: Number(field.length),
-        decimal_places: Number(field.decimal_places),
+        length: parsedLength,
+        decimal_places: parsedDecimals,
         required: Boolean(field.required),
         code_reference_text: field.code_reference_text,
         type_basis: field.type_basis,
@@ -210,7 +244,6 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     [detail, editReason, baselineFields]
   )
 
-  const isPublished = false
   const activeField = detail?.fields?.find((f) => f.id === editingFieldId) || null
   const isFieldDirty = useCallback(
     (field) => {
@@ -288,7 +321,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     function onKeyDown(e) {
       if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
         e.preventDefault()
-        if (!isPublished && !busy) {
+        if (!busy) {
           saveField(activeField)
         }
         return
@@ -315,7 +348,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       document.body.style.overflow = previousOverflow
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [activeField, tab, isPublished, busy, filteredFields, saveField, switchOrCloseField])
+  }, [activeField, tab, busy, filteredFields, saveField, switchOrCloseField])
 
   async function removeField(field) {
     const confirmed = await confirm({
@@ -352,6 +385,16 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       setError('请填写新字段的中文名称和英文列名。')
       return
     }
+    const parsedLength = Number(newField.length)
+    const parsedDecimals = newField.data_type === 'NUMBER' ? Number(newField.decimal_places ?? 0) : 0
+    if (!Number.isInteger(parsedLength) || parsedLength <= 0) {
+      setError('字段长度必须是大于 0 的整数。')
+      return
+    }
+    if (!Number.isInteger(parsedDecimals) || parsedDecimals < 0 || (newField.data_type === 'NUMBER' && parsedDecimals > parsedLength)) {
+      setError('小数位数必须是非负整数，且不能大于字段长度。')
+      return
+    }
     setBusy(true)
     setError('')
     try {
@@ -362,8 +405,8 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
           reason: '人工补充字段',
           field: {
             ...newField,
-            length: Number(newField.length),
-            decimal_places: Number(newField.decimal_places),
+            length: parsedLength,
+            decimal_places: parsedDecimals,
           },
         }),
       })
@@ -380,22 +423,14 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   }
 
   async function downloadTypeTemplate() {
+    setError('')
     const documentId = params.get('document_id')
     const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
-    const response = await fetch(`/api/v2/metadata/types/template${query}`)
-    if (!response.ok) {
-      setError('模板下载失败，请稍后重试。')
-      return
+    try {
+      await downloadFile(`/api/v2/metadata/types/template${query}`, '字段类型修正模板.csv')
+    } catch (err) {
+      setError(err.message || '模板下载失败，请稍后重试。')
     }
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = '字段类型修正模板.csv'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    URL.revokeObjectURL(url)
   }
 
   async function submitTypeImport(dryRun) {
@@ -669,7 +704,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                 </div>
               )}
 
-              {showTypeImport && !isPublished && (
+              {showTypeImport && (
                 <TypeImportPanel
                   file={typeImportFile}
                   result={typeImportResult}
@@ -683,7 +718,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                 />
               )}
 
-              {showAdd && !isPublished && (
+              {showAdd && (
                 <AddFieldForm
                   newField={newField}
                   busy={busy}
@@ -740,7 +775,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                     activeField={activeField}
                     filteredFields={filteredFields}
                     isDirty={activeFieldDirty}
-                    isPublished={isPublished}
+                    isPublished={false}
                     busy={busy}
                     editReason={editReason}
                     onEditReasonChange={setEditReason}
@@ -806,13 +841,18 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
                                     <button
                                       type="button"
                                       className="button-link"
-                                      onClick={() =>
-                                        navigate(
-                                          codeMeta.codeSetId
-                                            ? `/code-sets?set=${codeMeta.codeSetId}`
-                                            : `/code-sets?name=${encodeURIComponent(codeMeta.text)}`
-                                        )
-                                      }
+                                      onClick={() => {
+                                        if (codeMeta.codeSetId) {
+                                          openCodeSet(codeMeta.codeSetId)
+                                          return
+                                        }
+                                        const next = new URLSearchParams()
+                                        next.set('view', 'codes')
+                                        const docId = params.get('document_id') || detail?.document_id
+                                        if (docId) next.set('document_id', docId)
+                                        next.set('name', codeMeta.text)
+                                        navigate(`/documents?${next.toString()}`)
+                                      }}
                                     >
                                       维护码值 →
                                     </button>

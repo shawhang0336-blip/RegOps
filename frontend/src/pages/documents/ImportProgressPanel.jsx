@@ -37,7 +37,7 @@ export default function ImportProgressPanel({ progress, onClose, onCancel, cance
       <header className="import-progress-head">
         <div className="import-progress-title">
           <strong>{headline}</strong>
-          <span className="import-progress-file">{progress.file_name}</span>
+          <span className="import-progress-file">{progress.file_name || progress.fileName || ''}</span>
         </div>
         <div className="import-progress-meta">
           {progress.elapsed > 0 && <span className="import-timer">{formatDuration(progress.elapsed)}</span>}

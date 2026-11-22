@@ -77,6 +77,7 @@ export default function VersionsPage() {
   }
 
   useEffect(() => {
+    let cancelled = false
     setLoading(true)
     Promise.all([
       v2('/metadata/tables').catch(() => []),
@@ -84,6 +85,7 @@ export default function VersionsPage() {
       api('/api/runs').catch(() => []),
     ])
       .then(async ([tableList, docList, runList]) => {
+        if (cancelled) return
         setTables(tableList)
         setDocuments(docList)
         setRuns(runList)
@@ -101,12 +103,19 @@ export default function VersionsPage() {
           setBaseRunId(runList[0].id)
           setTargetRunId(runList[0].id)
         }
-        if (tableList[0]?.id) {
+        if (tableList[0]?.id && !cancelled) {
           await selectTable(tableList[0].id)
         }
       })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
+      .catch((err) => {
+        if (!cancelled) setError(err.message)
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   async function compareDocuments() {
@@ -133,7 +142,7 @@ export default function VersionsPage() {
     try {
       const created = await v2('/generation/runs', {
         method: 'POST',
-        body: JSON.stringify({ table_ids: affectedIds, accept_warnings: true }),
+        body: JSON.stringify({ table_ids: affectedIds, provider: 'live', accept_warnings: true }),
       })
       setNotice(`已对 ${affectedIds.length} 张受影响报表发起增量规则生成与验证。`)
       navigate(`/runs?run=${created.id}`)
@@ -190,7 +199,11 @@ export default function VersionsPage() {
             <button
               type="button"
               className="button secondary"
-              onClick={() => navigate(`/metadata?table=${detail.id}`)}
+              onClick={() => {
+                const qs = new URLSearchParams({ view: 'fields', table: detail.id })
+                if (detail.document_id) qs.set('document_id', detail.document_id)
+                navigate(`/documents?${qs.toString()}`)
+              }}
             >
               打开此表 →
             </button>
@@ -563,6 +576,9 @@ export default function VersionsPage() {
                     >
                       <option value="ALL">全部变更类型 ({detail.revisions.length})</option>
                       <option value="HUMAN_EDIT">人工修改</option>
+                      <option value="HUMAN_ADD">新增字段</option>
+                      <option value="HUMAN_DELETE">删除字段</option>
+                      <option value="DRAFT_CREATED">创建修改版本</option>
                       <option value="PUBLISHED">发布记录</option>
                       <option value="AI_EXTRACTION">自动识别</option>
                       <option value="AI_REVIEW">AI 复核</option>

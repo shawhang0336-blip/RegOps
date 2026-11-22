@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
 const THEME_KEY = 'regops_theme_mode'
 
@@ -19,18 +19,26 @@ export function ThemeProvider({ children }) {
     }
   })
 
-  function setTheme(nextTheme) {
+  const setTheme = useCallback((nextTheme) => {
     setThemeState(nextTheme)
     try {
       window.localStorage.setItem(THEME_KEY, nextTheme)
     } catch {
       // ignore
     }
-  }
+  }, [])
 
-  function toggleTheme() {
-    setTheme(theme === 'dark' ? 'light' : 'dark')
-  }
+  const toggleTheme = useCallback(() => {
+    setThemeState((prev) => {
+      const next = prev === 'dark' ? 'light' : 'dark'
+      try {
+        window.localStorage.setItem(THEME_KEY, next)
+      } catch {
+        // ignore
+      }
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -41,23 +49,20 @@ export function ThemeProvider({ children }) {
     function onKeyDown(e) {
       if (e.altKey && (e.key === 'd' || e.key === 'D')) {
         e.preventDefault()
-        setThemeState((prev) => {
-          const next = prev === 'dark' ? 'light' : 'dark'
-          try {
-            window.localStorage.setItem(THEME_KEY, next)
-          } catch {
-            // ignore
-          }
-          return next
-        })
+        toggleTheme()
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [])
+  }, [toggleTheme])
+
+  const contextValue = useMemo(
+    () => ({ theme, setTheme, toggleTheme }),
+    [theme, setTheme, toggleTheme],
+  )
 
   return (
-    <ThemeContext.Provider value={{ theme, setTheme, toggleTheme }}>
+    <ThemeContext.Provider value={contextValue}>
       {children}
     </ThemeContext.Provider>
   )

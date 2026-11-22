@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react'
 import { v2 } from '../api.js'
+import { BUDGET_META, validateBudgetInput } from '../utils/budget.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { StatusBadge } from './SharedUI.jsx'
+
+export { BUDGET_META, validateBudgetInput }
 
 const SERVICE_META = {
   mysql: {
@@ -19,53 +22,12 @@ const SERVICE_META = {
   },
 }
 
-const BUDGET_META = {
-  max_rules_per_table: {
-    label: '单表规则数量上限',
-    desc: 'AI 生成的显性 + 拓展规则总数不得超过此上限',
-    unit: '条 / 表',
-  },
-  max_cases_per_table: {
-    label: '每张报表的测试数据上限',
-    desc: '正常与异常测试数据的总行数上限',
-    unit: '行 / 表',
-  },
-  max_retries: {
-    label: '失败后的自动修正次数',
-    desc: '验证发现误拦截或漏拦截时，允许自动修正的最大轮数',
-    unit: '轮',
-  },
-  max_llm_concurrency: {
-    label: 'AI 同时处理任务数',
-    desc: '同一阶段允许并行处理的 AI 任务数量',
-    unit: '个',
-    min: 1,
-  },
-  max_llm_calls: {
-    label: '单批次 AI 调用上限',
-    desc: '内核 BudgetGuard 熔断保护；超过后自动停止并保留检查点（0 表示仅统计不熔断）',
-    unit: '次 / 批次',
-    min: 0,
-  },
-  max_total_tokens: {
-    label: '单批次 Token 上限',
-    desc: '累计输入+输出 Token 超过上限后自动熔断，防止异常循环空烧费用（0 表示不限制）',
-    unit: 'Tokens',
-    min: 0,
-  },
-  max_elapsed_seconds: {
-    label: '单批次最长计算耗时',
-    desc: '不含人工确认等待时间；纯计算耗时超过上限后自动熔断（0 表示不限制）',
-    unit: '秒',
-    min: 0,
-  },
-}
-
 export default function SettingsPage() {
   const [settings, setSettings] = useState(null)
   const [budget, setBudget] = useState({})
   const [results, setResults] = useState({})
   const [testingKind, setTestingKind] = useState('')
+  const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -87,9 +49,9 @@ export default function SettingsPage() {
         method: 'POST',
         body: JSON.stringify({}),
       })
-      setResults({ ...results, [kind]: result })
+      setResults((prev) => ({ ...prev, [kind]: result }))
     } catch (err) {
-      setResults({ ...results, [kind]: { ok: false, error: err.message } })
+      setResults((prev) => ({ ...prev, [kind]: { ok: false, error: err.message } }))
     } finally {
       setTestingKind('')
     }
@@ -97,18 +59,23 @@ export default function SettingsPage() {
 
   async function saveBudget() {
     setError('')
+    const checked = validateBudgetInput(budget)
+    if (!checked.ok) {
+      setError(checked.error)
+      return
+    }
+    setSaving(true)
     try {
       await v2('/settings/execution_budget', {
         method: 'PUT',
-        body: JSON.stringify({
-          value: Object.fromEntries(
-            Object.entries(budget).map(([key, value]) => [key, Number(value)])
-          ),
-        }),
+        body: JSON.stringify({ value: checked.value }),
       })
+      setBudget(checked.value)
       setNotice('确定性执行预算已保存，后续所有 AI 生成计划均严格受此上限约束。')
     } catch (err) {
       setError(err.message)
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -214,8 +181,8 @@ export default function SettingsPage() {
             <h2>生成数量上限</h2>
             <p>AI 可以按报表复杂度决定具体数量，但不会超过这里设置的上限。</p>
           </div>
-          <button type="button" className="button primary" onClick={saveBudget}>
-            保存预算配置
+          <button type="button" className="button primary" disabled={saving} onClick={saveBudget}>
+            {saving ? '保存中...' : '保存预算配置'}
           </button>
         </div>
 
@@ -230,6 +197,8 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   min={meta.min ?? 1}
+                  max={meta.max}
+                  step="1"
                   value={value}
                   onChange={(event) => setBudget({ ...budget, [key]: event.target.value })}
                 />

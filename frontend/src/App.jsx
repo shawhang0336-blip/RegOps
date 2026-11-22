@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from './api.js'
 import { FeedbackProvider } from './context/FeedbackContext.jsx'
 import { ThemeProvider, useTheme } from './context/ThemeContext.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
-import SettingsPage from './pages/SettingsPage.jsx'
-import PreparationWorkspace from './pages/PreparationWorkspace.jsx'
-import ArtifactsPage from './pages/ArtifactsPage.jsx'
-import RunsPage from './pages/RunsPage.jsx'
-import VersionsPage from './pages/VersionsPage.jsx'
+import { DetailSkeleton } from './components/Skeleton.jsx'
+
+const SettingsPage = lazy(() => import('./pages/SettingsPage.jsx'))
+const PreparationWorkspace = lazy(() => import('./pages/PreparationWorkspace.jsx'))
+const ArtifactsPage = lazy(() => import('./pages/ArtifactsPage.jsx'))
+const RunsPage = lazy(() => import('./pages/RunsPage.jsx'))
+const VersionsPage = lazy(() => import('./pages/VersionsPage.jsx'))
 
 const pipelineNavigation = [
   ['/documents', '规范解析与核对', '01', '上传文件，自动解析并核对字段和码表'],
@@ -58,9 +60,17 @@ function ScrollToTop() {
 function BackendHealthPill() {
   const [health, setHealth] = useState({ state: 'checking', info: null, checkedAt: null })
   const [probing, setProbing] = useState(false)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const check = useCallback(async (manual = false) => {
-    if (manual) setProbing(true)
+    if (manual && mountedRef.current) setProbing(true)
     const started = Date.now()
     try {
       const data = await api('/api/health')
@@ -68,11 +78,11 @@ function BackendHealthPill() {
         const elapsed = Date.now() - started
         if (elapsed < 260) await new Promise((resolve) => window.setTimeout(resolve, 260 - elapsed))
       }
-      setHealth({ state: 'online', info: data, checkedAt: new Date() })
+      if (mountedRef.current) setHealth({ state: 'online', info: data, checkedAt: new Date() })
     } catch {
-      setHealth({ state: 'offline', info: null, checkedAt: new Date() })
+      if (mountedRef.current) setHealth({ state: 'offline', info: null, checkedAt: new Date() })
     } finally {
-      if (manual) setProbing(false)
+      if (manual && mountedRef.current) setProbing(false)
     }
   }, [])
 
@@ -166,18 +176,21 @@ function WorkbenchLayout() {
       </header>
 
       <main className="main-content">
-        <ErrorBoundary>
+        <ErrorBoundary resetKey={location.pathname}>
           <div className="page-stage" key={location.pathname}>
-            <Routes>
-              <Route path="/" element={<PreparationWorkspace />} />
-              <Route path="/documents" element={<PreparationWorkspace />} />
-              <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
-              <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
-              <Route path="/generation" element={<ArtifactsPage />} />
-              <Route path="/runs" element={<RunsPage />} />
-              <Route path="/versions" element={<VersionsPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-            </Routes>
+            <Suspense fallback={<div className="panel"><DetailSkeleton blocks={4} /></div>}>
+              <Routes>
+                <Route path="/" element={<PreparationWorkspace />} />
+                <Route path="/documents" element={<PreparationWorkspace />} />
+                <Route path="/metadata" element={<PreparationRedirect view="fields" />} />
+                <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
+                <Route path="/generation" element={<ArtifactsPage />} />
+                <Route path="/runs" element={<RunsPage />} />
+                <Route path="/versions" element={<VersionsPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="*" element={<Navigate to="/documents" replace />} />
+              </Routes>
+            </Suspense>
           </div>
         </ErrorBoundary>
       </main>

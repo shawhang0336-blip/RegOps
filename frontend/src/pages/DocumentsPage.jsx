@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { useEventStream, watchDocumentProgress } from '../hooks/useEventStream.js'
@@ -10,12 +10,20 @@ import CurrentFilePicker from './documents/CurrentFilePicker.jsx'
 import ImportProgressPanel from './documents/ImportProgressPanel.jsx'
 import {
   COLUMN_MAPPING_FIELDS,
-  fileSha256,
   updateImportProgress,
 } from './documents/documentHelpers.js'
 
-export default function DocumentsPage({ embedded = false, importOnly = false, autoParse = false, onShowAssets, onSelectDocument }) {
+export default function DocumentsPage({
+  embedded = false,
+  importOnly = false,
+  autoParse = false,
+  selectedDocumentId = '',
+  onShowAssets,
+  onSelectDocument,
+}) {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const urlDocumentId = selectedDocumentId || searchParams.get('document_id') || ''
   const { confirm } = useFeedback()
   const [documents, setDocuments] = useState([])
   const [detail, setDetail] = useState(null)
@@ -39,16 +47,48 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const watchAbortRef = useRef(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      watchAbortRef.current?.abort()
+    }
+  }, [])
+
+  function beginWatchSignal() {
+    watchAbortRef.current?.abort()
+    const controller = new AbortController()
+    watchAbortRef.current = controller
+    return controller.signal
+  }
 
   async function load(preferredId) {
     const list = await v2('/documents')
+    if (!mountedRef.current) return
     setDocuments(list)
     const extracting = list.find((doc) => doc.status === 'EXTRACTING')
     if (extracting) {
-      setImportProgress((current) => current || { fileName: extracting.file_name, digest: extracting.sha256, stage: 3, status: 'WORKING', awaitReextract: false, autoParse: true })
+      setImportProgress((current) => current || {
+        document_id: extracting.id,
+        file_name: extracting.file_name,
+        digest: extracting.sha256,
+        stage: 3,
+        status: 'WORKING',
+        awaitReextract: false,
+        autoParse: true,
+      })
+    } else if (importProgress?.status === 'WORKING' && importProgress?.digest && !list.some((d) => d.sha256 === importProgress.digest)) {
+      setImportProgress(null)
     }
     const currentId = detail?.id
-    const targetId = preferredId || (list.some((doc) => doc.id === currentId) ? currentId : null) || list[0]?.id
+    const targetId =
+      preferredId ||
+      (urlDocumentId && list.some((doc) => doc.id === urlDocumentId) ? urlDocumentId : null) ||
+      (list.some((doc) => doc.id === currentId) ? currentId : null) ||
+      list[0]?.id
     if (targetId) {
       await selectDocument(targetId)
     } else {
@@ -57,16 +97,33 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
       setRaw(null)
       setArchitecture(null)
       setMappingBlock(null)
+      if (onSelectDocument) onSelectDocument('')
     }
   }
 
   useEffect(() => {
-    load().catch((err) => setError(friendlyError(err.message)))
+    load(urlDocumentId || undefined).catch((err) => {
+      if (mountedRef.current) setError(friendlyError(err.message))
+    })
   }, [])
 
   useEffect(() => {
-    if (importProgress) window.localStorage.setItem('regops-import-progress', JSON.stringify(importProgress))
-    else window.localStorage.removeItem('regops-import-progress')
+    if (!urlDocumentId || !documents.length) return
+    if (detail?.id === urlDocumentId) return
+    if (documents.some((doc) => doc.id === urlDocumentId)) {
+      selectDocument(urlDocumentId).catch((err) => {
+        if (mountedRef.current) setError(friendlyError(err.message))
+      })
+    }
+  }, [urlDocumentId, documents])
+
+  useEffect(() => {
+    try {
+      if (importProgress) window.localStorage.setItem('regops-import-progress', JSON.stringify(importProgress))
+      else window.localStorage.removeItem('regops-import-progress')
+    } catch {
+      // ignore storage quota / privacy mode errors
+    }
   }, [importProgress])
 
   const syncDigestProgress = async () => {
@@ -112,17 +169,19 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
   async function selectDocument(id) {
     const doc = await v2(`/documents/${id}`)
+    if (!mountedRef.current) return
     setDetail(doc)
     setShowUpload(false)
-    if (onSelectDocument) onSelectDocument(doc.id)
+    if (onSelectDocument && doc.id !== urlDocumentId) onSelectDocument(doc.id)
     const eligibleIds = (doc.blocks || []).filter((b) => b.eligible !== false && !b.superseded).map((b) => b.id)
     setSelected(eligibleIds)
     setRaw(null)
     setArchitectureExpanded(false)
-    setArchitecture(await v2(`/documents/${id}/architecture`).catch(() => null))
+    const arch = await v2(`/documents/${id}/architecture`).catch(() => null)
+    if (mountedRef.current) setArchitecture(arch)
   }
 
-  async function extractPreparedDocument(documentId) {
+  async function extractPreparedDocument(documentId, signal) {
     const prepared = await v2(`/documents/${documentId}`)
     const blockIds = (prepared.blocks || []).filter((block) => block.eligible !== false && !block.superseded).map((block) => block.id)
     if (!blockIds.length) throw new Error('文件中没有可解析的内容')
@@ -130,20 +189,31 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
       method: 'POST',
       body: JSON.stringify({ block_ids: blockIds, targets: ['metadata', 'code_sets'] }),
     })
-    // 接口是 202：真正的结果要轮询进度拿到
-    return watchDocumentProgress(documentId, setImportProgress)
+    // 接口是 202：真正的结果通过 SSE + 轮询进度拿到，并在切页时自动中止
+    return watchDocumentProgress(documentId, setImportProgress, { signal })
   }
 
   async function parseCurrentDocument() {
     if (!detail) return
+    const signal = beginWatchSignal()
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: detail.file_name, stage: 4, status: 'WORKING', detail: '正在准备解析', counters: {}, logs: [] })
+    setImportProgress({
+      document_id: detail.id,
+      file_name: detail.file_name,
+      stage: 4,
+      status: 'WORKING',
+      detail: '正在准备解析',
+      counters: {},
+      logs: [],
+    })
     try {
-      const result = await extractPreparedDocument(detail.id)
+      const result = await extractPreparedDocument(detail.id, signal)
+      if (signal.aborted || !mountedRef.current) return
       const tables = result?.counters?.tables || 0
       const codeSets = result?.counters?.code_sets || 0
       await load(detail.id)
+      if (!mountedRef.current) return
       if (result?.status === 'FAILED') {
         setError('解析未完成，请查看进度记录后重试。')
         return
@@ -151,45 +221,56 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
       setNotice(`解析完成：生成 ${tables} 张报表、${codeSets} 张码表。`)
       if (onShowAssets) onShowAssets(tables ? 'fields' : 'codes', '')
     } catch (err) {
+      if (!mountedRef.current) return
       setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
-      setBusy(false)
+      if (mountedRef.current) setBusy(false)
     }
   }
 
   async function handleFileUpload(file) {
     if (!file) return
+    const signal = beginWatchSignal()
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: file.name, stage: 1, status: 'WORKING', detail: '正在计算文件指纹', counters: {}, logs: [] })
+    setImportProgress({
+      file_name: file.name,
+      stage: 1,
+      status: 'WORKING',
+      detail: '正在上传文件并校验格式',
+      counters: {},
+      logs: [],
+    })
     try {
-      const digest = await fileSha256(file)
-      setImportProgress((current) => current ? { ...current, detail: '正在上传文件' } : current)
       const form = new FormData()
       form.append('file', file)
       const document = await v2('/documents', { method: 'POST', body: form })
+      if (signal.aborted || !mountedRef.current) return
 
       let snapshot = null
       if (document.processing) {
-        snapshot = await watchDocumentProgress(document.id, setImportProgress)
+        snapshot = await watchDocumentProgress(document.id, setImportProgress, { signal })
       } else {
         snapshot = await v2(`/documents/${document.id}/progress`).catch(() => null)
-        setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
+        if (mountedRef.current) setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
       }
+      if (signal.aborted || !mountedRef.current) return
 
       if (snapshot?.status === 'FAILED') {
         await load(document.id)
-        setError('结构检查未完成，请根据提示处理后重试。')
+        if (mountedRef.current) setError('结构检查未完成，请根据提示处理后重试。')
         return
       }
 
       if (autoParse) {
-        const result = await extractPreparedDocument(document.id)
+        const result = await extractPreparedDocument(document.id, signal)
+        if (signal.aborted || !mountedRef.current) return
         const tables = result?.counters?.tables || 0
         const codeSets = result?.counters?.code_sets || 0
         const failed = result?.status === 'FAILED'
         await load(document.id)
+        if (!mountedRef.current) return
         if (failed) {
           setError('解析未完成，请查看进度记录后重试。')
           return
@@ -198,6 +279,7 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
         if (onShowAssets) onShowAssets(tables ? 'fields' : 'codes', '')
       } else {
         await load(document.id)
+        if (!mountedRef.current) return
         setNotice(
           document.status === 'OVERVIEW_FAILED'
             ? `已保存「${document.file_name}」，但结构检查未完成，请点击“重新检查并解析”。`
@@ -205,11 +287,14 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
         )
       }
     } catch (err) {
+      if (!mountedRef.current) return
       setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
-      setBusy(false)
-      setShowUpload(false)
+      if (mountedRef.current) {
+        setBusy(false)
+        setShowUpload(false)
+      }
     }
   }
 
@@ -229,22 +314,35 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
   async function prepareDocument() {
     if (!detail) return
+    const signal = beginWatchSignal()
     setBusy(true)
     setError('')
-    setImportProgress({ fileName: detail.file_name, stage: 1, status: 'WORKING', detail: '正在重新检查文档结构', counters: {}, logs: [] })
+    setImportProgress({
+      document_id: detail.id,
+      file_name: detail.file_name,
+      stage: 1,
+      status: 'WORKING',
+      detail: '正在重新检查文档结构',
+      counters: {},
+      logs: [],
+    })
     try {
       await v2(`/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
-      const snapshot = await watchDocumentProgress(detail.id, setImportProgress)
+      const snapshot = await watchDocumentProgress(detail.id, setImportProgress, { signal })
+      if (signal.aborted || !mountedRef.current) return
       await load(detail.id)
+      if (!mountedRef.current) return
       if (snapshot?.status === 'FAILED') {
         setError('文件结构检查仍未完成，请查看提示后重试。')
         return
       }
       if (autoParse) {
-        const extraction = await extractPreparedDocument(detail.id)
+        const extraction = await extractPreparedDocument(detail.id, signal)
+        if (signal.aborted || !mountedRef.current) return
         const tables = extraction?.counters?.tables || 0
         const codeSets = extraction?.counters?.code_sets || 0
         await load(detail.id)
+        if (!mountedRef.current) return
         if (extraction?.status === 'FAILED') {
           setError('解析未完成，请查看进度记录后重试。')
           return
@@ -255,10 +353,11 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
         setNotice('文件结构检查和初步切块已完成，可以继续解析。')
       }
     } catch (err) {
+      if (!mountedRef.current) return
       setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
-      setBusy(false)
+      if (mountedRef.current) setBusy(false)
     }
   }
 
@@ -388,35 +487,47 @@ export default function DocumentsPage({ embedded = false, importOnly = false, au
 
   async function extractParallel(targets = ['metadata', 'code_sets']) {
     if (!selected.length || !detail) return
+    const signal = beginWatchSignal()
     setBusy(true)
     setError('')
+    setImportProgress({
+      document_id: detail.id,
+      file_name: detail.file_name,
+      stage: 4,
+      status: 'WORKING',
+      detail: `正在提取所选 ${selected.length} 个内容块`,
+      counters: {},
+      logs: [],
+    })
     try {
-      const result = await v2(`/documents/${detail.id}/extract-parallel`, {
+      await v2(`/documents/${detail.id}/extract-parallel`, {
         method: 'POST',
         body: JSON.stringify({ block_ids: selected, targets }),
       })
-      const tableCount = result.table_ids?.length || 0
-      const codeSetCount = result.code_set_ids?.length || 0
-      const resolvedCount = result.resolved_reference_count || 0
-      setNotice(`解析完成：识别 ${tableCount} 张报表、${codeSetCount} 张码值表，并关联 ${resolvedCount} 处字段码值。`)
-      if (result.errors?.length) {
-        const firstError = result.errors[0]
-        setError(`${result.errors.length} 项内容未完成：${friendlyError(firstError.error)}`)
+      const snapshot = await watchDocumentProgress(detail.id, setImportProgress, { signal })
+      if (signal.aborted || !mountedRef.current) return
+      const tableCount = snapshot?.counters?.tables || 0
+      const codeSetCount = snapshot?.counters?.code_sets || 0
+      await load(detail.id)
+      if (!mountedRef.current) return
+      if (snapshot?.status === 'FAILED') {
+        setError(friendlyError(snapshot.detail || '解析未完成，请查看进度记录后重试。'))
         return
       }
+      setNotice(`解析完成：识别 ${tableCount} 张报表、${codeSetCount} 张码值表。`)
       if (targets.length === 1 && targets[0] === 'code_sets') {
-        const firstSetId = result.code_set_ids?.[0] || ''
-        if (onShowAssets) onShowAssets('codes', firstSetId)
-        else navigate(firstSetId ? `/code-sets?set=${firstSetId}` : '/code-sets')
+        if (onShowAssets) onShowAssets('codes', '')
+        else navigate(`/documents?view=codes&document_id=${encodeURIComponent(detail.id)}`)
       } else {
-        const firstTableId = result.table_ids?.[0] || ''
-        if (onShowAssets) onShowAssets('fields', firstTableId)
-        else navigate(firstTableId ? `/metadata?table=${firstTableId}` : '/metadata')
+        if (onShowAssets) onShowAssets('fields', '')
+        else navigate(`/documents?view=fields&document_id=${encodeURIComponent(detail.id)}`)
       }
     } catch (err) {
+      if (!mountedRef.current) return
+      setImportProgress((current) => current ? { ...current, status: 'FAILED', detail: friendlyError(err.message) } : null)
       setError(friendlyError(err.message))
     } finally {
-      setBusy(false)
+      if (mountedRef.current) setBusy(false)
     }
   }
 

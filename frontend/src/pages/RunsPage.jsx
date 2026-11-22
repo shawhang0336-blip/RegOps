@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api, v2 } from '../api.js'
+import { api, downloadFile, v2 } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import { useEventStream } from '../hooks/useEventStream.js'
@@ -62,10 +62,13 @@ export default function RunsPage() {
   const [caseFilter, setCaseFilter] = useState('ALL')
   const [validationTab, setValidationTab] = useState('rules')
   const [busy, setBusy] = useState(false)
+  const [bundleBusy, setBundleBusy] = useState(false)
   const [previewBusy, setPreviewBusy] = useState(false)
+  const [traceOpen, setTraceOpen] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const requestRef = useRef(0)
+  const closeCleanup = useCallback(() => setShowCleanup(false), [])
 
   const select = useCallback(async (id, { silent = false } = {}) => {
     const reqId = ++requestRef.current
@@ -111,15 +114,23 @@ export default function RunsPage() {
     }
   }, [active?.id, params, select])
 
+  const runQueryParam = params.get('run')
+
   useEffect(() => {
     setLoading(true)
-    load(params.get('run'))
+    load(runQueryParam)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
     v2('/artifacts').then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (runQueryParam && active?.id && runQueryParam !== active.id) {
+      select(runQueryParam).catch((err) => setError(err.message))
+    }
+  }, [runQueryParam])
 
   const runIsActive = Boolean(active && ['RUNNING', 'AUDITING', 'READY_TO_AUDIT'].includes(active.status))
   const refreshActiveRun = useCallback(() => {
@@ -173,8 +184,15 @@ export default function RunsPage() {
     setError('')
     try {
       const rows = await api(table.audit_preview_url)
-      const row = (Array.isArray(rows) ? rows : []).find((item) => item.record_id === testCase.case_id)
-      if (!row) throw new Error(`没有在测试数据中找到用例 ${testCase.case_id}`)
+      const list = Array.isArray(rows) ? rows : []
+      const row = list.find((item) => item.record_id === testCase.case_id)
+      if (!row) {
+        throw new Error(
+          list.length >= 100
+            ? `前 100 行预览中未找到用例 ${testCase.case_id}（当前表测试数据超过 100 行）`
+            : `没有在测试数据中找到用例 ${testCase.case_id}`,
+        )
+      }
       setArtifact({
         title: `${testCase.case_kind === 'GOLDEN' ? 'AI 正常样本' : '规则变异样本'} · ${testCase.case_id}`,
         rows: [row],
@@ -184,6 +202,23 @@ export default function RunsPage() {
       setError(err.message)
     } finally {
       setPreviewBusy(false)
+    }
+  }
+
+  async function downloadBundle() {
+    if (!active) return
+    setBundleBusy(true)
+    setError('')
+    try {
+      const filename = await downloadFile(
+        `/api/v2/generation/runs/${active.id}/production-bundle`,
+        `production_${active.id.slice(0, 8)}.zip`,
+      )
+      setNotice(`生产部署包「${filename}」已开始下载。`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBundleBusy(false)
     }
   }
 
@@ -341,6 +376,12 @@ export default function RunsPage() {
   const errorMessage = active?.result?.error || ''
   const isCancelled = Boolean(active?.result?.cancelled)
   const isBudgetTripped = errorDetails?.error_kind === 'budget'
+  const shouldAutoExpandTrace =
+    busRejectEvents.length > 0 || goRedirectEvents.length > 0 || resumeEvents.length > 0 || isBudgetTripped || isCancelled
+
+  useEffect(() => {
+    setTraceOpen(shouldAutoExpandTrace)
+  }, [active?.id, shouldAutoExpandTrace])
   const budgetUsage = active?.result?.budget_usage || errorDetails?.budget_snapshot || null
   const budgetSpeedup = budgetUsage && budgetUsage.elapsed_seconds > 0 && budgetUsage.total_llm_seconds > 0
     ? (budgetUsage.total_llm_seconds / budgetUsage.elapsed_seconds).toFixed(1)
@@ -420,7 +461,7 @@ export default function RunsPage() {
               </button>
             )}
             {active && (
-              <button type="button" className="button secondary" disabled={busy} onClick={() => load(active.id)}>
+              <button type="button" className="button secondary" disabled={busy} onClick={() => load(active.id).catch((err) => setError(err.message))}>
                 刷新状态
               </button>
             )}
@@ -549,9 +590,15 @@ export default function RunsPage() {
                 </div>
                 {testData.length ? (
                   <div className="test-data-grid">
-                    {testData.map((table) => (
+                    {testData.map((table) => {
+                      const modeLabel = table.generation_mode === 'DETERMINISTIC'
+                        ? '确定性生成'
+                        : table.generation_mode === 'HYBRID_DETERMINISTIC_AI'
+                          ? '程序+AI 混合'
+                          : 'AI 赋值'
+                      return (
                       <article className="test-data-card" key={table.table_code}>
-                        <div className="test-data-card-head"><div><strong>{table.table_name}</strong><code>{table.table_code}</code></div><StatusBadge tone="violet">AI 赋值</StatusBadge></div>
+                        <div className="test-data-card-head"><div><strong>{table.table_name}</strong><code>{table.table_code}</code></div><StatusBadge tone={table.generation_mode === 'DETERMINISTIC' ? 'blue' : 'violet'}>{modeLabel}</StatusBadge></div>
                         <div className="test-data-metrics"><span>{table.generator_count} 个字段</span><span>{table.golden_count} 条正常样本</span><span>{table.audit_count} 条审计用例</span></div>
                         {table.generation_plan?.rationale && <p>{table.generation_plan.rationale}</p>}
                         <div className="actions">
@@ -560,7 +607,8 @@ export default function RunsPage() {
                           <button type="button" className="button-link" onClick={() => previewBaseline(table)}>查看 AI 赋值基线</button>
                         </div>
                       </article>
-                    ))}
+                      )
+                    })}
                   </div>
                 ) : <div className="empty">当前阶段还没有可浏览的 AI 测试数据。规则确认后会自动生成。</div>}
               </section>
@@ -635,23 +683,30 @@ export default function RunsPage() {
                   {uncoveredCount > 0 && <div className="action-callout"><div><strong>{uncoveredCount} 条规则没有有效覆盖</strong><p>未覆盖不能视为规则有效，也不会开放生产下载。</p></div><button type="button" className="button secondary sm" onClick={() => { setValidationTab('rules'); setRuleResultFilter('UNCOVERED') }}>查看未覆盖规则</button></div>}
                   <div className="issue-list">
                     {failedCases.slice(0, 10).map((testCase) => (
-                      <div className="issue-row" key={`${testCase.table_code}-${testCase.case_id}-issue`}><div><strong>{testCase.table_code} · {testCase.case_id}</strong><p>{testCase.missing_rules?.length ? `漏拦截：${testCase.missing_rules.join('、')}` : ''}{testCase.unexpected_rules?.length ? ` 误拦截：${testCase.unexpected_rules.join('、')}` : ''}</p></div><div className="actions"><button type="button" className="button secondary sm" onClick={() => previewCase(testCase)}>查看数据</button><button type="button" className="button-link" onClick={() => editTable(testCase.table_code)}>去第二步修改</button></div></div>
+                      <div className="issue-row" key={`${testCase.table_code}-${testCase.case_id}-issue`}><div><strong>{testCase.table_code} · {testCase.case_id}</strong><p>{testCase.missing_rules?.length ? `漏拦截：${testCase.missing_rules.join('、')}` : ''}{testCase.unexpected_rules?.length ? ` 误拦截：${testCase.unexpected_rules.join('、')}` : ''}</p></div><div className="actions"><button type="button" className="button secondary sm" disabled={previewBusy} onClick={() => previewCase(testCase)}>查看数据</button><button type="button" className="button-link" onClick={() => editTable(testCase.table_code)}>去第二步修改</button></div></div>
                     ))}
                   </div>
                 </section>
               )}
 
               <section className="run-section download-section">
-                <div className="panel-heading"><div><h2>生产产出包</h2><p>只包含正式表结构、码值和校验 SQL，不包含 AI 测试数据或沙箱表名。</p></div>{readyToDownload && <StatusBadge tone="green">可以下载</StatusBadge>}</div>
+                <div className="panel-heading"><div><h2>生产产出包</h2><p>同时输出 Oracle 23 与 MySQL 8 生产脚本及 SHA-256 完整性清单，不包含任何 AI 测试数据或沙箱表名。</p></div>{readyToDownload && <StatusBadge tone="green">可以下载</StatusBadge>}</div>
                 <ul className="bundle-file-list">
-                  <li><code>01_report_tables.sql</code><span>报表 Oracle DDL</span></li>
-                  <li><code>02_code_set_tables.sql</code><span>码表 Oracle DDL</span></li>
-                  <li><code>03_code_values_insert.sql</code><span>首次初始化：码值批量 INSERT ALL</span></li>
-                  <li><code>04_code_values_merge.sql</code><span>重复部署：码值 MERGE 更新</span></li>
-                  <li><code>05_validation_rules.sql</code><span>生产校验 SQL</span></li>
+                  <li><code>oracle/01~05_*.sql</code><span>Oracle 报表 DDL、码表 DDL、INSERT ALL / MERGE 与生产校验 SQL</span></li>
+                  <li><code>mysql/01~04_*.sql</code><span>MySQL 8 报表 DDL、码表 DDL、UPSERT 与生产校验 SQL</span></li>
+                  <li><code>manifest.json</code><span>全量交付物 SHA-256 校验清单与审计版本防篡改摘要</span></li>
+                  <li><code>rules.json / audit_summary.json</code><span>结构化规则定义与沙箱审计结论</span></li>
                 </ul>
                 {readyToDownload ? (
-                  <div className="production-download"><div className="production-download-info"><strong>生产部署包已就绪</strong><span>另附 MySQL 报表 DDL、manifest.json、rules.json 和审计摘要。</span></div><a className="button primary" href={`/api/v2/generation/runs/${active.id}/production-bundle`}>下载生产部署包 (.zip)</a></div>
+                  <div className="production-download">
+                    <div className="production-download-info">
+                      <strong>生产部署包已就绪</strong>
+                      <span>点击下载前后端将再次校验规则哈希未被篡改并实时签名打包。</span>
+                    </div>
+                    <button type="button" className="button primary" disabled={bundleBusy} onClick={downloadBundle}>
+                      {bundleBusy ? '正在打包下载...' : '下载生产部署包 (.zip)'}
+                    </button>
+                  </div>
                 ) : active.status === 'WAITING_TEST_APPROVAL' && summary.all_passed && !coverageIncomplete ? (
                   <div className="action-callout"><div><strong>验证已通过</strong><p>确认本次测试结果后开放生产下载。</p></div><button type="button" className="button primary" disabled={busy} onClick={confirmTests}>确认测试结果并开放下载</button></div>
                 ) : (
@@ -659,7 +714,11 @@ export default function RunsPage() {
                 )}
               </section>
 
-              <details className="run-section technical-run-details" open={busRejectEvents.length > 0 || goRedirectEvents.length > 0 || resumeEvents.length > 0 || isBudgetTripped || isCancelled}>
+              <details
+                className="run-section technical-run-details"
+                open={traceOpen}
+                onToggle={(e) => setTraceOpen(e.currentTarget.open)}
+              >
                 <summary>
                   ProdAgent 内核轨迹 · 当前节点 <code>{active.current_node || 'created'}</code>
                   {' · '}EventLog ({runEvents.length})
@@ -803,12 +862,12 @@ export default function RunsPage() {
       {artifact && <DataTableModal artifact={artifact} onClose={() => setArtifact(null)} />}
       <HistoryCleanupModal
         open={showCleanup}
-        onClose={() => setShowCleanup(false)}
+        onClose={closeCleanup}
         onCompleted={async (result) => {
           setNotice(
             `已清理 ${result.deleted_count} 个历史验证批次${result.sandbox_cleanup?.length ? `（${result.sandbox_cleanup.length} 张沙箱表已跳过或清理）` : ''}。`,
           )
-          await load()
+          await load().catch((err) => setError(err.message))
         }}
       />
     </>

@@ -34,8 +34,10 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const requestRef = useRef(0)
+  const loadRequestRef = useRef(0)
 
   async function load(preferredId) {
+    const loadId = ++loadRequestRef.current
     const documentId = params.get('document_id')
     const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     if (embedded && !documentId) {
@@ -52,6 +54,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
       v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
       v2(`/code-sets/readiness${readinessQuery}`).catch(() => null),
     ])
+    if (loadId !== loadRequestRef.current) return
     setSets(setList)
     setUnresolved(unresolvedList)
     setReadiness(readinessPayload)
@@ -67,8 +70,15 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     const targetId = preferredId || (setList.some((set) => set.id === paramSetId) ? paramSetId : null) || matchedByName || (setList.some((set) => set.id === currentId) ? currentId : null) || setList[0]?.id
     if (targetId) {
       await select(targetId)
+    } else {
+      setDetail(null)
+      setSelectedId(null)
     }
   }
+
+  const documentIdParam = params.get('document_id')
+  const setParam = params.get('set')
+  const nameParam = params.get('name')
 
   useEffect(() => {
     setSelectedId(null)
@@ -78,7 +88,17 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     load()
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [params.get('document_id')])
+  }, [documentIdParam])
+
+  useEffect(() => {
+    if (!sets.length) return
+    const target =
+      (setParam && sets.some((s) => s.id === setParam) ? setParam : null) ||
+      (nameParam ? sets.find((s) => s.name === nameParam || s.code === nameParam.toUpperCase())?.id : null)
+    if (target && detail?.id !== target) {
+      select(target)
+    }
+  }, [setParam, nameParam, sets])
 
   async function select(id) {
     const reqId = ++requestRef.current
@@ -127,8 +147,11 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     try {
       const result = await v2('/code-sets/upload-file', { method: 'POST', body: form })
       const firstId = result.code_set_ids?.[0]
-      await load(firstId)
-      if (onDocumentChange && result.document_id) onDocumentChange(result.document_id)
+      if (onDocumentChange && result.document_id && result.document_id !== params.get('document_id')) {
+        onDocumentChange(result.document_id)
+      } else {
+        await load(firstId)
+      }
       setNotice(
         `已从「${result.file_name}」提取 ${result.code_set_count} 张码值字典（共 ${result.total_value_count} 项码值）；全库已绑定 ${result.resolved_reference_count} 处字段码值引用。`
       )
@@ -309,7 +332,10 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
       const body = await v2(`/code-sets/${detail.id}/import`, { method: 'POST', body: form })
       setDetail(body.code_set)
       await load(body.code_set.id)
-      setNotice(`已从 Excel 成功导入 ${body.imported} 个码值项。`)
+      const extras = []
+      if (body.skipped_duplicate > 0) extras.push(`跳过重复 ${body.skipped_duplicate} 项`)
+      if (body.skipped_empty_label > 0) extras.push(`跳过缺中文含义 ${body.skipped_empty_label} 项`)
+      setNotice(`已从 Excel 成功导入 ${body.imported} 个码值项${extras.length ? `（${extras.join('，')}）` : ''}。`)
     } catch (err) {
       setError(err.message)
     } finally {

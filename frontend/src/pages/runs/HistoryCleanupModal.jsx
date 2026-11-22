@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../../api.js'
 import { StatusBadge, formatTime } from '../SharedUI.jsx'
 
@@ -7,6 +7,10 @@ export default function HistoryCleanupModal({ open, onClose, onCompleted }) {
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const busyRef = useRef(false)
+  const onCloseRef = useRef(onClose)
+  busyRef.current = busy
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open) return undefined
@@ -23,19 +27,24 @@ export default function HistoryCleanupModal({ open, onClose, onCompleted }) {
       .finally(() => {
         if (!cancelled) setLoading(false)
       })
+    return () => {
+      cancelled = true
+    }
+  }, [open])
 
+  useEffect(() => {
+    if (!open) return undefined
     const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     const onKeyDown = (event) => {
-      if (event.key === 'Escape' && !busy) onClose()
+      if (event.key === 'Escape' && !busyRef.current) onCloseRef.current?.()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => {
-      cancelled = true
       document.body.style.overflow = previousOverflow
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [open, busy, onClose])
+  }, [open])
 
   if (!open) return null
 

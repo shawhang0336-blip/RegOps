@@ -1,7 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 export default function CopyButton({ text, label = '复制', copiedLabel = '已复制', className = 'button secondary sm' }) {
   const [copied, setCopied] = useState(false)
+  const timerRef = useRef(null)
+
+  useEffect(() => () => {
+    if (timerRef.current) window.clearTimeout(timerRef.current)
+  }, [])
 
   async function handleCopy() {
     if (!text) return
@@ -18,7 +23,8 @@ export default function CopyButton({ text, label = '复制', copiedLabel = '已�
       document.body.removeChild(area)
     }
     setCopied(true)
-    window.setTimeout(() => setCopied(false), 1800)
+    if (timerRef.current) window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(() => setCopied(false), 1800)
   }
 
   return (

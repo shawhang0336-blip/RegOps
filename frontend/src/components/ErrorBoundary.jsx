@@ -10,6 +10,12 @@ export default class ErrorBoundary extends React.Component {
     return { error }
   }
 
+  componentDidUpdate(prevProps) {
+    if (this.state.error && this.props.resetKey !== prevProps.resetKey) {
+      this.setState({ error: null })
+    }
+  }
+
   componentDidCatch(error, info) {
     // 保留控制台输出便于排查
     console.error('[RegOps ErrorBoundary]', error, info)

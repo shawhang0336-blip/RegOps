@@ -73,10 +73,11 @@ export function RuleTable({ rows, showTable = false, decisions = {}, onDecision,
 export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNotice, onError }) {
   const [operatorFilter, setOperatorFilter] = useState('all')
   const [fieldSearch, setFieldSearch] = useState('')
-  const [activeRuleKey, setActiveRuleKey] = useState(null)
+  const [activeRuleRowId, setActiveRuleRowId] = useState(null)
   const [decisions, setDecisions] = useState({})
   const [approvalBusy, setApprovalBusy] = useState(false)
   const [showSuperseded, setShowSuperseded] = useState(false)
+  const runActive = ACTIVE_RUN_STATUSES.includes(runStatus)
   const pendingRules = rules.filter((rule) => rule.status === 'PENDING')
   const decidedCount = pendingRules.filter((rule) => decisions[rule.rule_hash]).length
 
@@ -132,7 +133,7 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
     if (q && !rule.field.toLowerCase().includes(q) && !rule.rule_key.toLowerCase().includes(q)) return false
     return true
   })
-  const activeIndex = visible.findIndex((rule) => rule.rule_key === activeRuleKey)
+  const activeIndex = visible.findIndex((rule) => rule.row_id === activeRuleRowId)
   const activeRule = activeIndex >= 0 ? visible[activeIndex] : null
 
   return (
@@ -160,7 +161,7 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
         </div>
       )}
       <div className="list-filter-bar rule-filter-bar">
-        <select aria-label="规则算子" value={operatorFilter} onChange={(e) => { setOperatorFilter(e.target.value); setActiveRuleKey(null) }}>
+        <select aria-label="规则算子" value={operatorFilter} onChange={(e) => { setOperatorFilter(e.target.value); setActiveRuleRowId(null) }}>
           <option value="all">全部算子 ({activeRules.length})</option>
           {Object.entries(operatorCounts).map(([op, count]) => (
             <option key={op} value={op}>{rules.find((rule) => rule.operator === op)?.operator_label || op} ({count})</option>
@@ -170,7 +171,7 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
           type="search"
           placeholder="按字段或规则名检索..."
           value={fieldSearch}
-          onChange={(e) => { setFieldSearch(e.target.value); setActiveRuleKey(null) }}
+          onChange={(e) => { setFieldSearch(e.target.value); setActiveRuleRowId(null) }}
         />
         {supersededRules.length > 0 && (
           <button
@@ -178,7 +179,7 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
             className={`button sm ${showSuperseded ? 'secondary' : 'ghost'}`}
             aria-pressed={showSuperseded}
             title="被去重替换的重复规则，默认不参与校验"
-            onClick={() => { setShowSuperseded(!showSuperseded); setActiveRuleKey(null) }}
+            onClick={() => { setShowSuperseded(!showSuperseded); setActiveRuleRowId(null) }}
           >
             {showSuperseded ? '隐藏' : '显示'}已替换 ({supersededRules.length})
           </button>
@@ -190,7 +191,7 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
         decisions={decisions}
         onDecision={(hash, decision) => setDecisions({ ...decisions, [hash]: decision })}
         canApprove={(rule) => rule.status === 'PENDING' && runStatus === 'WAITING_APPROVAL'}
-        onOpenRule={(rule) => setActiveRuleKey(rule.rule_key)}
+        onOpenRule={(rule) => setActiveRuleRowId(rule.row_id)}
         activeKey={activeRule?.row_id}
       />
 
@@ -200,9 +201,11 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
           rule={activeRule}
           index={activeIndex}
           total={visible.length}
-          onPrevious={activeIndex > 0 ? () => setActiveRuleKey(visible[activeIndex - 1].rule_key) : null}
-          onNext={activeIndex < visible.length - 1 ? () => setActiveRuleKey(visible[activeIndex + 1].rule_key) : null}
-          onClose={() => setActiveRuleKey(null)}
+          canEdit={!runActive && activeRule.status !== 'SUPERSEDED'}
+          editDisabledReason={runActive ? '当前运行批次仍在执行中，不能修改规则参数' : ''}
+          onPrevious={activeIndex > 0 ? () => setActiveRuleRowId(visible[activeIndex - 1].row_id) : null}
+          onNext={activeIndex < visible.length - 1 ? () => setActiveRuleRowId(visible[activeIndex + 1].row_id) : null}
+          onClose={() => setActiveRuleRowId(null)}
           onSaved={onSaved}
           onNotice={onNotice}
         />
@@ -287,11 +290,16 @@ export function AllRulesView({ overview, loading, refreshedAt, refreshing, onRef
         byRun.set(rule._runId, list)
       })
       const results = []
-      for (const [runId, list] of byRun) {
-        results.push(await api(`/api/runs/${runId}/approvals`, {
-          method: 'POST',
-          body: JSON.stringify({ provider: 'live', decisions: list }),
-        }))
+      try {
+        for (const [runId, list] of byRun) {
+          results.push(await api(`/api/runs/${runId}/approvals`, {
+            method: 'POST',
+            body: JSON.stringify({ provider: 'live', decisions: list }),
+          }))
+        }
+      } catch (err) {
+        if (results.length > 0) onSaved?.()
+        throw err
       }
       setDecisions({})
       if (results.some((body) => body.status === 'WAITING_APPROVAL')) {
@@ -441,6 +449,8 @@ export function AllRulesView({ overview, loading, refreshedAt, refreshing, onRef
           rule={activeRule}
           index={activeIndex}
           total={pendingRows.length}
+          canEdit={!ACTIVE_RUN_STATUSES.includes(activeRule._runStatus) && activeRule.status !== 'SUPERSEDED'}
+          editDisabledReason={ACTIVE_RUN_STATUSES.includes(activeRule._runStatus) ? '当前运行批次仍在执行中，不能修改规则参数' : ''}
           onPrevious={activeIndex > 0 ? () => setActiveRuleId(pendingRows[activeIndex - 1].row_id) : null}
           onNext={activeIndex < pendingRows.length - 1 ? () => setActiveRuleId(pendingRows[activeIndex + 1].row_id) : null}
           onClose={() => setActiveRuleId(null)}

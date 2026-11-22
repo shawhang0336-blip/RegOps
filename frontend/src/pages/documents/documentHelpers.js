@@ -15,6 +15,9 @@ export const COLUMN_MAPPING_FIELDS = [
 ]
 
 export async function fileSha256(file) {
+  if (typeof window === 'undefined' || !window.crypto?.subtle) {
+    return null
+  }
   const content = await file.arrayBuffer()
   const digest = await window.crypto.subtle.digest('SHA-256', content)
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')

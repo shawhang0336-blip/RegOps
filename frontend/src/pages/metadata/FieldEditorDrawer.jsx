@@ -105,13 +105,14 @@ export default function FieldEditorDrawer({
             <span>数据类型与长度</span>
             <div className="actions field-type-inputs">
               <select disabled={isPublished} value={activeField.data_type} onChange={(e) => onChangeProp(activeField.id, 'data_type', e.target.value)}>
-                <option value="VARCHAR">文本</option>
-                <option value="NUMBER">数值</option>
-                <option value="DATE">日期</option>
-                <option value="CHAR">定长文本</option>
+                <option value="VARCHAR">文本 (VARCHAR)</option>
+                <option value="NUMBER">数值 (NUMBER)</option>
+                {activeField.data_type && !['VARCHAR', 'NUMBER'].includes(activeField.data_type) && (
+                  <option value={activeField.data_type}>{activeField.data_type}（历史类型）</option>
+                )}
               </select>
-              <input type="number" disabled={isPublished} style={{ width: 92 }} value={activeField.length} onChange={(e) => onChangeProp(activeField.id, 'length', e.target.value)} title="字段长度" />
-              <input type="number" disabled={isPublished} style={{ width: 76 }} value={activeField.decimal_places} onChange={(e) => onChangeProp(activeField.id, 'decimal_places', e.target.value)} title="小数位数" />
+              <input type="number" min="1" disabled={isPublished} style={{ width: 92 }} value={activeField.length ?? ''} onChange={(e) => onChangeProp(activeField.id, 'length', e.target.value)} title="字段长度" />
+              <input type="number" min="0" disabled={isPublished || activeField.data_type !== 'NUMBER'} style={{ width: 76 }} value={activeField.decimal_places ?? 0} onChange={(e) => onChangeProp(activeField.id, 'decimal_places', e.target.value)} title="小数位数（仅数值型生效）" />
             </div>
           </label>
           <label className="span-2">
