@@ -1608,26 +1608,27 @@ def test_catalog_clean_structure_and_boundaries():
 
 
 def test_generation_clean_structure_and_core_boundary():
-    """验证 Layer 5 (Step 2) generation 归类红线：
-    1. 根目录收敛为三大正交子包（core/ + sql/ + workflow/）+ run_diff.py；
-    2. generation/core/*.py 严格零依赖 DB / LLM / kernel / policy / engine.sql / engine.workflow（纯离线领域内核）。
+    """验证 Layer 5 (Step 2) generation 与 Layer 6 (Step 3) delivery 的 1:1 归类红线：
+    1. generation/ 收敛为纯 Step 2 三大正交子包（core/ + sql/ + workflow/），严禁反向依赖 delivery；
+    2. generation/core/*.py 严格零依赖 DB / LLM / kernel / policy / ingestion / catalog / sql / workflow / delivery；
+    3. delivery/ 承接完整 Step 3（testing/ 造数+AB 沙箱 + workflow/ 总调度 + run_diff.py + production* + business_db.py）。
     """
+    import app.delivery as delivery_pkg
     import app.generation as generation_pkg
 
     generation_dir = Path(generation_pkg.__file__).resolve().parent
     assert {p.name for p in generation_dir.iterdir() if p.name != "__pycache__"} == {
         "__init__.py",
         "core",
-        "run_diff.py",
         "sql",
         "workflow",
     }
     core_dir = generation_dir / "core"
     sql_dir = generation_dir / "sql"
+    wf_dir = generation_dir / "workflow"
     assert {p.name for p in core_dir.glob("*.py")} == {
         "__init__.py",
         "binding.py",
-        "mutations.py",
         "planning.py",
         "rule_backfill.py",
         "rules.py",
@@ -1637,6 +1638,14 @@ def test_generation_clean_structure_and_core_boundary():
         "code_set_sql.py",
         "compiler.py",
         "oracle.py",
+    }
+    assert {p.name for p in wf_dir.glob("*.py")} == {
+        "__init__.py",
+        "nodes_front.py",
+        "runtime.py",
+        "stage_plan_schema.py",
+        "stage_rules.py",
+        "stages.py",
     }
     forbidden_core = (
         "app.infra.db",
@@ -1648,6 +1657,7 @@ def test_generation_clean_structure_and_core_boundary():
         "app.catalog",
         "app.generation.sql",
         "app.generation.workflow",
+        "app.delivery",
     )
     core_violations = [
         f"{p.name}: {m}"
@@ -1655,7 +1665,30 @@ def test_generation_clean_structure_and_core_boundary():
         for m in _ast_imported_modules(p)
         if any(m == bad or m.startswith(bad + ".") for bad in forbidden_core)
     ]
-    assert core_violations == [], f"generation/core 必须保持纯离线领域内核，严禁依赖 DB/LLM/SQL/Workflow：{core_violations}"
+    assert core_violations == [], f"generation/core 必须保持纯离线领域内核，严禁依赖 DB/LLM/SQL/Workflow/Delivery：{core_violations}"
+
+    delivery_dir = Path(delivery_pkg.__file__).resolve().parent
+    assert {p.name for p in delivery_dir.iterdir() if p.name != "__pycache__"} == {
+        "__init__.py",
+        "business_db.py",
+        "production.py",
+        "production_service.py",
+        "run_diff.py",
+        "testing",
+        "workflow",
+    }
+    assert {p.name for p in (delivery_dir / "testing").glob("*.py")} == {
+        "__init__.py",
+        "mutations.py",
+        "nodes_back.py",
+        "sandbox_audit.py",
+        "stage_audit.py",
+        "stage_data.py",
+    }
+    assert {p.name for p in (delivery_dir / "workflow").glob("*.py")} == {
+        "__init__.py",
+        "entrypoints.py",
+    }
 
 
 

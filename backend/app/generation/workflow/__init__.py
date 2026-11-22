@@ -1,114 +1,98 @@
-"""规则装配与审计流水线编排包（Engine Workflow）。
+"""Step 2 规则生成工作流（Layer 5: generation/workflow，对应前端 02 /generation）。
 
-结构一览（从 1,665 行单文件拆分为 4 个单一职责模块）：
-- `runtime.py`：受控 LLM 退避调用（`_call_validated`）+ Bus 前置门禁 + BSP 并发扇出（`_fanout`）；
-- `stages.py`：规划 / Schema / 规则 / Oracle 资产 / 黄金造数 / 审计用例 / 自愈重绑 7 大阶段实现；
-- `nodes.py`：面向 ProdAgent `Scheduler` 的前后段 `NodeBody` 装配；
-- `entrypoints.py`：`drive` / `start_generic_run` / `approve_generic_rules` / `confirm_generic_test_results` / `retry_generic_run`。
+职责边界：
+- `runtime.py`：受控 LLM 调用、并发上下文映射、BSP 扇出与规则落库；
+- `stage_plan_schema.py`：确定性生成规划与 Schema 编译；
+- `stage_rules.py`：单表规则 BSP Worker、跨表外键汇聚、语义去重、靶向自愈重绑与 Oracle 空跑准备；
+- `nodes_front.py`：Step 2 前半段节点体装配（`_front_bodies`）。
+
+注：Step 3 的造数、AB 沙箱真跑与全流程调度入口已收归 Layer 6 `app.delivery.testing` 与 `app.delivery.workflow`。
 """
 
-from app.generation.workflow.entrypoints import (
-    _create_run,
-    active_generic_runs,
-    approve_generic_rules,
-    cancel_generic_run,
-    cleanup_history_runs,
-    collect_run_oracle_tables,
-    confirm_generic_test_results,
-    continue_generic_run,
-    delete_generic_run,
-    drive,
-    history_cleanup_plan,
-    reaudit_generic_run,
-    recover_interrupted_generic_runs,
-    replay_generic_run,
-    retry_generic_run,
-    start_generic_run,
-    submit_generic_run,
+from app.generation.core.rule_backfill import (
+    _code_set_enum_backfill_candidates,
+    _declaration_quote,
+    _fixed_value_candidates,
+    _length_backfill_candidates,
+    _required_backfill_candidates,
 )
-from app.generation.workflow.nodes import _back_bodies, _front_bodies
+from app.generation.workflow.nodes_front import _front_bodies
 from app.generation.workflow.runtime import (
+    _BACKOFF_SECONDS,
+    _TRANSIENT_ATTEMPTS,
+    _VALIDATION_ATTEMPTS,
     ERROR_SUGGESTIONS,
     STAGE_BY_TOOL,
     _call_validated,
     _code_set_context,
     _emit,
     _error_details,
+    _fail_context,
     _fanout,
     _inner_width,
     _latest_payload,
+    _locate_payload,
+    _map_with_context,
     _pending_rules,
     _resolve_budget,
     _specs,
     _upsert_rule,
 )
-from app.generation.workflow.stages import (
-    _audit_stage,
-    _backfill_fixed_value_rules,
-    _backfill_length_rules,
-    _backfill_required_rules,
-    _code_set_enum_backfill_candidates,
-    _data_stage,
-    _declaration_quote,
-    _dedupe_approved_rules,
-    _ensure_oracle_assets,
-    _fixed_value_candidates,
-    _length_backfill_candidates,
+from app.generation.workflow.stage_plan_schema import (
     _plan_stage,
-    _rebind_failed_rules,
-    _required_backfill_candidates,
-    _rules_stage,
+    _provider_name,
     _schema_stage,
     _validate_plan,
 )
+from app.generation.workflow.stage_rules import (
+    _dedupe_approved_rules,
+    _drop_unsatisfiable_field_compare_eq,
+    _ensure_oracle_assets,
+    _rebind_failed_rules,
+    _rules_stage,
+    _summarize_deterministic_rule,
+    bind_table_rules_worker,
+    join_table_rules_barrier,
+    prepare_deterministic_rule_index,
+)
 
 __all__ = [
+    "_BACKOFF_SECONDS",
+    "_TRANSIENT_ATTEMPTS",
+    "_VALIDATION_ATTEMPTS",
     "ERROR_SUGGESTIONS",
     "STAGE_BY_TOOL",
-    "_audit_stage",
-    "_back_bodies",
-    "_backfill_fixed_value_rules",
-    "_backfill_length_rules",
-    "_backfill_required_rules",
     "_call_validated",
     "_code_set_context",
-    "_create_run",
-    "_data_stage",
+    "_code_set_enum_backfill_candidates",
     "_declaration_quote",
     "_dedupe_approved_rules",
+    "_drop_unsatisfiable_field_compare_eq",
     "_emit",
     "_ensure_oracle_assets",
     "_error_details",
+    "_fail_context",
     "_fanout",
     "_fixed_value_candidates",
     "_front_bodies",
     "_inner_width",
     "_latest_payload",
     "_length_backfill_candidates",
+    "_locate_payload",
+    "_map_with_context",
     "_pending_rules",
     "_plan_stage",
+    "_provider_name",
     "_rebind_failed_rules",
     "_required_backfill_candidates",
     "_resolve_budget",
     "_rules_stage",
     "_schema_stage",
     "_specs",
+    "_summarize_deterministic_rule",
     "_upsert_rule",
     "_validate_plan",
-    "active_generic_runs",
-    "approve_generic_rules",
-    "cancel_generic_run",
-    "cleanup_history_runs",
-    "collect_run_oracle_tables",
-    "confirm_generic_test_results",
-    "continue_generic_run",
-    "delete_generic_run",
-    "drive",
-    "history_cleanup_plan",
-    "reaudit_generic_run",
-    "recover_interrupted_generic_runs",
-    "replay_generic_run",
-    "retry_generic_run",
-    "start_generic_run",
-    "submit_generic_run",
+    "bind_table_rules_worker",
+    "join_table_rules_barrier",
+    "prepare_deterministic_rule_index",
 ]

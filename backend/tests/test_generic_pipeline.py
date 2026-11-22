@@ -4,20 +4,20 @@ import pytest
 
 from app.ingestion.parsers.pdf_catalog import parse_document_catalog
 from app.infra.config import Settings, get_settings
-from app.generation.core.binding import bind_generators, bind_rules, bind_schema
-from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
-from app.infra.llm import LlmTimeoutError
-from app.policy.regops_plan import project
-from app.generation.workflow import (
-    _call_validated,
+from app.delivery.production_service import build_production_bundle
+from app.delivery.testing.sandbox_audit import GenericOracleExecutor
+from app.delivery.workflow import (
     _create_run,
-    _dedupe_approved_rules,
     approve_generic_rules,
     confirm_generic_test_results,
     retry_generic_run,
     start_generic_run,
 )
-from app.delivery.production_service import build_production_bundle
+from app.generation.core.binding import bind_generators, bind_rules, bind_schema
+from app.generation.sql.oracle import OracleAssetPreparer, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
+from app.generation.workflow import _call_validated, _dedupe_approved_rules
+from app.infra.llm import LlmTimeoutError
+from app.policy.regops_plan import project
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.generation.core.rules import RuleValidationError
 from app.infra.errors import WorkflowError
@@ -146,7 +146,7 @@ def test_generic_run_records_ai_tool_calls_before_human_gate(organization_spec, 
     def prepare(self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs):
         physical = {spec.table_code: f"STAGING_{attempt}" for spec in specs}
         return {"attempt": attempt, "physical_tables": physical, "target_tables": {code: f"TARGET_{attempt}" for code in physical}, "code_set_tables": {}, "code_set_versions": {}, "code_set_record_counts": {}, "empty_run": {"all_passed": True, "rule_count": len(rules or []), "statement_count": len(rules or [])}}
-    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(OracleAssetPreparer, "prepare_assets", prepare)
     run = start_generic_run(session, spec_id, Settings(oracle_sandbox_url=None, blob_dir=str(tmp_path)), FixtureDesignLlm())
     assert project(session, run).status == "WAITING_APPROVAL"
     events = session.query(EventModel).filter(EventModel.run_id == run.id).order_by(EventModel.seq).all()
@@ -247,7 +247,7 @@ def test_assets_precede_rule_approval_and_export_follows_test_confirmation(organ
             "cases": [],
         }
 
-    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(OracleAssetPreparer, "prepare_assets", prepare)
     monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
     settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
     budget = {"max_rules_per_table": 10, "max_cases_per_table": 20, "max_retries": 3, "max_llm_concurrency": 4}
@@ -534,7 +534,7 @@ def test_self_heal_goto_rule_binder_only_rebinds_failed_rules_not_full_table(org
             ],
         }
 
-    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(OracleAssetPreparer, "prepare_assets", prepare)
     monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
     settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
     budget = {"max_rules_per_table": 10, "max_cases_per_table": 20, "max_retries": 3, "max_llm_concurrency": 2}
@@ -637,7 +637,7 @@ def test_retry_generic_run_resumes_from_last_completed_checkpoint_when_no_audit_
             "cases": [],
         }
 
-    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(OracleAssetPreparer, "prepare_assets", prepare)
     monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
     settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
     llm = FlakyGeneratorLlm()

@@ -14,7 +14,7 @@ from app.api.v2 import generation as generation_v2
 from app.api.v2 import metadata as metadata_v2
 from app.api.v2 import settings as settings_v2
 from app.catalog.pipeline_run import recover_interrupted_ingestion_runs
-from app.generation.workflow import recover_interrupted_generic_runs
+from app.delivery.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
 from app.infra.db import init_db
 from app.infra.llm import close_http_client

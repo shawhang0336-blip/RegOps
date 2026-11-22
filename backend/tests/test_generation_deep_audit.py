@@ -11,6 +11,12 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from app.delivery.production import compile_production_rule_query
+from app.delivery.run_diff import diff_runs
+from app.delivery.testing.mutations import build_deterministic_mutations
+from app.delivery.testing.sandbox_audit import GenericOracleExecutor
+from app.delivery.testing.stage_audit import bind_table_audit_worker
+from app.delivery.testing.stage_data import bind_table_data_worker
+from app.delivery.workflow.entrypoints import retry_generic_run
 from app.generation.core.binding import (
     GeneratorBinding,
     SchemaBinding,
@@ -18,7 +24,6 @@ from app.generation.core.binding import (
     materialize_golden_record,
     violates_single_field_rule,
 )
-from app.generation.core.mutations import build_deterministic_mutations
 from app.generation.core.planning import derive_generation_plan, needs_semantic_rule_binding
 from app.generation.core.rule_backfill import (
     _backfill_fixed_value_rules,
@@ -26,7 +31,6 @@ from app.generation.core.rule_backfill import (
     _backfill_required_rules,
 )
 from app.generation.core.rules import posix_classes_to_python
-from app.generation.run_diff import diff_runs
 from app.generation.sql.code_set_sql import (
     code_set_value_rows,
     compile_code_set_mysql_ddl,
@@ -35,11 +39,8 @@ from app.generation.sql.code_set_sql import (
     stable_code_set_table,
 )
 from app.generation.sql.compiler import compile_where
-from app.generation.sql.oracle import GenericOracleExecutor, OracleSandbox, physical_table_name
-from app.generation.workflow.entrypoints import retry_generic_run
+from app.generation.sql.oracle import OracleSandbox, physical_table_name
 from app.generation.workflow.runtime import _emit, _upsert_rule
-from app.generation.workflow.stage_audit import bind_table_audit_worker
-from app.generation.workflow.stage_data import bind_table_data_worker
 from app.generation.workflow.stage_plan_schema import _plan_stage
 from app.generation.workflow.stage_rules import (
     _ensure_oracle_assets,

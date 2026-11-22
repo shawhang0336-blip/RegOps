@@ -17,7 +17,7 @@ from app.generation.sql.code_set_sql import (
 from app.generation.core.binding import SchemaBinding, _as_number, bind_rules, violates_single_field_rule
 from app.generation.core.planning import needs_semantic_rule_binding
 from app.generation.sql.compiler import compile_rule_query
-from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
+from app.generation.sql.oracle import OracleAssetPreparer, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
 from app.generation.core.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
 from app.generation.core.rules import RuleValidationError
 from app.generation.workflow.runtime import (
@@ -490,7 +490,7 @@ def _ensure_oracle_assets(
         field_code_sets,
         {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
     )
-    assets = GenericOracleExecutor(settings.oracle_sandbox_url).prepare_assets(
+    assets = OracleAssetPreparer(settings.oracle_sandbox_url).prepare_assets(
         run.id, attempt, specs, typed_schemas, code_sets=code_sets, rules=rules, code_set_bindings=code_set_bindings
     )
     blobs = LocalBlobStore(settings.blob_dir)

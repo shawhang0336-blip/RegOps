@@ -549,6 +549,8 @@ def find_golden_rule_violations(
 
 
 MAX_CASE_ID_LENGTH = 64
+# 沙箱宽表文本列物理上限（Oracle VARCHAR2(4000 CHAR) / 4000 字节保护上限）
+SANDBOX_TEXT_LIMIT = 4000
 
 
 def normalize_case_id(case_id: str, max_len: int = MAX_CASE_ID_LENGTH) -> str:

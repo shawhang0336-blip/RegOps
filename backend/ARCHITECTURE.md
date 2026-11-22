@@ -68,30 +68,35 @@ backend/app/
 │   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 kernel.run + BudgetGuard）
 │   └── version_diff.py          #    跨版本监管制度文档差异对比与影响面分级（返回增量受影响表清单）
 │
-├── generation/                      # 层 5（Step 2：前端 02「生成表结构、码表和规则」+ 03 沙箱测试）：规则装配、造数、SQL 编译与沙箱审计
-│   ├── core/                    #    ① 纯离线领域内核（AST 锁死：零 DB、零 LLM、零 SQL/Workflow 依赖）
-│   │   ├── rules.py             #      13 类监管算子确定性校验、Oracle 正则规范化与基础构造
-│   │   ├── rule_backfill.py     #      前置四类确定性规则派生（必填 / 列宽上限 / 固定值 / 已发布码表 ENUM）
-│   │   ├── binding.py           #      确定性 Schema 编译 + Rule / Generator / 黄金自洽门禁 / AuditCase 校验
-│   │   └── mutations.py         #      确定性审计变异引擎（黄金基线 + 12 类非正则算子反例构造 + 正则兜底）
-│   ├── sql/                     #    ② 数据库方言编译与沙箱执行（MySQL 8 / Oracle 23）
-│   │   ├── compiler.py          #      规则 → Oracle / MySQL 原生校验 SQL 编译器
-│   │   ├── code_set_sql.py      #      码表物理表命名与 Oracle DDL / MERGE / INSERT SQL 编译
-│   │   └── oracle.py            #      OracleSandbox 物理表管理 + GenericOracleExecutor（prepare_assets 空跑 + execute 实战审计）
-│   ├── workflow/                #    ③ 18 节点 BSP 编排流水线（含全部 6 个受控 AI 介入点）
-│   │   ├── runtime.py           #      _call_validated（委托 llm_guard）与 _fanout（委托 kernel.scheduler.execute_wave）
-│   │   ├── stage_plan_schema.py #      预算规划与确定性 Schema 编译
-│   │   ├── stage_rules.py       #      单表规则 BSP Worker、跨表外键汇聚、Oracle 资产空跑预建、去重与靶向自愈
-│   │   ├── stage_data.py        #      单表黄金造数 BSP Worker、跨表外键对齐与确定性规则回填
-│   │   ├── stage_audit.py       #      单表审计变异 BSP Worker 与用例屏障汇聚
-│   │   ├── stages.py            #      向后兼容聚合重导出门面
-│   │   ├── nodes.py             #      13 个 ProdAgent NodeBody（真 BSP Send 扇出/Join 增量续跑 + 三路确定性归因自愈）
-│   │   └── entrypoints.py       #      RegOps Run 生命周期唯一业务门面（基于 kernel.run 装配全量操作）
-│   └── run_diff.py              #    跨验证批次规则与编译后 SQL 差异对比引擎
+├── generation/                  # 层 5（Step 2，对应前端 02「生成表结构、码表和规则」）：DDL、码表 SQL、规则装配与 Oracle 空跑
+│   ├── core/                    #    ① 纯离线领域内核（AST 锁死：零 DB/LLM/Catalog/SQL/Workflow/Delivery 依赖）
+│   │   ├── rules.py             #      13 类监管算子确定性校验、Oracle/POSIX 正则规范化与基础构造
+│   │   ├── planning.py          #      确定性预算规划（零 LLM）与规则绑定语义分流闸门
+│   │   ├── rule_backfill.py     #      前置四类确定性规则派生与回填（尊重人工 REJECTED）
+│   │   └── binding.py           #      确定性 Schema 编译 + Rule / Generator / 黄金自洽门禁 / AuditCase 校验
+│   ├── sql/                     #    ② 数据库方言编译与空跑资产准备（MySQL 8 / Oracle 23）
+│   │   ├── compiler.py          #      规则 → Oracle / MySQL 8 原生校验 SQL 编译器（CHAR_LENGTH / REGEXP_LIKE 'c' / Decimal）
+│   │   ├── code_set_sql.py      #      ≤64 字符码表命名与 Oracle MERGE/INSERT ALL + MySQL 8 DDL/UPSERT 编译
+│   │   └── oracle.py            #      OracleSandbox 物理表管理 + OracleAssetPreparer（Step 2 建表+灌码值+规则空跑）
+│   └── workflow/                #    ③ Step 2 前半段 BSP 规则生成流水线
+│       ├── runtime.py           #      _call_validated、_map_with_context（透传取消令牌）、_fanout 与规则落库
+│       ├── stage_plan_schema.py #      确定性生成规划与确定性 Schema 编译
+│       ├── stage_rules.py       #      单表规则 BSP Worker（语义分流）、跨表外键汇聚、Oracle 空跑准备、去重与靶向自愈
+│       ├── stages.py            #      Step 2 阶段聚合重导出门面
+│       └── nodes_front.py       #      Step 2 前半段节点体（规划 → 表结构 → 规则扇出/汇聚 → Oracle 空跑 & 人工确权门）
 │
-├── delivery/                    # 层 6（Step 3：前端 03「测试与下载」）：生产校验 SQL 打包与业务库只读抽样探查
-│   ├── production.py            #    生产校验包结构定义与只读 SQL 组装
-│   ├── production_service.py    #    面向已确认 Run 的生产包打包服务
+├── delivery/                    # 层 6（Step 3，对应前端 03「测试与下载」）：造测试数据 → AB 规则沙箱测试 → 打包下载
+│   ├── testing/                 #    ① Step 3.1 造数 & Step 3.2 AB 沙箱真跑验证
+│   │   ├── mutations.py         #      确定性反例变异引擎（黄金正例 A 基线 + 11 类非正则算子反例 B + 正则兜底）
+│   │   ├── stage_data.py        #      单表黄金正例造数 BSP Worker（独立 NUM_RANGE/UNIQUE_KEY 纯程序求解）与外键对齐
+│   │   ├── stage_audit.py       #      单表变异反例 BSP Worker 与用例屏障汇聚
+│   │   ├── sandbox_audit.py     #      GenericOracleExecutor（继承 OracleAssetPreparer，执行 AB 沙箱真跑与多黄金校验）
+│   │   └── nodes_back.py        #      Step 3.1/3.2 后半段节点体（造数 → 变异 → AB 沙箱审计 + 三路自愈 → 测试确认门）
+│   ├── workflow/                #    ② 全流程调度入口（单向拼装 Layer 5 Step 2 + Layer 6 Step 3 节点体）
+│   │   └── entrypoints.py       #      RegOps Run 生命周期唯一业务门面（创建/确权/测试确认/三路重试/重审/取消/删除/回放）
+│   ├── run_diff.py              #    跨验证批次规则与生产 SQL（含码表 NOT EXISTS）差异对比引擎
+│   ├── production.py            #    Step 3.3 生产 DDL / 只读 SQL 编译与参数内联
+│   ├── production_service.py    #    Step 3.3 生产部署 ZIP 包打包与完整性门禁
 │   └── business_db.py           #    业务库只读抽样探查连接器
 │
 └── api/                         # 层 7：HTTP 接口层（v1 与 v2 统一收口）

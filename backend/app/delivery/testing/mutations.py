@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.generation.core.binding import (
+    SANDBOX_TEXT_LIMIT,
     _as_number,
     violates_arithmetic_balance,
     violates_cond_value,
@@ -20,9 +21,6 @@ from app.generation.core.binding import (
     violates_single_field_rule,
 )
 from app.infra.contracts import AuditCaseBinding, FieldSpec, RuleDefinition, SpecDocument, field_map
-
-# 沙箱宽表文本列物理上限（Oracle VARCHAR2(4000 CHAR) / 4000 字节保护上限）
-SANDBOX_TEXT_LIMIT = 4000
 
 
 def make_distinct_key_value(value: Any, field: Optional[FieldSpec], offset: int) -> Any:

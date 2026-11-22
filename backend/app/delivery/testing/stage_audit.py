@@ -4,12 +4,13 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.catalog.code_sets.bindings import load_published_code_sets
-from app.generation.core.binding import bind_audit_cases, normalize_case_id
-from app.generation.core.mutations import (
+from app.delivery.testing.mutations import (
     build_deterministic_mutations,
     build_golden_audit_case,
     build_regexp_fallback_mutation,
 )
+from app.delivery.testing.stage_data import _next_asset_version
+from app.generation.core.binding import bind_audit_cases, normalize_case_id
 from app.generation.core.rules import RuleValidationError
 from app.generation.workflow.runtime import (
     _call_validated,
@@ -19,7 +20,6 @@ from app.generation.workflow.runtime import (
     _inner_width,
     _map_with_context,
 )
-from app.generation.workflow.stage_data import _next_asset_version
 from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import AuditCaseDefinitionModel
 from app.infra.blob_store import LocalBlobStore

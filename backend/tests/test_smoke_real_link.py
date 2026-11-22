@@ -24,7 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from app.policy.regops_plan import project
 from app.infra.config import Settings
 from app.infra.db import Base
-from app.generation.workflow import approve_generic_rules, confirm_generic_test_results, start_generic_run
+from app.delivery.workflow import approve_generic_rules, confirm_generic_test_results, start_generic_run
 from app.infra.db_tables import RuleModel, SpecificationModel
 
 pytestmark = pytest.mark.smoke

@@ -5,7 +5,7 @@ from typing import Dict, Iterable, List, Optional
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.generation.workflow import submit_generic_run
+from app.delivery.workflow import submit_generic_run
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.config import OPERATOR_PLACEHOLDER
@@ -19,7 +19,7 @@ def spawn_run_driver(
     generation_budget=None,
     allowed_statuses: Iterable[str] = ("RUNNING", "READY_TO_AUDIT"),
 ) -> bool:
-    """兼容薄壳：统一委托至 `engine.workflow.submit_generic_run`（底层基于 `kernel.run.submit_run`）。"""
+    """兼容薄壳：统一委托至 `delivery.workflow.submit_generic_run`（底层基于 `kernel.run.submit_run`）。"""
     return submit_generic_run(
         run_id,
         settings=settings if settings is not None else get_settings(),

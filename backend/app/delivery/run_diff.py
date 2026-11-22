@@ -1,4 +1,4 @@
-"""验证批次跨版本规则与 Oracle SQL 差异对比引擎（Layer 5: generation）。
+"""验证批次跨版本规则与 Oracle SQL 差异对比引擎（Layer 6: delivery）。
 
 支持任选两个历史验证批次（base_run_id vs target_run_id），逐条对比：
 - 新增规则（ADDED）、移除规则（REMOVED）、参数/状态/来源变更规则（MODIFIED）、未变更规则（UNCHANGED）；

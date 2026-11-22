@@ -1,8 +1,9 @@
-"""Step 2：规则生成与沙箱验证（Layer 5: Generation，对应前端「02 生成表结构、码表和规则」+「03 沙箱测试」）。
+"""Step 2：表结构、码表 SQL 与校验规则生成层（Layer 5: Generation，对应前端 02 /generation）。
 
-三大正交子包 + 跨批次差异对比：
-- `core/`：纯离线规则校验、确定性派生、绑定与反例变异内核（AST 锁死零 DB/LLM/SQL/Workflow 依赖）；
-- `sql/`：MySQL 8 / Oracle 23 校验 SQL 编译器、码表 DDL/UPSERT 编译与 Oracle 沙箱空跑/实战执行器；
-- `workflow/`：18 节点 BSP 编排流水线与 Run 生命周期唯一业务门面（含全部 6 个受控 AI 介入点）；
-- `run_diff.py`：跨验证批次规则与 SQL 差异对比引擎。
+三大正交子包：
+- `core/`：纯离线领域核（`rules.py` 规则校验 / `binding.py` 契约绑定与预判 / `planning.py` 确定性规划与语义闸门 / `rule_backfill.py` 四类机械规则派生）；
+- `sql/`：数据库方言编译与 Oracle 空跑准备（`compiler.py` / `code_set_sql.py` / `oracle.py`）；
+- `workflow/`：Step 2 前半段 BSP 规则生成节点与运行时（`runtime.py` / `stage_plan_schema.py` / `stage_rules.py` / `nodes_front.py`）。
+
+注：Step 3 的测试数据生成、AB 沙箱真跑验证、全流程调度入口与生产包导出全部收归 Layer 6 `delivery/`。
 """

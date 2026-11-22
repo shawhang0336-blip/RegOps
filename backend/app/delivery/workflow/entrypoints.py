@@ -1,10 +1,10 @@
-"""阶段二工作流与 RegOps Run 生命周期唯一业务入口（Workflow Entrypoints）。
+"""Step 3 全流程调度与 RegOps Run 生命周期唯一业务入口（Layer 6: delivery/workflow）。
 
-基于 Layer 1 微内核 `app.kernel.run`（机制在内），装配 RegOps 专属业务策略（策略在外）：
+基于 Layer 1 微内核 `app.kernel.run`（机制在内），单向拼装 Layer 5 Step 2（`nodes_front`）与 Layer 6 Step 3（`nodes_back`）：
 - `_create_run` / `start_generic_run` / `submit_generic_run`：统一创建与后台推进（带取消令牌与防重入）；
-- `drive` / `continue_generic_run`：组装 `RunContext` 与前后段节点体，交由唯一 `Scheduler` 推进；
+- `drive` / `continue_generic_run`：组装 `RunContext` 与 Step 2/3 节点体，交由唯一 `Scheduler` 推进；
 - `approve_generic_rules` / `confirm_generic_test_results`：基于 `kernel.run.answer_interrupt` 的幂等人工门；
-- `retry_generic_run` / `reaudit_generic_run`：断点续跑、自愈重绑与人工改参轻量重审；
+- `retry_generic_run` / `reaudit_generic_run`：断点续跑、三路自愈重绑与人工改参轻量重审；
 - `cancel_generic_run` / `recover_interrupted_generic_runs` / `active_generic_runs`：运行时取消与重启恢复；
 - `delete_generic_run` / `history_cleanup_plan` / `cleanup_history_runs` / `replay_generic_run`：
   带 6 表 + BlobStore + OracleSandbox 清理钩子的统一删除、历史整理与哈希链回放。
@@ -18,8 +18,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.delivery.testing.nodes_back import _back_bodies, _is_mechanically_derived_rule
 from app.generation.sql.oracle import OracleSandbox
-from app.generation.workflow.nodes import _back_bodies, _front_bodies, _is_mechanically_derived_rule
+from app.generation.workflow.nodes_front import _front_bodies
 from app.generation.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
 from app.infra.db_tables import (
     ApprovalModel,

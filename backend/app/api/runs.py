@@ -17,9 +17,9 @@ from app.api.deps import (
     run_view,
     spawn_run_driver,
 )
-from app.generation.sql.oracle import OracleSandbox
-from app.generation.run_diff import diff_runs
-from app.generation.workflow import (
+from app.delivery.run_diff import diff_runs
+from app.delivery.workflow import (
+    _regops_delete_pre_hook,
     active_generic_runs,
     approve_generic_rules,
     cancel_generic_run,
@@ -32,7 +32,7 @@ from app.generation.workflow import (
     retry_generic_run,
     start_generic_run,
 )
-from app.generation.workflow.entrypoints import _regops_delete_pre_hook
+from app.generation.sql.oracle import OracleSandbox
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
 from app.infra.errors import WorkflowError

@@ -13,17 +13,19 @@ from app.generation.core.binding import (
     violates_field_compare,
     violates_single_field_rule,
 )
-from app.generation.sql.compiler import compile_rule_query
-from app.generation.core.mutations import (
+from app.delivery.testing.mutations import (
     build_deterministic_mutations,
     build_golden_audit_case,
     build_regexp_fallback_mutation,
 )
-from app.generation.sql.oracle import GenericOracleExecutor
+from app.delivery.testing.sandbox_audit import GenericOracleExecutor
+from app.delivery.testing.stage_audit import _audit_stage
+from app.delivery.testing.stage_data import _data_stage
+from app.delivery.workflow import start_generic_run
+from app.generation.sql.compiler import compile_rule_query
+from app.generation.sql.oracle import OracleAssetPreparer
 from app.generation.core.rule_backfill import _code_set_enum_backfill_candidates
 from app.generation.core.rules import RuleValidationError
-from app.generation.workflow import start_generic_run
-from app.generation.workflow.stages import _audit_stage, _data_stage
 from app.infra.db_tables import CodeSetValidationModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument
@@ -406,7 +408,7 @@ def test_dual_path_self_heal_routes_golden_false_positive_to_data_generator_with
             ],
         }
 
-    monkeypatch.setattr(GenericOracleExecutor, "prepare_assets", prepare)
+    monkeypatch.setattr(OracleAssetPreparer, "prepare_assets", prepare)
     monkeypatch.setattr(GenericOracleExecutor, "execute", execute)
     settings = Settings(blob_dir=str(tmp_path), oracle_sandbox_url="sqlite://")
 
@@ -886,7 +888,7 @@ def test_delete_run_rows_collects_oracle_tables_from_failed_and_multi_attempt_ev
 
 def test_partition_coupled_chunks_keeps_distant_field_compare_cluster_together():
     """回归：相隔超过 12 个字段的 FIELD_COMPARE 关联字段（如 TXCCY 与 INCHARGECCY/OUTCHARGECCY）必须在同一批联合造数。"""
-    from app.generation.workflow.stages import _partition_coupled_chunks
+    from app.delivery.testing.stage_data import _partition_coupled_chunks
 
     fields = [
         FieldSpec(name=f"F_{i:02d}", content=f"字段{i}", data_type="VARCHAR", length=8, check_text="必填", evidence_page="1")
@@ -1148,7 +1150,7 @@ def test_audit_binding_rejects_empty_string_and_canonical_number_noops_for_oracl
 
 def test_regops_centralized_run_cancel_resume_recover_and_active_guard(tmp_path):
     """回归：P0 收口后，RegOps 的取消、断点续跑、启动恢复、活跃删除守卫全部经由 kernel.run 统一驱动。"""
-    from app.generation.workflow import (
+    from app.delivery.workflow import (
         _create_run,
         cancel_generic_run,
         delete_generic_run,
@@ -1262,13 +1264,13 @@ def test_regops_budget_guard_tracks_usage_and_trips_on_exceeded_limit():
 
 def test_bsp_send_partial_wave_checkpoint_and_per_table_incremental_resume(monkeypatch, tmp_path):
     """P3 回归：多表真 BSP Send 波次中表 1 成功、表 2 失败时，表 1 检查点先落 EventLog；断点续跑时表 1 零重跑，仅补跑表 2。"""
-    from app.generation.sql.oracle import GenericOracleExecutor
-    from app.generation.workflow import drive, retry_generic_run, start_generic_run
+    from app.delivery.workflow import drive, retry_generic_run, start_generic_run
+    from app.generation.sql.oracle import OracleAssetPreparer
     from app.infra.db_tables import EventModel, SpecificationModel
     from app.policy.regops_plan import project
 
     monkeypatch.setattr(
-        GenericOracleExecutor,
+        OracleAssetPreparer,
         "prepare_assets",
         lambda self, run_id, attempt, specs, schemas, code_sets=None, rules=None, **kwargs: {
             "attempt": attempt,
