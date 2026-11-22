@@ -154,9 +154,12 @@ def _latest_run_ids_by_table(session: Session) -> Dict[str, str]:
 
 
 @router.get("/rules")
-def all_table_rules(session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """所有已生成表的规则总览：按表分组（排除 MERGED 与历史旧版本），批量查询避免 N+1。"""
-    tables = latest_table_rows(session)
+def all_table_rules(
+    document_id: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    """所有已生成表的规则总览：按表分组（排除 DELETED 文档、MERGED 与历史旧版本），批量查询避免 N+1。"""
+    tables = latest_table_rows(session, document_id=document_id)
     latest = _latest_run_ids_by_table(session)
     table_codes_with_runs = {table.table_code for table in tables if table.table_code in latest}
     run_ids = {latest[code] for code in table_codes_with_runs}
@@ -200,6 +203,7 @@ def all_table_rules(session: Session = Depends(db_session)) -> Dict[str, Any]:
             {
                 "table": {
                     "id": table.id,
+                    "document_id": table.document_id,
                     "table_code": table.table_code,
                     "table_name": table.table_name,
                     "status": table.status,
@@ -221,8 +225,11 @@ def all_table_rules(session: Session = Depends(db_session)) -> Dict[str, Any]:
 
 
 @router.get("")
-def artifacts_status(session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """每张表最近一次生成的状态（排除 MERGED 碎片表与旧版本，批量折叠状态防 N+1）。"""
+def artifacts_status(
+    document_id: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    """每张表最近一次生成的状态（排除 DELETED 文档、MERGED 碎片表与旧版本，批量折叠状态防 N+1）。"""
     latest = _latest_run_ids_by_table(session)
     count_rows = (
         session.query(RuleModel.run_id, RuleModel.table_code, func.count())
@@ -233,7 +240,7 @@ def artifacts_status(session: Session = Depends(db_session)) -> Dict[str, Any]:
     rule_counts: Dict[str, Dict[str, int]] = {}
     for run_id, table_code, count in count_rows:
         rule_counts.setdefault(run_id, {})[table_code] = count
-    tables = latest_table_rows(session)
+    tables = latest_table_rows(session, document_id=document_id)
     run_ids = {latest[table.table_code] for table in tables if table.table_code in latest}
     runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
     run_states = project_many(session, runs.values()) if runs else {}

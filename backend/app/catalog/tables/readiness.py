@@ -25,6 +25,7 @@ required 本来就该是 false，条件写在规则里。同理，从校验原�
 import re
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.infra.db_tables import (
@@ -32,6 +33,8 @@ from app.infra.db_tables import (
     CodeValueModel,
     FieldCodeReferenceModel,
     FieldMetadataModel,
+    RawBlockModel,
+    SourceDocumentModel,
     TableMetadataModel,
 )
 
@@ -349,14 +352,25 @@ def latest_table_rows(
     session: Session,
     document_id: Optional[str] = None,
     status: Optional[str] = None,
+    *,
+    include_deleted_docs: bool = False,
 ) -> List[TableMetadataModel]:
-    """每张表只留最新版本行。
+    """每张表只留最新版本行，且默认排除已软删（DELETED）文档及已失效（superseded）块的孤儿表。
 
     同一个表重新提取会追加一条新版本行，旧行保留用于追溯。列表接口一直是这么去重的，
-    但就绪度这边没有，于是出现「汇总 151 张、列表 150 张」——差的就是 SAFE_6_9_2
-    的两个版本行。统计口径和列表必须看到同一批数据，否则用户会以为系统在瞎报。
+    就绪度、规则工作台与版本页必须看到同一批有效资产，否则已删文档的历史脏数据会穿透到第二步。
     """
     query = session.query(TableMetadataModel)
+    if not include_deleted_docs:
+        query = query.outerjoin(
+            SourceDocumentModel,
+            TableMetadataModel.document_id == SourceDocumentModel.id,
+        ).filter(
+            or_(
+                SourceDocumentModel.id.is_(None),
+                SourceDocumentModel.status != "DELETED",
+            )
+        )
     if status:
         query = query.filter(TableMetadataModel.status == status)
     else:
@@ -366,6 +380,18 @@ def latest_table_rows(
     rows = query.order_by(
         TableMetadataModel.source_ordinal.asc(), TableMetadataModel.table_code.asc()
     ).all()
+    if rows:
+        block_ids = list({row.block_id for row in rows if row.block_id})
+        if block_ids:
+            superseded_block_ids = {
+                block_id
+                for block_id, content_json in session.query(RawBlockModel.id, RawBlockModel.content_json)
+                .filter(RawBlockModel.id.in_(block_ids))
+                .all()
+                if isinstance(content_json, dict) and content_json.get("superseded")
+            }
+            if superseded_block_ids:
+                rows = [row for row in rows if row.block_id not in superseded_block_ids]
     latest: Dict[tuple, TableMetadataModel] = {}
     for row in rows:
         key = (row.document_id, row.table_code)

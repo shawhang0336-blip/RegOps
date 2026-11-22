@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,7 @@ from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     RawBlockModel,
+    SourceDocumentModel,
     TableMetadataModel,
 )
 from app.infra.config import get_settings
@@ -241,7 +242,12 @@ def unresolved_references(
         session.query(FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel)
         .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
         .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
-        .filter(FieldCodeReferenceModel.status == "UNRESOLVED")
+        .outerjoin(SourceDocumentModel, TableMetadataModel.document_id == SourceDocumentModel.id)
+        .filter(
+            FieldCodeReferenceModel.status == "UNRESOLVED",
+            TableMetadataModel.status != "MERGED",
+            or_(SourceDocumentModel.id.is_(None), SourceDocumentModel.status != "DELETED"),
+        )
     )
     if document_id:
         query = query.filter(TableMetadataModel.document_id == document_id)

@@ -920,3 +920,48 @@ def test_runs_oracle_preview_unconfigured_422_and_clean_messages(monkeypatch):
 
     cors_mw = next(mw for mw in fastapi_app.user_middleware if mw.cls.__name__ == "CORSMiddleware")
     assert all(origin.strip() for origin in cors_mw.kwargs["allow_origins"])
+
+
+def test_deleted_document_and_superseded_block_tables_excluded_from_artifacts_and_readiness():
+    """已软删（DELETED）文档和 superseded 块的脏表不得泄漏进第二步 /artifacts、/rules 与未决码值引用。"""
+    session = make_session()
+    active_doc, _, active_tbl = _seed_doc_block_table(session, table_code="T_LIVE_DOC", status="PUBLISHED", ordinal=1)
+    del_doc, _, del_tbl = _seed_doc_block_table(session, table_code="T_DELETED_DIRTY", status="PUBLISHED", ordinal=2)
+    del_doc.status = "DELETED"
+
+    sup_blk = RawBlockModel(
+        id=str(uuid.uuid4()),
+        document_id=active_doc.id,
+        ordinal=9,
+        block_type="XLSX_SHEET",
+        raw_content="",
+        source_locator={},
+        content_json={"superseded": True},
+        raw_hash=uuid.uuid4().hex,
+    )
+    session.add(sup_blk)
+    session.flush()
+    sup_tbl = TableMetadataModel(
+        id=str(uuid.uuid4()),
+        document_id=active_doc.id,
+        block_id=sup_blk.id,
+        table_code="T_SUP_ORPHAN",
+        table_name="失效块孤儿表",
+        table_definition="",
+        status="DRAFT",
+        current_version=1,
+        source_ordinal=9,
+    )
+    session.add(sup_tbl)
+    session.commit()
+
+    all_art = artifacts_api.artifacts_status(session=session)
+    codes = [t["table_code"] for t in all_art["tables"]]
+    assert codes == ["T_LIVE_DOC"]
+
+    scoped_art = artifacts_api.artifacts_status(document_id=active_doc.id, session=session)
+    assert [t["table_code"] for t in scoped_art["tables"]] == ["T_LIVE_DOC"]
+
+    empty_art = artifacts_api.artifacts_status(document_id=del_doc.id, session=session)
+    assert empty_art["tables"] == []
+

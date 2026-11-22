@@ -528,7 +528,18 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
         {showTypeImport ? '收起批量导入' : '批量导入类型修正'}
       </button>
       <button type="button" className="button secondary" onClick={() => setShowAdd(!showAdd)}>{showAdd ? '收起新增面板' : '+ 新增字段'}</button>
-      <button type="button" className="button secondary" onClick={() => navigate(`/generation?table=${detail.id}`)}>在第二步查看</button>
+      <button
+        type="button"
+        className="button secondary"
+        onClick={() => {
+          const qs = new URLSearchParams({ table: detail.id })
+          const docId = params.get('document_id') || detail.document_id
+          if (docId) qs.set('document_id', docId)
+          navigate(`/generation?${qs.toString()}`)
+        }}
+      >
+        在第二步查看
+      </button>
     </>
   )
 

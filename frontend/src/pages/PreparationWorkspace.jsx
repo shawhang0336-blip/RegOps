@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { v2 } from '../api.js'
+import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
 import PageHeader from './PageHeader.jsx'
 import DocumentsPage from './DocumentsPage.jsx'
 import MetadataPage from './MetadataPage.jsx'
@@ -19,12 +20,16 @@ export default function PreparationWorkspace() {
   useEffect(() => {
     let cancelled = false
     v2('/documents').then((list) => {
-      if (!cancelled && !documentId && list[0]) changeDocument(list[0].id)
+      if (cancelled || documentId) return
+      const saved = getSavedDocumentId()
+      const preferred = (saved && list.find((doc) => doc.id === saved)?.id) || list[0]?.id
+      if (preferred) changeDocument(preferred)
     }).catch(() => {})
     return () => { cancelled = true }
   }, [documentId])
 
   useEffect(() => {
+    if (documentId) setSavedDocumentId(documentId)
     setReadiness(null)
     setCodeSummary(null)
   }, [documentId])
@@ -40,6 +45,7 @@ export default function PreparationWorkspace() {
   }, [documentId, view, readiness])
 
   function changeDocument(nextDocumentId) {
+    setSavedDocumentId(nextDocumentId || '')
     const next = new URLSearchParams(params)
     if (nextDocumentId) next.set('document_id', nextDocumentId)
     else next.delete('document_id')
@@ -120,7 +126,11 @@ export default function PreparationWorkspace() {
                   : `全部 ${readyCount} 张报表都已就绪，可以进入第二步选表生成。`
                 : '正在评估报表和码表，请稍候；也可以先查看已识别的内容。'}
             </p>
-            <button type="button" className="button primary preparation-next" onClick={() => navigate('/generation')}>
+            <button
+              type="button"
+              className="button primary preparation-next"
+              onClick={() => navigate(documentId ? `/generation?document_id=${encodeURIComponent(documentId)}` : '/generation')}
+            >
               进入第二步
             </button>
           </div>

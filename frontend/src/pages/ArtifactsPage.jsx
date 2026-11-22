@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, v2 } from '../api.js'
 import { useEventStream } from '../hooks/useEventStream.js'
+import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
 import { StatusBadge, formatTime } from './SharedUI.jsx'
@@ -18,8 +19,9 @@ import { AllRulesView, RulesView } from './artifacts/RulesViews.jsx'
 
 export default function ArtifactsPage() {
   const navigate = useNavigate()
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
   const linkedTableId = params.get('table')
+  const urlDocParam = params.get('document_id') || ''
 
   const [tables, setTables] = useState([])
   const [readinessById, setReadinessById] = useState({})
@@ -41,11 +43,23 @@ export default function ArtifactsPage() {
   const [reauditBusy, setReauditBusy] = useState(false)
   const [statusFilter, setStatusFilter] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
-  const [docFilter, setDocFilter] = useState('all')
+  const [docFilter, setDocFilter] = useState(() => urlDocParam || getSavedDocumentId() || 'all')
   const [search, setSearch] = useState('')
   const requestRef = useRef(0)
   const tableWrapRef = useRef(null)
   const listScrollRef = useRef(0)
+
+  function handleDocFilterChange(nextDocId) {
+    setDocFilter(nextDocId)
+    setSelected([])
+    if (nextDocId && nextDocId !== 'all') {
+      setSavedDocumentId(nextDocId)
+    }
+    const next = new URLSearchParams(params)
+    if (nextDocId && nextDocId !== 'all') next.set('document_id', nextDocId)
+    else next.set('document_id', 'all')
+    setParams(next, { replace: true })
+  }
 
   async function load(preferredId) {
     const [data, readinessPayload, rulesOverview] = await Promise.all([
@@ -53,13 +67,37 @@ export default function ArtifactsPage() {
       v2('/metadata/readiness').catch(() => null),
       v2('/artifacts/rules').catch(() => null),
     ])
-    setTables(data.tables || [])
+    const allTables = data.tables || []
+    setTables(allTables)
     if (rulesOverview) setOverview(rulesOverview)
     const map = Object.fromEntries(
       (readinessPayload?.tables || []).map((item) => [item.table_id, item])
     )
     setReadinessById(map)
-    const target = preferredId || linkedTableId || currentId || data.tables.find((item) => item.generated && item.rule_count > 0)?.id
+
+    // 与第一步当前选中文档打通：优先 URL document_id → 指定 table 所属文档 → 第一步记住的文档 → 第一份有效文档
+    const availableDocIds = Array.from(new Set(allTables.map((item) => item.document_id).filter(Boolean)))
+    const linkedDocId = linkedTableId ? allTables.find((item) => item.id === linkedTableId)?.document_id : ''
+    let resolvedDoc = docFilter
+    if (urlDocParam === 'all') {
+      resolvedDoc = 'all'
+    } else if (urlDocParam && availableDocIds.includes(urlDocParam)) {
+      resolvedDoc = urlDocParam
+    } else if (linkedDocId && availableDocIds.includes(linkedDocId)) {
+      resolvedDoc = linkedDocId
+    } else if (resolvedDoc !== 'all' && !availableDocIds.includes(resolvedDoc)) {
+      resolvedDoc = availableDocIds[0] || 'all'
+    } else if (resolvedDoc === 'all' && !urlDocParam && availableDocIds.length > 0) {
+      const saved = getSavedDocumentId()
+      resolvedDoc = (saved && availableDocIds.includes(saved)) ? saved : availableDocIds[0]
+    }
+    if (resolvedDoc !== docFilter) setDocFilter(resolvedDoc)
+    if (resolvedDoc && resolvedDoc !== 'all') setSavedDocumentId(resolvedDoc)
+
+    const scopedTables = resolvedDoc === 'all'
+      ? allTables
+      : allTables.filter((item) => item.document_id === resolvedDoc)
+    const target = preferredId || linkedTableId || currentId || scopedTables.find((item) => item.generated && item.rule_count > 0)?.id
     if (target) await select(target)
   }
 
@@ -124,6 +162,16 @@ export default function ArtifactsPage() {
   useEffect(() => {
     load().catch((err) => setError(err.message)).finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    if (!urlDocParam || !tables.length) return
+    if (urlDocParam === 'all') {
+      if (docFilter !== 'all') setDocFilter('all')
+    } else if (tables.some((row) => row.document_id === urlDocParam) && docFilter !== urlDocParam) {
+      setDocFilter(urlDocParam)
+      setSavedDocumentId(urlDocParam)
+    }
+  }, [urlDocParam, tables])
 
   const runStatus = detail?.run?.status
   const runActive = Boolean(runStatus && ACTIVE_RUN_STATUSES.includes(runStatus))
@@ -195,14 +243,31 @@ export default function ArtifactsPage() {
     return hard[0]?.message || ''
   }
 
+  const scopedTables = useMemo(() => {
+    if (docFilter === 'all') return tables
+    return tables.filter((row) => row.document_id === docFilter)
+  }, [tables, docFilter])
+
+  const scopedOverview = useMemo(() => {
+    if (!overview) return null
+    if (docFilter === 'all') return overview
+    const allowedIds = new Set(scopedTables.map((row) => row.id))
+    return {
+      ...overview,
+      tables: (overview.tables || []).filter(
+        (group) => group.table?.document_id === docFilter || allowedIds.has(group.table?.id),
+      ),
+    }
+  }, [overview, docFilter, scopedTables])
+
   const selectableCount = useMemo(() => {
-    const ok = tables.filter((row) => selectable(row.id) === true).length
-    const bad = tables.filter((row) => selectable(row.id) === false).length
-    return { ok, bad, pending: tables.length - ok - bad }
-  }, [tables, readinessById])
+    const ok = scopedTables.filter((row) => selectable(row.id) === true).length
+    const bad = scopedTables.filter((row) => selectable(row.id) === false).length
+    return { ok, bad, pending: scopedTables.length - ok - bad }
+  }, [scopedTables, readinessById])
 
   const filteredTables = useMemo(() => {
-    return tables.filter((row) => {
+    return scopedTables.filter((row) => {
       const available = selectable(row.id)
       if (readinessFilter === 'selectable' && available !== true) return false
       if (readinessFilter === 'blocked' && available !== false) return false
@@ -211,12 +276,11 @@ export default function ArtifactsPage() {
       if (statusFilter === 'running' && !(row.generated && !['COMPLETED', 'FAILED'].includes(row.run_status))) return false
       if (statusFilter === 'verified' && !(row.run_status === 'COMPLETED' && row.all_passed)) return false
       if (statusFilter === 'failed' && row.run_status !== 'FAILED') return false
-      if (docFilter !== 'all' && row.document_id !== docFilter) return false
       const q = search.trim().toLowerCase()
       if (q && !String(row.table_name || '').toLowerCase().includes(q) && !String(row.table_code || '').toLowerCase().includes(q)) return false
       return true
     })
-  }, [tables, statusFilter, readinessFilter, docFilter, search, readinessById])
+  }, [scopedTables, statusFilter, readinessFilter, search, readinessById])
 
   function toggle(id) {
     if (selected.includes(id)) {
@@ -342,7 +406,7 @@ export default function ArtifactsPage() {
           className={workspaceTab === 'list' ? 'active' : ''}
           onClick={() => setWorkspaceTab('list')}
         >
-          报表清单 <span>{tables.length}</span>
+          报表清单 <span>{scopedTables.length}</span>
         </button>
         <button
           type="button"
@@ -351,7 +415,7 @@ export default function ArtifactsPage() {
           className={workspaceTab === 'rules' ? 'active' : ''}
           onClick={() => { setFocusMode(false); setWorkspaceTab('rules') }}
         >
-          校验规则 {overview ? <span>{overview.tables.length} 张表</span> : currentRow ? <span>{currentRow.table_code}</span> : <span>未选表</span>}
+          校验规则 {scopedOverview ? <span>{scopedOverview.tables.length} 张表</span> : currentRow ? <span>{currentRow.table_code}</span> : <span>未选表</span>}
         </button>
       </nav>
 
@@ -383,10 +447,10 @@ export default function ArtifactsPage() {
             <select aria-label="生成状态" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
               {GENERATION_FILTERS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
             </select>
-            {documents.length > 1 && (
-              <select aria-label="来源文件" value={docFilter} onChange={(e) => setDocFilter(e.target.value)}>
-                <option value="all">全部文件</option>
+            {documents.length > 0 && (
+              <select aria-label="来源文件" value={docFilter} onChange={(e) => handleDocFilterChange(e.target.value)}>
                 {documents.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+                {documents.length > 1 && <option value="all">全部有效文件（{tables.length} 张）</option>}
               </select>
             )}
           </div>
@@ -494,7 +558,7 @@ export default function ArtifactsPage() {
         <section className={`panel rule-workbench-panel tab-panel-stage ${focusMode && detailLoading && detail ? 'panel-transitioning' : ''}`} role="tabpanel">
           {!focusMode ? (
             <AllRulesView
-              overview={overview}
+              overview={scopedOverview}
               loading={loading && !overview}
               refreshedAt={refreshedAt}
               refreshing={refreshing}
