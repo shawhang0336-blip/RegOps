@@ -53,7 +53,7 @@ from app.assets.metadata_views import (
     type_basis_for,
 )
 from app.infra.llm import RealDesignLlm
-from app.policy.llm_guard import call_llm_validated
+from app.infra.llm_guard import call_llm_validated
 from app.infra.asset_models import (
     FieldCodeReferenceModel,
     FieldMetadataModel,

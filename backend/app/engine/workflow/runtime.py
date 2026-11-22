@@ -21,16 +21,18 @@ from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
 from app.kernel.run import BudgetExceededError
 from app.kernel.scheduler import execute_wave
-from app.policy.llm_guard import (
+from app.infra.llm_guard import (
     DEFAULT_BACKOFF_SECONDS as _BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_ATTEMPTS as _TRANSIENT_ATTEMPTS,
     DEFAULT_VALIDATION_ATTEMPTS as _VALIDATION_ATTEMPTS,
     ERROR_SUGGESTIONS,
     STAGE_BY_TOOL,
-    _fail_context,
-    _locate_payload,
     call_llm_validated,
+    current_llm_bus,
+    fail_context as _fail_context,
+    locate_payload as _locate_payload,
 )
+from app.policy.regops_bus import default_bus
 
 
 def _upsert_rule(session: Session, run: RunModel, rule: RuleDefinition, status: str) -> None:
@@ -128,7 +130,8 @@ def _emit(
 
 
 def _call_validated(llm, tool_name, instruction, payload, validator, timeout=None, backoff=None, bus=None):
-    """兼容入口：委托给策略层统一的 call_llm_validated（退避重试 + Bus 门禁 + 校验回喂）。"""
+    """兼容入口：委托给底座统一的 call_llm_validated，默认装配 RegOps 门禁总线。"""
+    active_bus = bus if bus is not None else (current_llm_bus() or default_bus())
     return call_llm_validated(
         llm,
         tool_name,
@@ -137,7 +140,7 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
         validator,
         timeout=timeout,
         backoff=backoff,
-        bus=bus,
+        bus=active_bus,
         transient_attempts=_TRANSIENT_ATTEMPTS,
         validation_attempts=_VALIDATION_ATTEMPTS,
     )

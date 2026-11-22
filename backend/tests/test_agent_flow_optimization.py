@@ -30,7 +30,7 @@ from app.infra.domain import Evidence, FieldSpec, RuleDefinition, SpecDocument
 from app.infra.llm import _tool_prompt_preamble
 from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
 from app.ingestion.structure_service import analyze_document_structure
-from app.policy.llm_guard import call_llm_validated
+from app.infra.llm_guard import call_llm_validated
 from app.policy.regops_bus import code_set_values_adjudicator, cross_table_adjudicator
 from app.policy.regops_plan import DEFAULT_PLAN, project, self_heal_cases_target, self_heal_data_target
 from .helpers import make_session

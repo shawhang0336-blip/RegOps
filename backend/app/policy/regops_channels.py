@@ -1,11 +1,13 @@
-"""RegOps 数据通道（Channel）规格、大对象表载荷解析与断点折叠恢复策略（策略层）。
+"""RegOps 数据通道（Channel）规格、大对象表载荷解析与断点折叠恢复策略（策略层 Layer 2）。
 
 定义 24 个命名数据通道（含多表汇聚与单表增量检查点通道），
-并提供从 EventLog + LocalBlobStore 无损恢复全部 Channel 的 `resolve_event_tables` / `recover_channels` / `build_context`。
+并提供从 EventLog + LocalBlobStore 单次查询无损恢复状态与全部 Channel 的
+`resolve_event_tables` / `recover_channels` / `build_context`。
 """
 
 import json
-from typing import Any, Dict, Optional
+import logging
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -23,7 +25,9 @@ from app.kernel.run import (
     merge_dict,
 )
 from .regops_bus import default_bus
-from .regops_plan import project
+from .regops_plan import fold, project
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_event_tables(
@@ -42,9 +46,10 @@ def resolve_event_tables(
             loaded = json.loads(blob_store.get(blob_uri).decode("utf-8"))
             if isinstance(loaded, dict):
                 return loaded
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取事件 tables_blob 失败（uri=%s）: %s", blob_uri, exc)
     return tables if isinstance(tables, dict) else {}
+
 
 DEFAULT_CHANNELS: Dict[str, ChannelSpec] = {
     "plans": ChannelSpec("plans", merge_dict),
@@ -75,7 +80,12 @@ DEFAULT_CHANNELS: Dict[str, ChannelSpec] = {
 }
 
 
-def recover_channels(session: Session, run: RunModel, settings: Any = None) -> Dict[str, Any]:
+def recover_channels(
+    session: Session,
+    run: RunModel,
+    settings: Any = None,
+    events: Optional[List[EventModel]] = None,
+) -> Dict[str, Any]:
     """从 EventLog + BlobStore 折叠恢复跨节点 Channel 状态。
 
     任何时刻中断（人工门等待、进程重启、网络超时），新建 RunContext 都能
@@ -92,12 +102,13 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
         "table_generators_done": {},
         "table_audit_cases_done": {},
     }
-    events = (
-        session.query(EventModel)
-        .filter(EventModel.run_id == run.id)
-        .order_by(EventModel.seq)
-        .all()
-    )
+    if events is None:
+        events = (
+            session.query(EventModel)
+            .filter(EventModel.run_id == run.id)
+            .order_by(EventModel.seq)
+            .all()
+        )
     for event in events:
         kind = event.kind
         payload = event.payload_json or {}
@@ -158,8 +169,8 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
                 if isinstance(items, list):
                     try:
                         typed_cases[code] = [AuditCaseBinding.model_validate(item) for item in items]
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("断点恢复反序列化审计用例失败（run=%s, table=%s）: %s", run.id, code, exc)
             if typed_cases:
                 shared["audit_cases"] = merge_dict(shared.get("audit_cases"), typed_cases)
             shared.pop("heal_cases_report", None)
@@ -200,8 +211,14 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
                         shared["self_heal_report"] = loaded_report
                         shared["table_generators_done"] = {}
                         shared["table_audit_cases_done"] = {}
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "断点恢复读取自愈报告失败（run=%s, target=%s, uri=%s）: %s",
+                        run.id,
+                        target_node,
+                        report_uri,
+                        exc,
+                    )
 
     approved_rows = (
         session.query(RuleModel)
@@ -211,8 +228,8 @@ def recover_channels(session: Session, run: RunModel, settings: Any = None) -> D
     if approved_rows:
         try:
             shared["rules"] = [RuleDefinition.model_validate(row.definition_json) for row in approved_rows]
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("断点恢复反序列化已批准规则失败（run=%s）: %s", run.id, exc)
     return shared
 
 
@@ -229,9 +246,15 @@ def build_context(
     attempt_base: Optional[int] = None,
     cancellation: Any = None,
 ) -> RunContext:
-    """从入口参数组装 RunContext，注入 RegOps 通道规格与门禁总线，并从事件账本自动折叠恢复 Channel 快照。"""
-    state = project(session, run)
-    shared = recover_channels(session, run, settings)
+    """从入口参数组装 RunContext：单次查询 EventModel 同时折叠 RunState 与全部 Channel 快照。"""
+    events = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id)
+        .order_by(EventModel.seq)
+        .all()
+    )
+    state = fold(events)
+    shared = recover_channels(session, run, settings, events=events)
     bus = default_bus()
     prior_usage = (state.result_json or {}).get("budget_usage") if isinstance(state.result_json, dict) else None
     budget_guard = BudgetGuard(

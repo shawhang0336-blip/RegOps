@@ -84,8 +84,8 @@ def fold_with(events: Iterable[EventModel], reducer: Optional[StateReducer] = No
     return state
 
 
-def _state_cache(session: Session) -> Dict[str, RunState]:
-    """session 级投影缓存。同一请求内多次读取不重复折叠；append_event 或 rollback 会自动失效它。"""
+def _state_cache(session: Session) -> Dict[str, Dict[int, RunState]]:
+    """session 级投影缓存（按 run_id 与 reducer 隔离）。同一请求内多次读取不重复折叠；append_event 或 rollback 会自动失效。"""
     return session.info.setdefault("_run_state_cache", {})
 
 
@@ -101,18 +101,20 @@ def project_with(
     reducer: Optional[StateReducer] = None,
 ) -> RunState:
     """查询并折叠某个 Run 的事件账本。所有状态读取的唯一权威入口。"""
+    active_reducer = reducer or _DEFAULT_REDUCER
+    reducer_key = id(active_reducer)
     cache = _state_cache(session)
-    if reducer is None and run.id in cache:
-        return cache[run.id]
+    by_reducer = cache.get(run.id)
+    if by_reducer is not None and reducer_key in by_reducer:
+        return by_reducer[reducer_key]
     events = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id)
         .order_by(EventModel.seq)
         .all()
     )
-    state = fold_with(events, reducer=reducer)
-    if reducer is None:
-        cache[run.id] = state
+    state = fold_with(events, reducer=active_reducer)
+    cache.setdefault(run.id, {})[reducer_key] = state
     return state
 
 
@@ -125,9 +127,11 @@ def project_many_with(
     ids = [run.id for run in runs]
     if not ids:
         return {}
+    active_reducer = reducer or _DEFAULT_REDUCER
+    reducer_key = id(active_reducer)
     cache = _state_cache(session)
-    if reducer is None and all(run_id in cache for run_id in ids):
-        return {run_id: cache[run_id] for run_id in ids}
+    if all(reducer_key in cache.get(run_id, {}) for run_id in ids):
+        return {run_id: cache[run_id][reducer_key] for run_id in ids}
     grouped: Dict[str, List[EventModel]] = defaultdict(list)
     rows = (
         session.query(EventModel)
@@ -137,9 +141,9 @@ def project_many_with(
     )
     for event in rows:
         grouped[event.run_id].append(event)
-    states = {run_id: fold_with(grouped.get(run_id, []), reducer=reducer) for run_id in ids}
-    if reducer is None:
-        cache.update(states)
+    states = {run_id: fold_with(grouped.get(run_id, []), reducer=active_reducer) for run_id in ids}
+    for run_id, state in states.items():
+        cache.setdefault(run_id, {})[reducer_key] = state
     return states
 
 

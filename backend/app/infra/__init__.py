@@ -9,6 +9,7 @@
 - `domain.py`：跨层共享契约（`FieldSpec` / `SpecDocument` / `RuleDefinition` / Binding 模型 / `LLM_OPERATORS` / `field_map`）；
 - `sql.py`：跨方言（Oracle / MySQL）安全 SQL 标识符转义；
 - `llm.py`：受控 Tool-Call 大模型客户端与并发限流；
+- `llm_guard.py`：受控大模型调用守卫（分轨退避重试、上下文作用域透传与可插拔 Bus 门禁回喂）；
 - `settings_store.py`：运行时执行预算配置（`DEFAULT_BUDGET` / `get_budget`）；
 - `task_runner.py`：带任务键去重的进程内有界后台任务执行器（`TaskRunner` / `task_runner`）；
 - `models.py`：核心运行时 ORM（`RunModel` / `EventModel` / `RuleModel` / `SpecificationModel`）；

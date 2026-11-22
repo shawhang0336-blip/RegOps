@@ -710,7 +710,7 @@ def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
     import threading
     import time
     import pytest
-    from app.policy.llm_guard import _backoff_wait
+    from app.infra.llm_guard import backoff_wait
 
     # 1) RetryPolicy 指数退避 + Jitter 边界校验
     no_jitter = kernel.RetryPolicy(max_attempts=3, base_delay=0.1, factor=2.0, jitter=0.0)
@@ -721,12 +721,12 @@ def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
     assert all(1.6 <= d <= 2.1 for d in samples)
     assert len(set(round(d, 6) for d in samples)) > 1
 
-    # 2) llm_guard._backoff_wait 在长退避期间收到取消信号立即唤醒并抛 RunCancelledError（不傻等 10s）
+    # 2) infra.llm_guard.backoff_wait 在长退避期间收到取消信号立即唤醒并抛 RunCancelledError（不傻等 10s）
     cancel_tok = kernel.CancellationToken()
     threading.Timer(0.03, lambda: cancel_tok.cancel("stop during backoff")).start()
     t0 = time.monotonic()
     with pytest.raises(kernel.RunCancelledError, match="stop during backoff"):
-        _backoff_wait((10.0,), 1, cancellation=cancel_tok, jitter=0.0)
+        backoff_wait((10.0,), 1, cancellation=cancel_tok, jitter=0.0)
     assert time.monotonic() - t0 < 1.0
 
     # 3) 双 ID（call_id 每次尝试递增变化；idempotency_key 跨重试恒定、且并发 Send Worker 之间严格隔离）
@@ -1297,14 +1297,22 @@ def test_kernel_deep_audit_fixes_across_all_five_modules():
     session.commit()
     assert kernel.verify_chain(session, run_ev) is True
 
-    # 回滚后投影缓存自动失效，不会读到已回滚的幽灵状态
-    proj_default = lambda s, r: kernel.project_with(s, r)
-    before_state = proj_default(session, run_ev)
+    # 回滚后投影缓存自动失效，不会读到已回滚的幽灵状态（显式 reducer 同样命中 session 级缓存并在 rollback 后失效）
+    def ev_reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start")
+        if kind == "RUN_FAILED":
+            return replace(state, status="FAILED", current_node=payload.get("node", state.current_node))
+        return state
+
+    proj_ev = lambda s, r: kernel.project_with(s, r, reducer=ev_reducer)
+    before_state = proj_ev(session, run_ev)
+    assert before_state.status == "RUNNING"
     kernel.append_event(session, run_ev, "RUN_FAILED", "s1", {"node": "s1", "result": {"error": "temp"}})
-    _ = proj_default(session, run_ev)  # 填充缓存为 FAILED
+    assert proj_ev(session, run_ev).status == "FAILED"  # 填充缓存为 FAILED
     session.rollback()
-    after_rollback_state = proj_default(session, run_ev)
-    assert after_rollback_state.status == before_state.status
+    after_rollback_state = proj_ev(session, run_ev)
+    assert after_rollback_state.status == "RUNNING"
 
     tr = kernel.build_trace(
         [
@@ -1362,6 +1370,71 @@ def test_kernel_deep_audit_fixes_across_all_five_modules():
     steps_t = sch_t.drive(ctx_t)
     assert len(steps_t) == 1
     assert proj_t(session, run_t).status == "COMPLETED"
+
+
+def test_policy_structure_clean_three_modules_and_infra_llm_guard():
+    """验证 policy 重构红线：
+    1. app/policy/ 严格收敛为三大核心策略模块（regops_plan / regops_bus / regops_channels + __init__），零 import 期全局污染；
+    2. llm_guard 归位 app/infra/（Layer 0，零反向依赖 kernel/policy）；
+    3. validator 内部 TypeError 代码缺陷快速失败不空耗重试，model_no_tool_call 走校验配额不触发网络退避休眠。
+    """
+    import time
+    import pytest
+    from app.infra.llm_guard import call_llm_validated
+
+    # 1) policy 目录收敛为精准 3 策略模块 + __init__.py，且 __all__ 全部可解析
+    policy_dir = Path(policy.__file__).resolve().parent
+    actual_policy_files = {p.name for p in policy_dir.glob("*.py")}
+    assert actual_policy_files == {
+        "__init__.py",
+        "regops_plan.py",
+        "regops_bus.py",
+        "regops_channels.py",
+    }
+    for name in policy.__all__:
+        assert hasattr(policy, name), f"policy.__all__ 缺少导出符号：{name}"
+
+    # 2) 内核 global_bus() 未被 policy import 污染任何监管业务门禁
+    assert kernel.global_bus()._adjudicators == []
+
+    # 3) validator 内部 TypeError 属于程序 Bug，应立即抛出而非被吞进 LLM 重试循环
+    calls = {"n": 0}
+
+    class OkLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            calls["n"] += 1
+            return {"rules": []}, {"provider": "test"}
+
+    def buggy_validator(_args):
+        raise TypeError("unexpected internal bug")
+
+    with pytest.raises(TypeError, match="unexpected internal bug"):
+        call_llm_validated(OkLlm(), "assign_rules", "instr", {}, buggy_validator)
+    assert calls["n"] == 1
+
+    # 4) model_no_tool_call 走 validation_attempts 配额，不触发长 backoff sleep
+    no_tool_calls = {"n": 0}
+
+    class NoToolLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            no_tool_calls["n"] += 1
+            raise RuntimeError("Model returned no tool call")
+
+    t0 = time.monotonic()
+    with pytest.raises(Exception) as exc_info:
+        call_llm_validated(
+            NoToolLlm(),
+            "assign_rules",
+            "instr",
+            {},
+            backoff=(5.0, 5.0),
+            transient_attempts=4,
+            validation_attempts=2,
+        )
+    assert time.monotonic() - t0 < 1.0
+    assert no_tool_calls["n"] == 2
+    assert getattr(exc_info.value, "context", {}).get("error_kind") == "model_no_tool_call"
+
 
 
 

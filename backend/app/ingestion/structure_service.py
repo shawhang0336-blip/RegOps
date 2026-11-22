@@ -11,7 +11,8 @@ from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.ingestion.extractors import extract_document, survey_document
 from app.infra.llm import RealDesignLlm
-from app.policy.llm_guard import call_llm_validated
+from app.infra.llm_guard import call_llm_validated, current_llm_bus, submit_with_context
+from app.policy.regops_bus import default_bus
 
 
 def _spec_digest(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,6 +302,7 @@ def inspect_document_overview(document_id: str, settings: Settings, force: bool 
                 {"file_name": document.file_name, "survey": survey},
                 timeout=60,
                 backoff=(1.0,),
+                bus=current_llm_bus() or default_bus(),
                 transient_attempts=2,
                 validation_attempts=2,
             )
@@ -442,6 +444,8 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
             llm = None
             llm_error = exc
 
+        active_bus = current_llm_bus() or default_bus()
+
         def plan_group(item):
             section, group = item
             if llm is None:
@@ -484,6 +488,7 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                     _validate_structure_args,
                     timeout=STRUCTURE_PLAN_TIMEOUT,
                     backoff=(1.0,),
+                    bus=active_bus,
                     transient_attempts=2,
                     validation_attempts=2,
                 )
@@ -492,7 +497,8 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                 return _default_group_plan(group, exc), {"error": f"{type(exc).__name__}: {exc}"}, "DEFAULT"
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            results = list(executor.map(plan_group, groups.items()))
+            futures = [submit_with_context(executor, plan_group, item) for item in groups.items()]
+            results = [f.result() for f in futures]
 
         architecture_id = ""
         for (section, group), (args, trace, mode) in zip(groups.items(), results):

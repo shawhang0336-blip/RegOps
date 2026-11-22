@@ -48,13 +48,13 @@ from app.kernel.run import (
     run_registry,
     submit_run as kernel_submit_run,
 )
-from app.policy.ingestion_plan import (
+from app.infra.llm_guard import llm_execution_scope
+from app.policy.regops_bus import default_bus
+from app.policy.regops_plan import (
     ACTIVE_INGESTION_STATUSES,
     project_ingestion,
     project_ingestion_many,
 )
-from app.policy.llm_guard import llm_execution_scope
-from app.policy.regops_bus import default_bus
 
 
 def _stages_catalog() -> List[Dict[str, Any]]:

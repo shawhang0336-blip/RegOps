@@ -1,12 +1,13 @@
-"""统一受控大模型调用守卫（策略层，跨阶段复用）。
+"""统一受控大模型调用守卫（基础设施层 Layer 0，跨阶段复用）。
 
 职责边界：
-- 位于 Layer 2（policy），仅依赖 infra（Layer 0）与 kernel（Layer 1），可供 ingestion / assets / engine 三阶段共同复用；
-- 按错误性质分类退避：
-  1. 网络/超时/5xx 瞬时错误：按退避序列重试并逐次放宽超时窗口，不向模型注入无关 feedback；
-  2. 模型漏调工具（no tool call / unexpected tool）：注入硬约束提示重试；
-  3. Bus 事前门禁拦截或确定性 validator 拒绝：把拒绝原因回喂给模型修正，并全程留痕 `bus_rejections`；
-  4. 鉴权/配置/不可用等不可恢复 RuntimeError（如 `LLM_API_KEY is required`、`offline unavailable`、`HTTP 400/401/403`）：快速失败不空耗重试预算。
+- 位于 Layer 0（infra），紧邻 `infra/llm.py`，零依赖 `kernel` 与 `policy`，可供 ingestion / assets / engine 三阶段共同复用；
+- 通过鸭子类型无缝配合上层通过 `llm_execution_scope` 或 `bus=` 参数注入的 Bus（门禁裁决 / 预算熔断 / 生命周期广播）与 CancellationToken（协作式取消）；
+- 按错误性质分轨容错：
+  1. 网络/超时/5xx 瞬时错误：消耗 `transient_attempts`，按带抖动退避序列重试并逐次放宽超时窗口，不向模型注入无关 feedback；
+  2. 模型漏调工具（no tool call / unexpected tool）：消耗 `validation_attempts`，立即注入硬约束提示重试，不虚耗退避等待与超时放宽；
+  3. Bus 事前门禁拦截或确定性 validator 拒绝（ValueError / KeyError）：消耗 `validation_attempts`，把拒绝原因回喂给模型修正并留痕 `bus_rejections`；
+  4. 鉴权/配置/不可用等不可恢复 RuntimeError，或 validator 内部代码缺陷（如 TypeError）：快速失败，不空耗重试预算。
 """
 
 from contextlib import contextmanager
@@ -19,7 +20,6 @@ import httpx
 
 from app.infra.errors import WorkflowError
 from app.infra.llm import LlmTimeoutError
-from app.policy.regops_bus import default_bus
 
 _ACTIVE_BUS: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_bus", default=None)
 _ACTIVE_CANCEL: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_cancel", default=None)
@@ -53,6 +53,7 @@ def submit_with_context(executor: Any, fn: Callable[..., Any], *args: Any, **kwa
     """向线程池提交任务时显式复制当前 contextvars，确保 worker 继承 Bus/BudgetGuard/CancellationToken。"""
     ctx = contextvars.copy_context()
     return executor.submit(ctx.run, fn, *args, **kwargs)
+
 
 STAGE_BY_TOOL = {
     "inspect_document_structure": "document_overview",
@@ -105,27 +106,31 @@ _TRANSIENT_TRANSPORT_MARKERS = (
 )
 
 
-def _locate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    table_code = payload.get("table_code") or (payload.get("table") or {}).get("table_code")
-    fields = payload.get("fields") or []
+def locate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """从工具输入 payload 中提取定位信息（table_code / 单字段名），用于结构化错误诊断。"""
+    safe = payload if isinstance(payload, dict) else {}
+    table_obj = safe.get("table")
+    table_code = safe.get("table_code") or (table_obj.get("table_code") if isinstance(table_obj, dict) else None)
+    fields = safe.get("fields") or []
     field = None
     if isinstance(fields, list) and len(fields) == 1 and isinstance(fields[0], dict):
         field = fields[0].get("name") or fields[0].get("field_en")
     return {"table_code": table_code, "field": field}
 
 
-def _fail_context(tool_name: str, payload: Dict[str, Any], error_kind: str, retried: bool = False) -> Dict[str, Any]:
+def fail_context(tool_name: str, payload: Dict[str, Any], error_kind: str, retried: bool = False) -> Dict[str, Any]:
+    """构造带阶段与表/字段定位的结构化失败上下文。"""
     context = {
         "tool_name": tool_name,
         "stage": STAGE_BY_TOOL.get(tool_name, tool_name),
         "error_kind": error_kind,
         "retried": retried,
     }
-    context.update(_locate_payload(payload))
+    context.update(locate_payload(payload))
     return context
 
 
-def _backoff_wait(
+def backoff_wait(
     steps: Tuple[float, ...],
     attempt: int,
     *,
@@ -173,7 +178,7 @@ def call_llm_validated(
     transient_attempts: int = DEFAULT_TRANSIENT_ATTEMPTS,
     validation_attempts: int = DEFAULT_VALIDATION_ATTEMPTS,
 ) -> Tuple[Any, Dict[str, Any]]:
-    """统一受控大模型调用：退避重试 + Bus 前置确定性门禁 + 校验失败回喂修正。"""
+    """统一受控大模型调用：退避重试 + 可插拔 Bus 前置门禁 + 校验失败回喂修正。"""
     feedback: Optional[str] = None
     rejection: Optional[str] = None
     bus_rejections: List[Dict[str, Any]] = []
@@ -183,7 +188,7 @@ def call_llm_validated(
     transient_used = 0
     validation_used = 0
     wait_steps = DEFAULT_BACKOFF_SECONDS if backoff is None else backoff
-    bus = bus if bus is not None else (_ACTIVE_BUS.get() or default_bus())
+    active_bus = bus if bus is not None else _ACTIVE_BUS.get()
     cancellation = _ACTIVE_CANCEL.get()
     validate_fn = validator if validator is not None else (lambda args: args)
 
@@ -191,8 +196,8 @@ def call_llm_validated(
     for attempt in range(1, max_total + 1):
         if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
             cancellation.raise_if_cancelled()
-        if hasattr(bus, "check_budget"):
-            bus.check_budget()
+        if active_bus is not None and hasattr(active_bus, "check_budget"):
+            active_bus.check_budget()
         attempt_timeout = timeout
         if timeout and transient_used:
             attempt_timeout = int(min(timeout * (1 + 0.5 * transient_used), timeout * 2))
@@ -208,7 +213,14 @@ def call_llm_validated(
                 else:
                     arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
 
-            rejection_reason = bus.adjudicate(tool_name, arguments, payload) if hasattr(bus, "adjudicate") else None
+            if not isinstance(arguments, dict):
+                raise ValueError(f"工具 {tool_name} 必须返回 JSON 对象参数，实际收到 {type(arguments).__name__}")
+
+            rejection_reason = (
+                active_bus.adjudicate(tool_name, arguments, payload)
+                if active_bus is not None and hasattr(active_bus, "adjudicate")
+                else None
+            )
             if rejection_reason:
                 bus_rejections.append(
                     {
@@ -233,18 +245,19 @@ def call_llm_validated(
                     trace["retried_after_timeout"] = True
                 if attempt > 1:
                     trace["attempts"] = attempt
-            if hasattr(bus, "fire"):
+            if active_bus is not None and hasattr(active_bus, "fire"):
+                loc = locate_payload(payload)
                 after_payload: Dict[str, Any] = {
                     "tool": tool_name,
                     "attempts": attempt,
-                    "table_code": payload.get("table_code") or (payload.get("table") or {}).get("table_code"),
+                    "table_code": loc["table_code"],
                 }
                 if isinstance(trace, dict):
                     if trace.get("elapsed_seconds") is not None:
                         after_payload["elapsed_seconds"] = trace.get("elapsed_seconds")
                     if isinstance(trace.get("usage"), dict):
                         after_payload["usage"] = trace["usage"]
-                bus.fire("tool.after", after_payload)
+                active_bus.fire("tool.after", after_payload)
             return result, trace
         except LlmTimeoutError as exc:
             transient_used += 1
@@ -252,29 +265,36 @@ def call_llm_validated(
             last_kind, last_error = "timeout", str(exc)
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
         except (httpx.HTTPError, TimeoutError, ConnectionError) as exc:
             transient_used += 1
             last_kind, last_error = "transport", f"{type(exc).__name__}: {exc}"
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
         except RuntimeError as exc:
             kind = _classify_runtime_error(exc)
-            transient_used += 1
             last_error = str(exc)
             if kind == "fatal_model_error":
+                transient_used += 1
                 last_kind = "model_error"
                 break
-            last_kind = kind
             if kind == "model_no_tool_call":
+                # 模型漏调工具属于输出契约违约，消耗校验配额并直接带硬提示重试，不虚耗网络退避时间
+                validation_used += 1
+                last_kind = kind
                 feedback = _NO_TOOL_CALL_HINT
+                if validation_used >= validation_attempts:
+                    break
+                continue
+            transient_used += 1
+            last_kind = kind
             if transient_used >= transient_attempts:
                 break
-            _backoff_wait(wait_steps, transient_used, cancellation=cancellation)
-        except (ValueError, KeyError, TypeError) as exc:
+            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+        except (ValueError, KeyError) as exc:
             validation_used += 1
-            rejection = str(exc)
+            rejection = f"缺少必填字段 {exc}" if isinstance(exc, KeyError) else str(exc)
             feedback = rejection
             last_kind, last_error = "validation", rejection
             if validation_used >= validation_attempts:
@@ -284,6 +304,8 @@ def call_llm_validated(
         message = f"{tool_name} model call timed out after retry ({transient_used} 次): {last_error}"
     elif last_kind == "validation":
         message = f"{tool_name} 连续 {validation_used} 次未通过参数校验：{last_error}"
+    elif last_kind == "model_no_tool_call":
+        message = f"{tool_name} 连续 {validation_used} 次没有拿到工具调用返回（{last_kind}）：{last_error}"
     else:
         message = f"{tool_name} 连续 {transient_used} 次没有拿到可用返回（{last_kind}）：{last_error}"
-    raise WorkflowError(message, context=_fail_context(tool_name, payload, last_kind, retried=transient_used > 1))
+    raise WorkflowError(message, context=fail_context(tool_name, payload, last_kind, retried=transient_used > 1))

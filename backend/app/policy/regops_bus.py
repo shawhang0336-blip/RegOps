@@ -1,6 +1,7 @@
-"""RegOps 事前确定性门禁策略（策略层）。
+"""RegOps 事前确定性门禁策略（策略层 Layer 2）。
 
-将五大监管业务门禁裁决器（Adjudicator）挂载到 ProdAgent 的 Bus 微内核上：
+将五大监管业务门禁裁决器（Adjudicator）装配到单次 Run 的 Bus 实例（`default_bus`），
+严守内核中立原则：不在模块导入时污染进程级根总线 `global_bus()`。
 1. field_whitelist_adjudicator：字段白名单门禁（覆盖 schema/rules/generators/audit_cases 全阶段）
 2. cross_table_adjudicator：跨表引用白名单门禁
 3. operator_whitelist_adjudicator：受控算子白名单门禁（仅允许 LLM_OPERATORS，拦截 LENGTH 等高误报算子）
@@ -30,6 +31,8 @@ def field_whitelist_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """字段名白名单门禁：所有字段名槽位必须来自 payload.field_names（或 payload.table.field_names）。"""
+    if not isinstance(args, dict):
+        return None
     safe_payload = payload if isinstance(payload, dict) else {}
     table_obj = safe_payload.get("table")
     allowed = safe_payload.get("field_names") or (
@@ -38,6 +41,10 @@ def field_whitelist_adjudicator(
     if not allowed:
         return None
     allowed_set = set(allowed)
+    allowed_sorted = sorted(allowed_set)
+
+    def _invalid_field(value: Any) -> bool:
+        return value is not None and (not isinstance(value, str) or value not in allowed_set)
 
     candidates: List[Any] = []
     for list_key in ("rules", "fields", "generators"):
@@ -57,32 +64,22 @@ def field_whitelist_adjudicator(
         for scope in scopes:
             for key in _FIELD_ARG_KEYS:
                 value = scope.get(key)
-                if value is not None and (not isinstance(value, str) or value not in allowed_set):
-                    return (
-                        f"字段幻觉拦截：参数 `{key}='{value}'` 不在字段白名单 "
-                        f"{sorted(allowed_set)} 中"
-                    )
+                if _invalid_field(value):
+                    return f"字段幻觉拦截：参数 `{key}='{value}'` 不在字段白名单 {allowed_sorted} 中"
             # 复杂监管算子字段列表槽位检查：ARITHMETIC_BALANCE.terms[].field / UNIQUE_KEY.key_fields[]
             terms = scope.get("terms")
             if isinstance(terms, list):
                 for term in terms:
-                    if (
-                        isinstance(term, dict)
-                        and term.get("field") is not None
-                        and (not isinstance(term.get("field"), str) or term.get("field") not in allowed_set)
-                    ):
+                    if isinstance(term, dict) and _invalid_field(term.get("field")):
                         return (
                             f"字段幻觉拦截：算术项 `terms.field='{term.get('field')}'` "
-                            f"不在字段白名单 {sorted(allowed_set)} 中"
+                            f"不在字段白名单 {allowed_sorted} 中"
                         )
             key_fields = scope.get("key_fields")
             if isinstance(key_fields, list):
                 for kf in key_fields:
-                    if kf is not None and (not isinstance(kf, str) or kf not in allowed_set):
-                        return (
-                            f"字段幻觉拦截：唯一键字段 `key_fields` 包含不在白名单中的 `{kf}` "
-                            f"{sorted(allowed_set)}"
-                        )
+                    if _invalid_field(kf):
+                        return f"字段幻觉拦截：唯一键字段 `key_fields` 包含不在白名单中的 `{kf}` {allowed_sorted}"
 
     for case in args.get("cases") or []:
         if not isinstance(case, dict):
@@ -93,7 +90,7 @@ def field_whitelist_adjudicator(
                 if field_key not in allowed_set:
                     return (
                         f"字段幻觉拦截：审计用例 `{case.get('case_id', '')}` 的变异字段 "
-                        f"`{field_key}` 不在字段白名单 {sorted(allowed_set)} 中"
+                        f"`{field_key}` 不在字段白名单 {allowed_sorted} 中"
                     )
     return None
 
@@ -102,11 +99,14 @@ def cross_table_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """跨表引用门禁：references_table / references_field / table_code / golden_overrides 必须在已确认表与字段白名单内。"""
+    if not isinstance(args, dict):
+        return None
     safe_payload = payload if isinstance(payload, dict) else {}
     allowed = safe_payload.get("table_codes") or safe_payload.get("selected_table_codes")
     if not allowed:
         return None
     allowed_set = set(allowed)
+    allowed_sorted = sorted(allowed_set)
     table_fields = safe_payload.get("table_fields") or {}
     for candidate in args.get("rules", []) or []:
         if not isinstance(candidate, dict):
@@ -116,7 +116,7 @@ def cross_table_adjudicator(
             for key in ("references_table", "table_code"):
                 value = scope.get(key)
                 if value is not None and value not in allowed_set:
-                    return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {sorted(allowed_set)} 中"
+                    return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {allowed_sorted} 中"
         if params and table_fields:
             ref_table = params.get("references_table")
             ref_field = params.get("references_field")
@@ -129,7 +129,7 @@ def cross_table_adjudicator(
     if isinstance(overrides, dict):
         for table_code, field_overrides in overrides.items():
             if table_code not in allowed_set:
-                return f"跨表引用拦截：golden_overrides 表 `{table_code}` 不在已确认表集合 {sorted(allowed_set)} 中"
+                return f"跨表引用拦截：golden_overrides 表 `{table_code}` 不在已确认表集合 {allowed_sorted} 中"
             if isinstance(field_overrides, dict) and table_code in table_fields:
                 allowed_cols = set(table_fields[table_code])
                 for col in field_overrides:
@@ -145,7 +145,7 @@ def operator_whitelist_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """受控算子白名单门禁：AI 只能选用 LLM_OPERATORS 中的算子（禁止 LENGTH 等高误报算子）。"""
-    if tool_name != "assign_rules":
+    if tool_name != "assign_rules" or not isinstance(args, dict):
         return None
     allowed_ops = set(LLM_OPERATORS)
     for candidate in args.get("rules", []) or []:
@@ -164,6 +164,8 @@ def code_set_values_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """已发布码表值域门禁：覆盖 assign_rules（ENUM 与 COND_VALUE.ENUM）与 assign_generators（单码表与多字段码表映射）。"""
+    if not isinstance(args, dict):
+        return None
     safe_payload = payload if isinstance(payload, dict) else {}
     published = safe_payload.get("published_code_set")
     published_map = safe_payload.get("published_code_sets")
@@ -224,9 +226,10 @@ def structure_block_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """文档结构切块门禁：source_block_ids 必须来自输入 candidate_blocks。"""
-    if tool_name != "assign_document_structure":
+    if tool_name != "assign_document_structure" or not isinstance(args, dict):
         return None
-    candidates = payload.get("candidate_blocks")
+    safe_payload = payload if isinstance(payload, dict) else {}
+    candidates = safe_payload.get("candidate_blocks")
     if not isinstance(candidates, list) or not candidates:
         return None
     allowed_ids = {item["id"] for item in candidates if isinstance(item, dict) and "id" in item}
@@ -252,9 +255,6 @@ def _attach_regops_adjudicators(bus: Bus) -> Bus:
     for fn in REGOPS_ADJUDICATORS:
         bus.add_adjudicator(fn)
     return bus
-
-
-_attach_regops_adjudicators(global_bus())
 
 
 def default_bus(parent: Optional[Bus] = None) -> Bus:
