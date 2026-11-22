@@ -1,7 +1,8 @@
 """阶段二子模块 3：黄金合规数据生成（单表 BSP Worker / 跨表外键对齐 / 三类确定性规则回填）。"""
 
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import func
 
@@ -12,6 +13,7 @@ from app.generation.core.binding import (
     bind_generators,
     find_golden_rule_violations,
     materialize_golden_record,
+    violates_single_field_rule,
 )
 from app.generation.core.rule_backfill import (
     _backfill_fixed_value_rules as _policy_backfill_fixed_value_rules,
@@ -33,14 +35,13 @@ from app.infra.contracts import RuleDefinition, canonical_json
 from app.infra.llm.schemas import spec_payload
 
 _GENERATOR_BATCH_SIZE = 12
+# 必须交给 AI 语义联合赋值的算子；独立无耦合的 NUM_RANGE 与单列 UNIQUE_KEY 已下沉到程序数学求解
 _SEMANTIC_GENERATOR_OPERATORS = {
     "REGEXP",
-    "NUM_RANGE",
     "FIELD_COMPARE",
     "COND_REQUIRED",
     "COND_VALUE",
     "ARITHMETIC_BALANCE",
-    "UNIQUE_KEY",
     "FOREIGN_KEY",
 }
 
@@ -80,12 +81,16 @@ def _coupled_field_names(
     table_rules: List[RuleDefinition],
     heal_report: Optional[Dict[str, Any]] = None,
 ) -> set:
-    """识别需要 AI 联合语义赋值的字段（正则、数值区间、跨字段比较、算术平衡、条件约束、唯一键、外键或误报自愈字段）。"""
+    """识别需要 AI 联合语义赋值的字段（正则、跨字段比较、算术平衡、条件约束、联合唯一键、外键或误报自愈字段）。"""
     coupled = set()
     rule_by_key = {rule.rule_key: rule for rule in table_rules}
     for rule in table_rules:
         if rule.operator in _SEMANTIC_GENERATOR_OPERATORS:
             coupled.update(_rule_related_fields(rule))
+        elif rule.operator == "UNIQUE_KEY":
+            key_fields = list(dict.fromkeys((rule.params or {}).get("key_fields") or [rule.field]))
+            if len(key_fields) > 1:
+                coupled.update(key_fields)
     if heal_report:
         for case in heal_report.get("cases", []):
             if case.get("table_code") != spec.table_code or case.get("case_kind") != "GOLDEN":
@@ -97,18 +102,107 @@ def _coupled_field_names(
     return coupled
 
 
+def _decimal_to_clean_number(value: Decimal, keep_int: bool) -> Any:
+    if keep_int and value == value.to_integral_value():
+        return int(value)
+    text_val = format(value.normalize(), "f")
+    if "." in text_val:
+        text_val = text_val.rstrip("0").rstrip(".")
+    return int(text_val) if "." not in text_val else float(text_val)
+
+
+def _solve_num_range_value(
+    field,
+    num_range_rules: List[RuleDefinition],
+    forbidden: set,
+    *,
+    need_sequence: bool = False,
+    golden_count: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """对无跨字段耦合的 NUM_RANGE 规则直接数学求解区间内合规取值（必要时配 SEQUENCE）。"""
+    decimals = int(getattr(field, "decimal_places", 0) or 0)
+    keep_int = decimals == 0
+    step = Decimal("1") if keep_int else Decimal("1").scaleb(-min(decimals, 2))
+    precision = max(1, min(int(getattr(field, "length", 0) or 18), 38))
+    int_digits = max(precision - decimals, 1)
+    max_abs = Decimal(10) ** min(int_digits, 15) - step
+
+    low: Optional[Decimal] = None
+    low_inc = True
+    high: Optional[Decimal] = None
+    high_inc = True
+    try:
+        for rule in num_range_rules:
+            params = rule.params or {}
+            if params.get("min") is not None:
+                v = Decimal(str(params["min"]).strip().replace(",", ""))
+                inc = bool(params.get("min_inclusive", True))
+                if low is None or v > low or (v == low and not inc):
+                    low, low_inc = v, inc
+            if params.get("max") is not None:
+                v = Decimal(str(params["max"]).strip().replace(",", ""))
+                inc = bool(params.get("max_inclusive", True))
+                if high is None or v < high or (v == high and not inc):
+                    high, high_inc = v, inc
+    except (InvalidOperation, ValueError):
+        return None
+
+    def _valid(cand_dec: Decimal) -> bool:
+        if abs(cand_dec) > max_abs:
+            return False
+        cand_num = _decimal_to_clean_number(cand_dec, keep_int)
+        if str(cand_num) in forbidden:
+            return False
+        return all(violates_single_field_rule("NUM_RANGE", r.params or {}, cand_num) is False for r in num_range_rules)
+
+    candidates: List[Decimal] = [Decimal("1"), Decimal("10"), Decimal("100"), Decimal("0")]
+    if low is not None and high is not None:
+        mid = ((low + high) / Decimal("2")).quantize(step, rounding=ROUND_FLOOR)
+        candidates = [mid, low if low_inc else low + step, high if high_inc else high - step] + candidates
+    elif low is not None:
+        base = low.quantize(step, rounding=ROUND_CEILING)
+        candidates = [base if (low_inc and base == low) else base + step, base + step * Decimal("10")] + candidates
+    elif high is not None:
+        base = high.quantize(step, rounding=ROUND_FLOOR)
+        candidates = [base if (high_inc and base == high) else base - step, base - step * Decimal("10")] + candidates
+
+    for cand in candidates:
+        if not _valid(cand):
+            continue
+        if need_sequence and golden_count > 1:
+            if all(_valid(cand + step * Decimal(i)) for i in range(golden_count)):
+                return {
+                    "field": field.name,
+                    "generator": "SEQUENCE",
+                    "params": {
+                        "start": _decimal_to_clean_number(cand, keep_int),
+                        "step": _decimal_to_clean_number(step, keep_int),
+                    },
+                }
+            continue
+        return {
+            "field": field.name,
+            "generator": "FIXED",
+            "params": {"value": _decimal_to_clean_number(cand, keep_int)},
+        }
+    return None
+
+
 def _deterministic_generator_item(
     field,
     table_code: str,
     table_rules: List[RuleDefinition],
     field_code_sets: Dict[Any, Any],
     required_ref_values: Dict[str, Any],
+    golden_count: int = 1,
 ) -> Optional[Dict[str, Any]]:
     """对无复杂语义约束的字段直接确定性构造合规生成器，减少 AI 杂活并保证码表对齐。"""
     if field.name in required_ref_values:
         return {"field": field.name, "generator": "FIXED", "params": {"value": required_ref_values[field.name]}}
 
     field_rules = [rule for rule in table_rules if rule.field == field.name]
+    is_unique = any(rule.operator == "UNIQUE_KEY" for rule in field_rules)
+    num_range_rules = [rule for rule in field_rules if rule.operator == "NUM_RANGE"]
     forbidden = {
         str(val)
         for rule in field_rules
@@ -128,9 +222,13 @@ def _deterministic_generator_item(
             for item in code_set["values"]
             if item.get("value") is not None and str(item["value"]) not in forbidden
         ]
-        if not candidates:
+        if num_range_rules:
+            candidates = [
+                c for c in candidates if all(violates_single_field_rule("NUM_RANGE", r.params or {}, c) is False for r in num_range_rules)
+            ]
+        if not candidates or (is_unique and golden_count > len(candidates)):
             return None
-        return {"field": field.name, "generator": "ENUM", "params": {"values": candidates[:10]}}
+        return {"field": field.name, "generator": "ENUM", "params": {"values": candidates[: max(10, golden_count)]}}
 
     enum_rules = [rule for rule in field_rules if rule.operator == "ENUM" and rule.params.get("values")]
     if enum_rules:
@@ -142,11 +240,45 @@ def _deterministic_generator_item(
         for other in allowed_sets[1:]:
             other_set = set(other)
             common = [v for v in common if v in other_set]
-        if not common:
+        if num_range_rules:
+            common = [
+                c for c in common if all(violates_single_field_rule("NUM_RANGE", r.params or {}, c) is False for r in num_range_rules)
+            ]
+        if not common or (is_unique and golden_count > len(common)):
             return None
         if len(common) == 1:
             return {"field": field.name, "generator": "FIXED", "params": {"value": common[0]}}
-        return {"field": field.name, "generator": "ENUM", "params": {"values": common[:10]}}
+        return {"field": field.name, "generator": "ENUM", "params": {"values": common[: max(10, golden_count)]}}
+
+    if num_range_rules:
+        return _solve_num_range_value(
+            field,
+            num_range_rules,
+            forbidden,
+            need_sequence=is_unique,
+            golden_count=golden_count,
+        )
+
+    if is_unique:
+        if (field.data_type or "").upper() == "NUMBER":
+            precision = int(getattr(field, "length", 0) or 10)
+            start = 1001 if precision >= 5 else 1
+            while any(str(start + i) in forbidden for i in range(max(1, golden_count))):
+                start += max(1, golden_count)
+            return {"field": field.name, "generator": "SEQUENCE", "params": {"start": start, "step": 1}}
+        exact_lengths = [
+            int(rule.params["length"]) for rule in field_rules if rule.operator == "LENGTH" and rule.params.get("length")
+        ]
+        if exact_lengths:
+            exact = exact_lengths[0]
+            if exact >= 2:
+                return {"field": field.name, "generator": "SEQUENCE", "params": {"start": 1, "step": 1, "padding": exact}}
+            return None
+        if max_len >= 6:
+            return {"field": field.name, "generator": "SEQUENCE", "params": {"prefix": "UQ", "start": 1001, "step": 1}}
+        if max_len >= 2:
+            return {"field": field.name, "generator": "SEQUENCE", "params": {"start": 1, "step": 1}}
+        return None
 
     if (field.data_type or "").upper() == "NUMBER":
         for cand in (1, 10, 2, 100):
@@ -246,7 +378,14 @@ def bind_table_data_worker(
         if field.name in coupled:
             ai_fields.append(field)
             continue
-        det_item = _deterministic_generator_item(field, spec.table_code, table_rules, field_code_sets, required_refs)
+        det_item = _deterministic_generator_item(
+            field,
+            spec.table_code,
+            table_rules,
+            field_code_sets,
+            required_refs,
+            golden_count=golden_count,
+        )
         if det_item is not None:
             try:
                 binding = GeneratorBinding.model_validate(det_item)
@@ -543,13 +682,40 @@ def _data_stage(
     )
 
 
-def _backfill_required_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    return _policy_backfill_required_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
+def _backfill_required_rules(
+    session,
+    run,
+    specs,
+    rules,
+    events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
+) -> List[RuleDefinition]:
+    return _policy_backfill_required_rules(
+        session, run, specs, rules, _upsert_rule, _emit, events=events, rejected_rules=rejected_rules
+    )
 
 
-def _backfill_length_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    return _policy_backfill_length_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
+def _backfill_length_rules(
+    session,
+    run,
+    specs,
+    rules,
+    events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
+) -> List[RuleDefinition]:
+    return _policy_backfill_length_rules(
+        session, run, specs, rules, _upsert_rule, _emit, events=events, rejected_rules=rejected_rules
+    )
 
 
-def _backfill_fixed_value_rules(session, run, specs, rules, events: Optional[List[tuple]] = None) -> List[RuleDefinition]:
-    return _policy_backfill_fixed_value_rules(session, run, specs, rules, _upsert_rule, _emit, events=events)
+def _backfill_fixed_value_rules(
+    session,
+    run,
+    specs,
+    rules,
+    events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
+) -> List[RuleDefinition]:
+    return _policy_backfill_fixed_value_rules(
+        session, run, specs, rules, _upsert_rule, _emit, events=events, rejected_rules=rejected_rules
+    )

@@ -1,7 +1,7 @@
 """阶段二子模块 2：规则绑定（单表 BSP Worker / 跨表 FK / 去重 / 自愈靶向重绑）与 Oracle 资产准备。"""
 
+import hashlib
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -14,7 +14,8 @@ from app.generation.sql.code_set_sql import (
     compile_code_set_oracle_ddl,
     sandbox_code_set_table,
 )
-from app.generation.core.binding import SchemaBinding, bind_rules, violates_single_field_rule
+from app.generation.core.binding import SchemaBinding, _as_number, bind_rules, violates_single_field_rule
+from app.generation.core.planning import needs_semantic_rule_binding
 from app.generation.sql.compiler import compile_rule_query
 from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
 from app.generation.core.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
@@ -25,17 +26,20 @@ from app.generation.workflow.runtime import (
     _emit,
     _fanout,
     _inner_width,
+    _map_with_context,
     _pending_rules,
     _upsert_rule,
 )
 from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
-from app.infra.contracts import RuleDefinition, calculate_rule_hash, canonical_json
+from app.infra.contracts import RuleDefinition, calculate_rule_hash, canonical_json, field_map
 from app.infra.errors import WorkflowError
 from app.infra.llm.schemas import spec_payload
 from app.infra.db_tables import EventModel, RuleModel, RunModel
 from app.policy.regops_plan import project
+
+_IN_CHUNK_SIZE = 500
 
 
 def _summarize_deterministic_rule(rule: RuleDefinition) -> Dict[str, Any]:
@@ -137,6 +141,17 @@ def bind_table_rules_worker(
 
     def _bind_one_field(field):
         field_det = det_by_field.get((spec.table_code, field.name), [])
+        needs_ai, gate_reason = needs_semantic_rule_binding(spec, field, field_det)
+        if not needs_ai:
+            return [], {
+                "provider": "DETERMINISTIC",
+                "model": "semantic-rule-gate",
+                "tool_name": "assign_rules",
+                "strategy": "DETERMINISTIC_ONLY_SKIPPED",
+                "field": field.name,
+                "reason": gate_reason,
+                "arguments": {"rules": []},
+            }
         payload = {
             **spec_payload(spec),
             "target_field": field.name,
@@ -201,15 +216,14 @@ def bind_table_rules_worker(
             }
 
     inner = max(1, min(_inner_width(concurrency, outer_workers), len(fields)))
-    if inner <= 1 or len(fields) <= 1:
-        field_results = [bind_field(field) for field in fields]
-    else:
-        with ThreadPoolExecutor(max_workers=inner) as field_executor:
-            field_results = list(field_executor.map(bind_field, fields))
+    field_results = _map_with_context(bind_field, fields, inner)
 
+    skipped_deterministic_count = 0
     for rules, trace in field_results:
         bound_rules.extend(rules)
         batch_traces.append(trace)
+        if trace.get("strategy") == "DETERMINISTIC_ONLY_SKIPPED":
+            skipped_deterministic_count += 1
     table_det_rules = [r for r in deterministic_rules if r.table_code == spec.table_code]
     bound_rules = _drop_unsatisfiable_field_compare_eq(table_det_rules + bound_rules, bound_rules)
     key_counts = {key: 1 for key in det_keys}
@@ -223,12 +237,15 @@ def bind_table_rules_worker(
             f"{spec.table_code} 的 {len(gaps)} 个字段全部未能绑定规则，首个失败：{gaps[0]['error']}",
             context={"stage": "rule_binder", "table_code": spec.table_code, "field": gaps[0]["field"]},
         )
-    first_trace = batch_traces[0] if batch_traces else {}
+    ai_traces = [tr for tr in batch_traces if tr.get("strategy") != "DETERMINISTIC_ONLY_SKIPPED"]
+    first_trace = ai_traces[0] if ai_traces else (batch_traces[0] if batch_traces else {})
     return bound_rules, {
-        "provider": _provider_name(llm, first_trace),
-        "model": (first_trace.get("model") or "unknown") if first_trace else "unknown",
+        "provider": _provider_name(llm, first_trace) if ai_traces else "DETERMINISTIC",
+        "model": (first_trace.get("model") or "unknown") if ai_traces else "semantic-rule-gate",
         "tool_name": "assign_rules",
         "batch_count": len(batch_traces),
+        "ai_field_count": len(ai_traces),
+        "skipped_deterministic_count": skipped_deterministic_count,
         "deterministic_count": len(table_det_rules),
         "batches": batch_traces,
         "gaps": gaps,
@@ -325,8 +342,26 @@ def join_table_rules_barrier(
                     raise RuleValidationError("Cross rule target table is outside the confirmed set")
                 bound.extend(bind_rules(target, [item], selected, specs_by_code=specs_by_code))
             overrides = args.get("golden_overrides", {})
-            if any(code not in selected for code in overrides):
-                raise RuleValidationError("Golden override references an unconfirmed table")
+            if overrides is None:
+                overrides = {}
+            if not isinstance(overrides, dict):
+                raise RuleValidationError("golden_overrides must be an object keyed by table_code")
+            for code, field_overrides in overrides.items():
+                if code not in selected:
+                    raise RuleValidationError("Golden override references an unconfirmed table")
+                if not isinstance(field_overrides, dict):
+                    raise RuleValidationError(f"golden_overrides[{code}] must be an object")
+                target_fields = field_map(specs_by_code[code])
+                for col, val in field_overrides.items():
+                    if col not in target_fields:
+                        raise RuleValidationError(f"golden_overrides[{code}].{col} is outside the target table whitelist")
+                    if val is not None and (target_fields[col].data_type or "").upper() == "NUMBER":
+                        try:
+                            _as_number(val)
+                        except ValueError as exc:
+                            raise RuleValidationError(
+                                f"golden_overrides[{code}].{col} must be numeric for NUMBER column: {exc}"
+                            ) from exc
             return (bound, overrides)
 
         (cross_rules, golden_overrides), trace = _call_validated(
@@ -426,20 +461,31 @@ def _ensure_oracle_assets(
 ):
     if attempt is None:
         attempt = project(session, run).attempt + 1
+    code_sets, field_code_sets = load_published_code_sets(session, specs)
+    rules_signature = hashlib.sha256(
+        canonical_json(sorted(rule.rule_hash for rule in (rules or []))).encode("utf-8")
+    ).hexdigest()[:16]
+    code_sets_signature = hashlib.sha256(
+        canonical_json(sorted((item["code"], item["version"]) for item in code_sets)).encode("utf-8")
+    ).hexdigest()[:16]
     existing = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id, EventModel.kind == "ORACLE_ASSETS_PREPARED")
         .order_by(EventModel.seq.desc())
         .first()
     )
-    if existing and existing.payload_json.get("attempt") == attempt:
+    if (
+        existing
+        and existing.payload_json.get("attempt") == attempt
+        and existing.payload_json.get("rules_signature") == rules_signature
+        and existing.payload_json.get("code_sets_signature") == code_sets_signature
+    ):
         return existing.payload_json["assets"]
 
     typed_schemas = {
         code: [SchemaBinding.model_validate(item) for item in items]
         for code, items in schema_payload.items()
     }
-    code_sets, field_code_sets = load_published_code_sets(session, specs)
     code_set_bindings = code_set_compile_bindings(
         field_code_sets,
         {item["code"]: sandbox_code_set_table(run.id, attempt, item["code"]) for item in code_sets},
@@ -473,23 +519,43 @@ def _ensure_oracle_assets(
         "oracle_precheck": assets["empty_run"],
     }
     for artifact_type, uri in [("MYSQL_DDL", ddl_uri), ("ORACLE_DDL", oracle_ddl_uri), ("VALIDATION_SQL", sql_uri)]:
-        session.add(
-            ArtifactModel(
-                id=str(uuid.uuid4()),
-                run_id=run.id,
-                artifact_type=artifact_type,
-                blob_uri=uri,
-                sha256=uri.removeprefix("blob://"),
-                version=attempt,
+        # 按 (run_id, artifact_type, version) 幂等更新，防止规则增改或重审同 attempt 时产生重复产物行
+        existing_artifact = (
+            session.query(ArtifactModel)
+            .filter(
+                ArtifactModel.run_id == run.id,
+                ArtifactModel.artifact_type == artifact_type,
+                ArtifactModel.version == attempt,
             )
+            .first()
         )
+        if existing_artifact is not None:
+            existing_artifact.blob_uri = uri
+            existing_artifact.sha256 = uri.removeprefix("blob://")
+        else:
+            session.add(
+                ArtifactModel(
+                    id=str(uuid.uuid4()),
+                    run_id=run.id,
+                    artifact_type=artifact_type,
+                    blob_uri=uri,
+                    sha256=uri.removeprefix("blob://"),
+                    version=attempt,
+                )
+            )
     _emit(
         events,
         session,
         run,
         "ORACLE_ASSETS_PREPARED",
         "oracle_asset_builder",
-        {"attempt": attempt, "assets": assets, "result": result},
+        {
+            "attempt": attempt,
+            "rules_signature": rules_signature,
+            "code_sets_signature": code_sets_signature,
+            "assets": assets,
+            "result": result,
+        },
     )
     session.flush()
     return assets
@@ -544,25 +610,66 @@ def _rebind_failed_rules(
     )
     if not failed_keys:
         return 0
-    rows = (
-        session.query(RuleModel)
-        .filter(RuleModel.run_id == run.id, RuleModel.rule_key.in_(failed_keys), RuleModel.status == "APPROVED")
-        .all()
-    )
+    rows: List[RuleModel] = []
+    for start in range(0, len(failed_keys), _IN_CHUNK_SIZE):
+        chunk = failed_keys[start : start + _IN_CHUNK_SIZE]
+        rows.extend(
+            session.query(RuleModel)
+            .filter(RuleModel.run_id == run.id, RuleModel.rule_key.in_(chunk), RuleModel.status == "APPROVED")
+            .all()
+        )
+    specs_by_code = {item.table_code: item for item in specs}
+    selected_table_codes = set(specs_by_code)
+    table_fields_map = {item.table_code: [f.name for f in item.fields] for item in specs}
+    _, field_code_sets = load_published_code_sets(session, specs)
     revised_count = 0
     for row in rows:
-        spec = next(item for item in specs if item.table_code == row.table_code)
+        spec = specs_by_code.get(row.table_code)
+        if spec is None:
+            _emit(
+                events,
+                session,
+                run,
+                "RULE_REBIND_GAP",
+                "rule_binder",
+                {"table_code": row.table_code, "rule_key": row.rule_key, "error": f"未找到对应表规格 {row.table_code}"},
+            )
+            continue
         current = RuleDefinition.model_validate(row.definition_json)
+        field_meta = next((field for field in spec.fields if field.name == current.field), None)
+        if field_meta is None:
+            _emit(
+                events,
+                session,
+                run,
+                "RULE_REBIND_GAP",
+                "rule_binder",
+                {
+                    "table_code": spec.table_code,
+                    "rule_key": current.rule_key,
+                    "error": f"表 {spec.table_code} 中未找到字段 {current.field}",
+                },
+            )
+            continue
         failed_cases = [case for case in report.get("cases", []) if row.rule_key in case.get("missing_rules", [])]
-        payload = {
+        payload: Dict[str, Any] = {
             **spec_payload(spec),
-            "fields": [next(field for field in spec.fields if field.name == current.field).model_dump()],
+            "fields": [field_meta.model_dump()],
             "current_rule": current.model_dump(),
             "failed_cases": failed_cases,
+            **_code_set_context(field_code_sets, spec.table_code, current.field),
         }
+        if current.operator == "FOREIGN_KEY":
+            payload["table_codes"] = sorted(selected_table_codes)
+            payload["table_fields"] = table_fields_map
 
         def validate_revision(args):
-            revised = bind_rules(spec, args.get("rules", []))
+            revised = bind_rules(
+                spec,
+                args.get("rules", []),
+                selected_table_codes=selected_table_codes,
+                specs_by_code=specs_by_code,
+            )
             if len(revised) != 1:
                 raise RuleValidationError("A failed rule must be revised into exactly one rule")
             if revised[0].rule_hash == current.rule_hash:

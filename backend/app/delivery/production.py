@@ -1,5 +1,6 @@
 import math
 import re
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from app.generation.sql.compiler import compile_where, quote_identifier
@@ -42,6 +43,10 @@ def sql_literal(value: Any) -> str:
         return "NULL"
     if isinstance(value, bool):
         return "1" if value else "0"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"Non-finite numeric SQL literal is not allowed: {value}")
+        return format(value, "f")
     if isinstance(value, (int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"Non-finite numeric SQL literal is not allowed: {value}")

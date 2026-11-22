@@ -14,7 +14,12 @@ from app.infra.contracts import (
     calculate_rule_hash,
     field_map,
 )
-from app.generation.core.rules import RuleValidationError, normalize_oracle_regexp, validate_rule
+from app.generation.core.rules import (
+    RuleValidationError,
+    normalize_oracle_regexp,
+    posix_classes_to_python,
+    validate_rule,
+)
 
 
 def compile_schema_bindings(spec: SpecDocument) -> List[SchemaBinding]:
@@ -205,7 +210,13 @@ def materialize_golden_record(spec: SpecDocument, bindings: List[GeneratorBindin
             values = item.params["values"]
             record[item.field] = values[index % len(values)]
         else:
-            value = item.params["start"] + index * item.params.get("step", 1)
+            start = item.params["start"]
+            step = item.params.get("step", 1)
+            if isinstance(start, int) and isinstance(step, int) and not isinstance(start, bool) and not isinstance(step, bool):
+                value: Any = start + index * step
+            else:
+                # 浮点累加会产出 0.30000000000000004 这类脏值（金额 SEQUENCE 入 NUMBER(22,2) 直接截断失真），统一走 Decimal
+                value = Decimal(str(start)) + Decimal(index) * Decimal(str(step))
             # AI 有时写 width 有时写 padding，两个都认
             padding = int(item.params.get("padding") or item.params.get("width") or 0)
             text = str(value).zfill(padding) if padding else str(value)
@@ -254,8 +265,8 @@ def violates_single_field_rule(operator: str, params: Dict[str, Any], value: Any
         if value is None or value == "":
             return False
         try:
-            # Oracle 的 REGEXP_LIKE 是「包含匹配」，用 search 对齐
-            return re.search(pattern, str(value)) is None
+            # Oracle 的 REGEXP_LIKE 是「包含匹配」，用 search 对齐；POSIX 字符类先翻译成 Python 等价写法
+            return re.search(posix_classes_to_python(pattern), str(value)) is None
         except re.error:
             return None
     if operator == "NUM_RANGE":

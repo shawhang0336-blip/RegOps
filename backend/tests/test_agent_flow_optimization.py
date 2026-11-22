@@ -679,7 +679,12 @@ def test_rule_binder_drops_cross_field_bleed_and_dedupes_pending_rules():
     from app.generation.workflow.stages import _dedupe_approved_rules, _rules_stage
 
     session = make_session()
-    spec = _sample_spec().model_copy(update={"fields": _sample_spec().fields[:2]})  # ORG_ID, TYPE_CODE
+    base_fields = _sample_spec().fields[:2]
+    semantic_fields = [
+        base_fields[0].model_copy(update={"check_text": "必填项，18位字母数字编码。"}),
+        base_fields[1].model_copy(update={"check_text": "必填项，2位数字代码。"}),
+    ]
+    spec = _sample_spec().model_copy(update={"fields": semantic_fields})  # ORG_ID, TYPE_CODE
     run = RunModel(id=str(uuid.uuid4()), spec_id=str(uuid.uuid4()))
     session.add(run)
     session.flush()
@@ -780,8 +785,9 @@ def test_data_stage_filters_extra_ai_fields_and_aligns_cross_table_fk_golden_val
     class OverReturningGeneratorLlm:
         def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
             assert tool_name == "assign_generators"
-            assert payload["target_fields"] == ["CUST_ORG_REF", "TXN_AMT"]
-            # 故意顺手把确定性字段 TXN_NO 也一起返回，且 CUST_ORG_REF 给一个与主表不同的值
+            # 独立无耦合的 NUM_RANGE(TXN_AMT) 已由程序数学求解，仅外键字段 CUST_ORG_REF 交 AI
+            assert payload["target_fields"] == ["CUST_ORG_REF"]
+            # 故意顺手把确定性字段 TXN_NO / TXN_AMT 也一起返回，且 CUST_ORG_REF 给一个与主表不同的值
             return {
                 "generators": [
                     {"field": "TXN_NO", "generator": "FIXED", "params": {"value": "AI_SHOULD_NOT_OVERWRITE"}},
@@ -791,9 +797,10 @@ def test_data_stage_filters_extra_ai_fields_and_aligns_cross_table_fk_golden_val
             }, {"provider": "test", "model": "test"}
 
     golden_records, generator_payload = _data_stage(session, run, [parent, child], OverReturningGeneratorLlm(), rules, {})
-    # 确定性字段 TXN_NO 未被 AI 覆盖
+    # 确定性字段 TXN_NO 与独立 NUM_RANGE 字段 TXN_AMT 均未被 AI 覆盖，且 TXN_AMT 落入 [1, 9999]
     assert golden_records["T_TXN"]["TXN_NO"] == "SAMPLE_OK"
-    assert golden_records["T_TXN"]["TXN_AMT"] == 88.5
+    assert 1 <= float(golden_records["T_TXN"]["TXN_AMT"]) <= 9999
+    assert golden_records["T_TXN"]["TXN_AMT"] != 88.5
     # 跨表异名外键黄金值与生成器均已与主表 ORG_ID 自动对齐
     assert golden_records["T_TXN"]["CUST_ORG_REF"] == golden_records["T_ORG"]["ORG_ID"]
     child_gens = {g["field"]: g for g in generator_payload["T_TXN"]["generators"]}

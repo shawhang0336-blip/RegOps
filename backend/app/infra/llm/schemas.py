@@ -315,7 +315,7 @@ _RULE_OPERATOR_PROMPT = (
     "术语推理、额外格式限制或不确定拓展必须使用 TERM_INFERENCE。"
     "算子参数契约：REQUIRED={}；ENUM/NOT_IN={values:[...]}；"
     "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；"
-    "COND_VALUE={if_field,if_operator:EQ|NE|IN|NOT_IN,if_values:[...],then_operator:ENUM|NOT_IN|REGEXP|LENGTH_MAX|NUM_RANGE,then_values/pattern/length/min/max}；"
+    "COND_VALUE={if_field,if_operator:EQ|NE,if_values:[...],then_operator:MUST_BE_NULL|ENUM|NOT_IN|NUM_RANGE,then_values/min/max}；"
     "LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}；"
     "NUM_RANGE={min,max,min_inclusive,max_inclusive}（数值上下限，边界默认含）；"
     "FIELD_COMPARE={right_field,operator:LT|LE|GT|GE|EQ|NE}（左字段必须满足该关系，如到期日>=起息日写 GE）；"

@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.generation.sql.oracle import OracleSandbox
-from app.generation.workflow.nodes import _back_bodies, _front_bodies
+from app.generation.workflow.nodes import _back_bodies, _front_bodies, _is_mechanically_derived_rule
 from app.generation.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
 from app.infra.db_tables import (
     ApprovalModel,
@@ -32,7 +32,7 @@ from app.infra.db_tables import (
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings, get_settings
 from app.infra.db import SessionLocal
-from app.infra.contracts import canonical_json
+from app.infra.contracts import RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.llm import RealDesignLlm
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
@@ -60,6 +60,8 @@ from app.policy.regops_plan import (
     INTERRUPT_ANSWER_KINDS,
     project,
     project_many,
+    self_heal_cases_target,
+    self_heal_data_target,
     self_heal_target,
 )
 
@@ -370,17 +372,38 @@ def retry_generic_run(
 
     _specs(session, run.spec_id)
     report = json.loads(LocalBlobStore(settings.blob_dir).get(report_uri).decode("utf-8"))
+    cases = report.get("cases", [])
+    golden_fp_cases = [
+        case for case in cases if case.get("case_kind") == "GOLDEN" and case.get("unexpected_rules")
+    ]
     failed_keys = sorted(
-        {rule_key for case in report.get("cases", []) for rule_key in case.get("missing_rules", [])}
+        {rule_key for case in cases for rule_key in case.get("missing_rules", [])}
     )
-    revisable = (
-        session.query(RuleModel)
-        .filter(RuleModel.run_id == run.id, RuleModel.rule_key.in_(failed_keys), RuleModel.status == "APPROVED")
-        .count()
-        if failed_keys
-        else 0
-    )
-    if not revisable:
+
+    if golden_fp_cases:
+        redirect_target = self_heal_data_target()
+        redirect_reason = "Golden baseline false positive -> regenerate compliant golden data without weakening rules"
+    elif failed_keys:
+        approved_rows: List[RuleModel] = []
+        for start in range(0, len(failed_keys), 500):
+            chunk = failed_keys[start : start + 500]
+            approved_rows.extend(
+                session.query(RuleModel)
+                .filter(RuleModel.run_id == run.id, RuleModel.rule_key.in_(chunk), RuleModel.status == "APPROVED")
+                .all()
+            )
+        if not approved_rows:
+            raise WorkflowError("No failed active rules could be revised")
+        rule_map = {
+            row.rule_key: RuleDefinition.model_validate(row.definition_json) for row in approved_rows
+        }
+        if all(_is_mechanically_derived_rule(k, rule_map) for k in failed_keys):
+            redirect_target = self_heal_cases_target()
+            redirect_reason = "Deterministic rule missed -> regenerate targeted audit mutations without weakening rules"
+        else:
+            redirect_target = self_heal_target()
+            redirect_reason = "Repair rules from the persisted failed audit before regenerating data"
+    else:
         raise WorkflowError("No failed active rules could be revised")
 
     append_event(
@@ -389,8 +412,8 @@ def retry_generic_run(
         "GO_REDIRECT",
         "human_retry",
         {
-            "target": self_heal_target(),
-            "reason": "Repair rules from the persisted failed audit before regenerating data",
+            "target": redirect_target,
+            "reason": redirect_reason,
             "origin": "human_retry",
             "failed_result": {"audit_report_blob": report_uri},
         },

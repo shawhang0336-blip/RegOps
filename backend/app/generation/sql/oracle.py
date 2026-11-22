@@ -8,19 +8,25 @@
 
 import copy
 import hashlib
+import re
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 
-from app.generation.sql.code_set_sql import compile_code_set_oracle_ddl, sandbox_code_set_table
+from app.generation.sql.code_set_sql import (
+    code_set_value_rows,
+    compile_code_set_oracle_ddl,
+    sandbox_code_set_table,
+)
 from app.generation.core.binding import materialize_golden_record
 from app.generation.sql.compiler import compile_rule_query
 from app.infra.contracts import AuditCaseBinding, GeneratorBinding, RuleDefinition, SchemaBinding, SpecDocument
 from app.infra.db import quote_identifier
+from app.infra.errors import WorkflowError
 
-# Oracle 12cR2+/23 标识符硬上限 128 字节；预留 7 字节给 "_TARGET" 后缀
-_MAX_SANDBOX_TABLE_LEN = 120
+# Oracle 12cR2+/23 标识符硬上限 128 字节（UTF-8 字节，非字符数）；预留 7 字节给 "_TARGET" 后缀
+_MAX_SANDBOX_TABLE_BYTES = 120
 
 
 def run_table_prefix(run_id: str) -> str:
@@ -30,23 +36,31 @@ def run_table_prefix(run_id: str) -> str:
 
 def physical_table_name(run_id: str, attempt: int, table_code: str) -> str:
     raw = f"{run_table_prefix(run_id)}{attempt}_{table_code}"
-    if len(raw) <= _MAX_SANDBOX_TABLE_LEN:
+    if len(raw.encode("utf-8")) <= _MAX_SANDBOX_TABLE_BYTES:
         return raw
     prefix = f"{run_table_prefix(run_id)}{attempt}_"
     digest = hashlib.sha256(table_code.encode("utf-8")).hexdigest()[:8].upper()
-    keep = max(8, _MAX_SANDBOX_TABLE_LEN - len(prefix) - len(digest) - 1)
-    return f"{prefix}{table_code[:keep]}_{digest}"
+    max_code_bytes = max(8, _MAX_SANDBOX_TABLE_BYTES - len(prefix.encode("utf-8")) - len(digest) - 1)
+    clipped = _truncate_utf8_bytes(table_code, max_code_bytes)
+    return f"{prefix}{clipped}_{digest}"
+
+
+def _adapt_sandbox_ddl(ddl: str, connection) -> str:
+    """Oracle 23 保持原样；本地离线 SQLite 测试沙箱去掉 Oracle 专属 `CHAR` 修饰词，便于真实建表联调。"""
+    if connection.dialect.name == "sqlite":
+        return re.sub(r"\bVARCHAR2\((\d+)\s+CHAR\)", r"VARCHAR(\1)", ddl)
+    return ddl
 
 
 def _drop_sandbox_table_if_exists(connection, table: str) -> None:
     """幂等清理同名沙箱残表：Oracle 的 CREATE TABLE 会隐式 COMMIT，重试前先清残表防 ORA-00955。"""
-    quoted = quote_identifier(table, "oracle")
     is_oracle = connection.dialect.name.startswith("oracle")
+    quoted = quote_identifier(table, "oracle" if is_oracle else "mysql")
     stmt = f"DROP TABLE {quoted} PURGE" if is_oracle else f"DROP TABLE IF EXISTS {quoted}"
     try:
         connection.execute(text(stmt))
     except Exception as exc:
-        if "ORA-00942" in str(exc) or "no such table" in str(exc).lower():
+        if "ORA-00942" in str(exc) or "no such table" in str(exc).lower() or "unknown table" in str(exc).lower():
             return
         raise
 
@@ -56,13 +70,16 @@ class OracleSandbox:
         self.engine = create_engine(database_url, pool_pre_ping=True)
 
     def preview(self, physical_table: str, limit: int = 20) -> List[Dict]:
-        quoted = quote_identifier(physical_table, "oracle")
         try:
             with self.engine.connect() as connection:
-                result = connection.execute(
-                    text(f"SELECT * FROM {quoted} WHERE ROWNUM <= :row_limit"),
-                    {"row_limit": limit},
+                is_oracle = connection.dialect.name.startswith("oracle")
+                quoted = quote_identifier(physical_table, "oracle" if is_oracle else "mysql")
+                sql = (
+                    f"SELECT * FROM {quoted} WHERE ROWNUM <= :row_limit"
+                    if is_oracle
+                    else f"SELECT * FROM {quoted} LIMIT :row_limit"
                 )
+                result = connection.execute(text(sql), {"row_limit": limit})
                 return [
                     {k: (v.read() if hasattr(v, "read") else v) for k, v in row.items()}
                     for row in result.mappings().all()
@@ -92,14 +109,17 @@ class OracleSandbox:
         errors: List[str] = []
         try:
             with self.engine.begin() as connection:
+                is_oracle = connection.dialect.name.startswith("oracle")
                 all_tables = {item for item in tables if item}
                 if run_ids:
                     all_tables.update(self._discover_run_tables(connection, list(run_ids)))
                 for table in sorted(all_tables):
                     try:
-                        connection.execute(text(f"DROP TABLE {quote_identifier(table, 'oracle')} PURGE"))
+                        quoted = quote_identifier(table, "oracle" if is_oracle else "mysql")
+                        stmt = f"DROP TABLE {quoted} PURGE" if is_oracle else f"DROP TABLE IF EXISTS {quoted}"
+                        connection.execute(text(stmt))
                     except Exception as exc:
-                        if "ORA-00942" in str(exc):
+                        if "ORA-00942" in str(exc) or "no such table" in str(exc).lower():
                             continue
                         errors.append(f"{table}: {type(exc).__name__}")
         finally:
@@ -296,6 +316,28 @@ class GenericOracleExecutor:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
 
+    def _populate_code_set_table(self, connection, table: str, code_set: Dict[str, Any]) -> None:
+        _drop_sandbox_table_if_exists(connection, table)
+        connection.execute(text(_adapt_sandbox_ddl(compile_code_set_oracle_ddl(table), connection)))
+        statement = text(
+            f"INSERT INTO {quote_identifier(table, 'oracle')} "
+            '("CODE_VALUE", "LABEL_CN", "LABEL_EN", "DEFINITION", "SORT_ORDER", "ENABLED") '
+            "VALUES (:code_value, :label_cn, :label_en, :definition, :sort_order, :enabled)"
+        )
+        batch_rows = [
+            {
+                "code_value": row["CODE_VALUE"],
+                "label_cn": row["LABEL_CN"],
+                "label_en": row["LABEL_EN"],
+                "definition": row["DEFINITION"],
+                "sort_order": row["SORT_ORDER"],
+                "enabled": row["ENABLED"],
+            }
+            for row in code_set_value_rows(code_set)
+        ]
+        if batch_rows:
+            connection.execute(statement, batch_rows)
+
     def prepare_assets(
         self,
         run_id: str,
@@ -318,35 +360,35 @@ class GenericOracleExecutor:
         try:
             with engine.begin() as connection:
                 for code_set in selected_code_sets:
-                    table = code_set_tables[code_set["code"]]
-                    _drop_sandbox_table_if_exists(connection, table)
-                    connection.execute(text(compile_code_set_oracle_ddl(table)))
-                    statement = text(
-                        f"INSERT INTO {quote_identifier(table, 'oracle')} "
-                        '("CODE_VALUE", "LABEL_CN", "LABEL_EN", "DEFINITION", "SORT_ORDER", "ENABLED") '
-                        "VALUES (:code_value, :label_cn, :label_en, :definition, :sort_order, :enabled)"
-                    )
-                    batch_rows = [
-                        {
-                            "code_value": value["value"],
-                            "label_cn": value["label_cn"],
-                            "label_en": value.get("label_en") or "",
-                            "definition": value.get("definition") or "",
-                            "sort_order": value.get("sort_order", 0),
-                            "enabled": 1 if value.get("enabled", True) else 0,
-                        }
-                        for value in code_set["values"]
-                    ]
-                    if batch_rows:
-                        connection.execute(statement, batch_rows)
+                    self._populate_code_set_table(connection, code_set_tables[code_set["code"]], code_set)
                 for spec in specs:
                     _drop_sandbox_table_if_exists(connection, target_tables[spec.table_code])
-                    connection.execute(text(compile_ai_schema_oracle_ddl(target_tables[spec.table_code], schemas[spec.table_code])))
+                    connection.execute(
+                        text(_adapt_sandbox_ddl(compile_ai_schema_oracle_ddl(target_tables[spec.table_code], schemas[spec.table_code]), connection))
+                    )
                     _drop_sandbox_table_if_exists(connection, physical_tables[spec.table_code])
-                    connection.execute(text(compile_sandbox_oracle_ddl(physical_tables[spec.table_code], spec)))
+                    connection.execute(
+                        text(_adapt_sandbox_ddl(compile_sandbox_oracle_ddl(physical_tables[spec.table_code], spec), connection))
+                    )
                 for rule in rules or []:
-                    sql, params = compile_rule_query(rule, "oracle", physical_tables, code_set_bindings)
-                    connection.execute(text(sql), params).fetchall()
+                    sql = ""
+                    try:
+                        sql, params = compile_rule_query(rule, "oracle", physical_tables, code_set_bindings)
+                        connection.execute(text(sql), params).fetchall()
+                    except Exception as exc:
+                        raise WorkflowError(
+                            f"Oracle 空跑校验失败（表 {rule.table_code} / 字段 {rule.field} / 规则 {rule.rule_key}）: {exc}",
+                            context={
+                                "stage": "oracle_asset_builder",
+                                "error_kind": "oracle_precheck",
+                                "table_code": rule.table_code,
+                                "field": rule.field,
+                                "rule_key": rule.rule_key,
+                                "operator": rule.operator,
+                                "sql": sql,
+                                "db_error": str(exc),
+                            },
+                        ) from exc
         finally:
             engine.dispose()
         return {
@@ -382,14 +424,43 @@ class GenericOracleExecutor:
         code_set_tables = {
             item["code"]: sandbox_code_set_table(run_id, attempt, item["code"]) for item in selected_code_sets
         }
+        prepared_code_set_codes = set()
+        prepared_spec_codes = set()
         if prepared_assets:
-            physical_tables = prepared_assets["physical_tables"]
-            target_tables = prepared_assets["target_tables"]
-            code_set_tables = prepared_assets["code_set_tables"]
+            prep_phys = prepared_assets.get("physical_tables") or {}
+            prep_tgt = prepared_assets.get("target_tables") or {}
+            prep_cs = prepared_assets.get("code_set_tables") or {}
+            for code, tbl in prep_phys.items():
+                physical_tables[code] = tbl
+                if code in prep_tgt:
+                    target_tables[code] = prep_tgt[code]
+                    prepared_spec_codes.add(code)
+            for cs_code, tbl in prep_cs.items():
+                code_set_tables[cs_code] = tbl
+                prepared_code_set_codes.add(cs_code)
+
+        # 当 golden_count > 1 时，将第 2..N 条黄金样本也纳入沙箱真实校验（不仅写入 _TARGET，防止多条黄金间 UNIQUE_KEY/交叉失配漏检）
+        effective_cases: Dict[str, List[AuditCaseBinding]] = {}
         records: Dict[str, List[Dict[str, Any]]] = {}
         from app.generation.core.mutations import make_distinct_key_value
 
         for spec in specs:
+            table_cases = list(audit_cases[spec.table_code])
+            existing_ids = {c.case_id for c in table_cases}
+            existing_golden = sum(1 for c in table_cases if "GOLDEN" in c.case_id.upper())
+            golden_total = max(1, int((golden_counts or {}).get(spec.table_code, 1)))
+            extra_golden_records: Dict[str, Dict[str, Any]] = {}
+            if golden_total > existing_golden and golden_generators and spec.table_code in golden_generators:
+                for g_idx in range(1, golden_total):
+                    extra_id = f"GOLDEN_BASELINE_{g_idx + 1}"
+                    if extra_id in existing_ids:
+                        continue
+                    existing_ids.add(extra_id)
+                    gen_rec = materialize_golden_record(spec, golden_generators[spec.table_code], g_idx)
+                    extra_golden_records[extra_id] = {**golden_records[spec.table_code], **gen_rec}
+                    table_cases.append(AuditCaseBinding(case_id=extra_id, overrides={}, expected_rule_keys=[]))
+            effective_cases[spec.table_code] = table_cases
+
             records[spec.table_code] = []
             spec_fields = {f.name: f for f in spec.fields}
             unique_rules = [
@@ -400,9 +471,12 @@ class GenericOracleExecutor:
                 if golden_generators and spec.table_code in golden_generators
                 else {}
             )
-            for row_idx, case in enumerate(audit_cases[spec.table_code]):
+            for row_idx, case in enumerate(table_cases):
                 is_golden = "GOLDEN" in case.case_id.upper()
-                record = copy.deepcopy(golden_records[spec.table_code])
+                if case.case_id in extra_golden_records:
+                    record = copy.deepcopy(extra_golden_records[case.case_id])
+                else:
+                    record = copy.deepcopy(golden_records[spec.table_code])
                 # 表含 UNIQUE_KEY 规则时：非黄金且未显式覆盖唯一键的普通变异行自动分配独立主键，
                 # 避免与其他单字段变异行继承同一黄金主键而污染 GOLDEN_BASELINE（DUP 变异行显式覆写不受影响）。
                 if unique_rules and not is_golden:
@@ -413,53 +487,37 @@ class GenericOracleExecutor:
                         primary_kf = key_fields[0]
                         gen = gen_by_field.get(primary_kf)
                         if gen is not None and gen.generator == "SEQUENCE":
-                            record[primary_kf] = materialize_golden_record(spec, [gen], row_idx + 1)[primary_kf]
+                            record[primary_kf] = materialize_golden_record(spec, [gen], row_idx + golden_total)[primary_kf]
                         else:
                             record[primary_kf] = make_distinct_key_value(
-                                record.get(primary_kf), spec_fields.get(primary_kf), row_idx + 1
+                                record.get(primary_kf), spec_fields.get(primary_kf), row_idx + golden_total
                             )
                 record.update(case.overrides)
                 record["record_id"] = case.case_id
                 records[spec.table_code].append(fit_sandbox_values(spec, record))
         hits = {
-            spec.table_code: {case.case_id: [] for case in audit_cases[spec.table_code]} for spec in specs
+            spec.table_code: {case.case_id: [] for case in effective_cases[spec.table_code]} for spec in specs
         }
         engine = create_engine(self.database_url, pool_pre_ping=True)
         try:
             with engine.begin() as connection:
-                for code_set in ([] if prepared_assets else selected_code_sets):
-                    table = code_set_tables[code_set["code"]]
-                    _drop_sandbox_table_if_exists(connection, table)
-                    connection.execute(text(compile_code_set_oracle_ddl(table)))
-                    statement = text(
-                        f"INSERT INTO {quote_identifier(table, 'oracle')} "
-                        '("CODE_VALUE", "LABEL_CN", "LABEL_EN", "DEFINITION", "SORT_ORDER", "ENABLED") '
-                        "VALUES (:code_value, :label_cn, :label_en, :definition, :sort_order, :enabled)"
-                    )
-                    cs_rows = [
-                        {
-                            "code_value": value["value"],
-                            "label_cn": value["label_cn"],
-                            "label_en": value.get("label_en") or "",
-                            "definition": value.get("definition") or "",
-                            "sort_order": value.get("sort_order", 0),
-                            "enabled": 1 if value.get("enabled", True) else 0,
-                        }
-                        for value in code_set["values"]
-                    ]
-                    if cs_rows:
-                        connection.execute(statement, cs_rows)
+                for code_set in selected_code_sets:
+                    if code_set["code"] in prepared_code_set_codes:
+                        continue
+                    self._populate_code_set_table(connection, code_set_tables[code_set["code"]], code_set)
                 for spec in specs:
                     table = physical_tables[spec.table_code]
                     target_table = target_tables[spec.table_code]
                     names = ["record_id"] + [field.name for field in spec.fields]
                     parameters = [f"value_{index}" for index in range(len(names))]
-                    if prepared_assets:
+                    if spec.table_code in prepared_spec_codes:
                         # 幂等清理：若上次同 attempt 执行因瞬时网络抖动中断重试，先清旧行防 ORA-00001 主键冲突
                         connection.execute(text(f"DELETE FROM {quote_identifier(target_table, 'oracle')}"))
                     else:
                         _drop_sandbox_table_if_exists(connection, target_table)
-                        connection.execute(text(compile_ai_schema_oracle_ddl(target_table, schemas[spec.table_code])))
+                        connection.execute(
+                            text(_adapt_sandbox_ddl(compile_ai_schema_oracle_ddl(target_table, schemas[spec.table_code]), connection))
+                        )
                     target_insert = text(
                         f"INSERT INTO {quote_identifier(target_table, 'oracle')} "
                         f"({', '.join(quote_identifier(name, 'oracle') for name in names)}) "
@@ -488,11 +546,11 @@ class GenericOracleExecutor:
                         golden_rows.append(dict(zip(parameters, [golden.get(name) for name in names])))
                     if golden_rows:
                         connection.execute(target_insert, golden_rows)
-                    if prepared_assets:
+                    if spec.table_code in prepared_spec_codes:
                         connection.execute(text(f"DELETE FROM {quote_identifier(table, 'oracle')}"))
                     else:
                         _drop_sandbox_table_if_exists(connection, table)
-                        connection.execute(text(compile_sandbox_oracle_ddl(table, spec)))
+                        connection.execute(text(_adapt_sandbox_ddl(compile_sandbox_oracle_ddl(table, spec), connection)))
                     statement = text(
                         f"INSERT INTO {quote_identifier(table, 'oracle')} "
                         f"({', '.join(quote_identifier(name, 'oracle') for name in names)}) "
@@ -516,7 +574,7 @@ class GenericOracleExecutor:
         co_triggered_total = 0
         hit_rules = set()
         for spec in specs:
-            for case in audit_cases[spec.table_code]:
+            for case in effective_cases[spec.table_code]:
                 is_golden = "GOLDEN" in case.case_id.upper()
                 # 黄金用例是「零命中」基线：AI 写的期望一律无效，命中任何规则都是误报
                 expected = set() if is_golden else set(case.expected_rule_keys)

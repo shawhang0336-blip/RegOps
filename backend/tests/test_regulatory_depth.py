@@ -233,9 +233,11 @@ def test_complex_operators_validation_sql_compilation_and_golden_guard():
     dup_violations = find_golden_rule_violations(spec, rules, {}, golden_generators=dup_gens, golden_count=2)
     assert any(v["rule_key"] == "R_RPTNO_UNIQ" for v in dup_violations)
 
-    # 耦合连通分量测试：ARITHMETIC_BALANCE 的 4 个金额字段必须打包在同一 chunk 内
+    # 耦合连通分量测试：ARITHMETIC_BALANCE / COND_VALUE 关联字段必须打包在同一 chunk 内；
+    # 单列无耦合 UNIQUE_KEY(RPTNO) 已下沉由程序确定性 SEQUENCE 求解，不再占用 AI 造数预算
     coupled = _coupled_field_names(spec, rules)
-    assert {"OPEN_BAL", "CREDIT_AMT", "DEBIT_AMT", "CLOSE_BAL", "CUSTYPE", "IDCODE", "RPTNO"}.issubset(coupled)
+    assert {"OPEN_BAL", "CREDIT_AMT", "DEBIT_AMT", "CLOSE_BAL", "CUSTYPE", "IDCODE"}.issubset(coupled)
+    assert "RPTNO" not in coupled
     chunks = _partition_coupled_chunks(spec.fields, rules, batch_size=4)
     bal_chunk = next(ch for ch in chunks if any(f.name == "CLOSE_BAL" for f in ch))
     assert {"OPEN_BAL", "CREDIT_AMT", "DEBIT_AMT", "CLOSE_BAL"}.issubset({f.name for f in bal_chunk})

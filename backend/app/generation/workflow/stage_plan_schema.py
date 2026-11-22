@@ -4,8 +4,9 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.generation.core.binding import compile_schema_bindings
+from app.generation.core.planning import derive_generation_plan
 from app.generation.core.rules import RuleValidationError
-from app.generation.workflow.runtime import _call_validated, _emit, _fanout
+from app.generation.workflow.runtime import _emit
 from app.infra.db_tables import GenerationPlanModel, SchemaDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import canonical_json
@@ -54,44 +55,36 @@ def _plan_stage(
     events: Optional[List[tuple]] = None,
     cancellation: Any = None,
 ):
-    def worker(spec):
-        return _call_validated(
-            llm,
-            "assign_generation_plan",
-            "根据表复杂度自行决定必做规则数、拓展规则数、黄金数据量和每规则变异数，并说明理由；不得超出输入预算。",
-            {**spec_payload(spec), "budget": budget},
-            lambda args: _validate_plan(args, budget),
-            bus=bus,
-        )
-
-    results = _fanout(
-        session,
-        run,
-        "generation_planner",
-        specs,
-        worker,
-        max_workers=concurrency,
-        events=events,
-        bus=bus,
-        cancellation=cancellation,
-    )
-    plans = {spec.table_code: result for spec, (result, _) in zip(specs, results)}
+    """确定性生成规划阶段：按字段数、机械规则数与唯一性信号计算每表预算配额（零 LLM 调用）。"""
+    plans: Dict[str, Dict[str, Any]] = {}
+    traces: Dict[str, Dict[str, Any]] = {}
+    for spec in specs:
+        raw_plan = derive_generation_plan(spec, budget)
+        validated = _validate_plan(raw_plan, budget)
+        plans[spec.table_code] = validated
+        traces[spec.table_code] = {
+            "strategy": "DETERMINISTIC_GENERATION_PLAN",
+            "provider": "DETERMINISTIC",
+            "model": "budget-planner",
+            "tool_name": "assign_generation_plan",
+            "arguments": validated,
+        }
     _emit(
         events,
         session,
         run,
         "GENERATION_PLANNED",
         "plan_barrier",
-        {"tables": plans, "budget": budget},
+        {"strategy": "DETERMINISTIC_GENERATION_PLAN", "tables": plans, "budget": budget},
     )
-    for spec, (_, trace) in zip(specs, results):
+    for spec in specs:
         session.add(
             GenerationPlanModel(
                 id=str(uuid.uuid4()),
                 run_id=run.id,
                 table_code=spec.table_code,
                 plan_json=plans[spec.table_code],
-                trace_json=trace,
+                trace_json=traces[spec.table_code],
             )
         )
     session.flush()

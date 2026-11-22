@@ -1,7 +1,6 @@
 """阶段二子模块 4：审计变异用例绑定（单表 BSP Worker + 波次屏障汇聚）。"""
 
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.catalog.code_sets.bindings import load_published_code_sets
@@ -12,7 +11,14 @@ from app.generation.core.mutations import (
     build_regexp_fallback_mutation,
 )
 from app.generation.core.rules import RuleValidationError
-from app.generation.workflow.runtime import _call_validated, _code_set_context, _emit, _fanout, _inner_width
+from app.generation.workflow.runtime import (
+    _call_validated,
+    _code_set_context,
+    _emit,
+    _fanout,
+    _inner_width,
+    _map_with_context,
+)
 from app.generation.workflow.stage_data import _next_asset_version
 from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import AuditCaseDefinitionModel
@@ -100,8 +106,9 @@ def bind_table_audit_worker(
             "针对 target_rule 按 generation_plan.mutations_per_rule 设计单点变异用例。"
             "expected_rule_keys 至少要包含 target_rule 自身（这条用例必须打死它）；"
             "同一变异值顺带触发的其它规则不必全部列出，也不要把它们当成额外义务。"
-            "变异值必须是真正违规的取值（例如置空用 null、超长要真的超过声明长度、正则要构造贴近业务但明确不符合格式的反例），"
-            "用空格或制表符冒充空值不算违规。ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
+            "变异值必须是真正违规的取值（例如置空用 null、超长要真的超过声明长度、正则要构造贴近业务但明确不符合格式的反例）。"
+            "注意：REQUIRED 可用 null 或纯空白触发缺失；但 REGEXP/ENUM/LENGTH_MAX 等带非空守卫的规则绝不可用 null 或空串冒充非法值。"
+            "ENUM 负样本应使用 published_code_sets 之外的明确非法值。"
         )
         return _call_validated(
             llm,
@@ -145,11 +152,7 @@ def bind_table_audit_worker(
     ai_results = []
     if ai_target_rules:
         inner = max(1, min(_inner_width(concurrency, outer_workers), len(ai_target_rules)))
-        if inner <= 1 or len(ai_target_rules) <= 1:
-            ai_results = [bind_cases(rule) for rule in ai_target_rules]
-        else:
-            with ThreadPoolExecutor(max_workers=inner) as audit_executor:
-                ai_results = list(audit_executor.map(bind_cases, ai_target_rules))
+        ai_results = _map_with_context(bind_cases, ai_target_rules, inner)
 
     case_items = []
     case_ids = set()

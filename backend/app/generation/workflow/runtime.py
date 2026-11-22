@@ -7,8 +7,9 @@
   事件写集 `_emit` 与失败上下文诊断 `_error_details`。
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -28,9 +29,11 @@ from app.infra.llm.guard import (
     ERROR_SUGGESTIONS,
     STAGE_BY_TOOL,
     call_llm_validated,
+    current_cancellation,
     current_llm_bus,
     fail_context as _fail_context,
     locate_payload as _locate_payload,
+    submit_with_context,
 )
 from app.policy.regops_bus import default_bus
 
@@ -158,6 +161,31 @@ def _resolve_budget(session: Session, generation_budget=None):
 def _inner_width(concurrency: int, outer_workers: int) -> int:
     """外层扇出已占用的并发额度，剩下的才给字段级内层池，避免外层 4 × 内层 4 = 16 线程争抢。"""
     return max(1, concurrency // max(1, outer_workers))
+
+
+def _map_with_context(fn: Callable[[Any], Any], items: Sequence[Any], max_workers: int) -> List[Any]:
+    """保留 contextvars（取消令牌 / Run 级 Bus / BudgetGuard）的内层并发映射，遇取消或预算熔断立即撤回排队任务。"""
+    cancellation = current_cancellation()
+    if max_workers <= 1 or len(items) <= 1:
+        results = []
+        for item in items:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            results.append(fn(item))
+        return results
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [submit_with_context(executor, fn, item) for item in items]
+        results = []
+        try:
+            for future in futures:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
+                results.append(future.result())
+            return results
+        except BaseException:
+            for pending in futures:
+                pending.cancel()
+            raise
 
 
 def _fanout(

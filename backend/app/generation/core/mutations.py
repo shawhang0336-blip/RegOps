@@ -425,6 +425,11 @@ def build_deterministic_mutations(
         dup_overrides = {
             primary_kf: make_distinct_key_value(golden_record.get(primary_kf), fields.get(primary_kf), 9001)
         }
+        # 联合唯一键：SQL 判重带 `每个键列 IS NOT NULL` 守卫，黄金值为空的键列必须显式补非空值，否则两条 DUP 永不触发
+        for idx, kf in enumerate(key_fields[1:], start=1):
+            current = golden_record.get(kf)
+            if current is None or not str(current).strip():
+                dup_overrides[kf] = make_distinct_key_value(None, fields.get(kf), 9001 + idx)
         cases.append(
             AuditCaseBinding(
                 case_id=f"MUT_{key}_DUP_1",

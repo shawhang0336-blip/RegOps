@@ -326,10 +326,20 @@ def _back_bodies(specs, settings):
         schema_payload = ctx.get("schema_payload")
         heal_data_report = ctx.shared.pop("heal_data_report", None)
         rows = ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "APPROVED").all()
+        rejected_rows = (
+            ctx.session.query(RuleModel).filter(RuleModel.run_id == ctx.run.id, RuleModel.status == "REJECTED").all()
+        )
         rules = [RuleDefinition.model_validate(row.definition_json) for row in rows]
-        rules = _backfill_required_rules(ctx.session, ctx.run, specs, rules, events=events)
-        rules = _backfill_length_rules(ctx.session, ctx.run, specs, rules, events=events)
-        rules = _backfill_fixed_value_rules(ctx.session, ctx.run, specs, rules, events=events)
+        rejected_rules = [RuleDefinition.model_validate(row.definition_json) for row in rejected_rows]
+        rules = _backfill_required_rules(
+            ctx.session, ctx.run, specs, rules, events=events, rejected_rules=rejected_rules
+        )
+        rules = _backfill_length_rules(
+            ctx.session, ctx.run, specs, rules, events=events, rejected_rules=rejected_rules
+        )
+        rules = _backfill_fixed_value_rules(
+            ctx.session, ctx.run, specs, rules, events=events, rejected_rules=rejected_rules
+        )
         prepared_assets = _ensure_oracle_assets(
             ctx.session,
             ctx.run,
@@ -659,7 +669,8 @@ def _back_bodies(specs, settings):
             {rule_key for case in cases for rule_key in case.get("missing_rules", [])}
         )
         if not report["all_passed"] and attempt < first_attempt + max_attempts - 1:
-            if golden_fp_cases and not missing_rule_keys:
+            # 黄金基线本身误报时优先修复造数，绝不在脏黄金样本上改写规则（否则好规则会被改歪）
+            if golden_fp_cases:
                 return Outcome(
                     shared={
                         **shared,

@@ -104,6 +104,34 @@ def normalize_oracle_regexp(pattern: str) -> str:
     return "".join(out)
 
 
+_POSIX_CLASS_TO_PYTHON = {
+    "digit": "0-9",
+    "alpha": "A-Za-z",
+    "alnum": "A-Za-z0-9",
+    "upper": "A-Z",
+    "lower": "a-z",
+    "space": r" \t\r\n\f\v",
+    "blank": r" \t",
+    "xdigit": "0-9A-Fa-f",
+    "punct": r"!-/:-@\[-`{-~",
+}
+
+
+def posix_classes_to_python(pattern: str) -> str:
+    """把 Oracle POSIX 字符类（`[[:digit:]]`）翻译成 Python `re` 等价写法，供 Python 侧预判与 Oracle 语义对齐。
+
+    Python `re` 不认识 `[:digit:]`，会把 `[[:digit:]]` 解析成「`[:digt` 中任一字符 + `]`」，
+    导致对 `^[[:digit:]]{8}$` 这类正则的违规预判完全相反。
+    """
+    if not isinstance(pattern, str) or "[:" not in pattern:
+        return pattern
+    return re.sub(
+        r"\[:([a-z]+):\]",
+        lambda m: _POSIX_CLASS_TO_PYTHON.get(m.group(1), m.group(0)),
+        pattern,
+    )
+
+
 def _explicit_rule(
     spec: SpecDocument,
     rule_key: str,

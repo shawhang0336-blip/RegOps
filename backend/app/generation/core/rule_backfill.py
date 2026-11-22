@@ -1,26 +1,61 @@
-"""RegOps 规则确定性回填策略（策略层）。
+"""RegOps 规则确定性回填策略（Layer 5 generation/core，纯函数，零跨业务层依赖）。
 
-将不需要也不应该完全依赖大模型自由发挥的三类确定性元数据规则抽离为独立策略：
+将不需要也不应该完全依赖大模型自由发挥的四类确定性元数据规则抽离为独立策略：
 1. 必填回填（_backfill_required_rules）：字典校验列以「必填」开头且未绑 REQUIRED 规则的字段；
 2. 列宽上限回填（_backfill_length_rules）：VARCHAR 声明了列宽（1..4000）且未绑长度规则的字段；
-3. 固定取值回填（_backfill_fixed_value_rules）：原文明确要求「本项固定为 XXX」且非条件句的字段。
+3. 固定取值回填（_backfill_fixed_value_rules）：原文明确要求「本项固定为 XXX」且非条件句的字段；
+4. 已发布码表回填（_backfill_code_set_enum_rules）：字段已绑定已发布码表时确定性派生白名单 ENUM。
+
+同时尊重人工在审核门明确拒绝（REJECTED）的规则：凡已被人工否决的同字段同算子规则，绝不在下游强行复活。
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import re
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.infra.contracts import RuleDefinition, calculate_rule_hash
 from app.infra.errors import WorkflowError
 from app.generation.core.binding import bind_rules
 from app.generation.core.rules import RuleValidationError
 
+_FIXED_VALUE_HINT_RE = re.compile(r"(?:本项)?(?:固定|恒)\s*(?:填|填报|填写|取\s*值|取|为|值)?\s*[:：]?\s*")
+_QUOTES = "\"'“”‘’「」『』《》【】[]()（） "
+_CONDITIONAL_PHRASE_RE = re.compile(r"(如|若|当|如果)[^。；]{0,40}(则|时|的|，)")
 
-def _required_backfill_candidates(specs, rules) -> List[tuple]:
-    """找出「原文句首写必填、但规则集里没有 REQUIRED」的字段。
+
+def _parse_fixed_value(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = _FIXED_VALUE_HINT_RE.search(text)
+    if not match:
+        return None
+    rest = text[match.end() :].strip()
+    value = rest.split("，")[0].split("。")[0].strip(_QUOTES).strip()
+    value = re.split(r"[，。；;、\s]", value, maxsplit=1)[0].strip(_QUOTES)
+    if not value or len(value) > 30:
+        return None
+    if "或" in rest[: len(value) + 4]:
+        return None
+    return value
+
+
+def _is_conditional_phrase(text: str) -> bool:
+    return bool(text and _CONDITIONAL_PHRASE_RE.search(text))
+
+
+def _rejected_field_ops(rejected_rules: Optional[Iterable[RuleDefinition]], operators: set) -> set:
+    if not rejected_rules:
+        return set()
+    return {(rule.table_code, rule.field) for rule in rejected_rules if rule.operator in operators}
+
+
+def _required_backfill_candidates(specs, rules, rejected_rules: Optional[Iterable[RuleDefinition]] = None) -> List[tuple]:
+    """找出「原文句首写必填、但规则集里没有 REQUIRED（且未被人工明确拒绝）」的字段。
 
     只认句首的「必填」：「非必填项，当…时必填」和「条件必填」都不是无条件必填，
     误补一条 REQUIRED 会把合法的空值判成违规，比漏补伤害更大。
     """
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "REQUIRED"}
+    covered.update(_rejected_field_ops(rejected_rules, {"REQUIRED"}))
     candidates = []
     for spec in specs:
         for field in spec.fields:
@@ -40,10 +75,11 @@ def _backfill_required_rules(
     upsert_rule: Callable,
     emit: Callable,
     events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[RuleDefinition]:
-    """按字典原文机械补齐必填规则。"""
+    """按字典原文机械补齐必填规则（跳过已被人工明确 REJECTED 的字段）。"""
     added: List[RuleDefinition] = []
-    for spec, field in _required_backfill_candidates(specs, rules):
+    for spec, field in _required_backfill_candidates(specs, rules, rejected_rules=rejected_rules):
         text = (field.check_text or "").strip()
         rule_key = f"{spec.table_code}_{field.name}_REQUIRED"
         try:
@@ -93,13 +129,14 @@ def _backfill_required_rules(
     return rules + added
 
 
-def _length_backfill_candidates(specs, rules) -> List[tuple]:
-    """找出「字典声明了长度、但规则集里没有任何长度约束」的文本字段。"""
+def _length_backfill_candidates(specs, rules, rejected_rules: Optional[Iterable[RuleDefinition]] = None) -> List[tuple]:
+    """找出「字典声明了长度、但规则集里没有任何长度约束（且未被人工明确拒绝）」的文本字段。"""
     covered = {
         (rule.table_code, rule.field)
         for rule in rules
         if rule.operator in {"LENGTH", "LENGTH_MAX"}
     }
+    covered.update(_rejected_field_ops(rejected_rules, {"LENGTH", "LENGTH_MAX"}))
     candidates = []
     for spec in specs:
         for field in spec.fields:
@@ -131,10 +168,11 @@ def _backfill_length_rules(
     upsert_rule: Callable,
     emit: Callable,
     events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[RuleDefinition]:
-    """按类型（长度）列机械补齐 LENGTH_MAX。"""
+    """按类型（长度）列机械补齐 LENGTH_MAX（跳过已被人工明确 REJECTED 的字段）。"""
     added: List[RuleDefinition] = []
-    for spec, field in _length_backfill_candidates(specs, rules):
+    for spec, field in _length_backfill_candidates(specs, rules, rejected_rules=rejected_rules):
         rule_key = f"{spec.table_code}_{field.name}_LENGTH_MAX"
         try:
             bound = bind_rules(
@@ -188,20 +226,19 @@ def _backfill_length_rules(
     return rules + added
 
 
-def _fixed_value_candidates(specs, rules) -> List[tuple]:
-    """找出「原文明确要求本项固定填某个值」的字段。"""
-    from app.catalog.code_sets.parser import is_conditional_phrase, parse_fixed_value
-
+def _fixed_value_candidates(specs, rules, rejected_rules: Optional[Iterable[RuleDefinition]] = None) -> List[tuple]:
+    """找出「原文明确要求本项固定填某个值（且未被人工明确拒绝）」的字段。"""
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
+    covered.update(_rejected_field_ops(rejected_rules, {"ENUM"}))
     candidates = []
     for spec in specs:
         for field in spec.fields:
             if (spec.table_code, field.name) in covered:
                 continue
-            value = parse_fixed_value(field.code_reference or "") or parse_fixed_value(field.check_text or "")
+            value = _parse_fixed_value(field.code_reference or "") or _parse_fixed_value(field.check_text or "")
             if not value:
                 continue
-            if is_conditional_phrase(field.check_text or ""):
+            if _is_conditional_phrase(field.check_text or ""):
                 continue
             candidates.append((spec, field, value))
     return candidates
@@ -215,10 +252,11 @@ def _backfill_fixed_value_rules(
     upsert_rule: Callable,
     emit: Callable,
     events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[RuleDefinition]:
-    """按原文的固定值要求补齐 ENUM。"""
+    """按原文的固定值要求补齐 ENUM（跳过已被人工明确 REJECTED 的字段）。"""
     added: List[RuleDefinition] = []
-    for spec, field, value in _fixed_value_candidates(specs, rules):
+    for spec, field, value in _fixed_value_candidates(specs, rules, rejected_rules=rejected_rules):
         rule_key = f"{spec.table_code}_{field.name}_FIXED_VALUE_ENUM"
         try:
             bound = bind_rules(
@@ -275,11 +313,13 @@ def _code_set_enum_backfill_candidates(
     specs,
     rules,
     field_code_sets: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[tuple]:
-    """找出「字段已绑定已发布码表且有启用码值、但尚未有 ENUM 规则」的字段。"""
+    """找出「字段已绑定已发布码表且有启用码值、但尚未有 ENUM 规则（且未被人工明确拒绝）」的字段。"""
     if not field_code_sets:
         return []
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
+    covered.update(_rejected_field_ops(rejected_rules, {"ENUM"}))
     candidates = []
     for spec in specs:
         for field in spec.fields:
@@ -304,10 +344,13 @@ def _backfill_code_set_enum_rules(
     upsert_rule: Callable,
     emit: Callable,
     events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[RuleDefinition]:
     """按已发布码表确定性派生全量 ENUM 规则（执行期自动编译为 Oracle 码表 NOT EXISTS 子查询）。"""
     added: List[RuleDefinition] = []
-    for spec, field, code_set, values in _code_set_enum_backfill_candidates(specs, rules, field_code_sets):
+    for spec, field, code_set, values in _code_set_enum_backfill_candidates(
+        specs, rules, field_code_sets, rejected_rules=rejected_rules
+    ):
         rule_key = f"{spec.table_code}_{field.name}_CODE_SET_ENUM"
         code_name = code_set.get("name") or code_set.get("code") or "已发布码表"
         try:
@@ -369,13 +412,14 @@ def derive_deterministic_rules(
     existing_rules: Optional[List[RuleDefinition]] = None,
     field_code_sets: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
     events: Optional[List[tuple]] = None,
+    rejected_rules: Optional[Iterable[RuleDefinition]] = None,
 ) -> List[RuleDefinition]:
     """前置确定性规则派生总入口：在 AI 规则绑定前直接产出四类机械规则。"""
     rules: List[RuleDefinition] = list(existing_rules or [])
-    rules = _backfill_required_rules(session, run, specs, rules, upsert_rule, emit, events=events)
-    rules = _backfill_length_rules(session, run, specs, rules, upsert_rule, emit, events=events)
-    rules = _backfill_fixed_value_rules(session, run, specs, rules, upsert_rule, emit, events=events)
+    rules = _backfill_required_rules(session, run, specs, rules, upsert_rule, emit, events=events, rejected_rules=rejected_rules)
+    rules = _backfill_length_rules(session, run, specs, rules, upsert_rule, emit, events=events, rejected_rules=rejected_rules)
+    rules = _backfill_fixed_value_rules(session, run, specs, rules, upsert_rule, emit, events=events, rejected_rules=rejected_rules)
     rules = _backfill_code_set_enum_rules(
-        session, run, specs, rules, field_code_sets, upsert_rule, emit, events=events
+        session, run, specs, rules, field_code_sets, upsert_rule, emit, events=events, rejected_rules=rejected_rules
     )
     return rules

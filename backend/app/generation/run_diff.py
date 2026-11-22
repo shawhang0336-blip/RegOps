@@ -9,21 +9,50 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.catalog.code_sets.bindings import code_set_compile_bindings, load_published_code_sets
+from app.generation.sql.code_set_sql import stable_code_set_table
 from app.generation.sql.compiler import compile_where
-from app.infra.contracts import RuleDefinition, canonical_json
-from app.infra.db_tables import RuleModel, RunModel
+from app.infra.contracts import RuleDefinition, SpecDocument, canonical_json
+from app.infra.db_tables import RuleModel, RunModel, SpecificationModel
 from app.policy.regops_plan import project
 
 
-def _compile_rule_sql(definition: RuleDefinition) -> Optional[str]:
+def _run_code_set_bindings(session: Session, run: RunModel) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """加载该批次规格快照对应的已发布码表编译绑定，使对比 SQL 与生产实际执行的 NOT EXISTS 保持一致。"""
+    spec_row = session.get(SpecificationModel, run.spec_id)
+    if not spec_row or not isinstance(spec_row.content_json, dict) or not spec_row.content_json.get("tables"):
+        return {}
     try:
-        sql, _ = compile_where(definition, "oracle", {definition.table_code: definition.table_code})
+        specs = [SpecDocument.model_validate(item) for item in spec_row.content_json["tables"]]
+        code_sets, field_code_sets = load_published_code_sets(session, specs)
+        if not code_sets:
+            return {}
+        table_by_code = {item["code"]: stable_code_set_table(item["code"]) for item in code_sets}
+        return code_set_compile_bindings(field_code_sets, table_by_code)
+    except Exception:
+        return {}
+
+
+def _compile_rule_sql(
+    definition: RuleDefinition,
+    code_set_bindings: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> Optional[str]:
+    try:
+        sql, _ = compile_where(
+            definition,
+            "oracle",
+            {definition.table_code: definition.table_code},
+            code_set_bindings=code_set_bindings,
+        )
         return sql
     except Exception:
         return None
 
 
-def _rule_entry(row: RuleModel) -> Dict[str, Any]:
+def _rule_entry(
+    row: RuleModel,
+    code_set_bindings: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     definition = RuleDefinition.model_validate(row.definition_json)
     return {
         "rule_key": definition.rule_key,
@@ -35,7 +64,7 @@ def _rule_entry(row: RuleModel) -> Dict[str, Any]:
         "source": row.source,
         "status": row.status,
         "rationale": definition.rationale,
-        "sql": _compile_rule_sql(definition),
+        "sql": _compile_rule_sql(definition, code_set_bindings=code_set_bindings),
     }
 
 
@@ -67,12 +96,15 @@ def diff_runs(session: Session, base_run_id: str, target_run_id: str) -> Dict[st
         .all()
     )
 
-    base_entries = [_rule_entry(r) for r in base_rows]
-    target_entries = [_rule_entry(r) for r in target_rows]
+    base_bindings = _run_code_set_bindings(session, base_run)
+    target_bindings = _run_code_set_bindings(session, target_run)
+    base_entries = [_rule_entry(r, code_set_bindings=base_bindings) for r in base_rows]
+    target_entries = [_rule_entry(r, code_set_bindings=target_bindings) for r in target_rows]
 
-    base_by_exact = {_match_key(e): e for e in base_entries}
+    base_by_exact: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
     base_by_semantic: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
     for e in base_entries:
+        base_by_exact.setdefault(_match_key(e), []).append(e)
         base_by_semantic.setdefault(_semantic_key(e), []).append(e)
 
     matched_base_hashes = set()
@@ -82,7 +114,12 @@ def diff_runs(session: Session, base_run_id: str, target_run_id: str) -> Dict[st
     unchanged_count = 0
 
     for tgt in target_entries:
-        base = base_by_exact.get(_match_key(tgt))
+        exact_candidates = [
+            c for c in base_by_exact.get(_match_key(tgt), []) if c["rule_hash"] not in matched_base_hashes
+        ]
+        base = next((c for c in exact_candidates if c["rule_hash"] == tgt["rule_hash"]), None)
+        if base is None and exact_candidates:
+            base = exact_candidates[0]
         if base is None:
             candidates = [
                 c for c in base_by_semantic.get(_semantic_key(tgt), [])

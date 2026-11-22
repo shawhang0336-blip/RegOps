@@ -1,8 +1,29 @@
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 
 from app.generation.core.rules import normalize_oracle_regexp
 from app.infra.contracts import RuleDefinition, SpecDocument
 from app.infra.db import quote_identifier
+
+
+def _num_param(value: Any) -> Any:
+    """数值绑定参数：整数 → int；15 位内可无损往返的小数 → float；更高精度金融金额 → Decimal。
+
+    直接 `float()` 会让 NUMBER(22,2)/DECIMAL(22,2) 的大额边界（如 12345678901234567.89）丢精度，
+    与 Python 侧 Decimal 预判口径不一致；oracledb / PyMySQL 均原生支持 Decimal 绑定。
+    """
+    try:
+        dec = Decimal(str(value).strip().replace(",", ""))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid numeric parameter: {value!r}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"Non-finite numeric parameter: {value!r}")
+    if dec == dec.to_integral_value() and abs(dec) < Decimal(2) ** 63:
+        return int(dec)
+    as_float = float(dec)
+    if Decimal(repr(as_float)) == dec:
+        return as_float
+    return dec
 
 
 def _blank_fold(field: str, dialect: str) -> str:
@@ -143,10 +164,10 @@ def compile_where(
             min_v = rule.params.get("min")
             max_v = rule.params.get("max")
             if min_v is not None:
-                params["then_min"] = float(min_v)
+                params["then_min"] = _num_param(min_v)
                 bounds.append(f"{field} {'<' if rule.params.get('min_inclusive', True) else '<='} :then_min")
             if max_v is not None:
-                params["then_max"] = float(max_v)
+                params["then_max"] = _num_param(max_v)
                 bounds.append(f"{field} {'>' if rule.params.get('max_inclusive', True) else '>='} :then_max")
             return f"({cond_expr} AND {field} IS NOT NULL AND ({' OR '.join(bounds)}))", params
         raise ValueError(f"Unsupported COND_VALUE then_operator: {then_op}")
@@ -154,12 +175,12 @@ def compile_where(
         terms = list(rule.params["terms"])
         null_as_zero = bool(rule.params.get("null_as_zero", False))
         balance_op = rule.params.get("operator", "EQ")
-        tol = float(rule.params["tolerance"]) if rule.params.get("tolerance") is not None else (0.0001 if balance_op == "EQ" else 0.0)
+        tol = _num_param(rule.params["tolerance"]) if rule.params.get("tolerance") is not None else (Decimal("0.0001") if balance_op == "EQ" else 0)
         guards = []
         lhs_parts = []
         for idx, term in enumerate(terms):
             col = f"t.{quote_identifier(term['field'], dialect)}"
-            coef = float(term.get("coef", 1))
+            coef = _num_param(term.get("coef", 1))
             coef_key = f"bal_coef_{idx}"
             params[coef_key] = coef
             if null_as_zero:
@@ -174,9 +195,9 @@ def compile_where(
             guards.append(f"{rhs_col} IS NOT NULL")
             rhs_expr = rhs_col
         else:
-            params["bal_target"] = float(rule.params["target_value"])
+            params["bal_target"] = _num_param(rule.params["target_value"])
             rhs_expr = ":bal_target"
-        params["bal_tol"] = tol
+        params["bal_tol"] = _num_param(tol)
         if balance_op == "EQ":
             breach = f"ABS(({lhs_expr}) - ({rhs_expr})) > :bal_tol"
         elif balance_op == "GE":
@@ -208,14 +229,18 @@ def compile_where(
     if rule.operator in {"LENGTH", "LENGTH_MAX"}:
         params["expected_length"] = int(rule.params["length"])
         comparison = "<>" if rule.operator == "LENGTH" else ">"
-        return f"({field} IS NOT NULL AND LENGTH({field}) {comparison} :expected_length)", params
+        # MySQL 8 的 LENGTH() 统计 UTF-8 字节（4 个汉字 = 12），VARCHAR(n) 的 n 是字符数，必须用 CHAR_LENGTH；
+        # Oracle VARCHAR2(n CHAR) 的 LENGTH() 本身就是字符数
+        length_fn = "LENGTH" if dialect == "oracle" else "CHAR_LENGTH"
+        return f"({field} IS NOT NULL AND {length_fn}({field}) {comparison} :expected_length)", params
     if rule.operator == "REGEXP":
         raw_pattern = rule.params["pattern"]
         if dialect == "oracle":
             params["expected_pattern"] = normalize_oracle_regexp(raw_pattern)
             return f"({field} IS NOT NULL AND NOT REGEXP_LIKE({field}, :expected_pattern))", params
         params["expected_pattern"] = raw_pattern
-        return f"({field} IS NOT NULL AND {field} NOT REGEXP :expected_pattern)", params
+        # MySQL 8 默认 utf8mb4_0900_ai_ci 下 REGEXP 大小写不敏感，与 Oracle REGEXP_LIKE 不一致；'c' 强制区分大小写
+        return f"({field} IS NOT NULL AND NOT REGEXP_LIKE({field}, :expected_pattern, 'c'))", params
     if rule.operator == "FOREIGN_KEY":
         reference_code = rule.params["references_table"]
         reference_table = (physical_tables or {}).get(reference_code, reference_code)
@@ -232,10 +257,10 @@ def compile_where(
         min_value = rule.params.get("min")
         max_value = rule.params.get("max")
         if min_value is not None:
-            params["range_min"] = float(min_value)
+            params["range_min"] = _num_param(min_value)
             bounds.append(f"{field} {'<' if rule.params.get('min_inclusive', True) else '<='} :range_min")
         if max_value is not None:
-            params["range_max"] = float(max_value)
+            params["range_max"] = _num_param(max_value)
             bounds.append(f"{field} {'>' if rule.params.get('max_inclusive', True) else '>='} :range_max")
         if not bounds:
             raise ValueError("NUM_RANGE requires at least one of min/max")

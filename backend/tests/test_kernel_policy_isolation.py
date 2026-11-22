@@ -1628,6 +1628,7 @@ def test_generation_clean_structure_and_core_boundary():
         "__init__.py",
         "binding.py",
         "mutations.py",
+        "planning.py",
         "rule_backfill.py",
         "rules.py",
     }
@@ -1643,6 +1644,8 @@ def test_generation_clean_structure_and_core_boundary():
         "app.infra.llm",
         "app.kernel",
         "app.policy",
+        "app.ingestion",
+        "app.catalog",
         "app.generation.sql",
         "app.generation.workflow",
     )
