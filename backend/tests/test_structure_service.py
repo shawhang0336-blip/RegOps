@@ -319,3 +319,100 @@ def test_all_scope_sends_every_block_to_ai(monkeypatch):
     # 完整 spec 不能原样塞进 prompt，只给摘要
     assert "parsed_spec" in candidates[0]["structure"]
     assert "fields" not in candidates[0]["structure"]["parsed_spec"]
+
+
+def test_ingestion_deep_audit_ordinal_collision_split_preserve_cancel_and_progress(monkeypatch):
+    """回归：ingestion 深审核心修复：
+    1. 多章节文档中对前序分组执行合并/拆分，新块 ordinal 按整份文档最大序号分配，不撞 uq_raw_block_order 唯一键；
+    2. split_markers 保留分界标题/表头文本在切分后的新块开头，绝不吞掉表头；
+    3. analyze_document_structure 绝不吞掉 RunCancelledError / BudgetExceededError；
+    4. extract_pdf 仅调用一次 _extract_pdf_text（不重复跑两遍 pdftotext）；
+    5. import_progress 超过容量上限时淘汰已完成旧记录，且绝不淘汰 WORKING 中的文档。
+    """
+    from pathlib import Path
+    from app.infra.llm.guard import llm_execution_scope
+    from app.ingestion import import_progress
+    from app.ingestion.parsers import extractors
+    from app.kernel.run import CancellationToken, RunCancelledError
+
+    # 1) 多章节合并/拆分不撞 uq_raw_block_order，且 split_markers 保留表头文本
+    session = make_session()
+    doc = SourceDocumentModel(
+        id=str(uuid.uuid4()), file_name="multi.docx", file_type="docx", sha256=uuid.uuid4().hex,
+        blob_uri="blob://multi", spec_version="TEST", status="UPLOADED", block_count=3,
+    )
+    b0 = RawBlockModel(id=str(uuid.uuid4()), document_id=doc.id, ordinal=0, block_type="DOCX_TABLE",
+                       raw_content="表1说明\n6.2 涉外收支\n字段 | 校验", source_locator={"section": "6.1"}, content_json={}, raw_hash="h0")
+    b1 = RawBlockModel(id=str(uuid.uuid4()), document_id=doc.id, ordinal=1, block_type="DOCX_TABLE",
+                       raw_content="第2组块", source_locator={"section": "6.2"}, content_json={}, raw_hash="h1")
+    b2 = RawBlockModel(id=str(uuid.uuid4()), document_id=doc.id, ordinal=2, block_type="DOCX_TABLE",
+                       raw_content="第3组块", source_locator={"section": "6.3"}, content_json={}, raw_hash="h2")
+    session.add_all([doc, b0, b1, b2])
+    session.commit()
+
+    # 仅传入第 1 组 [b0] 做 split，新块必须从 ordinal=3 起跳，不能撞上已有 b1(ordinal=1) 或 b2(ordinal=2)
+    split_args = {
+        "blocks": [{
+            "source_block_ids": [b0.id],
+            "role": "TABLE_METADATA",
+            "title": "拆分块",
+            "column_mapping": {},
+            "human_required": False,
+            "warnings": [],
+            "split_markers": ["6.2 涉外收支"],
+        }],
+        "global_warnings": [],
+    }
+    _apply_plan(session, doc, [b0], split_args)
+    session.commit()
+    new_blocks = (
+        session.query(RawBlockModel)
+        .filter(RawBlockModel.document_id == doc.id, RawBlockModel.ordinal >= 3)
+        .order_by(RawBlockModel.ordinal)
+        .all()
+    )
+    assert [b.ordinal for b in new_blocks] == [3, 4]
+    assert new_blocks[0].raw_content == "表1说明"
+    assert new_blocks[1].raw_content.startswith("6.2 涉外收支")
+
+    # 2) 切块阶段收到 CancellationToken 取消信号时立即向上抛 RunCancelledError（不被吞为 DEFAULT）
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda s: SingleCallLlm())
+    tok = CancellationToken()
+    tok.cancel("operator stopped")
+    with pytest.raises(RunCancelledError):
+        with llm_execution_scope(cancellation=tok):
+            analyze_document_structure(doc.id, Settings())
+
+    # 3) extract_pdf 仅提取一次 PDF 文本
+    calls = {"pdf": 0}
+
+    def fake_extract_pdf_text(_p):
+        calls["pdf"] += 1
+        return "fake pdf text"
+
+    monkeypatch.setattr(extractors, "_extract_pdf_text", fake_extract_pdf_text)
+    monkeypatch.setattr(extractors, "parse_document_catalog", lambda p, *, full_text=None, digest=None: [
+        {"section": "6.1", "table_code": "T1", "reason": "ok", "spec": {"version": "V1", "terms_text": "t", "dictionary_text": "d"}}
+    ])
+    monkeypatch.setattr(extractors, "parse_document_code_sets", lambda p, *, full_text=None: [])
+    fake_pdf = Path(__file__)
+    ver, blks = extractors.extract_pdf(fake_pdf)
+    assert ver == "V1" and len(blks) == 1
+    assert calls["pdf"] == 1
+
+    # 4) import_progress 有界淘汰：超限时驱逐已完成记录，不驱逐 WORKING 记录
+    monkeypatch.setattr(import_progress, "MAX_TRACKED_DOCUMENTS", 3)
+    import_progress._STATE.clear()
+    try:
+        import_progress.start("doc-done-1", "a.pdf")
+        import_progress.finish("doc-done-1", status="DONE")
+        import_progress.start("doc-working", "b.pdf")
+        import_progress.start("doc-done-2", "c.pdf")
+        import_progress.finish("doc-done-2", status="DONE")
+        import_progress.start("doc-new", "d.pdf")
+        assert "doc-working" in import_progress._STATE
+        assert "doc-new" in import_progress._STATE
+        assert "doc-done-1" not in import_progress._STATE
+    finally:
+        import_progress._STATE.clear()

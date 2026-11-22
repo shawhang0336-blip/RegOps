@@ -317,13 +317,19 @@ def _parse_rules_or_revision_catalog(full_text: str, path: Path, digest: str) ->
     return entries
 
 
-def parse_document_catalog(pdf_path: str) -> List[Dict[str, Any]]:
+def parse_document_catalog(
+    pdf_path: str,
+    *,
+    full_text: Optional[str] = None,
+    digest: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     path = Path(pdf_path).resolve()
     if not path.is_file():
         raise SpecParseError(f"Source PDF not found: {path}")
-    raw = path.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    full_text = _extract_pdf_text(path)
+    if digest is None:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if full_text is None:
+        full_text = _extract_pdf_text(path)
 
     if "第六章 数据接口格式" in full_text:
         entries = _parse_chapter6_catalog(full_text, path, digest)
@@ -404,12 +410,17 @@ def extract_code_pairs_from_section(section_text: str, section_id: str, title: s
     return values
 
 
-def parse_document_code_sets(pdf_path: str) -> List[Dict[str, Any]]:
+def parse_document_code_sets(
+    pdf_path: str,
+    *,
+    full_text: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Scan PDF for standalone code tables (Chapter 9, Section 1.4.3.1, Appendix 一~九) and inline field enums."""
     path = Path(pdf_path).resolve()
     if not path.is_file():
         return []
-    full_text = _extract_pdf_text(path)
+    if full_text is None:
+        full_text = _extract_pdf_text(path)
     code_sets: List[Dict[str, Any]] = []
 
     # 1. SAFE 1.3 Chapter 9 Code Sets

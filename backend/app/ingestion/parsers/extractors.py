@@ -7,7 +7,11 @@ from docx import Document
 from openpyxl import load_workbook
 
 from app.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
+from app.ingestion.parsers.pdf_parser import _extract_pdf_text
 from app.infra.contracts import canonical_json
+
+# 单 Sheet 行上限：20,000 行可完整覆盖行政区划（3,200+ 行）等大型监管码表，同时防百万行恶意表格撑爆内存
+MAX_XLSX_ROWS = 20000
 
 CODE_HEADER_VAL_ALIASES = {
     "value", "code", "码值", "代码", "编码", "国家/地区代码", "币种代码",
@@ -87,7 +91,11 @@ def _sniff_tabular_code_set(title: str, headers: List[str], rows: List[List[str]
 
 
 def extract_pdf(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    entries = parse_document_catalog(str(path))
+    # 同一份 PDF 只跑一次 pdftotext 与 SHA-256，共享给目录表与附录码表扫描
+    resolved = path.resolve()
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    full_text = _extract_pdf_text(resolved)
+    entries = parse_document_catalog(str(resolved), full_text=full_text, digest=digest)
     blocks = []
     for index, entry in enumerate(entries):
         raw = ""
@@ -104,7 +112,7 @@ def extract_pdf(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
                 entry,
             )
         )
-    code_sets = parse_document_code_sets(str(path))
+    code_sets = parse_document_code_sets(str(resolved), full_text=full_text)
     for cs in code_sets:
         blocks.append(
             _block(
@@ -169,46 +177,49 @@ def extract_docx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
 def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
     workbook = load_workbook(path, read_only=False, data_only=False)
     blocks = []
-    for sheet in workbook.worksheets:
-        rows = []
-        for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 2000), values_only=True):
-            values = ["" if value is None else str(value) for value in row]
-            while values and values[-1] == "":
-                values.pop()
-            if values:
-                rows.append(values)
-        if not rows:
-            continue
-        raw = "\n".join(" | ".join(row) for row in rows)
-        code_spec = _sniff_tabular_code_set(sheet.title, rows[0], rows)
-        payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "sheet": sheet.title, "table_name": sheet.title}
-        if code_spec:
-            payload["candidate_role"] = "CODE_SET"
-            payload["code_set_spec"] = code_spec
-            payload["reason"] = f"Excel 码值表候选（{len(code_spec['values'])} 项）"
-            payload["field_count"] = len(code_spec["values"])
-        blocks.append(
-            _block(
-                len(blocks),
-                "XLSX_SHEET",
-                raw,
-                {
-                    "sheet": sheet.title,
-                    "row_count": len(rows),
-                    "truncated": sheet.max_row > 2000,
-                    "merged_ranges": [str(item) for item in sheet.merged_cells.ranges],
-                },
-                payload,
+    try:
+        for sheet in workbook.worksheets:
+            sheet_max_row = int(sheet.max_row or 0)
+            if sheet_max_row <= 0:
+                continue
+            rows = []
+            for row in sheet.iter_rows(min_row=1, max_row=min(sheet_max_row, MAX_XLSX_ROWS), values_only=True):
+                values = ["" if value is None else str(value) for value in row]
+                while values and values[-1] == "":
+                    values.pop()
+                if values:
+                    rows.append(values)
+            if not rows:
+                continue
+            raw = "\n".join(" | ".join(row) for row in rows)
+            code_spec = _sniff_tabular_code_set(sheet.title, rows[0], rows)
+            payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "sheet": sheet.title, "table_name": sheet.title}
+            if code_spec:
+                payload["candidate_role"] = "CODE_SET"
+                payload["code_set_spec"] = code_spec
+                payload["reason"] = f"Excel 码值表候选（{len(code_spec['values'])} 项）"
+                payload["field_count"] = len(code_spec["values"])
+            blocks.append(
+                _block(
+                    len(blocks),
+                    "XLSX_SHEET",
+                    raw,
+                    {
+                        "sheet": sheet.title,
+                        "row_count": len(rows),
+                        "truncated": sheet_max_row > MAX_XLSX_ROWS,
+                        "merged_ranges": [str(item) for item in sheet.merged_cells.ranges],
+                    },
+                    payload,
+                )
             )
-        )
-    workbook.close()
+    finally:
+        workbook.close()
     return "UNKNOWN", blocks
 
 
 def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
     if file_type == "pdf":
-        from app.ingestion.parsers.pdf_parser import _extract_pdf_text
-
         text = _extract_pdf_text(path)
         headings = []
         for line in text.splitlines():
@@ -243,16 +254,27 @@ def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
     if file_type == "xlsx":
         workbook = load_workbook(path, read_only=False, data_only=False)
         sheets = []
-        for sheet in workbook.worksheets:
-            sample_rows = []
-            for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 6), values_only=True):
-                values = ["" if value is None else str(value) for value in row]
-                while values and values[-1] == "":
-                    values.pop()
-                if values:
-                    sample_rows.append(values)
-            sheets.append({"sheet": sheet.title, "row_count": sheet.max_row, "column_count": sheet.max_column, "sample_rows": sample_rows})
-        workbook.close()
+        try:
+            for sheet in workbook.worksheets:
+                sheet_max_row = int(sheet.max_row or 0)
+                sample_rows = []
+                if sheet_max_row > 0:
+                    for row in sheet.iter_rows(min_row=1, max_row=min(sheet_max_row, 6), values_only=True):
+                        values = ["" if value is None else str(value) for value in row]
+                        while values and values[-1] == "":
+                            values.pop()
+                        if values:
+                            sample_rows.append(values)
+                sheets.append(
+                    {
+                        "sheet": sheet.title,
+                        "row_count": sheet_max_row,
+                        "column_count": int(sheet.max_column or 0),
+                        "sample_rows": sample_rows,
+                    }
+                )
+        finally:
+            workbook.close()
         return {
             "file_type": file_type,
             "sheet_count": len(sheets),

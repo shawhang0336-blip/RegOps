@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
@@ -12,7 +13,22 @@ from app.infra.db import SessionLocal
 from app.ingestion.parsers.extractors import extract_document, survey_document
 from app.infra.llm import RealDesignLlm
 from app.infra.llm.guard import call_llm_validated, current_llm_bus, submit_with_context
+from app.kernel.run import BudgetExceededError, RunCancelledError
 from app.policy.regops_bus import default_bus
+
+
+def _next_document_ordinal(session: Session, document_id: str) -> int:
+    """按整份文档查询最大块序号 + 1，彻底避免多分组切块或 ordinal=0 父块细分时撞 uq_raw_block_order 唯一键。"""
+    current_max = session.query(func.max(RawBlockModel.ordinal)).filter(RawBlockModel.document_id == document_id).scalar()
+    return (int(current_max) + 1) if current_max is not None else 0
+
+
+def _active_block_count(session: Session, document_id: str) -> int:
+    return sum(
+        1
+        for block in session.query(RawBlockModel).filter(RawBlockModel.document_id == document_id).all()
+        if not (block.content_json or {}).get("superseded")
+    )
 
 
 def _spec_digest(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -194,7 +210,10 @@ def _inherit_spec(by_id: Dict[str, RawBlockModel], source_ids: List[str]) -> Dic
 
 def _apply_plan(session: Session, document: SourceDocumentModel, blocks: List[RawBlockModel], args: Dict[str, Any]) -> None:
     by_id = {block.id: block for block in blocks}
-    next_ordinal = max((block.ordinal for block in blocks), default=0) + 1
+    next_ordinal = max(
+        _next_document_ordinal(session, document.id),
+        max((block.ordinal for block in blocks), default=-1) + 1,
+    )
     for item in args["blocks"]:
         source_ids = list(item.get("source_block_ids") or [])
         role = item.get("role") or "NARRATIVE"
@@ -202,7 +221,7 @@ def _apply_plan(session: Session, document: SourceDocumentModel, blocks: List[Ra
         column_mapping = item.get("column_mapping") or {}
         human_required = bool(item.get("human_required"))
         warnings = item.get("warnings") or []
-        split_markers = item.get("split_markers") or []
+        split_markers = [str(m) for m in (item.get("split_markers") or []) if str(m or "").strip()]
         if not source_ids:
             continue
         if len(source_ids) == 1 and not split_markers:
@@ -220,17 +239,26 @@ def _apply_plan(session: Session, document: SourceDocumentModel, blocks: List[Ra
         for source_id in source_ids:
             by_id[source_id].content_json = {**by_id[source_id].content_json, "superseded": True}
         if split_markers:
-            remaining = by_id[source_ids[0]].raw_content
-            raw_parts = []
+            raw_text = by_id[source_ids[0]].raw_content
+            # 按单调偏移量切片并把分界 marker 保留在新段开头，绝不吞掉章节标题或表头
+            offsets: List[int] = []
+            cursor = 0
             for marker in split_markers:
-                before, separator, after = remaining.partition(marker)
-                if before.strip():
-                    raw_parts.append(before.strip())
-                if not separator:
+                idx = raw_text.find(marker, cursor)
+                if idx < 0:
                     raise ValueError(f"Split marker not found: {marker}")
-                remaining = after
-            if remaining.strip():
-                raw_parts.append(remaining.strip())
+                offsets.append(idx)
+                cursor = idx + len(marker)
+            raw_parts = []
+            if offsets[0] > 0:
+                head = raw_text[: offsets[0]].strip()
+                if head:
+                    raw_parts.append(head)
+            for i, start_pos in enumerate(offsets):
+                end_pos = offsets[i + 1] if i + 1 < len(offsets) else len(raw_text)
+                chunk = raw_text[start_pos:end_pos].strip()
+                if chunk:
+                    raw_parts.append(chunk)
         else:
             raw_parts = ["\n\n--- ORIGINAL BLOCK BOUNDARY ---\n\n".join(by_id[source_id].raw_content for source_id in source_ids)]
         for part in raw_parts:
@@ -258,10 +286,7 @@ def _apply_plan(session: Session, document: SourceDocumentModel, blocks: List[Ra
             next_ordinal += 1
     session.flush()
     document.status = "STRUCTURE_REVIEWED"
-    document.block_count = sum(
-        1 for block in session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).all()
-        if not block.content_json.get("superseded")
-    )
+    document.block_count = _active_block_count(session, document.id)
 
 
 def latest_document_architecture(session, document_id: str, statuses=None):
@@ -314,6 +339,8 @@ def inspect_document_overview(document_id: str, settings: Settings, force: bool 
             result["chunking_strategy"] = expected_strategy
             result["warnings"] = warnings
             status = "OVERVIEW_NEEDS_REVIEW" if result.get("requires_human") else "OVERVIEW_REVIEWED"
+        except (BudgetExceededError, RunCancelledError):
+            raise
         except Exception as exc:
             result = {}
             trace = {"error": f"{type(exc).__name__}: {exc}"}
@@ -493,6 +520,8 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
                     validation_attempts=2,
                 )
                 return args, trace, "AI"
+            except (BudgetExceededError, RunCancelledError):
+                raise
             except Exception as exc:  # noqa: BLE001
                 return _default_group_plan(group, exc), {"error": f"{type(exc).__name__}: {exc}"}, "DEFAULT"
 
@@ -519,13 +548,15 @@ def analyze_document_structure(document_id: str, settings: Settings) -> str:
 
 def _split_segments(raw_content: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:
     segments = args.get("segments", [])
-    if not segments:
+    if not isinstance(segments, list) or not segments:
         raise ValueError("No semantic segments returned")
-    results = []
+    results: List[Dict[str, Any]] = []
     cursor = 0
     markers = set()
     for segment in segments:
-        marker = segment["start_marker"].strip()
+        if not isinstance(segment, dict):
+            raise ValueError("Segment entry must be an object")
+        marker = str(segment.get("start_marker") or "").strip()
         if not marker:
             raise ValueError("Empty segment marker")
         if marker in markers:
@@ -534,21 +565,38 @@ def _split_segments(raw_content: str, args: Dict[str, Any]) -> List[Dict[str, An
         start = raw_content.find(marker, cursor)
         if start < 0:
             raise ValueError(f"Segment marker not found: {marker}")
-        if start < cursor:
-            raise ValueError("Segment markers are out of order")
         if start > cursor and not results:
             prefix = raw_content[:start].strip()
             if prefix:
-                results.append({"segment_type": "NARRATIVE", "title": "块前说明", "content": prefix, "requires_human": False, "warnings": []})
-        results.append({**segment, "content": raw_content[start:], "_start": start})
-        cursor = start
-    final = []
+                results.append(
+                    {
+                        "segment_type": "NARRATIVE",
+                        "title": "块前说明",
+                        "requires_human": False,
+                        "warnings": [],
+                        "_start": 0,
+                    }
+                )
+        results.append(
+            {
+                **segment,
+                "segment_type": segment.get("segment_type") or "NARRATIVE",
+                "title": segment.get("title") or "未命名段落",
+                "requires_human": bool(segment.get("requires_human", False)),
+                "warnings": list(segment.get("warnings") or []),
+                "_start": start,
+            }
+        )
+        cursor = start + len(marker)
+    final: List[Dict[str, Any]] = []
     for index, segment in enumerate(results):
         start = segment.pop("_start")
         end = results[index + 1]["_start"] if index + 1 < len(results) else len(raw_content)
         content = raw_content[start:end].strip()
         if content:
             final.append({**segment, "content": content})
+    if not final:
+        raise ValueError("No non-empty segments produced")
     return final
 
 
@@ -556,19 +604,28 @@ def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[
     """对保留下来的混装大块做块内细分（术语 / XML / 数据字典 / 码值 / 主键），拆出子块并保留父块证据链。"""
     with SessionLocal() as session:
         parent = session.get(RawBlockModel, block_id)
-        if not parent or parent.content_json.get("superseded"):
+        if not parent or (parent.content_json or {}).get("superseded"):
             raise ValueError("Active parent block not found")
-        if parent.content_json.get("segmented"):
+        if (parent.content_json or {}).get("segmented"):
             return parent.content_json["segment_ids"]
         llm = llm or RealDesignLlm(settings)
+        active_bus = current_llm_bus() or default_bus()
         try:
-            args, trace = llm.assign(
+            segments, trace = call_llm_validated(
+                llm,
                 "assign_block_segments",
                 "分析保留块内部结构，按术语、XML、数据字典、码值、主键和说明给出 start_marker/end_marker，供程序切块。标记需要人工确认的部分，不得虚构字段。",
                 {"source_locator": parent.source_locator, "content": parent.content_json, "raw_content": parent.raw_content},
+                lambda args: _split_segments(parent.raw_content, args),
+                timeout=STRUCTURE_PLAN_TIMEOUT,
+                backoff=(1.0,),
+                bus=active_bus,
+                transient_attempts=2,
+                validation_attempts=2,
             )
-            segments = _split_segments(parent.raw_content, args)
-        except Exception as exc:
+        except (BudgetExceededError, RunCancelledError):
+            raise
+        except Exception as exc:  # noqa: BLE001
             trace = {"error": f"{type(exc).__name__}: {exc}"}
             segments = [
                 {
@@ -579,7 +636,8 @@ def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[
                     "warnings": [trace["error"]],
                 }
             ]
-        parent_spec = parent.content_json.get("spec")
+        parent_spec = (parent.content_json or {}).get("spec")
+        next_ordinal = _next_document_ordinal(session, parent.document_id)
         segment_ids = []
         for index, segment in enumerate(segments):
             raw = segment["content"]
@@ -589,7 +647,7 @@ def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[
                 RawBlockModel(
                     id=segment_id,
                     document_id=parent.document_id,
-                    ordinal=parent.ordinal * 1000 + index,
+                    ordinal=next_ordinal + index,
                     block_type=segment["segment_type"],
                     raw_content=raw,
                     source_locator={**parent.source_locator, "parent_block_id": parent.id, "segment_index": index, "title": segment["title"]},
@@ -597,7 +655,7 @@ def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[
                         "parent_block_id": parent.id,
                         "parent_spec": parent_spec,
                         "segment_type": segment["segment_type"],
-                        "column_mapping": parent.content_json.get("column_mapping", {}),
+                        "column_mapping": (parent.content_json or {}).get("column_mapping", {}),
                         "human_required": segment["requires_human"],
                         "structure_warnings": segment["warnings"],
                         "superseded": segment["segment_type"] == "IGNORE",
@@ -605,9 +663,11 @@ def analyze_block_segments(block_id: str, settings: Settings, llm=None) -> List[
                     raw_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 )
             )
-        parent.content_json = {**parent.content_json, "segmented": True, "segment_ids": segment_ids, "superseded": True}
+        parent.content_json = {**(parent.content_json or {}), "segmented": True, "segment_ids": segment_ids, "superseded": True}
+        session.flush()
         parent_document = session.get(SourceDocumentModel, parent.document_id)
-        parent_document.block_count = len(segments)
+        if parent_document is not None:
+            parent_document.block_count = _active_block_count(session, parent.document_id)
         architecture = DocumentArchitectureModel(
             id=str(uuid.uuid4()),
             document_id=parent.document_id,

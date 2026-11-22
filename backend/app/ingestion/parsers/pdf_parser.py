@@ -352,9 +352,11 @@ def _extract_pdf_text(pdf_path: Path) -> str:
         )
     except FileNotFoundError as exc:
         raise SpecParseError("pdftotext is required to import the source PDF") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SpecParseError("pdftotext timed out while extracting the source PDF") from exc
     except subprocess.CalledProcessError as exc:
         raise SpecParseError(exc.stderr.decode("utf-8", errors="replace")) from exc
-    return result.stdout.decode("utf-8")
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def _between(text: str, start_marker: str, end_marker: str, start: int = 0) -> str:

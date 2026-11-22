@@ -14,6 +14,20 @@ _LOCK = threading.Lock()
 _STATE: Dict[str, Dict[str, Any]] = {}
 
 MAX_LOGS = 40
+MAX_TRACKED_DOCUMENTS = 200
+
+
+def _evict_finished_if_needed() -> None:
+    """进程长驻防内存泄漏：超过上限时优先淘汰最早更新的已完成/失败记录，绝不驱逐 WORKING 中的文档。"""
+    if len(_STATE) < MAX_TRACKED_DOCUMENTS:
+        return
+    removable = sorted(
+        ((doc_id, item.get("updated_at", 0.0)) for doc_id, item in _STATE.items() if item.get("status") != "WORKING"),
+        key=lambda pair: pair[1],
+    )
+    overflow = len(_STATE) - MAX_TRACKED_DOCUMENTS + 1
+    for doc_id, _ in removable[:overflow]:
+        _STATE.pop(doc_id, None)
 
 STAGE_LABELS = {
     1: ("校验并保存文件", "检查格式、大小和文件指纹"),
@@ -29,6 +43,7 @@ def _now() -> float:
 
 def start(document_id: str, file_name: str, *, auto_parse: bool = False) -> None:
     with _LOCK:
+        _evict_finished_if_needed()
         _STATE[document_id] = {
             "document_id": document_id,
             "file_name": file_name,

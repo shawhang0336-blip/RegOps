@@ -65,3 +65,48 @@ def test_merge_metadata_tables_prefers_data_dictionary():
     assert result
     statuses = {row.id: row.status for row in session.query(TableMetadataModel).all()}
     assert "MERGED" in statuses.values()
+
+
+def test_split_segments_preserves_prefix_and_preserves_doc_block_count_and_ordinal_zero(monkeypatch):
+    """回归：首段前有前置文本时不炸 KeyError('_start')；ordinal=0 父块细分不撞唯一键且不覆盖整份文档 block_count。"""
+    from app.infra.config import Settings
+    from app.infra.db_tables import SourceDocumentModel
+
+    # 1) start_marker 不在第 0 字符时，块前说明正确保留不炸 KeyError
+    segs = _split_segments(
+        "章节总说明\n术语：金额定义\n字段校验：必填",
+        {
+            "segments": [
+                {"segment_type": "TERMINOLOGY", "title": "术语", "start_marker": "术语："},
+                {"segment_type": "DATA_DICTIONARY", "title": "字典", "start_marker": "字段校验："},
+            ]
+        },
+    )
+    assert [s["segment_type"] for s in segs] == ["NARRATIVE", "TERMINOLOGY", "DATA_DICTIONARY"]
+    assert segs[0]["content"] == "章节总说明"
+
+    # 2) ordinal=0 父块 + 存在其他兄弟块时：细分不撞 uq_raw_block_order 且 block_count 为全部活跃块数
+    session = make_session()
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    doc = SourceDocumentModel(
+        id=str(uuid.uuid4()), file_name="ord0.pdf", file_type="pdf", sha256=uuid.uuid4().hex,
+        blob_uri="blob://ord0", spec_version="TEST", status="UPLOADED", block_count=2,
+    )
+    parent = RawBlockModel(
+        id=str(uuid.uuid4()), document_id=doc.id, ordinal=0, block_type="TABLE_METADATA",
+        raw_content="前置导语\n术语\n<REC>\n字段校验\n主键", source_locator={"section": "6.1"},
+        content_json={"column_mapping": {}}, raw_hash="p0",
+    )
+    sibling = RawBlockModel(
+        id=str(uuid.uuid4()), document_id=doc.id, ordinal=1, block_type="TABLE_METADATA",
+        raw_content="另一张独立表", source_locator={"section": "6.2"},
+        content_json={}, raw_hash="s1",
+    )
+    session.add_all([doc, parent, sibling])
+    session.commit()
+
+    ids = analyze_block_segments(parent.id, Settings(), SegmentFixtureLlm())
+    assert len(ids) == 5  # 前置导语 + 4 个语义段
+    refreshed_doc = session.get(SourceDocumentModel, doc.id)
+    # 5 个新子块 + 1 个未动兄弟块 = 6（不能被覆盖成 5）
+    assert refreshed_doc.block_count == 6
