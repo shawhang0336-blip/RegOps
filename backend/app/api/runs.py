@@ -80,7 +80,7 @@ def create_run(request: RunRequest, session: Session = Depends(db_session)) -> D
     if request.provider != "live":
         raise HTTPException(
             status_code=422,
-            detail="The production path requires provider=live and programmatic GLM calls",
+            detail="The production path requires provider=live",
         )
     try:
         run = start_generic_run(session, request.spec_id, get_settings())
@@ -300,7 +300,9 @@ def validation_detail(run_id: str, session: Session = Depends(db_session)) -> Di
             {
                 "table_code": table_code,
                 "table_name": table_names.get(table_code) or table_code,
-                "generation_mode": "AI_FIELD_ASSIGNMENT",
+                "generation_mode": generator.get("generation_mode") or (
+                    "HYBRID_DETERMINISTIC_AI" if generator else "DETERMINISTIC"
+                ),
                 "generator_count": len(generator.get("generators") or []),
                 "golden_record": generator.get("golden_record") or {},
                 "golden_count": int(plan.get("golden_count") or 1),
@@ -461,6 +463,8 @@ def oracle_preview(
     physical_table = state.result_json[result_key].get(table_code)
     if not physical_table:
         raise HTTPException(status_code=404, detail="Table is outside this run")
+    if not settings.oracle_sandbox_url:
+        raise HTTPException(status_code=422, detail="Oracle sandbox is not configured")
     try:
         return OracleSandbox(settings.oracle_sandbox_url).preview(physical_table, limit)
     except Exception as exc:

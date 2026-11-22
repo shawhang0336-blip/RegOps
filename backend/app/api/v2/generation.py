@@ -1,4 +1,5 @@
 import hashlib
+import re
 import uuid
 from typing import Any, Dict, List, Tuple
 
@@ -63,11 +64,13 @@ def download_production_bundle(run_id: str, session: Session = Depends(db_sessio
     try:
         _, content = build_production_bundle(session, run, get_settings().blob_dir)
     except WorkflowError as exc:
+        session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]", "", run_id[:8]) or "bundle"
     return StreamingResponse(
         iter([content]),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="production_{run_id[:8]}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="production_{safe_stem}.zip"'},
     )
 
 
@@ -76,8 +79,11 @@ def _prepare_generation_run(
     request: GenerationRequest,
     settings,
 ) -> Tuple[RunModel, Dict[str, int], Dict[str, List[Dict[str, Any]]], List[str]]:
-    """两遍预检：自动定稿并发布关联码表 → 校验就绪度 → 冻结元数据快照并创建 Run。"""
-    tables = [session.get(TableMetadataModel, table_id) for table_id in request.table_ids]
+    """两遍预检：去重并拦截 MERGED → 自动定稿并发布关联码表 → 校验就绪度 → 冻结元数据快照并创建 Run。"""
+    unique_ids = list(dict.fromkeys(tid for tid in request.table_ids if tid))
+    if not unique_ids:
+        raise HTTPException(status_code=422, detail="Select at least one published table")
+    tables = [session.get(TableMetadataModel, table_id) for table_id in unique_ids]
     if any(not table for table in tables):
         raise HTTPException(status_code=404, detail="Metadata table not found")
 
@@ -86,8 +92,17 @@ def _prepare_generation_run(
     auto_published: Dict[str, List[Dict[str, Any]]] = {}
     auto_finalized: List[str] = []
 
-    # 第一遍：自动定稿 + 取规格 + 自动发布码表（仅 NEEDS_REVIEW 阻断）
+    # 第一遍：自动定稿 + 取规格 + 自动发布码表（拦截 MERGED / NEEDS_REVIEW）
     for table in tables:
+        if table.status == "MERGED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "stage": "metadata",
+                    "table_code": table.table_code,
+                    "message": f"{table.table_code} 已被合并（MERGED），请改选合并后的目标表。",
+                },
+            )
         if table.status == "NEEDS_REVIEW":
             raise HTTPException(
                 status_code=409,

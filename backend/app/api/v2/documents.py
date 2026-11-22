@@ -1,7 +1,8 @@
 import hashlib
+import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -17,27 +18,21 @@ from app.catalog.version_diff import diff_documents
 from app.catalog.pipeline_run import (
     cancel_document_run,
     document_progress_view,
+    latest_document_run,
     list_document_runs,
     start_document_extract_run,
     start_document_prepare_run,
 )
 from app.infra.db_tables import (
     DocumentArchitectureModel,
-    FieldCodeReferenceModel,
-    FieldMetadataModel,
     RawBlockModel,
     SourceDocumentModel,
-    TableMetadataModel,
 )
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.errors import WorkflowError
 from app.infra.task_runner import task_runner
 from app.ingestion.parsers.extractors import extract_document
-from app.ingestion.import_progress import ensure as progress_ensure
-from app.ingestion.import_progress import finish as progress_finish
-from app.ingestion.import_progress import snapshot as progress_snapshot
-from app.ingestion.import_progress import start as progress_start
 from app.ingestion.import_progress import update as progress_update
 from app.ingestion.parsers.quality import inspect_block
 from app.ingestion.structure_service import (
@@ -48,10 +43,31 @@ from app.ingestion.structure_service import (
     latest_document_architecture,
     reextract_document_blocks,
 )
+from app.kernel.run import run_registry
+from app.policy.regops_plan import ACTIVE_INGESTION_STATUSES, project_ingestion
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 FILE_TYPES = {"pdf": "pdf", "docx": "docx", "xlsx": "xlsx"}
+ALLOWED_BLOCK_TYPES = frozenset(
+    {
+        "TABLE_SPEC",
+        "TABLE_METADATA",
+        "TABLE_CANDIDATE",
+        "CODE_SET",
+        "CODE_SET_CANDIDATE",
+        "DOCUMENT_TABLE",
+        "DOCX_TABLE",
+        "XLSX_SHEET",
+        "PDF_SECTION",
+        "NARRATIVE",
+        "PROSE",
+        "TEXT",
+        "GLOSSARY",
+        "HEADER",
+        "IGNORE",
+    }
+)
 
 
 class ParallelExtractRequest(BaseModel):
@@ -145,8 +161,25 @@ def store_initial_blocks(document_id: str) -> SourceDocumentModel:
         return document
 
 
-def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True) -> SourceDocumentModel:
-    suffix = Path(filename).suffix.lower().lstrip(".")
+def _document_has_active_run(session: Session, document: SourceDocumentModel) -> bool:
+    if document.status in {"PREPARING", "EXTRACTING"}:
+        return True
+    latest = latest_document_run(session, document.id)
+    if not latest:
+        return False
+    if run_registry().is_active(latest.id):
+        return True
+    return project_ingestion(session, latest).status in ACTIVE_INGESTION_STATUSES
+
+
+def _ingest_uploaded_file(
+    filename: Optional[str],
+    content: bytes,
+    *,
+    prepare: bool = True,
+) -> Tuple[SourceDocumentModel, bool]:
+    clean_name = (filename or "").strip()
+    suffix = Path(clean_name).suffix.lower().lstrip(".")
     if suffix not in FILE_TYPES:
         raise HTTPException(status_code=422, detail="Only PDF, DOCX and XLSX are supported")
     if len(content) > 30 * 1024 * 1024:
@@ -159,13 +192,20 @@ def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True)
     settings = get_settings()
     target = Path(settings.blob_dir) / "uploads" / f"{digest}.{suffix}"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
+    tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_bytes(content)
+        os.replace(tmp_path, target)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
     reimport_deleted = False
     with SessionLocal() as session:
         existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one_or_none()
         if existing:
             if existing.status != "DELETED":
-                return existing
+                return existing, False
             reimport_deleted = True
             existing.status = "OVERVIEW_REQUIRED"
             existing.spec_version = "UNKNOWN"
@@ -174,7 +214,7 @@ def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True)
         else:
             document = SourceDocumentModel(
                 id=str(uuid.uuid4()),
-                file_name=Path(filename).name,
+                file_name=Path(clean_name).name,
                 file_type=suffix,
                 sha256=digest,
                 blob_uri=f"blob://uploads/{digest}.{suffix}",
@@ -187,75 +227,34 @@ def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True)
             document_id = document.id
     if not prepare:
         with SessionLocal() as session:
-            return session.get(SourceDocumentModel, document_id)
+            return session.get(SourceDocumentModel, document_id), reimport_deleted
     inspect_document_overview(document_id, settings, force=reimport_deleted)
     with SessionLocal() as session:
         document = session.get(SourceDocumentModel, document_id)
         if document.status == "OVERVIEW_FAILED":
-            return document
+            return document, reimport_deleted
     if reimport_deleted:
         reextract_document_blocks(document_id, settings)
         with SessionLocal() as session:
-            return session.get(SourceDocumentModel, document_id)
-    return store_initial_blocks(document_id)
+            return session.get(SourceDocumentModel, document_id), reimport_deleted
+    return store_initial_blocks(document_id), reimport_deleted
 
 
-def prepare_document_work(document_id: str, settings, *, reimport_deleted: bool = False) -> None:
-    """后台执行“结构检查 + 初步切块”，并把每一步写进进度与 Bus 广播。"""
-    progress_update(
-        document_id,
-        stage=2,
-        status="WORKING",
-        detail="AI 正在判断文档结构与切块方式",
-        log="开始检查整份文件结构",
-    )
-    try:
-        inspect_document_overview(document_id, settings, force=reimport_deleted)
-    except Exception as exc:  # noqa: BLE001
-        progress_finish(document_id, status="FAILED", detail=f"结构检查失败：{type(exc).__name__}")
-        raise
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        status = document.status if document else ""
-    if status == "OVERVIEW_FAILED":
-        progress_update(
-            document_id,
-            detail="结构体检未完成，继续按文件类型切块",
-            log="结构体检失败，跳过诊断信息，直接进入切块",
-        )
-
-    progress_update(
-        document_id,
-        stage=3,
-        detail="正在按文件类型切分内容块",
-        log="结构检查完成，开始初步切块",
-    )
-    try:
-        if reimport_deleted:
-            reextract_document_blocks(document_id, settings)
-        else:
-            store_initial_blocks(document_id)
-    except Exception as exc:  # noqa: BLE001
-        progress_finish(document_id, status="FAILED", detail=f"初步切块失败：{type(exc).__name__}")
-        raise
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        count = document.block_count if document else 0
-    progress_update(
-        document_id,
-        counters={"blocks": count},
-        detail=f"已生成 {count} 个内容块",
-        log=f"初步切块完成：{count} 个内容块",
-    )
-    progress_finish(document_id, status="READY", detail="结构检查与切块完成，可以开始解析字段")
+def ingest_uploaded_file(filename: str, content: bytes, *, prepare: bool = True) -> SourceDocumentModel:
+    document, _ = _ingest_uploaded_file(filename, content, prepare=prepare)
+    return document
 
 
 @router.post("", status_code=201)
 async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     """保存文件后立即返回，结构检查与切块交由统一的 Step 1 Ingestion Run（kernel.run）驱动。"""
     content = await file.read()
-    document = ingest_uploaded_file(file.filename, content, prepare=False)
-    already_ready = document.status in {"UPLOADED", "EXTRACTED", "EXTRACTION_PARTIAL", "STRUCTURE_REVIEWED"} and document.block_count
+    document, reimport_deleted = _ingest_uploaded_file(file.filename, content, prepare=False)
+    already_ready = (
+        not reimport_deleted
+        and document.status in {"UPLOADED", "EXTRACTED", "EXTRACTION_PARTIAL", "STRUCTURE_REVIEWED"}
+        and bool(document.block_count)
+    )
     if already_ready:
         return {**document_summary(document), "processing": False}
     settings = get_settings()
@@ -263,7 +262,7 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         document.id,
         document.file_name,
         settings,
-        reimport_deleted=False,
+        reimport_deleted=reimport_deleted,
         initial_bytes=len(content),
         session_factory=SessionLocal,
         runner=task_runner(),
@@ -290,6 +289,8 @@ def delete_document(document_id: str, session: Session = Depends(db_session)) ->
     document = session.get(SourceDocumentModel, document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
+    if _document_has_active_run(session, document):
+        raise HTTPException(status_code=409, detail="文档正在解析或切块中，请先取消当前任务后再删除")
     document.status = "DELETED"
     session.commit()
     return {"id": document.id, "status": document.status, "assets_preserved": True}
@@ -430,75 +431,31 @@ def analyze_structure(document_id: str, session: Session = Depends(db_session)) 
     }
 
 
-def _run_extraction(document_id: str, block_ids: List[str], targets: Optional[List[str]], needs_analysis: bool) -> None:
-    settings = get_settings()
-    total = len(block_ids)
-    progress_update(
-        document_id,
-        stage=4,
-        status="WORKING",
-        detail=f"正在逐块提取字段与码表（0/{total}）",
-        counters={"blocks_total": total, "blocks_done": 0},
-        log=f"开始解析 {total} 个内容块",
-    )
-    try:
-        if needs_analysis:
-            analyze_document_structure(document_id, settings)
-
-        def _on_block(done: int, count: int, tables: int) -> None:
-            progress_update(
-                document_id,
-                detail=f"正在逐块提取字段与码表（{done}/{count}）",
-                counters={"blocks_total": count, "blocks_done": done, "tables": tables},
-                log=f"已完成 {done}/{count} 个内容块，产出 {tables} 张报表",
-            )
-
-        result = extract_parallel_for_blocks(block_ids, settings, targets, on_progress=_on_block)
-        final_status = "EXTRACTION_PARTIAL" if result.get("errors") else "EXTRACTED"
-        if result.get("errors") and not result.get("table_ids") and not result.get("code_set_ids"):
-            final_status = "EXTRACTION_FAILED"
-    except Exception as exc:  # noqa: BLE001
-        result = {"table_ids": [], "code_set_ids": [], "errors": [{"error": f"{type(exc).__name__}: {exc}"}]}
-        final_status = "EXTRACTION_FAILED"
-    with SessionLocal() as session:
-        document = session.get(SourceDocumentModel, document_id)
-        document.status = final_status
-        session.add(
-            DocumentArchitectureModel(
-                id=str(uuid.uuid4()),
-                document_id=document_id,
-                status=final_status,
-                plan_json={"stage": "EXTRACTION", "result": result},
-                warnings_json=[item.get("error", "解析未完成") for item in result.get("errors", [])],
-                trace_json={"table_count": len(result.get("table_ids", [])), "code_set_count": len(result.get("code_set_ids", []))},
-            )
-        )
-        session.commit()
-    tables = len(result.get("table_ids", []))
-    code_sets = len(result.get("code_set_ids", []))
-    if final_status == "EXTRACTION_FAILED":
-        progress_finish(document_id, status="FAILED", detail=result["errors"][0]["error"] if result.get("errors") else "解析失败")
-    else:
-        summary_text = f"解析完成：{tables} 张报表、{code_sets} 张码表"
-        progress_update(
-            document_id,
-            counters={"tables": tables, "code_sets": code_sets, "blocks_done": total, "blocks_total": total},
-            log=summary_text,
-        )
-        progress_finish(document_id, status="DONE", detail=summary_text)
-
-
 @router.post("/{document_id}/extract-parallel", status_code=202)
 def extract_document_parallel(
     document_id: str,
     request: ParallelExtractRequest,
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
-    if not request.block_ids:
+    unique_block_ids = list(dict.fromkeys(bid for bid in request.block_ids if bid))
+    if not unique_block_ids:
         raise HTTPException(status_code=422, detail="Select at least one raw block")
     document = session.get(SourceDocumentModel, document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
+    if document.status == "DELETED":
+        raise HTTPException(status_code=409, detail="已删除文档不能发起解析")
+    if _document_has_active_run(session, document):
+        raise HTTPException(status_code=409, detail="当前文档已有正在运行的解析或切块任务")
+    blocks = (
+        session.query(RawBlockModel)
+        .filter(RawBlockModel.document_id == document_id, RawBlockModel.id.in_(unique_block_ids))
+        .all()
+    )
+    if len(blocks) != len(unique_block_ids):
+        raise HTTPException(status_code=422, detail="所选内容块不存在或不属于当前文档")
+    if any((block.content_json or {}).get("superseded") for block in blocks):
+        raise HTTPException(status_code=409, detail="Superseded raw blocks cannot be extracted")
     needs_analysis = document.status == "UPLOADED"
     file_name = document.file_name
     document.status = "EXTRACTING"
@@ -506,7 +463,7 @@ def extract_document_parallel(
     run_id = start_document_extract_run(
         document_id,
         file_name,
-        list(request.block_ids),
+        unique_block_ids,
         request.targets,
         needs_analysis,
         get_settings(),
@@ -520,7 +477,7 @@ def extract_document_parallel(
         "status": "EXTRACTING",
         "document_id": document_id,
         "run_id": run_id,
-        "block_count": len(request.block_ids),
+        "block_count": len(unique_block_ids),
     }
 
 
@@ -549,10 +506,17 @@ def adjust_structure(
     document = session.get(SourceDocumentModel, document_id)
     if not block or block.document_id != document_id or not document:
         raise HTTPException(status_code=404, detail="Raw block not found")
+    if "block_type" in changes:
+        new_type = str(changes["block_type"] or "").strip()
+        if new_type not in ALLOWED_BLOCK_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"不支持的 block_type: {new_type}",
+            )
     for key in ["block_type", "column_mapping", "human_required"]:
         if key in changes:
             if key == "block_type":
-                setattr(block, key, changes[key])
+                setattr(block, key, str(changes[key]).strip())
             else:
                 block.content_json = {**block.content_json, key: changes[key]}
     document.status = "STRUCTURE_REVIEWED"

@@ -151,13 +151,24 @@ async def event_stream(
     )
 
 
+_MAX_BLOB_TEXT_BYTES = 5 * 1024 * 1024
+
+
 @router.get("/api/blobs/{digest}")
 def get_blob(digest: str) -> Dict:
     settings = get_settings()
     try:
-        content = LocalBlobStore(settings.blob_dir).get(f"blob://{digest}").decode("utf-8")
+        raw = LocalBlobStore(settings.blob_dir).get(f"blob://{digest}")
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail="Blob not found") from exc
+    if raw.startswith(b"PK\x03\x04") or b"\x00" in raw[:4096]:
+        raise HTTPException(status_code=422, detail="Binary blob cannot be previewed as text; use the download endpoint")
+    if len(raw) > _MAX_BLOB_TEXT_BYTES:
+        raise HTTPException(status_code=413, detail="Blob exceeds text preview size limit (5 MB)")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Non-UTF-8 binary blob cannot be previewed as text") from exc
     try:
         return {"digest": digest, "content": content, "json": json.loads(content)}
     except json.JSONDecodeError:

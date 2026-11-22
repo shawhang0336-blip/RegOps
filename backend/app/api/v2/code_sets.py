@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
@@ -34,6 +36,8 @@ from app.infra.config import OPERATOR_PLACEHOLDER
 from app.ingestion.structure_service import analyze_document_structure
 
 router = APIRouter(prefix="/code-sets", tags=["code-sets"])
+
+_MAX_IMPORT_BYTES = 30 * 1024 * 1024
 
 
 class CodeSetRequest(BaseModel):
@@ -141,17 +145,32 @@ def list_code_sets(
 
 @router.post("", status_code=201)
 def create_code_set(request: CodeSetRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
+    code = request.code.strip().upper()
+    name = request.name.strip()
+    if not code or not name:
+        raise HTTPException(status_code=422, detail="码表代码与名称不能为空")
+    existing = (
+        session.query(CodeSetModel.id)
+        .filter(func.upper(CodeSetModel.code) == code, CodeSetModel.current_version == 1)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"码表代码 {code} 已存在")
     row = CodeSetModel(
         id=str(uuid.uuid4()),
-        code=request.code.upper(),
-        name=request.name,
+        code=code,
+        name=name,
         definition=request.definition,
         source_type=request.source_type,
         status="DRAFT",
         current_version=1,
     )
     session.add(row)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=f"码表代码 {code} 已存在") from exc
     return detail(session, row)
 
 
@@ -338,10 +357,26 @@ def edit_code_set(
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     for key in ["code", "name", "definition"]:
         if key in request.changes:
-            setattr(row, key, request.changes[key])
+            val = request.changes[key]
+            if key == "code":
+                cleaned = str(val or "").strip().upper()
+                if not cleaned:
+                    raise HTTPException(status_code=422, detail="码表代码不能为空")
+                setattr(row, key, cleaned)
+            elif key == "name":
+                cleaned = str(val or "").strip()
+                if not cleaned:
+                    raise HTTPException(status_code=422, detail="码表名称不能为空")
+                setattr(row, key, cleaned)
+            else:
+                setattr(row, key, "" if val is None else str(val))
     row.current_version += 1
     row.status = "DRAFT"
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=f"码表代码 {row.code} 与当前版本冲突") from exc
     return detail(session, row)
 
 
@@ -373,15 +408,30 @@ def add_value(
         raise HTTPException(status_code=404, detail="Code set not found")
     if row.current_version != request.expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    sort_order = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).count()
+    code_val = request.value.strip()
+    label_cn = request.label_cn.strip()
+    if not code_val or not label_cn:
+        raise HTTPException(status_code=422, detail="码值和中文含义不能为空")
+    existing_ci = {
+        (val or "").strip().upper()
+        for (val,) in session.query(CodeValueModel.value).filter(CodeValueModel.code_set_id == row.id).all()
+    }
+    if code_val.upper() in existing_ci:
+        raise HTTPException(status_code=409, detail=f"码值 {code_val} 已存在（忽略大小写重复）")
+    max_order = (
+        session.query(func.max(CodeValueModel.sort_order))
+        .filter(CodeValueModel.code_set_id == row.id)
+        .scalar()
+    )
+    sort_order = (max_order + 1) if max_order is not None else 0
     session.add(
         CodeValueModel(
             id=str(uuid.uuid4()),
             code_set_id=row.id,
-            value=request.value,
-            label_cn=request.label_cn,
-            label_en=request.label_en,
-            definition=request.definition,
+            value=code_val,
+            label_cn=label_cn,
+            label_en=request.label_en.strip(),
+            definition=request.definition.strip(),
             sort_order=sort_order,
             enabled=True,
             source_locator={"editor": request.editor},
@@ -390,7 +440,11 @@ def add_value(
     row.current_version += 1
     row.status = "DRAFT"
     refresh_reference_status(session, row.id)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=f"码值 {code_val} 已存在") from exc
     return detail(session, row)
 
 
@@ -407,13 +461,36 @@ def edit_value(
         raise HTTPException(status_code=404, detail="Code value not found")
     if row.current_version != request.expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    for key in ["value", "label_cn", "label_en", "definition", "enabled", "sort_order"]:
+    if "value" in request.changes:
+        new_val = str(request.changes["value"] or "").strip()
+        if not new_val:
+            raise HTTPException(status_code=422, detail="码值不能为空")
+        other_ci = {
+            (val or "").strip().upper()
+            for (vid, val) in session.query(CodeValueModel.id, CodeValueModel.value)
+            .filter(CodeValueModel.code_set_id == row.id)
+            .all()
+            if vid != value.id
+        }
+        if new_val.upper() in other_ci:
+            raise HTTPException(status_code=409, detail=f"码值 {new_val} 已存在（忽略大小写重复）")
+        value.value = new_val
+    if "label_cn" in request.changes:
+        new_label = str(request.changes["label_cn"] or "").strip()
+        if not new_label:
+            raise HTTPException(status_code=422, detail="中文含义不能为空")
+        value.label_cn = new_label
+    for key in ["label_en", "definition", "enabled", "sort_order"]:
         if key in request.changes:
             setattr(value, key, request.changes[key])
     row.current_version += 1
     row.status = "DRAFT"
     refresh_reference_status(session, row.id)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=f"码值 {value.value} 已存在") from exc
     return detail(session, row)
 
 
@@ -442,6 +519,12 @@ def publish_code_set(
     return detail(session, row)
 
 
+def _cell_text(values: tuple, idx: Optional[int]) -> str:
+    if idx is None or idx >= len(values) or values[idx] is None:
+        return ""
+    return str(values[idx]).strip()
+
+
 @router.post("/{code_set_id}/import")
 async def import_values(
     code_set_id: str,
@@ -449,16 +532,23 @@ async def import_values(
     file: UploadFile = File(...),
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
-    if not file.filename.lower().endswith(".xlsx"):
+    filename = file.filename or ""
+    if not filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=422, detail="Code import requires XLSX")
     row = session.get(CodeSetModel, code_set_id)
     if not row:
         raise HTTPException(status_code=404, detail="Code set not found")
     if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    workbook = load_workbook(BytesIO(await file.read()), data_only=True)
-    sheet = workbook.active
-    rows = list(sheet.iter_rows(values_only=True))
+    content = await file.read()
+    if len(content) > _MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds the 30 MB limit")
+    try:
+        workbook = load_workbook(BytesIO(content), data_only=True)
+        sheet = workbook.active
+        rows = list(sheet.iter_rows(values_only=True)) if sheet is not None else []
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"无法解析 Excel 文件：{type(exc).__name__}") from exc
     if not rows:
         raise HTTPException(status_code=422, detail="Empty workbook")
     headers = [str(value or "").strip() for value in rows[0]]
@@ -471,16 +561,34 @@ async def import_values(
     indexes = {aliases.get(header): index for index, header in enumerate(headers) if aliases.get(header)}
     if "value" not in indexes or "label_cn" not in indexes:
         raise HTTPException(status_code=422, detail="Required columns: value/码值/代码 and label_cn/含义/名称")
-    existing = {item.value for item in session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).all()}
-    sort_order = len(existing)
+    # MySQL 8 默认 utf8mb4_0900_ai_ci 对 uq_code_value 忽略大小写，Python 端统一按大写去重避免 1062 崩溃
+    existing_ci = {
+        (item.value or "").strip().upper()
+        for item in session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).all()
+    }
+    max_order = (
+        session.query(func.max(CodeValueModel.sort_order))
+        .filter(CodeValueModel.code_set_id == row.id)
+        .scalar()
+    )
+    sort_order = (max_order + 1) if max_order is not None else 0
     imported = 0
+    skipped_duplicate = 0
+    skipped_empty_label = 0
     for values in rows[1:]:
-        code = str(values[indexes["value"]] or "").strip()
-        label = str(values[indexes["label_cn"]] or "").strip()
-        if not code or code in existing:
+        code = _cell_text(values, indexes["value"])
+        label = _cell_text(values, indexes["label_cn"])
+        if not code:
             continue
-        label_en = str(values[indexes["label_en"]] or "").strip() if "label_en" in indexes and indexes["label_en"] < len(values) else ""
-        defn = str(values[indexes["definition"]] or "").strip() if "definition" in indexes and indexes["definition"] < len(values) else ""
+        if not label:
+            skipped_empty_label += 1
+            continue
+        code_ci = code.upper()
+        if code_ci in existing_ci:
+            skipped_duplicate += 1
+            continue
+        label_en = _cell_text(values, indexes.get("label_en"))
+        defn = _cell_text(values, indexes.get("definition"))
         session.add(
             CodeValueModel(
                 id=str(uuid.uuid4()),
@@ -491,14 +599,23 @@ async def import_values(
                 definition=defn,
                 sort_order=sort_order,
                 enabled=True,
-                source_locator={"file": file.filename},
+                source_locator={"file": filename},
             )
         )
-        existing.add(code)
+        existing_ci.add(code_ci)
         sort_order += 1
         imported += 1
     row.current_version += 1
     row.status = "DRAFT"
     refresh_reference_status(session, row.id)
-    session.commit()
-    return {"imported": imported, "code_set": detail(session, row)}
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="导入包含重复码值") from exc
+    return {
+        "imported": imported,
+        "skipped_duplicate": skipped_duplicate,
+        "skipped_empty_label": skipped_empty_label,
+        "code_set": detail(session, row),
+    }

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +16,38 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 EDITABLE_SETTINGS = {"execution_budget"}
 READONLY_ENV_SETTINGS = {"mysql", "oracle", "llm"}
+
+BUDGET_BOUNDS: Dict[str, Tuple[int, int]] = {
+    "max_rules_per_table": (1, 500),
+    "max_cases_per_table": (1, 20000),
+    "max_retries": (0, 20),
+    "max_llm_concurrency": (1, 32),
+    "max_llm_calls": (0, 10000),
+    "max_total_tokens": (0, 100_000_000),
+    "max_elapsed_seconds": (0, 86400),
+}
+
+
+def _validate_execution_budget(raw: Dict[str, Any]) -> Dict[str, int]:
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="execution_budget must be a JSON object")
+    unknown = sorted(set(raw.keys()) - set(BUDGET_BOUNDS.keys()))
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown budget fields: {', '.join(unknown)}")
+    validated: Dict[str, int] = {}
+    for field_name, val in raw.items():
+        if val is None:
+            continue
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise HTTPException(status_code=422, detail=f"Budget field '{field_name}' must be an integer")
+        lo, hi = BUDGET_BOUNDS[field_name]
+        if val < lo or val > hi:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Budget field '{field_name}' must be between {lo} and {hi}",
+            )
+        validated[field_name] = val
+    return validated
 
 
 class SettingRequest(BaseModel):
@@ -53,12 +85,15 @@ def save_setting(key: str, request: SettingRequest, session: Session = Depends(d
         )
     if key not in EDITABLE_SETTINGS:
         raise HTTPException(status_code=404, detail="Unknown setting")
+    value_to_save: Dict[str, Any] = (
+        _validate_execution_budget(request.value) if key == "execution_budget" else request.value
+    )
     row = session.get(SystemSettingModel, key)
     if not row:
-        row = SystemSettingModel(key=key, value_json=request.value, secret_reference=request.secret_reference)
+        row = SystemSettingModel(key=key, value_json=value_to_save, secret_reference=request.secret_reference)
         session.add(row)
     else:
-        row.value_json = request.value
+        row.value_json = value_to_save
         row.secret_reference = request.secret_reference
     session.commit()
     return {"key": key, "saved": True}
