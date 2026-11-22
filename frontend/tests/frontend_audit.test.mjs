@@ -1,13 +1,29 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-import { ApiError, api, downloadFile, formatApiErrorDetail } from '../src/api.js'
+import { ApiError, api, downloadFile, formatApiErrorDetail } from '../src/api/client.js'
 import { formatTime, parseBackendDate } from '../src/utils/dateTime.js'
 import { BUDGET_META, validateBudgetInput } from '../src/utils/budget.js'
-import { fileSha256, updateImportProgress } from '../src/pages/documents/documentHelpers.js'
-import { tableGate, typeBasisMeta } from '../src/pages/metadata/metadataHelpers.js'
-import { formatParams, groupStatusMeta, runLabel, sortRules } from '../src/pages/artifacts/artifactHelpers.js'
+import { fileSha256, updateImportProgress } from '../src/features/catalog/documents/documentHelpers.js'
+import { tableGate, typeBasisMeta } from '../src/features/catalog/metadata/metadataHelpers.js'
+import { formatParams, groupStatusMeta, runLabel, sortRules } from '../src/features/generation/artifactHelpers.js'
 import { watchDocumentProgress } from '../src/hooks/useEventStream.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const SRC_DIR = path.resolve(__dirname, '../src')
+
+function walkFiles(dir, exts) {
+  const out = []
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...walkFiles(full, exts))
+    else if (!exts || exts.includes(path.extname(entry.name))) out.push(full)
+  }
+  return out
+}
 
 test('ApiError formats FastAPI 422 array detail into readable Chinese instead of raw JSON', () => {
   const err = new ApiError(422, [
@@ -190,4 +206,65 @@ test('helper contracts remain deterministic across document/metadata/artifact he
     { operator: 'REQUIRED', field: 'A' },
   ])
   assert.deepEqual(sorted.map((r) => `${r.operator}:${r.field}`), ['REQUIRED:A', 'REQUIRED:Z', 'REGEXP:B'])
+})
+
+test('architecture guard: clean src/ layout aligned 1:1 with backend 4 domains', () => {
+  const rootEntries = fs.readdirSync(SRC_DIR).filter((name) => !name.startsWith('.')).sort()
+  assert.deepEqual(rootEntries, [
+    'api',
+    'app',
+    'components',
+    'context',
+    'features',
+    'hooks',
+    'main.jsx',
+    'styles',
+    'utils',
+  ])
+
+  const apiFiles = fs.readdirSync(path.join(SRC_DIR, 'api')).sort()
+  assert.deepEqual(apiFiles, ['catalog.js', 'client.js', 'delivery.js', 'generation.js', 'platform.js'])
+
+  const featureDomains = fs.readdirSync(path.join(SRC_DIR, 'features')).sort()
+  assert.deepEqual(featureDomains, ['catalog', 'delivery', 'generation', 'platform'])
+})
+
+test('architecture guard: all /api/* paths centralized in src/api/ and strict one-way layer imports', () => {
+  const jsFiles = walkFiles(SRC_DIR, ['.js', '.jsx'])
+  const rawApiViolations = []
+  const layerViolations = []
+
+  const importPattern = /(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"](\.[^'"]+)['"]|import\(\s*['"](\.[^'"]+)['"]\s*\)/g
+
+  for (const file of jsFiles) {
+    const rel = path.relative(SRC_DIR, file).replaceAll(path.sep, '/')
+    const topDir = rel.includes('/') ? rel.split('/')[0] : 'root'
+    const text = fs.readFileSync(file, 'utf-8')
+
+    // 1. 严禁 src/api/ 以外的文件硬编码 /api/ 路径
+    if (topDir !== 'api') {
+      const hits = text.match(/['"`]\/api\/[^'"`]+['"`]/g)
+      if (hits) rawApiViolations.push(`${rel}: ${hits.join(', ')}`)
+    }
+
+    // 2. 严格单向依赖校验：底座层严禁反向依赖 features/ 或 app/
+    for (const m of text.matchAll(importPattern)) {
+      const spec = m[1] || m[2]
+      const target = path.relative(SRC_DIR, path.resolve(path.dirname(file), spec)).replaceAll(path.sep, '/')
+      const targetTop = target.includes('/') ? target.split('/')[0] : 'root'
+
+      if (['api', 'components', 'context', 'hooks', 'utils'].includes(topDir) && ['features', 'app'].includes(targetTop)) {
+        layerViolations.push(`${rel} -> ${target}`)
+      }
+      if (topDir === 'utils' && ['api', 'components', 'context', 'hooks'].includes(targetTop)) {
+        layerViolations.push(`${rel} -> ${target}`)
+      }
+      if (topDir === 'api' && ['components', 'context', 'hooks', 'utils'].includes(targetTop)) {
+        layerViolations.push(`${rel} -> ${target}`)
+      }
+    }
+  }
+
+  assert.deepEqual(rawApiViolations, [], `禁止在 src/api/ 外裸写 /api/* 路径：${rawApiViolations.join('; ')}`)
+  assert.deepEqual(layerViolations, [], `发现反向跨层依赖：${layerViolations.join('; ')}`)
 })

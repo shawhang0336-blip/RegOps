@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { StatusBadge, formatTime } from '../SharedUI.jsx'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import { formatTime } from '../../utils/dateTime.js'
 
 function toneForKind(kind) {
   const k = String(kind || '').toUpperCase()

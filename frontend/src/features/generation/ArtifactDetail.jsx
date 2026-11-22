@@ -1,5 +1,5 @@
 import CopyButton from '../../components/CopyButton.jsx'
-import { StatusBadge } from '../SharedUI.jsx'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
 
 export function ProductStatusBar({ detail, activeView, onSelect, onShowRules }) {
   const hasRun = Boolean(detail.run)

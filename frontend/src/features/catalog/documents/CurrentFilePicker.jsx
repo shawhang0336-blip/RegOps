@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { formatTime } from '../SharedUI.jsx'
+import { formatTime } from '../../../utils/dateTime.js'
 
 export default function CurrentFilePicker({ documents, currentId, busy, onSelect }) {
   const [open, setOpen] = useState(false)

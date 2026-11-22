@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api, downloadFile } from '../api.js'
-import { useFeedback } from '../context/FeedbackContext.jsx'
-import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
-import { useEventStream } from '../hooks/useEventStream.js'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { DataTableModal, StatusBadge, formatTime } from './SharedUI.jsx'
-import HistoryCleanupModal from './runs/HistoryCleanupModal.jsx'
-import RunTraceTimeline from './runs/RunTraceTimeline.jsx'
+import * as deliveryApi from '../../api/delivery.js'
+import * as generationApi from '../../api/generation.js'
+import { getBlob } from '../../api/platform.js'
+import { DataTableModal } from '../../components/DataTableModal.jsx'
+import PageHeader from '../../components/PageHeader.jsx'
+import { DetailSkeleton, ListSkeleton } from '../../components/Skeleton.jsx'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import StatusMessage from '../../components/StatusMessage.jsx'
+import { useFeedback } from '../../context/FeedbackContext.jsx'
+import { useEventStream } from '../../hooks/useEventStream.js'
+import { formatTime } from '../../utils/dateTime.js'
+import HistoryCleanupModal from './HistoryCleanupModal.jsx'
+import RunTraceTimeline from './RunTraceTimeline.jsx'
 
 const RESULT_LABELS = {
   EFFECTIVE: { label: '规则有效', tone: 'green' },
@@ -76,11 +80,11 @@ export default function RunsPage() {
     if (!silent) setDetailLoading(true)
     try {
       const [run, detail, planList, busData, replayData] = await Promise.all([
-        api(`/api/runs/${id}`),
-        api(`/api/runs/${id}/validation-detail`).catch(() => null),
-        api(`/api/generation/plans/${id}`).catch(() => []),
-        api(`/api/runs/${id}/bus-events`).catch(() => ({ events: [] })),
-        api(`/api/runs/${id}/replay`).catch(() => null),
+        deliveryApi.getRun(id),
+        deliveryApi.getRunValidationDetail(id).catch(() => null),
+        generationApi.listGenerationPlans(id).catch(() => []),
+        deliveryApi.getRunBusEvents(id).catch(() => ({ events: [] })),
+        deliveryApi.getRunReplay(id).catch(() => null),
       ])
       if (reqId !== requestRef.current) return
       setActive(run)
@@ -100,7 +104,7 @@ export default function RunsPage() {
   }, [])
 
   const load = useCallback(async (preferredId, options = {}) => {
-    const list = await api('/api/runs')
+    const list = await deliveryApi.listRuns()
     setRuns(list)
     const target = preferredId || active?.id || params.get('run') || list[0]?.id
     if (target) {
@@ -121,7 +125,7 @@ export default function RunsPage() {
     load(runQueryParam)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-    api('/api/artifacts').then((payload) => {
+    generationApi.listArtifactsStatus().then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
   }, [])
@@ -148,7 +152,7 @@ export default function RunsPage() {
 
   async function openArtifact(uri, title) {
     try {
-      const body = await api(`/api/blobs/${uri.replace('blob://', '')}`)
+      const body = await getBlob(uri)
       setArtifact({ title, content: body.content })
     } catch (err) {
       setError(err.message)
@@ -160,7 +164,7 @@ export default function RunsPage() {
     setPreviewBusy(true)
     setError('')
     try {
-      const rows = await api(url)
+      const rows = await deliveryApi.fetchRunPreview(url)
       setArtifact({ title, rows: Array.isArray(rows) ? rows : [], content: JSON.stringify(rows, null, 2) })
     } catch (err) {
       setError(err.message)
@@ -183,7 +187,7 @@ export default function RunsPage() {
     setPreviewBusy(true)
     setError('')
     try {
-      const rows = await api(table.audit_preview_url)
+      const rows = await deliveryApi.fetchRunPreview(table.audit_preview_url)
       const list = Array.isArray(rows) ? rows : []
       const row = list.find((item) => item.record_id === testCase.case_id)
       if (!row) {
@@ -210,10 +214,7 @@ export default function RunsPage() {
     setBundleBusy(true)
     setError('')
     try {
-      const filename = await downloadFile(
-        `/api/generation/runs/${active.id}/production-bundle`,
-        `production_${active.id.slice(0, 8)}.zip`,
-      )
+      const filename = await generationApi.downloadProductionBundle(active.id)
       setNotice(`生产部署包「${filename}」已开始下载。`)
     } catch (err) {
       setError(err.message)
@@ -226,7 +227,7 @@ export default function RunsPage() {
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/runs/${active.id}/retry`, { method: 'POST', body: JSON.stringify({}) })
+      const body = await deliveryApi.retryRun(active.id)
       setNotice('已重新处理失败项，正在刷新验证结果。')
       await load(body.id)
     } catch (err) {
@@ -249,10 +250,7 @@ export default function RunsPage() {
     setBusy(true)
     setError('')
     try {
-      const res = await api(`/api/runs/${active.id}/cancel`, {
-        method: 'POST',
-        body: JSON.stringify({ reason: '由操作员在控制台主动中止' }),
-      })
+      const res = await deliveryApi.cancelRun(active.id, '由操作员在控制台主动中止')
       setNotice(
         res.cancelled
           ? '批次已中止并保留检查点，可随时点击“从断点继续执行”恢复。'
@@ -270,7 +268,7 @@ export default function RunsPage() {
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/runs/${active.id}/test-confirmation`, { method: 'POST', body: JSON.stringify({}) })
+      const body = await deliveryApi.confirmRunTestResults(active.id)
       setNotice('测试结果已确认，生产部署包已开放下载。')
       await load(body.id)
     } catch (err) {
@@ -292,9 +290,9 @@ export default function RunsPage() {
     setBusy(true)
     setError('')
     try {
-      const result = await api(`/api/runs/${run.id}`, { method: 'DELETE', body: JSON.stringify({}) })
+      const result = await deliveryApi.deleteRun(run.id)
       setNotice(`已删除批次「${batchTitle(run)}」${result.sandbox_cleanup?.length ? `，${result.sandbox_cleanup.length} 张沙箱表已不存在或跳过` : ''}。`)
-      const list = await api('/api/runs')
+      const list = await deliveryApi.listRuns()
       setRuns(list)
       if (active?.id === run.id) {
         if (list[0]) {

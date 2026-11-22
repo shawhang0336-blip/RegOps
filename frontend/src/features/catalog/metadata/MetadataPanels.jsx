@@ -1,11 +1,6 @@
-import {
-  StatusBadge,
-  formatTime,
-  friendlyError,
-  groupValidationIssues,
-  issueLabel,
-  issueSeverity,
-} from '../SharedUI.jsx'
+import { StatusBadge } from '../../../components/StatusBadge.jsx'
+import { formatTime } from '../../../utils/dateTime.js'
+import { friendlyError, groupValidationIssues, issueLabel, issueSeverity } from '../../../utils/labels.js'
 
 export function TypeImportPanel({
   file,

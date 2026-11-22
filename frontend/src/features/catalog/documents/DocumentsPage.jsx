@@ -1,17 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api.js'
-import { useFeedback } from '../context/FeedbackContext.jsx'
-import { useEventStream, watchDocumentProgress } from '../hooks/useEventStream.js'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { SourceLocatorTag, StatusBadge, formatTime, friendlyError } from './SharedUI.jsx'
-import CurrentFilePicker from './documents/CurrentFilePicker.jsx'
-import ImportProgressPanel from './documents/ImportProgressPanel.jsx'
+import * as catalogApi from '../../../api/catalog.js'
+import { SourceLocatorTag } from '../../../components/EvidenceCard.jsx'
+import PageHeader from '../../../components/PageHeader.jsx'
+import { StatusBadge } from '../../../components/StatusBadge.jsx'
+import StatusMessage from '../../../components/StatusMessage.jsx'
+import { useFeedback } from '../../../context/FeedbackContext.jsx'
+import { useEventStream, watchDocumentProgress } from '../../../hooks/useEventStream.js'
+import { formatTime } from '../../../utils/dateTime.js'
+import { friendlyError } from '../../../utils/labels.js'
+import CurrentFilePicker from './CurrentFilePicker.jsx'
+import ImportProgressPanel from './ImportProgressPanel.jsx'
 import {
   COLUMN_MAPPING_FIELDS,
   updateImportProgress,
-} from './documents/documentHelpers.js'
+} from './documentHelpers.js'
 
 export default function DocumentsPage({
   embedded = false,
@@ -66,7 +69,7 @@ export default function DocumentsPage({
   }
 
   async function load(preferredId) {
-    const list = await api('/api/documents')
+    const list = await catalogApi.listDocuments()
     if (!mountedRef.current) return
     setDocuments(list)
     const extracting = list.find((doc) => doc.status === 'EXTRACTING')
@@ -129,7 +132,7 @@ export default function DocumentsPage({
   const syncDigestProgress = async () => {
     if (!importProgress?.digest) return
     try {
-      const list = await api('/api/documents')
+      const list = await catalogApi.listDocuments()
       const document = list.find((item) => item.sha256 === importProgress.digest)
       if (document) setImportProgress((current) => updateImportProgress(current, document))
     } catch {
@@ -157,10 +160,7 @@ export default function DocumentsPage({
     if (!confirmed) return
     setError('')
     try {
-      await api(`/api/documents/${docId}/cancel`, {
-        method: 'POST',
-        body: JSON.stringify({ reason: '由操作员在文档工作台主动中止' }),
-      })
+      await catalogApi.cancelDocument(docId, '由操作员在文档工作台主动中止')
       setNotice('已发送中止指令，正在安全收尾。')
     } catch (err) {
       setError(friendlyError(err.message))
@@ -168,7 +168,7 @@ export default function DocumentsPage({
   }
 
   async function selectDocument(id) {
-    const doc = await api(`/api/documents/${id}`)
+    const doc = await catalogApi.getDocument(id)
     if (!mountedRef.current) return
     setDetail(doc)
     setShowUpload(false)
@@ -177,18 +177,15 @@ export default function DocumentsPage({
     setSelected(eligibleIds)
     setRaw(null)
     setArchitectureExpanded(false)
-    const arch = await api(`/api/documents/${id}/architecture`).catch(() => null)
+    const arch = await catalogApi.getDocumentArchitecture(id).catch(() => null)
     if (mountedRef.current) setArchitecture(arch)
   }
 
   async function extractPreparedDocument(documentId, signal) {
-    const prepared = await api(`/api/documents/${documentId}`)
+    const prepared = await catalogApi.getDocument(documentId)
     const blockIds = (prepared.blocks || []).filter((block) => block.eligible !== false && !block.superseded).map((block) => block.id)
     if (!blockIds.length) throw new Error('文件中没有可解析的内容')
-    await api(`/api/documents/${documentId}/extract-parallel`, {
-      method: 'POST',
-      body: JSON.stringify({ block_ids: blockIds, targets: ['metadata', 'code_sets'] }),
-    })
+    await catalogApi.extractDocumentParallel(documentId, blockIds, ['metadata', 'code_sets'])
     // 接口是 202：真正的结果通过 SSE + 轮询进度拿到，并在切页时自动中止
     return watchDocumentProgress(documentId, setImportProgress, { signal })
   }
@@ -243,16 +240,14 @@ export default function DocumentsPage({
       logs: [],
     })
     try {
-      const form = new FormData()
-      form.append('file', file)
-      const document = await api('/api/documents', { method: 'POST', body: form })
+      const document = await catalogApi.uploadDocument(file)
       if (signal.aborted || !mountedRef.current) return
 
       let snapshot = null
       if (document.processing) {
         snapshot = await watchDocumentProgress(document.id, setImportProgress, { signal })
       } else {
-        snapshot = await api(`/api/documents/${document.id}/progress`).catch(() => null)
+        snapshot = await catalogApi.getDocumentProgress(document.id).catch(() => null)
         if (mountedRef.current) setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
       }
       if (signal.aborted || !mountedRef.current) return
@@ -327,7 +322,7 @@ export default function DocumentsPage({
       logs: [],
     })
     try {
-      await api(`/api/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
+      await catalogApi.prepareDocument(detail.id)
       const snapshot = await watchDocumentProgress(detail.id, setImportProgress, { signal })
       if (signal.aborted || !mountedRef.current) return
       await load(detail.id)
@@ -374,7 +369,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      await api(`/api/documents/${detail.id}`, { method: 'DELETE' })
+      await catalogApi.deleteDocument(detail.id)
       await load()
       setNotice(`已移除「${detail.file_name}」，相关解析结果仍然保留。`)
     } catch (err) {
@@ -394,7 +389,7 @@ export default function DocumentsPage({
     if (!confirmed) return
     setBusy(true)
     try {
-      await api(`/api/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
+      await catalogApi.reextractDocument(detail.id)
       await selectDocument(detail.id)
       setNotice('已重新识别文件内容，历史核对结果仍然保留。')
     } catch (err) {
@@ -409,7 +404,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      const result = await api(`/api/documents/${detail.id}/analyze-structure`, { method: 'POST', body: JSON.stringify({}) })
+      const result = await catalogApi.analyzeDocumentStructure(detail.id)
       setArchitecture(result)
       await selectDocument(detail.id)
       setArchitectureExpanded(true)
@@ -425,7 +420,7 @@ export default function DocumentsPage({
     setMappingBlock(block)
     setMappingForm(block.column_mapping || {})
     try {
-      const rawBlock = await api(`/api/documents/${detail.id}/blocks/${block.id}`)
+      const rawBlock = await catalogApi.getRawBlock(detail.id, block.id)
       const content = rawBlock.content_json || {}
       const options = content.headers || content.rows?.[0] || []
       setMappingOptions(Array.from(new Set(options.map((item) => String(item).trim()).filter(Boolean))))
@@ -438,10 +433,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      await api(`/api/documents/${detail.id}/blocks/${block.id}/structure`, {
-        method: 'PATCH',
-        body: JSON.stringify({ human_required: false }),
-      })
+      await catalogApi.adjustBlockStructure(detail.id, block.id, { human_required: false })
       await selectDocument(detail.id)
       setNotice(`已确认「${block.table_name || block.source_locator?.section || '当前内容'}」无误。`)
     } catch (err) {
@@ -458,9 +450,10 @@ export default function DocumentsPage({
       const columnMapping = Object.fromEntries(
         Object.entries(mappingForm).filter(([, value]) => String(value).trim())
       )
-      await api(`/api/documents/${detail.id}/blocks/${mappingBlock.id}/structure`, {
-        method: 'PATCH',
-        body: JSON.stringify({ column_mapping: columnMapping, human_required: true, editor: '结构调整人工确认' }),
+      await catalogApi.adjustBlockStructure(detail.id, mappingBlock.id, {
+        column_mapping: columnMapping,
+        human_required: true,
+        editor: '结构调整人工确认',
       })
       await selectDocument(detail.id)
       setMappingBlock(null)
@@ -474,14 +467,14 @@ export default function DocumentsPage({
 
   async function viewArchitecture() {
     if (!architecture) {
-      setArchitecture(await api(`/api/documents/${detail.id}/architecture`))
+      setArchitecture(await catalogApi.getDocumentArchitecture(detail.id))
     }
     setArchitectureExpanded(!architectureExpanded)
   }
 
   async function showRaw(blockId) {
     if (!detail) return
-    setRaw(await api(`/api/documents/${detail.id}/blocks/${blockId}`))
+    setRaw(await catalogApi.getRawBlock(detail.id, blockId))
     window.setTimeout(() => document.getElementById('raw-content-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
   }
 
@@ -500,10 +493,7 @@ export default function DocumentsPage({
       logs: [],
     })
     try {
-      await api(`/api/documents/${detail.id}/extract-parallel`, {
-        method: 'POST',
-        body: JSON.stringify({ block_ids: selected, targets }),
-      })
+      await catalogApi.extractDocumentParallel(detail.id, selected, targets)
       const snapshot = await watchDocumentProgress(detail.id, setImportProgress, { signal })
       if (signal.aborted || !mountedRef.current) return
       const tableCount = snapshot?.counters?.tables || 0

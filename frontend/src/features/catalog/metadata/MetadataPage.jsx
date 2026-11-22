@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api, downloadFile } from '../api.js'
-import { useFeedback } from '../context/FeedbackContext.jsx'
-import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { RevisionDiffView, StatusBadge, groupValidationIssues } from './SharedUI.jsx'
-import FieldEditorDrawer from './metadata/FieldEditorDrawer.jsx'
-import { AddFieldForm, TypeImportPanel, ValidationTabView } from './metadata/MetadataPanels.jsx'
-import { emptyField, tableGate, typeBasisMeta } from './metadata/metadataHelpers.js'
+import * as catalogApi from '../../../api/catalog.js'
+import PageHeader from '../../../components/PageHeader.jsx'
+import { RevisionDiffView } from '../../../components/RevisionDiffView.jsx'
+import { DetailSkeleton, ListSkeleton } from '../../../components/Skeleton.jsx'
+import { StatusBadge } from '../../../components/StatusBadge.jsx'
+import StatusMessage from '../../../components/StatusMessage.jsx'
+import { useFeedback } from '../../../context/FeedbackContext.jsx'
+import { groupValidationIssues } from '../../../utils/labels.js'
+import FieldEditorDrawer from './FieldEditorDrawer.jsx'
+import { AddFieldForm, TypeImportPanel, ValidationTabView } from './MetadataPanels.jsx'
+import { emptyField, tableGate, typeBasisMeta } from './metadataHelpers.js'
 
 export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadinessChange, reportFilter, onReportFilterChange }) {
   const navigate = useNavigate()
@@ -49,7 +51,6 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   async function load(preferredId) {
     const loadId = ++loadRequestRef.current
     const documentId = params.get('document_id')
-    const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     if (embedded && !documentId) {
       setTables([])
       setDetail(null)
@@ -57,10 +58,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       return
     }
     const [tableList, unresolvedList, codeSetList, readinessPayload] = await Promise.all([
-      api(`/api/metadata/tables${scopeQuery}`),
-      api(`/api/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
-      api(`/api/code-sets${scopeQuery}`).catch(() => []),
-      api(`/api/metadata/readiness${scopeQuery}`).catch(() => null),
+      catalogApi.listMetadataTables({ documentId }),
+      catalogApi.listUnresolvedCodeReferences({ documentId }).catch(() => []),
+      catalogApi.listCodeSets({ documentId }).catch(() => []),
+      catalogApi.getMetadataReadiness({ documentId }).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setTables(tableList)
@@ -114,7 +115,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setSelectedId(id)
     setDetailLoading(true)
     try {
-      const data = await api(`/api/metadata/tables/${id}`)
+      const data = await catalogApi.getMetadataTable(id)
       if (reqId !== requestRef.current) return
       setDetail(data)
       setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
@@ -157,10 +158,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      await api(`/api/metadata/tables/${table.id}`, {
-        method: 'DELETE',
-        body: JSON.stringify({ expected_version: table.current_version }),
-      })
+      await catalogApi.deleteMetadataTable(table.id, { expected_version: table.current_version })
       setNotice(`已删除「${table.table_code}」。`)
       if (detail?.id === table.id) setDetail(null)
       await load()
@@ -223,13 +221,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       setBusy(true)
       setError('')
       try {
-        const body = await api(`/api/metadata/tables/${detail.id}/fields/${field.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            expected_version: detail.current_version,
-            reason: editReason || '人工复核元数据',
-            changes,
-          }),
+        const body = await catalogApi.editMetadataField(detail.id, field.id, {
+          expected_version: detail.current_version,
+          reason: editReason || '人工复核元数据',
+          changes,
         })
         setDetail(body)
         setBaselineFields(Object.fromEntries((body.fields || []).map((item) => [item.id, { ...item }])))
@@ -361,13 +356,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/metadata/tables/${detail.id}/fields/${field.id}`, {
-        method: 'DELETE',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          reason: '人工删除字段',
-          changes: {},
-        }),
+      const body = await catalogApi.deleteMetadataField(detail.id, field.id, {
+        expected_version: detail.current_version,
+        reason: '人工删除字段',
+        changes: {},
       })
       setDetail(body)
       setEditingFieldId(null)
@@ -398,17 +390,14 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/metadata/tables/${detail.id}/fields`, {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          reason: '人工补充字段',
-          field: {
-            ...newField,
-            length: parsedLength,
-            decimal_places: parsedDecimals,
-          },
-        }),
+      const body = await catalogApi.addMetadataField(detail.id, {
+        expected_version: detail.current_version,
+        reason: '人工补充字段',
+        field: {
+          ...newField,
+          length: parsedLength,
+          decimal_places: parsedDecimals,
+        },
       })
       setDetail(body)
       setShowAdd(false)
@@ -425,9 +414,8 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   async function downloadTypeTemplate() {
     setError('')
     const documentId = params.get('document_id')
-    const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     try {
-      await downloadFile(`/api/metadata/types/template${query}`, '字段类型修正模板.csv')
+      await catalogApi.downloadFieldTypeTemplate({ documentId })
     } catch (err) {
       setError(err.message || '模板下载失败，请稍后重试。')
     }
@@ -447,7 +435,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       form.append('dry_run', dryRun ? 'true' : 'false')
       const documentId = params.get('document_id')
       if (documentId) form.append('document_id', documentId)
-      const result = await api('/api/metadata/types/import', { method: 'POST', body: form })
+      const result = await catalogApi.importFieldTypes(form)
       setTypeImportResult(result)
       if (!dryRun) {
         setNotice(

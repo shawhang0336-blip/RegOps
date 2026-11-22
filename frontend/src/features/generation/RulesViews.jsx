@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { api } from '../../api.js'
-import { StatusBadge, formatTime } from '../SharedUI.jsx'
+import { submitRunApprovals } from '../../api/delivery.js'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import { formatTime } from '../../utils/dateTime.js'
 import RuleDrawer from './RuleDrawer.jsx'
 import {
   ACTIVE_RUN_STATUSES,
@@ -92,13 +93,10 @@ export function RulesView({ rules, runId, runStatus, onSaved, onContinue, onNoti
     }
     setApprovalBusy(true)
     try {
-      const body = await api(`/api/runs/${runId}/approvals`, {
-        method: 'POST',
-        body: JSON.stringify({
-          provider: 'live',
-          decisions: pendingRules.map((rule) => ({ rule_hash: rule.rule_hash, decision: decisions[rule.rule_hash] })),
-        }),
-      })
+      const body = await submitRunApprovals(
+        runId,
+        pendingRules.map((rule) => ({ rule_hash: rule.rule_hash, decision: decisions[rule.rule_hash] })),
+      )
       setDecisions({})
       if (body.status === 'WAITING_APPROVAL') {
         onNotice?.('本表规则已确认；整批仍等待其他报表处理。')
@@ -292,10 +290,7 @@ export function AllRulesView({ overview, loading, refreshedAt, refreshing, onRef
       const results = []
       try {
         for (const [runId, list] of byRun) {
-          results.push(await api(`/api/runs/${runId}/approvals`, {
-            method: 'POST',
-            body: JSON.stringify({ provider: 'live', decisions: list }),
-          }))
+          results.push(await submitRunApprovals(runId, list))
         }
       } catch (err) {
         if (results.length > 0) onSaved?.()

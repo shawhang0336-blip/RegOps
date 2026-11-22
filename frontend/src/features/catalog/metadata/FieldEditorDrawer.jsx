@@ -1,4 +1,4 @@
-import { EvidenceCard } from '../SharedUI.jsx'
+import { EvidenceCard } from '../../../components/EvidenceCard.jsx'
 
 export default function FieldEditorDrawer({
   activeField,

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
-import { api } from '../api.js'
+import { getDocumentProgress } from '../api/catalog.js'
+import { buildEventStreamUrl } from '../api/platform.js'
 
 const DEFAULT_BUS_TOPICS = [
   'run.created',
@@ -35,7 +36,7 @@ export function usePolling(callback, { enabled = true, intervalMs = 5000 } = {})
 }
 
 /**
- * 订阅后端 ProdAgent Bus 的 SSE 实时事件流（`/api/events/stream`），并在连接异常时自动退化为低频轮询兜底。
+ * 订阅后端 ProdAgent Bus 的 SSE 实时事件流，并在连接异常时自动退化为低频轮询兜底。
  */
 export function useEventStream({
   enabled = true,
@@ -91,12 +92,7 @@ export function useEventStream({
     }
 
     if (typeof window !== 'undefined' && typeof window.EventSource !== 'undefined') {
-      const params = new URLSearchParams()
-      if (runId) params.set('run_id', runId)
-      if (documentId) params.set('document_id', documentId)
-      if (topicsKey) params.set('topics', topicsKey)
-      const query = params.toString()
-      source = new window.EventSource(`/api/events/stream${query ? `?${query}` : ''}`)
+      source = new window.EventSource(buildEventStreamUrl({ runId, documentId, topics: topicsKey }))
 
       const listenTopics = topicsKey
         ? topicsKey.split(',').map((t) => t.trim()).filter(Boolean)
@@ -184,7 +180,7 @@ export function watchDocumentProgress(
       }
       fetching = true
       try {
-        const next = await api(`/api/documents/${documentId}/progress`).catch(() => null)
+        const next = await getDocumentProgress(documentId).catch(() => null)
         if (next && !finished && !signal?.aborted) {
           latest = next
           onUpdate?.(next)
@@ -198,8 +194,7 @@ export function watchDocumentProgress(
     }
 
     if (typeof window !== 'undefined' && typeof window.EventSource !== 'undefined') {
-      const qs = new URLSearchParams({ document_id: documentId, topics: 'document.progress' })
-      source = new window.EventSource(`/api/events/stream?${qs.toString()}`)
+      source = new window.EventSource(buildEventStreamUrl({ documentId, topics: 'document.progress' }))
       source.addEventListener('document.progress', () => {
         pull()
       })

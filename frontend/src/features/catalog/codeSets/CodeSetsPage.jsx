@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api.js'
-import { useFeedback } from '../context/FeedbackContext.jsx'
-import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { ISSUE_LABELS, SourceLocatorTag, StatusBadge, friendlyError, issueSeverity } from './SharedUI.jsx'
+import * as catalogApi from '../../../api/catalog.js'
+import { SourceLocatorTag } from '../../../components/EvidenceCard.jsx'
+import PageHeader from '../../../components/PageHeader.jsx'
+import { DetailSkeleton, ListSkeleton } from '../../../components/Skeleton.jsx'
+import { StatusBadge } from '../../../components/StatusBadge.jsx'
+import StatusMessage from '../../../components/StatusMessage.jsx'
+import { useFeedback } from '../../../context/FeedbackContext.jsx'
+import { ISSUE_LABELS, friendlyError, issueSeverity } from '../../../utils/labels.js'
 
 export default function CodeSetsPage({ embedded = false, onDocumentChange, onSummaryChange, statusFilter, onStatusFilterChange }) {
   const [params] = useSearchParams()
@@ -39,7 +41,6 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   async function load(preferredId) {
     const loadId = ++loadRequestRef.current
     const documentId = params.get('document_id')
-    const scopeQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     if (embedded && !documentId) {
       setSets([])
       setDetail(null)
@@ -48,11 +49,10 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     }
     // 不带 referenced_only：汇总数要和下面的列表张数对得上，
     // 也要拿到每张码表自己的 blockers 才能显示「齐备 / 需补」
-    const readinessQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     const [setList, unresolvedList, readinessPayload] = await Promise.all([
-      api(`/api/code-sets${scopeQuery}`),
-      api(`/api/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
-      api(`/api/code-sets/readiness${readinessQuery}`).catch(() => null),
+      catalogApi.listCodeSets({ documentId }),
+      catalogApi.listUnresolvedCodeReferences({ documentId }).catch(() => []),
+      catalogApi.getCodeSetReadiness({ documentId }).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setSets(setList)
@@ -106,7 +106,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setDetailLoading(true)
     setEditingValueId(null)
     try {
-      const data = await api(`/api/code-sets/${id}`)
+      const data = await catalogApi.getCodeSet(id)
       if (reqId === requestRef.current) setDetail(data)
     } catch (err) {
       if (reqId === requestRef.current) setError(err.message)
@@ -126,7 +126,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      await api(`/api/code-sets/${set.id}`, { method: 'DELETE' })
+      await catalogApi.deleteCodeSet(set.id)
       setNotice(`已删除「${set.code}」。`)
       if (detail?.id === set.id) setDetail(null)
       await load()
@@ -145,7 +145,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const result = await api('/api/code-sets/upload-file', { method: 'POST', body: form })
+      const result = await catalogApi.uploadCodeSetDocument(form)
       const firstId = result.code_set_ids?.[0]
       if (onDocumentChange && result.document_id && result.document_id !== params.get('document_id')) {
         onDocumentChange(result.document_id)
@@ -187,10 +187,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await api('/api/code-sets', {
-        method: 'POST',
-        body: JSON.stringify({ ...newSet, source_type: 'MANUAL' }),
-      })
+      const body = await catalogApi.createCodeSet({ ...newSet, source_type: 'MANUAL' })
       setNewSet({ code: '', name: '', definition: '' })
       await load(body.id)
       setNotice(`已创建码值表「${body.name} (${body.code})」。`)
@@ -209,12 +206,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/code-sets/${detail.id}/values`, {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          ...newValue,
-        }),
+      const body = await catalogApi.addCodeValue(detail.id, {
+        expected_version: detail.current_version,
+        ...newValue,
       })
       setDetail(body)
       setNewValue({ value: '', label_cn: '', label_en: '' })
@@ -231,13 +225,10 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/code-sets/${detail.id}/values/${value.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          reason: '人工启停码值项',
-          changes: { enabled: !value.enabled },
-        }),
+      const body = await catalogApi.editCodeValue(detail.id, value.id, {
+        expected_version: detail.current_version,
+        reason: '人工启停码值项',
+        changes: { enabled: !value.enabled },
       })
       setDetail(body)
       await load(body.id)
@@ -266,18 +257,15 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/code-sets/${detail.id}/values/${value.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          expected_version: detail.current_version,
-          reason: '人工行内编辑码值项',
-          changes: {
-            value: editDraft.value.trim(),
-            label_cn: editDraft.label_cn.trim(),
-            label_en: editDraft.label_en.trim(),
-            definition: editDraft.definition.trim(),
-          },
-        }),
+      const body = await catalogApi.editCodeValue(detail.id, value.id, {
+        expected_version: detail.current_version,
+        reason: '人工行内编辑码值项',
+        changes: {
+          value: editDraft.value.trim(),
+          label_cn: editDraft.label_cn.trim(),
+          label_en: editDraft.label_en.trim(),
+          definition: editDraft.definition.trim(),
+        },
       })
       setDetail(body)
       setEditingValueId(null)
@@ -294,10 +282,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const result = await api('/api/code-sets/references/relink', {
-        method: 'POST',
-        body: JSON.stringify({}),
-      })
+      const result = await catalogApi.relinkCodeReferences()
       await load(detail?.id)
       setNotice(`引用重新对齐完成：已对齐 ${result.resolved} 处（总引用 ${result.total}，剩余 ${result.unresolved} 处未决）。`)
     } catch (err) {
@@ -329,7 +314,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await api(`/api/code-sets/${detail.id}/import`, { method: 'POST', body: form })
+      const body = await catalogApi.importCodeValues(detail.id, form)
       setDetail(body.code_set)
       await load(body.code_set.id)
       const extras = []

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api.js'
-import { BUDGET_META, validateBudgetInput } from '../utils/budget.js'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { StatusBadge } from './SharedUI.jsx'
+import { getSettings, saveExecutionBudget, testConnection } from '../../api/platform.js'
+import PageHeader from '../../components/PageHeader.jsx'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import StatusMessage from '../../components/StatusMessage.jsx'
+import { BUDGET_META, validateBudgetInput } from '../../utils/budget.js'
 
 export { BUDGET_META, validateBudgetInput }
 
@@ -32,7 +32,7 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState('')
 
   async function load() {
-    const body = await api('/api/settings')
+    const body = await getSettings()
     setSettings(body)
     setBudget(body.execution_budget || {})
   }
@@ -45,10 +45,7 @@ export default function SettingsPage() {
     setError('')
     setTestingKind(kind)
     try {
-      const result = await api(`/api/settings/test/${kind}`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      })
+      const result = await testConnection(kind)
       setResults((prev) => ({ ...prev, [kind]: result }))
     } catch (err) {
       setResults((prev) => ({ ...prev, [kind]: { ok: false, error: err.message } }))
@@ -66,10 +63,7 @@ export default function SettingsPage() {
     }
     setSaving(true)
     try {
-      await api('/api/settings/execution_budget', {
-        method: 'PUT',
-        body: JSON.stringify({ value: checked.value }),
-      })
+      await saveExecutionBudget(checked.value)
       setBudget(checked.value)
       setNotice('确定性执行预算已保存，后续所有 AI 生成计划均严格受此上限约束。')
     } catch (err) {

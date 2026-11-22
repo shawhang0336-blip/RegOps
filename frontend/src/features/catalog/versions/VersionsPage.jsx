@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api } from '../api.js'
-import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { RevisionDiffView, StatusBadge, formatTime } from './SharedUI.jsx'
+import { diffDocuments, getMetadataTable, listDocuments, listMetadataTables } from '../../../api/catalog.js'
+import { diffRuns, listRuns } from '../../../api/delivery.js'
+import { createGenerationRun } from '../../../api/generation.js'
+import PageHeader from '../../../components/PageHeader.jsx'
+import { RevisionDiffView } from '../../../components/RevisionDiffView.jsx'
+import { DetailSkeleton, ListSkeleton } from '../../../components/Skeleton.jsx'
+import { StatusBadge } from '../../../components/StatusBadge.jsx'
+import StatusMessage from '../../../components/StatusMessage.jsx'
+import { formatTime } from '../../../utils/dateTime.js'
 
 const IMPACT_META = {
   BREAKING: { label: '破坏性变更', tone: 'red' },
@@ -67,7 +71,7 @@ export default function VersionsPage() {
     setSelectedId(id)
     setDetailLoading(true)
     try {
-      const data = await api(`/api/metadata/tables/${id}`)
+      const data = await getMetadataTable(id)
       if (reqId === requestRef.current) setDetail(data)
     } catch (err) {
       if (reqId === requestRef.current) setError(err.message)
@@ -80,9 +84,9 @@ export default function VersionsPage() {
     let cancelled = false
     setLoading(true)
     Promise.all([
-      api('/api/metadata/tables').catch(() => []),
-      api('/api/documents').catch(() => []),
-      api('/api/runs').catch(() => []),
+      listMetadataTables().catch(() => []),
+      listDocuments().catch(() => []),
+      listRuns().catch(() => []),
     ])
       .then(async ([tableList, docList, runList]) => {
         if (cancelled) return
@@ -123,8 +127,7 @@ export default function VersionsPage() {
     setDiffBusy(true)
     setError('')
     try {
-      const data = await api(`/api/documents/diff?base_id=${encodeURIComponent(baseDocId)}&target_id=${encodeURIComponent(targetDocId)}`,
-      )
+      const data = await diffDocuments(baseDocId, targetDocId)
       setDocDiff(data)
     } catch (err) {
       setError(err.message)
@@ -139,10 +142,7 @@ export default function VersionsPage() {
     setGenBusy(true)
     setError('')
     try {
-      const created = await api('/api/generation/runs', {
-        method: 'POST',
-        body: JSON.stringify({ table_ids: affectedIds, provider: 'live', accept_warnings: true }),
-      })
+      const created = await createGenerationRun({ tableIds: affectedIds, acceptWarnings: true })
       setNotice(`已对 ${affectedIds.length} 张受影响报表发起增量规则生成与验证。`)
       navigate(`/runs?run=${created.id}`)
     } catch (err) {
@@ -157,9 +157,7 @@ export default function VersionsPage() {
     setRunDiffBusy(true)
     setError('')
     try {
-      const data = await api(
-        `/api/runs/diff?base_run_id=${encodeURIComponent(baseRunId)}&target_run_id=${encodeURIComponent(targetRunId)}`,
-      )
+      const data = await diffRuns(baseRunId, targetRunId)
       setRunDiff(data)
     } catch (err) {
       setError(err.message)

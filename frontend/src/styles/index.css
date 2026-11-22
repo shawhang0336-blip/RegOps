@@ -1,0 +1,5 @@
+/* 全局样式统一入口：显式固定层叠顺序（base -> pages -> styles -> ux） */
+@import './base.css';
+@import './pages.css';
+@import './styles.css';
+@import './ux.css';

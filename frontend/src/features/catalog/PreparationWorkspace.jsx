@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api.js'
-import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
-import PageHeader from './PageHeader.jsx'
-import DocumentsPage from './DocumentsPage.jsx'
-import MetadataPage from './MetadataPage.jsx'
-import CodeSetsPage from './CodeSetsPage.jsx'
+import { getMetadataReadiness, listDocuments } from '../../api/catalog.js'
+import PageHeader from '../../components/PageHeader.jsx'
+import { getSavedDocumentId, setSavedDocumentId } from '../../utils/activeDocument.js'
+import CodeSetsPage from './codeSets/CodeSetsPage.jsx'
+import DocumentsPage from './documents/DocumentsPage.jsx'
+import MetadataPage from './metadata/MetadataPage.jsx'
 
 export default function PreparationWorkspace() {
   const navigate = useNavigate()
@@ -19,7 +19,7 @@ export default function PreparationWorkspace() {
 
   useEffect(() => {
     let cancelled = false
-    api('/api/documents').then((list) => {
+    listDocuments().then((list) => {
       if (cancelled || documentId) return
       const saved = getSavedDocumentId()
       const preferred = (saved && list.find((doc) => doc.id === saved)?.id) || list[0]?.id
@@ -37,8 +37,7 @@ export default function PreparationWorkspace() {
   useEffect(() => {
     if (!documentId || view !== 'codes' || readiness) return undefined
     let cancelled = false
-    const query = `?document_id=${encodeURIComponent(documentId)}`
-    api(`/api/metadata/readiness${query}`).then((payload) => {
+    getMetadataReadiness({ documentId }).then((payload) => {
       if (!cancelled) setReadiness(payload)
     }).catch(() => {})
     return () => { cancelled = true }

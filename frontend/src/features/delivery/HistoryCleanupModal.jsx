@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../../api.js'
-import { StatusBadge, formatTime } from '../SharedUI.jsx'
+import { cleanupHistoryRuns, getHistoryCleanupPreview } from '../../api/delivery.js'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import { formatTime } from '../../utils/dateTime.js'
 
 export default function HistoryCleanupModal({ open, onClose, onCompleted }) {
   const [preview, setPreview] = useState(null)
@@ -17,7 +18,7 @@ export default function HistoryCleanupModal({ open, onClose, onCompleted }) {
     let cancelled = false
     setLoading(true)
     setError('')
-    api('/api/runs/history/cleanup-preview')
+    getHistoryCleanupPreview()
       .then((data) => {
         if (!cancelled) setPreview(data)
       })
@@ -52,7 +53,7 @@ export default function HistoryCleanupModal({ open, onClose, onCompleted }) {
     setBusy(true)
     setError('')
     try {
-      const result = await api('/api/runs/history/cleanup', { method: 'POST', body: JSON.stringify({}) })
+      const result = await cleanupHistoryRuns()
       onCompleted?.(result)
       onClose()
     } catch (err) {

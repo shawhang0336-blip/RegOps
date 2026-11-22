@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api.js'
-import { useEventStream } from '../hooks/useEventStream.js'
-import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
-import PageHeader from './PageHeader.jsx'
-import StatusMessage from './StatusMessage.jsx'
-import { StatusBadge, formatTime } from './SharedUI.jsx'
+import { getMetadataReadiness } from '../../api/catalog.js'
+import { reauditRun } from '../../api/delivery.js'
+import * as generationApi from '../../api/generation.js'
+import PageHeader from '../../components/PageHeader.jsx'
+import { StatusBadge } from '../../components/StatusBadge.jsx'
+import StatusMessage from '../../components/StatusMessage.jsx'
+import { useEventStream } from '../../hooks/useEventStream.js'
+import { getSavedDocumentId, setSavedDocumentId } from '../../utils/activeDocument.js'
+import { formatTime } from '../../utils/dateTime.js'
+import { ArtifactDetail, ProductStatusBar } from './ArtifactDetail.jsx'
+import { AllRulesView, RulesView } from './RulesViews.jsx'
 import {
   ACTIVE_RUN_STATUSES,
   GENERATION_FILTERS,
@@ -13,9 +18,7 @@ import {
   READINESS_FILTERS,
   runLabel,
   runTone,
-} from './artifacts/artifactHelpers.js'
-import { ArtifactDetail, ProductStatusBar } from './artifacts/ArtifactDetail.jsx'
-import { AllRulesView, RulesView } from './artifacts/RulesViews.jsx'
+} from './artifactHelpers.js'
 
 export default function ArtifactsPage() {
   const navigate = useNavigate()
@@ -63,9 +66,9 @@ export default function ArtifactsPage() {
 
   async function load(preferredId) {
     const [data, readinessPayload, rulesOverview] = await Promise.all([
-      api('/api/artifacts'),
-      api('/api/metadata/readiness').catch(() => null),
-      api('/api/artifacts/rules').catch(() => null),
+      generationApi.listArtifactsStatus(),
+      getMetadataReadiness().catch(() => null),
+      generationApi.listAllTableRules().catch(() => null),
     ])
     const allTables = data.tables || []
     setTables(allTables)
@@ -109,7 +112,7 @@ export default function ArtifactsPage() {
       setArtifactView(null)
     }
     try {
-      const data = await api(`/api/artifacts/${id}`)
+      const data = await generationApi.getTableArtifacts(id)
       if (requestId === requestRef.current) {
         setDetail(data)
         setRefreshedAt(new Date())
@@ -122,7 +125,7 @@ export default function ArtifactsPage() {
   }
 
   async function refreshSummary() {
-    const data = await api('/api/artifacts').catch(() => null)
+    const data = await generationApi.listArtifactsStatus().catch(() => null)
     if (data) {
       const nextTables = data.tables || []
       setTables(nextTables)
@@ -139,7 +142,7 @@ export default function ArtifactsPage() {
   }
 
   async function refreshOverview() {
-    const data = await api('/api/artifacts/rules').catch(() => null)
+    const data = await generationApi.listAllTableRules().catch(() => null)
     if (data) {
       setOverview(data)
       setRefreshedAt(new Date())
@@ -313,9 +316,9 @@ export default function ArtifactsPage() {
     setBusy(true)
     setError('')
     try {
-      const run = await api('/api/generation/runs', {
-        method: 'POST',
-        body: JSON.stringify({ table_ids: ids, provider: 'live', accept_warnings: Boolean(options.acceptWarnings) }),
+      const run = await generationApi.createGenerationRun({
+        tableIds: ids,
+        acceptWarnings: Boolean(options.acceptWarnings),
       })
       setPreflight(null)
       setNotice('已启动生成，正在跳转执行中心。')
@@ -337,7 +340,7 @@ export default function ArtifactsPage() {
     setReauditBusy(true)
     setError('')
     try {
-      await api(`/api/runs/${detail.run.id}/reaudit`, { method: 'POST' })
+      await reauditRun(detail.run.id)
       setNotice('已发起重新验证：规则保持不动（含手工修改），只重跑 AI 造数与 Oracle 验证。')
       select(currentId, { background: true })
       refreshOverview()
