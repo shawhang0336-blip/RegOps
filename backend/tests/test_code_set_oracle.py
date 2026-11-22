@@ -3,18 +3,20 @@ import uuid
 import pytest
 
 from app.infra.db_tables import CodeSetModel, CodeValueModel
-from app.assets.code_sets.oracle import (
+from app.catalog.code_sets.bindings import (
+    load_published_code_sets,
+    validate_code_set_usage,
+)
+from app.engine.code_set_sql import (
     compile_code_set_oracle_ddl,
     compile_code_set_oracle_insert,
     compile_code_set_oracle_merge,
-    load_published_code_sets,
     stable_code_set_table,
-    validate_code_set_usage,
 )
 from app.infra.contracts import RuleDefinition
 from app.engine.binding import GeneratorBinding
 from app.engine.workflow import _code_set_context
-from app.assets.metadata_service import metadata_to_spec, publish_table
+from app.catalog.tables.service import metadata_to_spec, publish_table
 from app.infra.errors import WorkflowError
 from .test_metadata_service import make_metadata
 from .helpers import make_session

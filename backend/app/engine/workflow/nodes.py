@@ -11,12 +11,14 @@
 import uuid
 from typing import Any, Dict, List
 
-from app.assets.code_sets.oracle import (
+from app.catalog.code_sets.bindings import (
     code_set_compile_bindings,
-    compile_code_set_oracle_ddl,
     load_published_code_sets,
-    sandbox_code_set_table,
     validate_code_set_usage,
+)
+from app.engine.code_set_sql import (
+    compile_code_set_oracle_ddl,
+    sandbox_code_set_table,
 )
 from app.engine.binding import GeneratorBinding, SchemaBinding
 from app.engine.compiler import compile_rule_query

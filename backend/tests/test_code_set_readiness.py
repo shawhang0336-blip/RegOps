@@ -7,7 +7,7 @@ from app.infra.db_tables import (
     FieldMetadataModel,
     TableMetadataModel,
 )
-from app.assets.code_sets.readiness import evaluate_code_set, evaluate_code_sets, summarize_code_sets
+from app.catalog.code_sets.readiness import evaluate_code_set, evaluate_code_sets, summarize_code_sets
 from .helpers import make_session
 
 

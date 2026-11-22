@@ -173,7 +173,7 @@ def evaluate_table(
     # 码表质量只认 code_set_readiness 那一套判断。
     # 以前这里又写了一遍（未发布=ERROR、码值 0=ERROR…），两套逻辑必然漂移，
     # 结果就是码表页说「86 张齐备 83」，元数据页却报 110 个码值问题，数字对不上。
-    from app.assets.code_sets.readiness import evaluate_code_set, is_reference_placeholder
+    from app.catalog.code_sets.readiness import evaluate_code_set, is_reference_placeholder
 
     for code_set_id, code_set in code_sets.items():
         # 按这张表的视角检查：码值超长是相对引用字段长度说的，

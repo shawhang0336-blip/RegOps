@@ -10,9 +10,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
-from app.assets.code_sets.service import extract_parallel_for_blocks
-from app.assets.metadata_domain import MetadataFieldDraft
-from app.assets.metadata_service import (
+from app.catalog.extraction import extract_parallel_for_blocks
+from app.catalog.tables.domain import MetadataFieldDraft
+from app.catalog.tables.service import (
     apply_field_type_import,
     metadata_to_spec,
     publish_table,
@@ -21,7 +21,7 @@ from app.assets.metadata_service import (
     table_summary,
     update_field,
 )
-from app.assets.readiness import evaluate_document, evaluate_table, latest_table_rows
+from app.catalog.tables.readiness import evaluate_document, evaluate_table, latest_table_rows
 from app.infra.db_tables import (
     FieldMetadataModel,
     MetadataRevisionModel,

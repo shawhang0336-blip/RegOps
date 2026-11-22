@@ -13,8 +13,8 @@ from app.infra.db_tables import (
     FieldMetadataModel,
     TableMetadataModel,
 )
-from app.assets.code_sets.service import remove_code_set
-from app.assets.metadata_service import remove_table
+from app.catalog.code_sets.service import remove_code_set
+from app.catalog.tables.service import remove_table
 from .helpers import make_session
 from .test_readiness import make_table
 

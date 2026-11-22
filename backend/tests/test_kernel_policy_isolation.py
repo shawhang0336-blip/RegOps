@@ -1,9 +1,9 @@
 """ProdAgent 架构分层边界测试：验证「机制在内（app.kernel），策略在外（app.policy）」与整洁目录边界。
 
 核心断言：
-1. `app/kernel/*.py` 通过 AST 静态依赖检查，零引用任何业务域（ingestion / assets / engine / delivery / api）或策略层（policy）；
+1. `app/kernel/*.py` 通过 AST 静态依赖检查，零引用任何业务域（ingestion / catalog / engine / delivery / api）或策略层（policy）；
 2. 仅依赖 `app.kernel` 即可独立定义并驱动一个与监管业务完全无关的通用工作流；
-3. `backend/app/` 根目录保持整洁，只允许入口 `main.py` 与八大分层包（kernel / policy / infra / ingestion / assets / engine / delivery / api）。
+3. `backend/app/` 根目录保持整洁，只允许入口 `main.py` 与八大分层包（kernel / policy / infra / ingestion / catalog / engine / delivery / api）。
 """
 
 import ast
@@ -20,7 +20,7 @@ from .helpers import make_session
 FORBIDDEN_LAYERS_FOR_KERNEL = {
     "policy",
     "ingestion",
-    "assets",
+    "catalog",
     "engine",
     "delivery",
     "api",
@@ -33,20 +33,20 @@ ALLOWED_ROOT_ENTRIES = {
     "policy",
     "infra",
     "ingestion",
-    "assets",
+    "catalog",
     "engine",
     "delivery",
     "api",
 }
 
 # 严格单向八层拓扑序：任意跨层 import 必须满足 LAYER_RANK[target] < LAYER_RANK[source]，
-# 彻底杜绝反向依赖（如 engine -> api）与横向循环依赖（如 policy <-> engine、assets <-> engine）。
+# 彻底杜绝反向依赖（如 engine -> api）与横向循环依赖（如 policy <-> engine、catalog <-> engine）。
 LAYER_RANK = {
     "infra": 0,
     "kernel": 1,
     "policy": 2,
     "ingestion": 3,
-    "assets": 4,
+    "catalog": 4,
     "engine": 5,
     "delivery": 6,
     "api": 7,
@@ -1539,6 +1539,69 @@ def test_ingestion_clean_structure_and_pure_parsers_boundary():
                 if any(mod == bad or mod.startswith(bad + ".") for bad in forbidden):
                     violations.append(f"{py_file.name}: {mod}")
     assert violations == [], f"ingestion/parsers 必须保持纯解析零 DB/LLM 依赖：{violations}"
+
+
+def test_catalog_clean_structure_and_boundaries():
+    """验证 Layer 4 catalog 归类红线：
+    1. 根目录收敛为对称双子域（tables/ + code_sets/）+ 跨子域协同（extraction.py + version_diff.py）；
+    2. code_sets/ 严禁反向 import catalog/tables/（彻底消除循环依赖）；
+    3. 纯模型与纯解析叶模块（tables/domain.py、code_sets/parser.py）零 DB/LLM 依赖；
+    4. catalog/ 整体零 SQL 方言编译器（原 Oracle DDL 编译已下沉至 Layer 5 engine/code_set_sql.py）。
+    """
+    import app.catalog as catalog_pkg
+
+    catalog_dir = Path(catalog_pkg.__file__).resolve().parent
+    actual_entries = {p.name for p in catalog_dir.iterdir() if p.name != "__pycache__"}
+    assert actual_entries == {"__init__.py", "code_sets", "extraction.py", "tables", "version_diff.py"}
+
+    tables_dir = catalog_dir / "tables"
+    code_sets_dir = catalog_dir / "code_sets"
+    assert {p.name for p in tables_dir.glob("*.py")} == {
+        "__init__.py",
+        "domain.py",
+        "mutations.py",
+        "readiness.py",
+        "service.py",
+        "views.py",
+    }
+    assert {p.name for p in code_sets_dir.glob("*.py")} == {
+        "__init__.py",
+        "bindings.py",
+        "linking.py",
+        "parser.py",
+        "readiness.py",
+        "service.py",
+    }
+
+    def _imported_mods(py_file: Path) -> list:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        mods = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods.extend(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                mods.append(node.module)
+        return mods
+
+    # code_sets/ 绝不反向依赖 tables/
+    reverse_violations = [
+        f"{p.name}: {m}"
+        for p in sorted(code_sets_dir.glob("*.py"))
+        for m in _imported_mods(p)
+        if m == "app.catalog.tables" or m.startswith("app.catalog.tables.")
+    ]
+    assert reverse_violations == [], f"catalog/code_sets 不得反向依赖 catalog/tables：{reverse_violations}"
+
+    # 纯叶模块零 DB / LLM / kernel / policy 依赖
+    forbidden_pure = ("app.infra.db", "app.infra.db_tables", "app.infra.llm", "app.kernel", "app.policy")
+    pure_violations = [
+        f"{p.relative_to(catalog_dir)}: {m}"
+        for p in (tables_dir / "domain.py", code_sets_dir / "parser.py")
+        for m in _imported_mods(p)
+        if any(m == bad or m.startswith(bad + ".") for bad in forbidden_pure)
+    ]
+    assert pure_violations == [], f"catalog 纯契约/纯解析模块必须零 DB/LLM 依赖：{pure_violations}"
+
 
 
 

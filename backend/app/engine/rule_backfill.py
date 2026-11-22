@@ -190,7 +190,7 @@ def _backfill_length_rules(
 
 def _fixed_value_candidates(specs, rules) -> List[tuple]:
     """找出「原文明确要求本项固定填某个值」的字段。"""
-    from app.assets.code_sets.parser import is_conditional_phrase, parse_fixed_value
+    from app.catalog.code_sets.parser import is_conditional_phrase, parse_fixed_value
 
     covered = {(rule.table_code, rule.field) for rule in rules if rule.operator == "ENUM"}
     candidates = []

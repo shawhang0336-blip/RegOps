@@ -9,17 +9,17 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
 from app.api.v2.documents import ingest_uploaded_file
-from app.assets.code_sets.readiness import evaluate_code_set, evaluate_code_sets, is_reference_placeholder
-from app.assets.code_sets.service import (
+from app.catalog.code_sets.readiness import evaluate_code_set, evaluate_code_sets, is_reference_placeholder
+from app.catalog.code_sets.service import (
     auto_link_all_references,
     code_set_summaries,
     code_set_summary,
     document_code_set_ids,
     document_code_set_ordinals,
-    extract_parallel_for_blocks,
     refresh_reference_status,
     remove_code_set,
 )
+from app.catalog.extraction import extract_parallel_for_blocks
 from app.infra.db_tables import (
     CodeSetModel,
     CodeSetValidationModel,

@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from app.assets.code_sets.service import extract_code_sets_for_block
+from app.catalog.code_sets.service import extract_code_sets_for_block
 from app.engine.binding import (
     GeneratorBinding,
     bind_rules,
@@ -494,7 +494,7 @@ def test_structure_service_recovers_after_bus_block_id_rejection(monkeypatch):
 
 def test_adaptive_code_set_review_skips_ai_for_clean_structured_tables(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.assets.code_sets.service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.code_sets.service.SessionLocal", lambda: session)
     calls = []
 
     class CountingLlm:
@@ -502,7 +502,7 @@ def test_adaptive_code_set_review_skips_ai_for_clean_structured_tables(monkeypat
             calls.append(tool_name)
             return {"issues": []}, {"provider": "test"}
 
-    monkeypatch.setattr("app.assets.code_sets.service.RealDesignLlm", lambda settings: CountingLlm())
+    monkeypatch.setattr("app.catalog.code_sets.service.RealDesignLlm", lambda settings: CountingLlm())
     doc = SourceDocumentModel(
         id=str(uuid.uuid4()),
         file_name="codes.xlsx",
@@ -615,11 +615,11 @@ def test_cross_table_foreign_key_allows_non_identical_field_names_and_blocks_hal
 
 def test_metadata_extraction_with_zero_suspect_fields_succeeds_without_zero_worker_crash(monkeypatch):
     """回归：所有字段均为确定性可解析（suspect_items=[] / chunks=[]）时，不得因 max_workers=0 崩溃。"""
-    from app.assets.metadata_service import extract_metadata_for_block
+    from app.catalog.tables.service import extract_metadata_for_block
     from app.infra.db_tables import TableMetadataModel
 
     session = make_session()
-    monkeypatch.setattr("app.assets.metadata_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.tables.service.SessionLocal", lambda: session)
     doc = SourceDocumentModel(
         id=str(uuid.uuid4()),
         file_name="clean.xlsx",
@@ -898,8 +898,8 @@ def test_partition_coupled_chunks_keeps_distant_field_compare_cluster_together()
 
 def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbinds():
     """回归：非制表符展平术语文本不得把相邻字段的「见币种代码表」串味到前面字段；清空 code_reference_text 必须解绑旧引用。"""
-    from app.assets.code_sets.linking import ensure_field_reference
-    from app.assets.metadata_service import _deterministic_field_draft
+    from app.catalog.code_sets.linking import ensure_field_reference
+    from app.catalog.tables.service import _deterministic_field_draft
     from app.infra.db_tables import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
     from app.ingestion.parsers.pdf_parser import lookup_term_definition
 

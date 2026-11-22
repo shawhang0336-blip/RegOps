@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 
-from app.assets.code_sets.oracle import load_published_code_sets
+from app.catalog.code_sets.bindings import load_published_code_sets
 from app.engine.binding import (
     GeneratorBinding,
     _validate_generator_item,

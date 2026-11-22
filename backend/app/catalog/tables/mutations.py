@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.assets.metadata_domain import MetadataTableDraft, require_valid_metadata
-from app.assets.metadata_views import (
+from app.catalog.tables.domain import MetadataTableDraft, require_valid_metadata
+from app.catalog.tables.views import (
     TYPE_BASIS_INFERRED,
     TYPE_BASIS_MANUAL,
     TYPE_BASIS_SOURCE,
@@ -70,7 +70,7 @@ def update_field(
     if {"data_type", "length", "decimal_places"} & set(changes) and "type_basis" not in changes:
         field.type_basis = TYPE_BASIS_MANUAL
     if "code_reference_text" in changes:
-        from app.assets.code_sets.linking import ensure_field_reference
+        from app.catalog.code_sets.linking import ensure_field_reference
 
         ensure_field_reference(session, field)
     table.current_version += 1
@@ -143,8 +143,8 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
         ],
     )
     require_valid_metadata(draft)
-    from app.assets.code_sets.service import ensure_table_references
-    from app.assets.readiness import evaluate_table
+    from app.catalog.code_sets.linking import ensure_table_references
+    from app.catalog.tables.readiness import evaluate_table
 
     ensure_table_references(session, table)
     session.flush()
@@ -160,7 +160,7 @@ def publish_table(session: Session, table: TableMetadataModel, approver: str, ex
     # 码表「发布」原本是独立的人工动作，但没人会为了 165 张码表挨个点，
     # 不点的话阶段 2 的 load_published_code_sets 又直接抛错。检查不通过的
     # （空码表、码值超长）留给人补数据，那才是真需要动手的地方。
-    from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
+    from app.catalog.code_sets.readiness import auto_publish_referenced_code_sets
 
     auto = auto_publish_referenced_code_sets(session, table)
     if auto["published"]:

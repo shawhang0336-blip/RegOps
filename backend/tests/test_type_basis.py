@@ -7,7 +7,7 @@ from app.infra.db_tables import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.assets.metadata_service import apply_field_type_import, type_basis_for, update_field
+from app.catalog.tables.service import apply_field_type_import, type_basis_for, update_field
 from .helpers import make_session
 
 DECLARED_CONTEXT = """字段 内容 类型（长度） 校验

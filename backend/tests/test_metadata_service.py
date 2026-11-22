@@ -10,8 +10,8 @@ from app.infra.db_tables import (
     TableMetadataModel,
 )
 from app.infra.config import Settings
-from app.assets.metadata_domain import MetadataFieldDraft, MetadataTableDraft, validate_metadata_draft
-from app.assets.metadata_service import (
+from app.catalog.tables.domain import MetadataFieldDraft, MetadataTableDraft, validate_metadata_draft
+from app.catalog.tables.service import (
     _deterministic_field_draft,
     _persist_draft,
     extract_metadata_for_block,
@@ -188,7 +188,7 @@ def test_failed_assignment_skips_second_llm_review(monkeypatch):
     block = session.get(RawBlockModel, table.block_id)
     block.content_json = {"headers": ["字段中文名", "字段名", "字段校验"], "rows": [["字段中文名", "字段名", "字段校验"], ["机构名称", "CUSTNAME", "必填"]]}
     session.commit()
-    monkeypatch.setattr("app.assets.metadata_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.tables.service.SessionLocal", lambda: session)
     calls = []
 
     class UnavailableLlm:
@@ -196,7 +196,7 @@ def test_failed_assignment_skips_second_llm_review(monkeypatch):
             calls.append(tool_name)
             raise RuntimeError("offline unavailable")
 
-    monkeypatch.setattr("app.assets.metadata_service.RealDesignLlm", lambda settings: UnavailableLlm())
+    monkeypatch.setattr("app.catalog.tables.service.RealDesignLlm", lambda settings: UnavailableLlm())
     extract_metadata_for_block(block.id, Settings(), auto_link=False)
 
     assert calls == ["assign_metadata"]
@@ -209,7 +209,7 @@ def test_failed_assignment_skips_second_llm_review(monkeypatch):
 
 
 def test_enforce_issue_evidence_downgrades_type_claims_without_source():
-    from app.assets.metadata_service import enforce_issue_evidence
+    from app.catalog.tables.service import enforce_issue_evidence
 
     # 来源没有类型声明：类型类 ERROR 属于推断，必须降级
     raw = "指对应月度末，境外被投资机构合并资产负债表中的“资产总额”。"
@@ -226,7 +226,7 @@ def test_enforce_issue_evidence_downgrades_type_claims_without_source():
 
 
 def test_enforce_issue_evidence_keeps_claim_when_source_declares_type():
-    from app.assets.metadata_service import enforce_issue_evidence
+    from app.catalog.tables.service import enforce_issue_evidence
 
     raw = "A0117   实收资本   数值型，22.2   必填项。"
     issues = [{"severity": "ERROR", "code": "TYPE_MISMATCH", "field_en": "A0117", "message": "当前是 VARCHAR(128)"}]
@@ -235,7 +235,7 @@ def test_enforce_issue_evidence_keeps_claim_when_source_declares_type():
 
 
 def test_enforce_issue_evidence_downgrades_unfindable_quote():
-    from app.assets.metadata_service import enforce_issue_evidence
+    from app.catalog.tables.service import enforce_issue_evidence
 
     raw = "A0117   实收资本   数值型，22.2   必填项。"
     issues = [
@@ -253,14 +253,14 @@ def test_enforce_issue_evidence_downgrades_unfindable_quote():
 
 
 def test_table_needs_review_only_for_errors():
-    from app.assets.metadata_service import table_needs_review
+    from app.catalog.tables.service import table_needs_review
 
     assert table_needs_review([{"severity": "WARNING"}, {"severity": "INFO"}]) is False
     assert table_needs_review([{"severity": "WARNING"}, {"severity": "ERROR"}]) is True
 
 
 def test_field_declares_length_distinguishes_missing_length():
-    from app.assets.metadata_service import _field_declares_length
+    from app.catalog.tables.service import _field_declares_length
 
     raw = (
         "CGYN             是否有反担保人   数值型         必填项，1-是，0-否。\n"
@@ -272,7 +272,7 @@ def test_field_declares_length_distinguishes_missing_length():
 
 
 def test_enforce_issue_evidence_downgrades_length_claim_without_declared_length():
-    from app.assets.metadata_service import enforce_issue_evidence
+    from app.catalog.tables.service import enforce_issue_evidence
 
     raw = "CGYN  是否有反担保人  数值型  必填项，1-是，0-否。\n"
     issues = [
@@ -284,7 +284,7 @@ def test_enforce_issue_evidence_downgrades_length_claim_without_declared_length(
 
 
 def test_rule_assembly_issues_do_not_block_metadata_stage():
-    from app.assets.metadata_service import enforce_issue_evidence, table_needs_review
+    from app.catalog.tables.service import enforce_issue_evidence, table_needs_review
 
     raw = "A0101  境外被投资机构代码  字符型，256  必填项。"
     issues = [

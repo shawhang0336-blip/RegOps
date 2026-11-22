@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.assets.code_sets.parser import (
+from app.catalog.code_sets.parser import (
     is_rule_reference,
     normalize_code_set_name,
     parse_fixed_value,

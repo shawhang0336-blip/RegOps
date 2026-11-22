@@ -214,7 +214,8 @@ def start_document_prepare_run(
     if store_blocks_fn is None:
         def _default_store_blocks(doc_id: str) -> None:
             from pathlib import Path
-            from app.assets.code_sets.service import auto_link_all_references, extract_code_sets_for_block
+            from app.catalog.code_sets.linking import auto_link_all_references
+            from app.catalog.code_sets.service import extract_code_sets_for_block
             from app.ingestion.parsers.extractors import extract_document
             from app.ingestion.parsers.quality import inspect_block
             from app.ingestion.structure_service import invoke_extract_document, latest_chunking_plan
@@ -462,7 +463,7 @@ def start_document_extract_run(
 ) -> str:
     """创建并提交 Step 1 文档多块并发解析（extract）Run。"""
     sf = session_factory if session_factory is not None else SessionLocal
-    from app.assets.code_sets.service import extract_parallel_for_blocks
+    from app.catalog.extraction import extract_parallel_for_blocks
     from app.ingestion.structure_service import analyze_document_structure
 
     analyze_fn = analyze_structure_fn or analyze_document_structure

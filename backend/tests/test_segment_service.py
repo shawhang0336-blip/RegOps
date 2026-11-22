@@ -1,6 +1,6 @@
 import uuid
 
-from app.assets.metadata_mutations import merge_metadata_tables
+from app.catalog.tables.mutations import merge_metadata_tables
 from app.infra.db_tables import RawBlockModel, TableMetadataModel
 from app.ingestion.structure_service import _split_segments, analyze_block_segments
 from .test_metadata_service import make_metadata

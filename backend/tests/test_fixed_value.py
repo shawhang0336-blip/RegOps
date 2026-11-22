@@ -10,7 +10,7 @@ AI 抽取时把「本项固定填“中国”」填进了 code_reference_text，
 把 E0901 也卡成必须等于"个人"，非个人主体时的真实名称全会被判违规。
 """
 
-from app.assets.code_sets.service import is_conditional_phrase, parse_fixed_value
+from app.catalog.code_sets.parser import is_conditional_phrase, parse_fixed_value
 
 
 def test_unconditional_fixed_value():

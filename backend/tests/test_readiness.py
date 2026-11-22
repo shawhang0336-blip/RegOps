@@ -9,8 +9,8 @@ from app.infra.db_tables import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.assets.metadata_service import publish_table
-from app.assets.readiness import evaluate_document, evaluate_table, split_preflight_issues, summarize
+from app.catalog.tables.service import publish_table
+from app.catalog.tables.readiness import evaluate_document, evaluate_table, split_preflight_issues, summarize
 from .helpers import make_session
 
 
@@ -341,7 +341,7 @@ def test_auto_publish_takes_over_the_manual_publish_step():
     几百张码表挨个确认本来就确认不过来，而没发的话阶段 2 的
     load_published_code_sets 直接抛错退出。
     """
-    from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
+    from app.catalog.code_sets.readiness import auto_publish_referenced_code_sets
 
     session = make_session()
     table = make_table(
@@ -365,7 +365,7 @@ def test_auto_publish_takes_over_the_manual_publish_step():
 def test_auto_publish_refuses_empty_code_set():
     """空码表不能自动发出去——那正是需要人补数据的情况。"""
     from app.infra.db_tables import CodeValueModel
-    from app.assets.code_sets.readiness import auto_publish_referenced_code_sets
+    from app.catalog.code_sets.readiness import auto_publish_referenced_code_sets
 
     session = make_session()
     table = make_table(

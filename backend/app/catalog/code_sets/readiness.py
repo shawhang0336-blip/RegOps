@@ -172,7 +172,7 @@ def evaluate_code_sets(
 ) -> Dict[str, Any]:
     query = session.query(CodeSetModel)
     if document_id:
-        from app.assets.code_sets.service import document_code_set_ids
+        from app.catalog.code_sets.linking import document_code_set_ids
 
         ids = document_code_set_ids(session, document_id)
         query = query.filter(CodeSetModel.id.in_(ids))

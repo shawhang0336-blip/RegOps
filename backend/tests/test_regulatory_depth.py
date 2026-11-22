@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from app.assets.version_diff import diff_documents
+from app.catalog.version_diff import diff_documents
 from app.engine.binding import (
     GeneratorBinding,
     SchemaBinding,

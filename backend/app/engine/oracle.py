@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 
-from app.assets.code_sets.oracle import compile_code_set_oracle_ddl, sandbox_code_set_table
+from app.engine.code_set_sql import compile_code_set_oracle_ddl, sandbox_code_set_table
 from app.engine.binding import materialize_golden_record
 from app.engine.compiler import compile_rule_query
 from app.infra.contracts import AuditCaseBinding, GeneratorBinding, RuleDefinition, SchemaBinding, SpecDocument

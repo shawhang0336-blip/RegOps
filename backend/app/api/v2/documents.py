@@ -8,12 +8,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
-from app.assets.code_sets.service import (
+from app.catalog.code_sets.service import (
     auto_link_all_references,
     extract_code_sets_for_block,
-    extract_parallel_for_blocks,
 )
-from app.assets.version_diff import diff_documents
+from app.catalog.extraction import extract_parallel_for_blocks
+from app.catalog.version_diff import diff_documents
 from app.engine.ingestion_run import (
     cancel_document_run,
     document_progress_view,

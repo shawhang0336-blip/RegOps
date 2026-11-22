@@ -4,7 +4,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.assets.code_sets.oracle import load_published_code_sets
+from app.catalog.code_sets.bindings import load_published_code_sets
 from app.engine.binding import bind_audit_cases, normalize_case_id
 from app.engine.mutations import (
     build_deterministic_mutations,

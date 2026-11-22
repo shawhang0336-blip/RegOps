@@ -14,13 +14,13 @@ from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
-from app.assets.metadata_domain import (
+from app.catalog.tables.domain import (
     MetadataFieldDraft,
     MetadataTableDraft,
     require_valid_metadata,
     validate_metadata_draft,
 )
-from app.assets.metadata_mutations import (
+from app.catalog.tables.mutations import (
     IMPORT_HEADER_ALIASES,
     TYPE_ALIASES,
     apply_field_type_import,
@@ -29,7 +29,7 @@ from app.assets.metadata_mutations import (
     remove_table,
     update_field,
 )
-from app.assets.metadata_views import (
+from app.catalog.tables.views import (
     CONTEXT_AFTER,
     CONTEXT_BEFORE,
     CONTEXT_MAX_CHARS,
@@ -529,7 +529,7 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
             else "AI_SELF_VALIDATED"
         )
         if auto_link:
-            from app.assets.code_sets.service import ensure_table_references
+            from app.catalog.code_sets.linking import ensure_table_references
 
             ensure_table_references(session, table)
         session.commit()

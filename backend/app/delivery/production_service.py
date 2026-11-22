@@ -9,12 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.infra.db_tables import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
-from app.assets.code_sets.oracle import (
+from app.catalog.code_sets.bindings import (
     code_set_compile_bindings,
+    load_published_code_sets,
+)
+from app.engine.code_set_sql import (
     compile_code_set_oracle_ddl,
     compile_code_set_oracle_insert,
     compile_code_set_oracle_merge,
-    load_published_code_sets,
     stable_code_set_table,
 )
 from app.infra.contracts import RuleDefinition, canonical_json
