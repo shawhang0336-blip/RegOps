@@ -9,15 +9,15 @@ from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
 from app.infra.contracts import canonical_json
-from app.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
-from app.ingestion.parsers.pdf_generic import (
+from app.catalog.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
+from app.catalog.ingestion.parsers.pdf_generic import (
     default_pdf_strategy,
     detect_pdf_profiles,
     extract_pdf_generic_sections,
     extract_pdf_headings,
     extract_pdf_page_windows,
 )
-from app.ingestion.parsers.pdf_parser import SpecParseError, _extract_pdf_text
+from app.catalog.ingestion.parsers.pdf_parser import SpecParseError, _extract_pdf_text
 
 # 单 Sheet 行上限：20,000 行可完整覆盖行政区划（3,200+ 行）等大型监管码表，同时防百万行恶意表格撑爆内存
 MAX_XLSX_ROWS = 20000

@@ -29,7 +29,7 @@ from app.infra.config import Settings
 from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument
 from app.infra.llm.schemas import _tool_prompt_preamble
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
-from app.ingestion.structure_service import analyze_document_structure
+from app.catalog.ingestion.structure_service import analyze_document_structure
 from app.infra.llm.guard import call_llm_validated
 from app.policy.regops_bus import code_set_values_adjudicator, cross_table_adjudicator
 from app.policy.regops_plan import DEFAULT_PLAN, project, self_heal_cases_target, self_heal_data_target
@@ -442,7 +442,7 @@ def test_call_llm_validated_fails_fast_on_fatal_runtime_error():
 
 def test_structure_service_recovers_after_bus_block_id_rejection(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
     doc = SourceDocumentModel(
         id=str(uuid.uuid4()),
         file_name="sample.docx",
@@ -486,7 +486,7 @@ def test_structure_service_recovers_after_bus_block_id_rejection(monkeypatch):
             }, {"provider": "test"}
 
     llm = BusRecoverLlm()
-    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
     analyze_document_structure(doc.id, Settings())
     assert llm.calls == 2
     assert llm.feedbacks[1] and "块 ID 幻觉拦截" in llm.feedbacks[1]
@@ -901,7 +901,7 @@ def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbi
     from app.catalog.code_sets.linking import ensure_field_reference
     from app.catalog.tables.service import _deterministic_field_draft
     from app.infra.db_tables import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
-    from app.ingestion.parsers.pdf_parser import lookup_term_definition
+    from app.catalog.ingestion.parsers.pdf_parser import lookup_term_definition
 
     flattened = "金融机构标识码 国家外汇管理局签发的12位标识码。 发生日期 账户收支余发生变动日期。 币种 币种代码，见币种代码表。"
     assert lookup_term_definition(flattened, "发生日期") == "账户收支余发生变动日期。"

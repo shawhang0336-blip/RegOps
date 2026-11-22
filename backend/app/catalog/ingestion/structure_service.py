@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.ingestion.parsers.extractors import (
+from app.catalog.ingestion.parsers.extractors import (
     ALLOWED_STRATEGIES_BY_FILE_TYPE,
     extract_document,
     survey_document,

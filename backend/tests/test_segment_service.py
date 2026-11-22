@@ -2,7 +2,7 @@ import uuid
 
 from app.catalog.tables.mutations import merge_metadata_tables
 from app.infra.db_tables import RawBlockModel, TableMetadataModel
-from app.ingestion.structure_service import _split_segments, analyze_block_segments
+from app.catalog.ingestion.structure_service import _split_segments, analyze_block_segments
 from .test_metadata_service import make_metadata
 from .helpers import make_session
 
@@ -36,7 +36,7 @@ def make_parent(session):
 
 def test_block_segments_are_hierarchical_and_keep_parent_evidence(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
     parent = make_parent(session)
     ids = analyze_block_segments(parent.id, __import__('app.infra.config', fromlist=['Settings']).Settings(), SegmentFixtureLlm())
     assert len(ids) == 4
@@ -87,7 +87,7 @@ def test_split_segments_preserves_prefix_and_preserves_doc_block_count_and_ordin
 
     # 2) ordinal=0 父块 + 存在其他兄弟块时：细分不撞 uq_raw_block_order 且 block_count 为全部活跃块数
     session = make_session()
-    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
     doc = SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="ord0.pdf", file_type="pdf", sha256=uuid.uuid4().hex,
         blob_uri="blob://ord0", spec_version="TEST", status="UPLOADED", block_count=2,

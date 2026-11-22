@@ -28,12 +28,12 @@ from app.infra.db import SessionLocal
 from app.infra.errors import WorkflowError
 from app.infra.db_tables import EventModel, RunModel
 from app.infra.config import get_budget
-from app.ingestion.import_progress import STAGE_LABELS
-from app.ingestion.import_progress import ensure as progress_ensure
-from app.ingestion.import_progress import finish as progress_finish
-from app.ingestion.import_progress import snapshot as progress_snapshot
-from app.ingestion.import_progress import start as progress_start
-from app.ingestion.import_progress import update as progress_update
+from app.catalog.ingestion.import_progress import STAGE_LABELS
+from app.catalog.ingestion.import_progress import ensure as progress_ensure
+from app.catalog.ingestion.import_progress import finish as progress_finish
+from app.catalog.ingestion.import_progress import snapshot as progress_snapshot
+from app.catalog.ingestion.import_progress import start as progress_start
+from app.catalog.ingestion.import_progress import update as progress_update
 from app.kernel.event_log import append_event, verify_chain
 from app.kernel.run import (
     BudgetExceededError,
@@ -206,7 +206,7 @@ def start_document_prepare_run(
 ) -> str:
     """创建并提交 Step 1 文档结构检查与切块（prepare）Run。"""
     sf = session_factory if session_factory is not None else SessionLocal
-    from app.ingestion.structure_service import inspect_document_overview, reextract_document_blocks
+    from app.catalog.ingestion.structure_service import inspect_document_overview, reextract_document_blocks
 
     overview_fn = inspect_overview_fn or inspect_document_overview
     reextract_fn = reextract_blocks_fn or reextract_document_blocks
@@ -216,9 +216,9 @@ def start_document_prepare_run(
             from pathlib import Path
             from app.catalog.code_sets.linking import auto_link_all_references
             from app.catalog.code_sets.service import extract_code_sets_for_block
-            from app.ingestion.parsers.extractors import extract_document
-            from app.ingestion.parsers.quality import inspect_block
-            from app.ingestion.structure_service import invoke_extract_document, latest_chunking_plan
+            from app.catalog.ingestion.parsers.extractors import extract_document
+            from app.catalog.ingestion.parsers.quality import inspect_block
+            from app.catalog.ingestion.structure_service import invoke_extract_document, latest_chunking_plan
 
             with sf() as s:
                 doc = s.get(SourceDocumentModel, doc_id)
@@ -464,7 +464,7 @@ def start_document_extract_run(
     """创建并提交 Step 1 文档多块并发解析（extract）Run。"""
     sf = session_factory if session_factory is not None else SessionLocal
     from app.catalog.extraction import extract_parallel_for_blocks
-    from app.ingestion.structure_service import analyze_document_structure
+    from app.catalog.ingestion.structure_service import analyze_document_structure
 
     analyze_fn = analyze_structure_fn or analyze_document_structure
     parallel_fn = extract_parallel_fn or extract_parallel_for_blocks

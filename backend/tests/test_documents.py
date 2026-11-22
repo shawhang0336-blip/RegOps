@@ -85,9 +85,9 @@ def test_uploading_deleted_document_rebuilds_blocks(monkeypatch, tmp_path):
                 "warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
-    monkeypatch.setattr("app.ingestion.structure_service.extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.extract_document", lambda path, file_type: ("TEST", [extracted_block()]))
 
     reimported = documents.ingest_uploaded_file("sample.xlsx", content)
 
@@ -126,7 +126,7 @@ def extracted_block():
 def configure_upload(session, monkeypatch, tmp_path):
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)
     monkeypatch.setattr(documents, "get_settings", lambda: Settings(blob_dir=str(tmp_path)))
-    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
 
 
 def test_document_overview_runs_before_initial_chunking(monkeypatch, tmp_path):
@@ -147,7 +147,7 @@ def test_document_overview_runs_before_initial_chunking(monkeypatch, tmp_path):
                 "warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", lambda path, file_type: (calls.append("INITIAL_CHUNK") or ("TEST", [extracted_block()])))
 
     document = documents.ingest_uploaded_file("sample.xlsx", xlsx_content())
@@ -180,7 +180,7 @@ def test_failed_overview_blocks_chunking_and_can_retry(monkeypatch, tmp_path):
         assert not should_fail, "Initial chunking must not run after a failed overview"
         return "TEST", [extracted_block()]
 
-    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
+    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: OverviewLlm())
     monkeypatch.setattr(documents, "extract_document", extract)
 
     document = documents.ingest_uploaded_file("sample.xlsx", xlsx_content())
@@ -286,12 +286,12 @@ def test_extraction_exception_does_not_leave_running_state(monkeypatch):
 def test_ingestion_run_persists_eventlog_budget_cancel_recovery_and_isolates_from_generation_runs(monkeypatch):
     """P2 回归：Step 1 文档解析纳入 kernel.run，支持 EventLog 重启还原、BudgetGuard 记账、取消/回收，且不污染 Step 2 批次列表。"""
     from app.api.runs import list_runs
-    from app.engine.ingestion_run import (
+    from app.catalog.pipeline_run import (
         cancel_document_run,
         list_document_runs,
         recover_interrupted_ingestion_runs,
     )
-    from app.ingestion.import_progress import forget as progress_forget
+    from app.catalog.ingestion.import_progress import forget as progress_forget
     from app.kernel.run import create_run as kernel_create_run
     from app.infra.llm.guard import call_llm_validated
 

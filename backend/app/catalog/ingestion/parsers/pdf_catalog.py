@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.ingestion.parsers.pdf_parser import (
+from app.catalog.ingestion.parsers.pdf_parser import (
     SpecParseError,
     _between,
     _extract_pdf_text,

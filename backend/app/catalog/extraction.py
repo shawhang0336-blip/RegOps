@@ -17,7 +17,7 @@ from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.infra.db_tables import RawBlockModel
 from app.infra.llm.guard import current_cancellation, submit_with_context
-from app.ingestion.structure_service import analyze_block_segments
+from app.catalog.ingestion.structure_service import analyze_block_segments
 from app.kernel.run import BudgetExceededError, RunCancelledError
 
 

@@ -25,7 +25,7 @@ from app.catalog.code_sets.service import (
 )
 from app.catalog.extraction import extract_parallel_for_blocks
 from app.infra.config import Settings
-from app.ingestion.parsers.extractors import extract_xlsx
+from app.catalog.ingestion.parsers.extractors import extract_xlsx
 from app.catalog.tables.service import publish_table
 from .test_metadata_service import make_metadata
 from .helpers import make_session
