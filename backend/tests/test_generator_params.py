@@ -10,7 +10,7 @@
 
 import pytest
 
-from app.infra.domain import FieldSpec, SpecDocument
+from app.infra.contracts import FieldSpec, SpecDocument
 from app.engine.binding import bind_generators, materialize_golden_record
 from app.engine.rules import RuleValidationError
 

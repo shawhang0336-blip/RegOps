@@ -16,7 +16,7 @@ from app.policy.regops_plan import (
 )
 from app.kernel.plan import PlanEdge, PlanNode, RetryPolicy, WorkflowPlan
 from app.kernel.event_log import append_event
-from app.infra.models import RunModel
+from app.infra.db_tables import RunModel
 from .helpers import make_session
 
 

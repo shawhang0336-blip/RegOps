@@ -10,7 +10,7 @@ import uuid
 
 from app.kernel.event_log import append_event, verify_chain
 from app.policy.regops_plan import fold, project
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 from .helpers import make_session
 
 

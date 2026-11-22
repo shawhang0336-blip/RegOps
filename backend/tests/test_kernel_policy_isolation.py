@@ -13,7 +13,7 @@ from pathlib import Path
 
 import app.kernel as kernel
 import app.policy as policy
-from app.infra.models import RunModel
+from app.infra.db_tables import RunModel
 
 from .helpers import make_session
 
@@ -1049,7 +1049,7 @@ def test_kernel_scheduler_guards_max_waves_and_graph_stalled():
 
 def test_kernel_outcome_park_multi_interrupt_and_scheduler_resume():
     """验证 HITL 落盘放手闭环：Outcome.park 自动补 node、同波多中断全落账、Scheduler.resume 线程隔离喂值重跑。"""
-    from app.infra.models import EventModel
+    from app.infra.db_tables import EventModel
 
     session = make_session()
     bus = kernel.Bus()
@@ -1454,11 +1454,11 @@ def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
         "__init__.py",
         "blob_store.py",
         "config.py",
+        "contracts.py",
         "db.py",
-        "domain.py",
+        "db_tables.py",
         "errors.py",
         "llm",
-        "models.py",
         "task_runner.py",
     }
     actual_llm_files = {p.name for p in (infra_dir / "llm").glob("*.py")}

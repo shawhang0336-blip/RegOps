@@ -1,6 +1,6 @@
 import pytest
 
-from app.infra.domain import Evidence, RuleDefinition, calculate_rule_hash
+from app.infra.contracts import Evidence, RuleDefinition, calculate_rule_hash
 from app.engine.rules import RuleValidationError, build_explicit_rules, validate_rule
 
 

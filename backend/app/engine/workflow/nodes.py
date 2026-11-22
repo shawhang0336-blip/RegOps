@@ -39,11 +39,11 @@ from app.engine.workflow.stage_rules import (
     join_table_rules_barrier,
     prepare_deterministic_rule_index,
 )
-from app.infra.models import ArtifactModel
+from app.infra.db_tables import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
-from app.infra.domain import RuleDefinition, canonical_json
+from app.infra.contracts import RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
-from app.infra.models import RuleModel
+from app.infra.db_tables import RuleModel
 from app.kernel.interrupt import Interrupt
 from app.kernel.run import RunContext
 from app.kernel.scheduler import Outcome, Send

@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from app.infra.models import (
+from app.infra.db_tables import (
     FieldMetadataModel,
     MetadataValidationModel,
     RawBlockModel,

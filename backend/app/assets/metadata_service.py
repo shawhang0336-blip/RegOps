@@ -54,7 +54,7 @@ from app.assets.metadata_views import (
 )
 from app.infra.llm import RealDesignLlm
 from app.infra.llm.guard import call_llm_validated
-from app.infra.models import (
+from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     MetadataRevisionModel,

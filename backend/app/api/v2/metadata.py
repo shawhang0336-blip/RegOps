@@ -22,7 +22,7 @@ from app.assets.metadata_service import (
     update_field,
 )
 from app.assets.readiness import evaluate_document, evaluate_table, latest_table_rows
-from app.infra.models import (
+from app.infra.db_tables import (
     FieldMetadataModel,
     MetadataRevisionModel,
     MetadataValidationModel,

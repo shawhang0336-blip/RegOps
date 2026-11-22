@@ -46,7 +46,7 @@ def test_prompt_no_longer_offers_exact_length():
 
 def test_bind_rules_rejects_exact_length_even_if_model_returns_it():
     """enum 只是提示，模型仍可能硬返回 LENGTH；绑定层要硬拦。"""
-    from app.infra.domain import FieldSpec, SpecDocument
+    from app.infra.contracts import FieldSpec, SpecDocument
     from app.engine.binding import bind_rules
     from app.engine.rules import RuleValidationError
 
@@ -77,7 +77,7 @@ def test_bind_rules_rejects_exact_length_even_if_model_returns_it():
 
 
 def test_bind_rules_still_accepts_length_max():
-    from app.infra.domain import FieldSpec, SpecDocument
+    from app.infra.contracts import FieldSpec, SpecDocument
     from app.engine.binding import bind_rules
 
     spec = SpecDocument(

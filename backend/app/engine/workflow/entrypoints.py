@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.engine.oracle import OracleSandbox
 from app.engine.workflow.nodes import _back_bodies, _front_bodies
 from app.engine.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
-from app.infra.models import (
+from app.infra.db_tables import (
     ApprovalModel,
     ArtifactModel,
     AuditCaseDefinitionModel,
@@ -32,10 +32,10 @@ from app.infra.models import (
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings, get_settings
 from app.infra.db import SessionLocal
-from app.infra.domain import canonical_json
+from app.infra.contracts import canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.llm import RealDesignLlm
-from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
 from app.kernel.interrupt import answer_interrupt, record_interrupt_answer

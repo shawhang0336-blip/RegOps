@@ -4,7 +4,7 @@ import pytest
 
 from app.engine.binding import bind_schema
 from app.kernel.event_log import append_event
-from app.infra.models import RunModel
+from app.infra.db_tables import RunModel
 from app.delivery.production import (
     compile_production_mysql_ddl,
     compile_production_oracle_ddl,

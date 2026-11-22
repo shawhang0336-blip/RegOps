@@ -71,7 +71,7 @@ def get_settings() -> Settings:
 
 def get_budget(session: Session) -> Dict[str, int]:
     """读取确定性执行预算配置，缺失项以 DEFAULT_BUDGET 兜底。"""
-    from app.infra.models import SystemSettingModel
+    from app.infra.db_tables import SystemSettingModel
 
     row = session.get(SystemSettingModel, "execution_budget")
     return {**DEFAULT_BUDGET, **(row.value_json if row else {})}

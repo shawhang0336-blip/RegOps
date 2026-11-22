@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.domain import FieldSpec, SpecDocument
-from app.infra.models import (
+from app.infra.contracts import FieldSpec, SpecDocument
+from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     MetadataRevisionModel,

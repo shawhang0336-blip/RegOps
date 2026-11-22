@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import ArtifactModel
+from app.infra.db_tables import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
 from app.assets.code_sets.oracle import (
     code_set_compile_bindings,
@@ -17,11 +17,11 @@ from app.assets.code_sets.oracle import (
     load_published_code_sets,
     stable_code_set_table,
 )
-from app.infra.domain import RuleDefinition, canonical_json
+from app.infra.contracts import RuleDefinition, canonical_json
 from app.policy.regops_plan import project
 from app.engine.binding import SchemaBinding
 from app.engine.workflow import _latest_payload, _specs
-from app.infra.models import RuleModel, RunModel
+from app.infra.db_tables import RuleModel, RunModel
 from app.delivery.production import (
     compile_production_mysql_ddl,
     compile_production_oracle_ddl,

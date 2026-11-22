@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.infra.domain import FieldSpec, SpecDocument
+from app.infra.contracts import FieldSpec, SpecDocument
 from app.ingestion.spec_parser import (
     SpecParseError,
     _between,

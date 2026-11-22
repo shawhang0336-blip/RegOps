@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
-from app.infra.models import SystemSettingModel
+from app.infra.db_tables import SystemSettingModel
 from app.infra.config import get_settings
 from app.infra.llm import RealDesignLlm
 from app.infra.config import DEFAULT_BUDGET, get_budget

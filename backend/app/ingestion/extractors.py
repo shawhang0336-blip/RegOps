@@ -7,7 +7,7 @@ from docx import Document
 from openpyxl import load_workbook
 
 from app.ingestion.catalog import parse_document_catalog, parse_document_code_sets
-from app.infra.domain import canonical_json
+from app.infra.contracts import canonical_json
 
 CODE_HEADER_VAL_ALIASES = {
     "value", "code", "码值", "代码", "编码", "国家/地区代码", "币种代码",

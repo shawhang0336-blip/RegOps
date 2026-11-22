@@ -14,12 +14,12 @@ from app.assets.metadata_service import metadata_to_spec, publish_table
 from app.assets.readiness import evaluate_table, split_preflight_issues
 from app.delivery.production_service import build_production_bundle
 from app.engine.workflow import _create_run
-from app.infra.models import GenerationPlanModel, TableMetadataModel
+from app.infra.db_tables import GenerationPlanModel, TableMetadataModel
 from app.infra.config import get_settings
-from app.infra.domain import canonical_json
+from app.infra.contracts import canonical_json
 from app.infra.errors import WorkflowError
 from app.infra.config import OPERATOR_PLACEHOLDER
-from app.infra.models import RunModel, SpecificationModel
+from app.infra.db_tables import RunModel, SpecificationModel
 from app.infra.config import get_budget
 
 router = APIRouter(prefix="/generation", tags=["generation"])

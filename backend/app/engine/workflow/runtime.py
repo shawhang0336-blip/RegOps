@@ -12,10 +12,10 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.domain import RuleDefinition, SpecDocument
+from app.infra.contracts import RuleDefinition, SpecDocument
 from app.infra.errors import WorkflowError
 from app.infra.llm import configure_llm_concurrency
-from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.infra.config import get_budget
 from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event

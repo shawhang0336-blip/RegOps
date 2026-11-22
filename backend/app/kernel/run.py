@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 from app.infra.task_runner import TaskRunner, task_runner
 from .bus import Bus, global_bus
 from .event_log import (

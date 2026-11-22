@@ -3,7 +3,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-from app.infra.domain import (
+from app.infra.contracts import (
     LLM_OPERATORS,
     AuditCaseBinding,
     Evidence,

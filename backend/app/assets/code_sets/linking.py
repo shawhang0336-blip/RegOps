@@ -19,7 +19,7 @@ from app.assets.code_sets.parser import (
     parse_fixed_value,
     parse_inline_enum,
 )
-from app.infra.models import (
+from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,

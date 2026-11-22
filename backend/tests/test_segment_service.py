@@ -1,6 +1,6 @@
 import uuid
 
-from app.infra.models import RawBlockModel, TableMetadataModel
+from app.infra.db_tables import RawBlockModel, TableMetadataModel
 from app.ingestion.segment_service import _split_segments, analyze_block_segments, merge_metadata_tables
 from .test_metadata_service import make_metadata
 from .helpers import make_session
@@ -19,7 +19,7 @@ class SegmentFixtureLlm:
 
 
 def make_parent(session):
-    document = __import__('app.infra.models', fromlist=['SourceDocumentModel']).SourceDocumentModel(
+    document = __import__('app.infra.db_tables', fromlist=['SourceDocumentModel']).SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="sample.pdf", file_type="pdf", sha256=uuid.uuid4().hex,
         blob_uri="blob://sample", spec_version="TEST", status="UPLOADED", block_count=1,
     )

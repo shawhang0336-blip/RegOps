@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 from app.kernel.event_log import (
     RunState,
     fold_with,

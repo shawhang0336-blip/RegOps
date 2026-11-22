@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 
 
 @dataclass(frozen=True)

@@ -27,9 +27,9 @@ from app.engine.workflow.runtime import (
     _upsert_rule,
 )
 from app.engine.workflow.stage_plan_schema import _provider_name
-from app.infra.models import GeneratorDefinitionModel
+from app.infra.db_tables import GeneratorDefinitionModel
 from app.infra.blob_store import LocalBlobStore
-from app.infra.domain import RuleDefinition, canonical_json
+from app.infra.contracts import RuleDefinition, canonical_json
 from app.infra.llm.schemas import spec_payload
 
 _GENERATOR_BATCH_SIZE = 12

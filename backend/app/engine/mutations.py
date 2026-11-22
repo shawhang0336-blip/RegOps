@@ -20,7 +20,7 @@ from app.engine.binding import (
     violates_single_field_rule,
 )
 from app.engine.oracle import SANDBOX_TEXT_LIMIT
-from app.infra.domain import AuditCaseBinding, FieldSpec, RuleDefinition, SpecDocument, field_map
+from app.infra.contracts import AuditCaseBinding, FieldSpec, RuleDefinition, SpecDocument, field_map
 
 
 def make_distinct_key_value(value: Any, field: Optional[FieldSpec], offset: int) -> Any:

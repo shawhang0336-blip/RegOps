@@ -2,7 +2,7 @@ import math
 import re
 from typing import Any, Dict, Iterable, List
 
-from app.infra.domain import Evidence, RuleDefinition, SpecDocument, calculate_rule_hash, field_map
+from app.infra.contracts import Evidence, RuleDefinition, SpecDocument, calculate_rule_hash, field_map
 
 
 class RuleValidationError(ValueError):

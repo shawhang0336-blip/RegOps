@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import (
+from app.infra.db_tables import (
     DocumentArchitectureModel,
     FieldCodeReferenceModel,
     FieldMetadataModel,
@@ -26,7 +26,7 @@ from app.infra.models import (
 from app.infra.config import Settings, get_settings
 from app.infra.db import SessionLocal
 from app.infra.errors import WorkflowError
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 from app.infra.config import get_budget
 from app.ingestion.import_progress import STAGE_LABELS
 from app.ingestion.import_progress import ensure as progress_ensure

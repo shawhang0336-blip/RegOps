@@ -12,7 +12,7 @@ from app.kernel.run import Identity, RunContext
 from app.policy.regops_channels import build_context
 from app.kernel.event_log import append_event
 from app.policy.regops_plan import project
-from app.infra.models import EventModel, RunModel
+from app.infra.db_tables import EventModel, RunModel
 from app.kernel.scheduler import Outcome, Scheduler
 from app.policy.regops_plan import DEFAULT_PLAN
 from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan

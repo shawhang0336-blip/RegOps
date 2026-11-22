@@ -17,7 +17,7 @@ from app.api.deps import db_session
 from app.assets.code_sets.oracle import code_set_compile_bindings, load_published_code_sets
 from app.engine.compiler import compile_where
 from app.engine.rules import RuleValidationError, validate_rule
-from app.infra.models import (
+from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
     FieldMetadataModel,
@@ -26,9 +26,9 @@ from app.infra.models import (
 )
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
-from app.infra.domain import RuleDefinition, SpecDocument, calculate_rule_hash
+from app.infra.contracts import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.infra.config import OPERATOR_PLACEHOLDER
-from app.infra.models import RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import RuleModel, RunModel, SpecificationModel
 from app.policy.regops_plan import project
 
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])

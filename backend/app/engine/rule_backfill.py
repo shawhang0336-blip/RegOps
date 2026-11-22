@@ -8,7 +8,7 @@
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from app.infra.domain import RuleDefinition, calculate_rule_hash
+from app.infra.contracts import RuleDefinition, calculate_rule_hash
 from app.infra.errors import WorkflowError
 from app.engine.binding import bind_rules
 from app.engine.rules import RuleValidationError

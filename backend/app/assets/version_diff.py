@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import (
+from app.infra.db_tables import (
     FieldMetadataModel,
     SourceDocumentModel,
     TableMetadataModel,

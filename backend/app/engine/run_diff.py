@@ -10,8 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.engine.compiler import compile_where
-from app.infra.domain import RuleDefinition, canonical_json
-from app.infra.models import RuleModel, RunModel
+from app.infra.contracts import RuleDefinition, canonical_json
+from app.infra.db_tables import RuleModel, RunModel
 from app.policy.regops_plan import project
 
 

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
+from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.ingestion.extractors import extract_document, survey_document

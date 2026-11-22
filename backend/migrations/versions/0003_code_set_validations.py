@@ -6,7 +6,7 @@ Revises: 0002_document_architecture
 
 from alembic import op
 
-from app.infra.models import CodeSetValidationModel
+from app.infra.db_tables import CodeSetValidationModel
 
 revision = "0003_code_set_validations"
 down_revision = "0002_document_architecture"

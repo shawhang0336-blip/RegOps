@@ -20,7 +20,7 @@ from app.assets.code_sets.service import (
     refresh_reference_status,
     remove_code_set,
 )
-from app.infra.models import (
+from app.infra.db_tables import (
     CodeSetModel,
     CodeSetValidationModel,
     CodeValueModel,

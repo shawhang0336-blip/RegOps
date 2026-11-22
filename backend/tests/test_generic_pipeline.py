@@ -18,7 +18,7 @@ from app.engine.workflow import (
     start_generic_run,
 )
 from app.delivery.production_service import build_production_bundle
-from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.engine.rules import RuleValidationError
 from app.infra.errors import WorkflowError
 from .helpers import make_session

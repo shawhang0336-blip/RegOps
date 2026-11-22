@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.models import (
+from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,
@@ -12,7 +12,7 @@ from app.infra.models import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.infra.domain import GeneratorBinding, RuleDefinition, SpecDocument
+from app.infra.contracts import GeneratorBinding, RuleDefinition, SpecDocument
 from app.infra.errors import WorkflowError
 from app.infra.db import quote_identifier
 

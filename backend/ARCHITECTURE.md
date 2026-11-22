@@ -16,12 +16,12 @@ backend/app/
 ├── main.py                      # 极简 FastAPI 启动入口（lifespan / CORS / 挂载路由）
 │
 ├── infra/                       # 层 0：基础设施与跨层共享契约（7 模块 + llm/ 子包，零上层依赖）
-│   ├── config.py                #    环境配置 Settings、运行预算（DEFAULT_BUDGET / get_budget）与操作人占位常量
-│   ├── db.py                    #    MySQL/Oracle 生产连接池、Base / SessionLocal / Alembic 初始化与 SQL 安全转义（quote_identifier）
-│   ├── models.py                #    全部 20 张 ORM 表统一定义（运行时账本 / 文档与资产元数据 / 生成规划与产物）
-│   ├── domain.py                #    跨层共享 Pydantic 值对象（FieldSpec / SpecDocument / RuleDefinition / Binding / LLM_OPERATORS）
-│   ├── errors.py                #    统一领域异常 WorkflowError（携带结构化错误定位 context）
 │   ├── blob_store.py            #    SHA-256 内容寻址不可变大对象存储（原子临时文件替换，并发零竞态）
+│   ├── config.py                #    环境配置 Settings、运行预算（DEFAULT_BUDGET / get_budget）与操作人占位常量
+│   ├── contracts.py             #    跨层共享 Pydantic 数据契约（FieldSpec / SpecDocument / RuleDefinition / Binding / LLM_OPERATORS）
+│   ├── db.py                    #    MySQL/Oracle 生产连接池、Base / SessionLocal / Alembic 初始化与 SQL 安全转义（quote_identifier）
+│   ├── db_tables.py             #    全部 20 张数据库 ORM 表统一定义（运行时账本 / 文档与资产元数据 / 生成规划与产物）
+│   ├── errors.py                #    统一领域异常 WorkflowError（携带结构化错误定位 context）
 │   ├── task_runner.py           #    带任务键去重的进程内有界后台线程池（TaskRunner）
 │   └── llm/                     #    受控大模型子包
 │       ├── client.py            #      OpenAI 兼容 HTTP 客户端（httpx 连接池复用、并发信号量、502/504 非 JSON 容错）

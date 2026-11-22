@@ -29,9 +29,9 @@ from app.engine.oracle import GenericOracleExecutor
 from app.engine.run_diff import diff_runs
 from app.engine.rules import RuleValidationError, validate_rule
 from app.engine.workflow.stage_data import _coupled_field_names, _partition_coupled_chunks
-from app.infra.models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
-from app.infra.domain import FieldSpec, RuleDefinition, SpecDocument
-from app.infra.models import RuleModel, RunModel
+from app.infra.db_tables import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from app.infra.contracts import FieldSpec, RuleDefinition, SpecDocument
+from app.infra.db_tables import RuleModel, RunModel
 from app.kernel.run import create_run
 from app.policy.regops_bus import default_bus
 
@@ -580,7 +580,7 @@ def test_policy_rules_compiler_deep_audit_fixes():
     from app.delivery.production import compile_production_rule_query, sql_literal
     from app.engine.binding import violates_arithmetic_balance
     from app.engine.compiler import compile_where
-    from app.infra.domain import Evidence
+    from app.infra.contracts import Evidence
     from app.kernel.event_log import RunState
     from app.policy.regops_bus import (
         code_set_values_adjudicator,
@@ -722,7 +722,7 @@ def test_oracle_module_deep_audit_fixes(monkeypatch):
         fit_sandbox_values,
         physical_table_name,
     )
-    from app.infra.domain import AuditCaseBinding, FieldSpec, SchemaBinding, SpecDocument
+    from app.infra.contracts import AuditCaseBinding, FieldSpec, SchemaBinding, SpecDocument
 
     # 1) 超长表名自动哈希压缩，拼接 _TARGET 后仍严格 <= 128 字节（防 ORA-00972）
     long_code = "SAFE_" + "A" * 130

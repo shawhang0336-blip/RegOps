@@ -21,7 +21,7 @@ from app.engine.ingestion_run import (
     start_document_extract_run,
     start_document_prepare_run,
 )
-from app.infra.models import (
+from app.infra.db_tables import (
     DocumentArchitectureModel,
     FieldCodeReferenceModel,
     FieldMetadataModel,

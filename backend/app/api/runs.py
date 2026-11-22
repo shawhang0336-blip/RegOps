@@ -36,7 +36,7 @@ from app.engine.workflow.entrypoints import _regops_delete_pre_hook
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import get_settings
 from app.infra.errors import WorkflowError
-from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.bus import global_bus
 from app.kernel.event_log import project_trace
 from app.policy.regops_channels import resolve_event_tables

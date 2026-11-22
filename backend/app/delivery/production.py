@@ -3,7 +3,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.engine.compiler import compile_where, quote_identifier
-from app.infra.domain import RuleDefinition
+from app.infra.contracts import RuleDefinition
 from app.engine.binding import SchemaBinding
 
 

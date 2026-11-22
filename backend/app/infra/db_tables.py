@@ -1,6 +1,6 @@
 """统一 ORM 表模型定义（基础设施层 Layer 0，全部 20 张 MySQL/Oracle 兼容表）。
 
-按领域清晰划分为三组，消除此前 `models.py` 与 `asset_models.py` 边界模糊的问题：
+按领域清晰划分为三组，消除此前 `db_tables.py` 与 `asset_models.py` 边界模糊的问题：
 1. 核心运行时账本与系统配置：`RunModel` / `EventModel` / `SpecificationModel` / `RuleModel` / `SystemSettingModel`；
 2. Step 1 文档导入、元数据与码表资产：`SourceDocumentModel` / `DocumentArchitectureModel` / `RawBlockModel` /
    `TableMetadataModel` / `FieldMetadataModel` / `MetadataRevisionModel` / `MetadataValidationModel` /

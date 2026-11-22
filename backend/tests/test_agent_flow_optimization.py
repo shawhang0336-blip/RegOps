@@ -24,11 +24,11 @@ from app.engine.rule_backfill import _code_set_enum_backfill_candidates
 from app.engine.rules import RuleValidationError
 from app.engine.workflow import start_generic_run
 from app.engine.workflow.stages import _audit_stage, _data_stage
-from app.infra.models import CodeSetValidationModel, RawBlockModel, SourceDocumentModel
+from app.infra.db_tables import CodeSetValidationModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
-from app.infra.domain import Evidence, FieldSpec, RuleDefinition, SpecDocument
+from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument
 from app.infra.llm.schemas import _tool_prompt_preamble
-from app.infra.models import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.ingestion.structure_service import analyze_document_structure
 from app.infra.llm.guard import call_llm_validated
 from app.policy.regops_bus import code_set_values_adjudicator, cross_table_adjudicator
@@ -616,7 +616,7 @@ def test_cross_table_foreign_key_allows_non_identical_field_names_and_blocks_hal
 def test_metadata_extraction_with_zero_suspect_fields_succeeds_without_zero_worker_crash(monkeypatch):
     """回归：所有字段均为确定性可解析（suspect_items=[] / chunks=[]）时，不得因 max_workers=0 崩溃。"""
     from app.assets.metadata_service import extract_metadata_for_block
-    from app.infra.models import TableMetadataModel
+    from app.infra.db_tables import TableMetadataModel
 
     session = make_session()
     monkeypatch.setattr("app.assets.metadata_service.SessionLocal", lambda: session)
@@ -900,7 +900,7 @@ def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbi
     """回归：非制表符展平术语文本不得把相邻字段的「见币种代码表」串味到前面字段；清空 code_reference_text 必须解绑旧引用。"""
     from app.assets.code_sets.linking import ensure_field_reference
     from app.assets.metadata_service import _deterministic_field_draft
-    from app.infra.models import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
+    from app.infra.db_tables import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
     from app.ingestion.spec_parser import lookup_term_definition
 
     flattened = "金融机构标识码 国家外汇管理局签发的12位标识码。 发生日期 账户收支余发生变动日期。 币种 币种代码，见币种代码表。"
@@ -1257,7 +1257,7 @@ def test_bsp_send_partial_wave_checkpoint_and_per_table_incremental_resume(monke
     """P3 回归：多表真 BSP Send 波次中表 1 成功、表 2 失败时，表 1 检查点先落 EventLog；断点续跑时表 1 零重跑，仅补跑表 2。"""
     from app.engine.oracle import GenericOracleExecutor
     from app.engine.workflow import drive, retry_generic_run, start_generic_run
-    from app.infra.models import EventModel, SpecificationModel
+    from app.infra.db_tables import EventModel, SpecificationModel
     from app.policy.regops_plan import project
 
     monkeypatch.setattr(

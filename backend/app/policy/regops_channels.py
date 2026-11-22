@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
-from app.infra.domain import AuditCaseBinding, RuleDefinition
-from app.infra.models import EventModel, RuleModel, RunModel
+from app.infra.contracts import AuditCaseBinding, RuleDefinition
+from app.infra.db_tables import EventModel, RuleModel, RunModel
 from app.kernel.run import (
     BudgetGuard,
     BudgetLimits,

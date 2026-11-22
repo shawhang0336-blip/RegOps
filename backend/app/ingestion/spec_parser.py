@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.infra.domain import FieldSpec, SpecDocument
+from app.infra.contracts import FieldSpec, SpecDocument
 
 
 class SpecParseError(ValueError):
