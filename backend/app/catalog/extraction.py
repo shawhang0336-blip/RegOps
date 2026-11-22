@@ -103,6 +103,8 @@ def extract_parallel_for_blocks(
                     if cid not in code_set_ids:
                         code_set_ids.append(cid)
             except (RunCancelledError, BudgetExceededError):
+                for f in list(meta_futures.values()) + list(cs_futures.values()):
+                    f.cancel()
                 raise
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "code_sets", "error": f"{type(exc).__name__}: {exc}"})
@@ -113,6 +115,8 @@ def extract_parallel_for_blocks(
                 if table_id:
                     table_ids.append(table_id)
             except (RunCancelledError, BudgetExceededError):
+                for f in list(meta_futures.values()) + list(cs_futures.values()):
+                    f.cancel()
                 raise
             except Exception as exc:
                 errors.append({"block_id": bid, "track": "metadata", "error": f"{type(exc).__name__}: {exc}"})

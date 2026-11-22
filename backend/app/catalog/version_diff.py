@@ -116,18 +116,17 @@ def _diff_table_fields(
 def _load_doc_tables(
     session: Session, document_id: str
 ) -> Tuple[List[TableMetadataModel], Dict[str, List[FieldMetadataModel]]]:
-    tables = (
-        session.query(TableMetadataModel)
-        .filter(TableMetadataModel.document_id == document_id)
-        .order_by(TableMetadataModel.source_ordinal, TableMetadataModel.table_code)
-        .all()
-    )
+    """只加载每张表的最新版本有效行（过滤 MERGED 子表与历史旧版本），并按 500 项分片防 Oracle ORA-01795。"""
+    from app.catalog.tables.readiness import latest_table_rows
+
+    tables = latest_table_rows(session, document_id=document_id)
     table_ids = [t.id for t in tables]
     fields_by_table: Dict[str, List[FieldMetadataModel]] = {tid: [] for tid in table_ids}
-    if table_ids:
+    for idx in range(0, len(table_ids), 500):
+        chunk = table_ids[idx : idx + 500]
         for field in (
             session.query(FieldMetadataModel)
-            .filter(FieldMetadataModel.table_id.in_(table_ids))
+            .filter(FieldMetadataModel.table_id.in_(chunk))
             .order_by(FieldMetadataModel.sort_order, FieldMetadataModel.field_en)
             .all()
         ):

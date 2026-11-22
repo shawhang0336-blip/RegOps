@@ -41,9 +41,10 @@ def validate_metadata_draft(draft: MetadataTableDraft) -> List[Dict[str, Any]]:
     seen = set()
     low_confidence = []
     for field in draft.fields:
-        if field.field_en in seen:
+        key_ci = field.field_en.strip().upper()
+        if key_ci in seen:
             issues.append({"severity": "ERROR", "code": "DUPLICATE_FIELD", "field_en": field.field_en})
-        seen.add(field.field_en)
+        seen.add(key_ci)
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", field.field_en):
             issues.append({"severity": "ERROR", "code": "INVALID_FIELD_NAME", "field_en": field.field_en})
         if field.data_type == "NUMBER" and field.decimal_places > field.length:

@@ -111,7 +111,7 @@ def evaluate_table(
                     name,
                 )
             )
-        seen[name] = seen.get(name, 0) + 1
+        seen[name.upper()] = seen.get(name.upper(), 0) + 1
 
         data_type = (field.data_type or "").upper()
         length = int(field.length or 0)
@@ -359,6 +359,8 @@ def latest_table_rows(
     query = session.query(TableMetadataModel)
     if status:
         query = query.filter(TableMetadataModel.status == status)
+    else:
+        query = query.filter(TableMetadataModel.status != "MERGED")
     if document_id:
         query = query.filter(TableMetadataModel.document_id == document_id)
     rows = query.order_by(
@@ -368,10 +370,15 @@ def latest_table_rows(
     for row in rows:
         key = (row.document_id, row.table_code)
         current = latest.get(key)
-        if current is None or (row.current_version or 0) >= (current.current_version or 0):
+        if current is None or (row.current_version or 0, row.id) >= (current.current_version or 0, current.id):
             latest[key] = row
     live_ids = {row.id for row in latest.values()}
     return [row for row in rows if row.id in live_ids]
+
+
+def _chunked(items: List[Any], size: int = 500):
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
 
 
 def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:
@@ -379,39 +386,35 @@ def evaluate_document(session: Session, document_id: Optional[str] = None) -> Di
     if not tables:
         return {"summary": summarize([]), "tables": []}
     table_ids = [table.id for table in tables]
-    fields = (
-        session.query(FieldMetadataModel)
-        .filter(FieldMetadataModel.table_id.in_(table_ids))
-        .order_by(FieldMetadataModel.sort_order)
-        .all()
-    )
+    fields: List[FieldMetadataModel] = []
+    for chunk in _chunked(table_ids):
+        fields.extend(
+            session.query(FieldMetadataModel)
+            .filter(FieldMetadataModel.table_id.in_(chunk))
+            .order_by(FieldMetadataModel.sort_order)
+            .all()
+        )
     field_ids = [field.id for field in fields]
-    refs = (
-        session.query(FieldCodeReferenceModel)
-        .filter(FieldCodeReferenceModel.field_id.in_(field_ids))
-        .all()
-        if field_ids
-        else []
-    )
-    code_set_ids = {ref.code_set_id for ref in refs}
-    code_sets = (
-        session.query(CodeSetModel).filter(CodeSetModel.id.in_(code_set_ids)).all()
-        if code_set_ids
-        else []
-    )
-    values = (
-        session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(code_set_ids)).all()
-        if code_set_ids
-        else []
-    )
-    refs_with_field = (
-        session.query(FieldCodeReferenceModel, FieldMetadataModel)
-        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-        .filter(FieldCodeReferenceModel.code_set_id.in_(code_set_ids))
-        .all()
-        if code_set_ids
-        else []
-    )
+    refs: List[FieldCodeReferenceModel] = []
+    for chunk in _chunked(field_ids):
+        refs.extend(
+            session.query(FieldCodeReferenceModel)
+            .filter(FieldCodeReferenceModel.field_id.in_(chunk))
+            .all()
+        )
+    code_set_ids = list({ref.code_set_id for ref in refs})
+    code_sets: List[CodeSetModel] = []
+    values: List[CodeValueModel] = []
+    refs_with_field: List = []
+    for chunk in _chunked(code_set_ids):
+        code_sets.extend(session.query(CodeSetModel).filter(CodeSetModel.id.in_(chunk)).all())
+        values.extend(session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(chunk)).all())
+        refs_with_field.extend(
+            session.query(FieldCodeReferenceModel, FieldMetadataModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+            .filter(FieldCodeReferenceModel.code_set_id.in_(chunk))
+            .all()
+        )
     fields_by_table: Dict[str, List[FieldMetadataModel]] = {}
     for field in fields:
         fields_by_table.setdefault(field.table_id, []).append(field)

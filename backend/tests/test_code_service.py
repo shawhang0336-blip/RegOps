@@ -209,8 +209,8 @@ def test_code_set_ai_review_runs_once_for_unchanged_content(monkeypatch):
     session.add_all([document, block])
     session.commit()
 
-    extract_code_sets_for_block(block.id, Settings())
-    extract_code_sets_for_block(block.id, Settings())
+    extract_code_sets_for_block(block.id, Settings(), review_with_ai=True)
+    extract_code_sets_for_block(block.id, Settings(), review_with_ai=True)
     row = session.query(CodeSetModel).one()
     assert row.status == "AI_SELF_VALIDATED"
     assert row.current_version == 1

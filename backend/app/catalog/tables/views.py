@@ -23,9 +23,10 @@ from app.infra.db_tables import (
 )
 
 
-# 来源原文里出现这些字样，才说明这份文档真的声明了数据类型/长度
+# 来源原文里出现这些字样，才说明这份文档真的声明了数据类型/长度（兼容外管局中文声明与 EAST/1104/SQL 标准声明）
 TYPE_DECLARATION_HINTS = (
     "类型（长度）",
+    "数据类型",
     "字符型",
     "数值型",
     "整数型",
@@ -33,6 +34,13 @@ TYPE_DECLARATION_HINTS = (
     "定长",
     "变长",
     "数据格式",
+    "VARCHAR",
+    "CHAR(",
+    "NUMBER(",
+    "DECIMAL(",
+    "NUMERIC(",
+    "C..",
+    "N..",
 )
 
 # 与类型/长度相关的问题码前缀；原文没有类型声明时，这类 ERROR 只能算推断
@@ -98,7 +106,8 @@ def _excerpt_for_fields(raw: str, field_names: List[str], *, max_chars: int = CO
 
 def _source_declares_type(raw_context: str) -> bool:
     text = raw_context or ""
-    return any(hint in text for hint in TYPE_DECLARATION_HINTS)
+    upper = text.upper()
+    return any((hint in text) or (hint.isascii() and hint in upper) for hint in TYPE_DECLARATION_HINTS)
 
 
 # "校验规则有没有装配好"是后续阶段的职责，阶段 1 的字段复核不该用它阻断整张表
@@ -118,23 +127,33 @@ def _is_rule_assembly_issue(code: str) -> bool:
 
 
 def _field_declares_length(raw_context: str, field_en: str) -> Optional[bool]:
-    """判断原文对该字段是否给出了明确的长度。
+    """判断原文对该字段是否给出了明确的长度（支持外管局中文声明与 EAST/1104/Word/Excel 常见 SQL 类型声明）。
 
-    True = 写了"数值型，13.8"这类完整声明；False = 只写了"数值型"没给长度；
+    True = 写了"数值型，13.8" / "VARCHAR(60)" / "DECIMAL(20,2)" / "C..30" 这类完整声明；
+    False = 只写了"数值型" / "VARCHAR" / "NUMBER" 没给长度；
     None = 原文里找不到该字段的类型声明。
     """
     if not field_en:
         return None
-    type_pattern = r"(定长字符型|变长字符型|字符型|数值型|日期型|整数型|长整数型|时间型)"
+    cn_type_pattern = r"(定长字符型|变长字符型|字符型|数值型|日期型|整数型|长整数型|时间型)"
+    sql_type_with_len = (
+        r"(?:\b(?:VARCHAR2?|CHAR|NUMBER|DECIMAL|NUMERIC)\s*[(（]\s*\d+(?:\s*[,，.]\s*\d+)?\s*[)）]"
+        r"|\b[CN]\.{0,2}\d+(?:[.,]\d+)?\b"
+        r"|\b(?:DATE|TIMESTAMP|INTEGER|INT)\b)"
+    )
+    sql_type_bare = r"\b(?:VARCHAR2?|CHAR|NUMBER|DECIMAL|NUMERIC)\b"
+    field_token_re = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(field_en)}(?![A-Za-z0-9_])", re.IGNORECASE)
     lines = (raw_context or "").split("\n")
     found_type = False
     for index, line in enumerate(lines):
         stripped = line.lstrip()
-        if not stripped.startswith(field_en):
+        if not (stripped.startswith(field_en) or field_token_re.search(stripped)):
             continue
-        if re.search(type_pattern + r"\s*[，,]\s*\d+", stripped):
+        if re.search(cn_type_pattern + r"\s*[，,(（]\s*\d+", stripped):
             return True
-        if re.search(type_pattern, stripped):
+        if re.search(sql_type_with_len, stripped, re.IGNORECASE):
+            return True
+        if re.search(cn_type_pattern, stripped):
             found_type = True
             # 长度可能被折到下一行，但下一行必须是纯续行（不是新字段）才算
             nxt = lines[index + 1] if index + 1 < len(lines) else ""
@@ -142,6 +161,8 @@ def _field_declares_length(raw_context: str, field_en: str) -> Optional[bool]:
                 r"^\s*[，,]?\s*\d{1,3}(\.\d+)?", nxt
             ):
                 return True
+        elif re.search(sql_type_bare, stripped, re.IGNORECASE):
+            found_type = True
     return False if found_type else None
 
 
@@ -273,12 +294,16 @@ def table_detail(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
         .limit(30)
         .all()
     )
-    refs = {
-        ref.field_id: ref.code_set_id
-        for ref in session.query(FieldCodeReferenceModel)
-        .filter(FieldCodeReferenceModel.field_id.in_([field.id for field in fields]))
-        .all()
-    }
+    refs: Dict[str, str] = {}
+    field_ids = [field.id for field in fields]
+    for idx in range(0, len(field_ids), 500):
+        chunk = field_ids[idx : idx + 500]
+        for ref in (
+            session.query(FieldCodeReferenceModel)
+            .filter(FieldCodeReferenceModel.field_id.in_(chunk))
+            .all()
+        ):
+            refs[ref.field_id] = ref.code_set_id
     return {
         **table_summary(table),
         "fields": [{**_field_view(field), "code_set_id": refs.get(field.id)} for field in fields],
@@ -311,7 +336,11 @@ def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocumen
     if table.status != "PUBLISHED" or table.published_version != table.current_version:
         raise ValueError("TABLE_NOT_PUBLISHED")
     document = session.get(SourceDocumentModel, table.document_id)
+    if not document:
+        raise ValueError("SOURCE_DOCUMENT_NOT_FOUND")
     block = session.get(RawBlockModel, table.block_id)
+    if not block:
+        raise ValueError("RAW_BLOCK_NOT_FOUND")
     fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).order_by(FieldMetadataModel.sort_order).all()
     return SpecDocument(
         version=document.spec_version,

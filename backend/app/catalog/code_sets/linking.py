@@ -29,6 +29,11 @@ from app.infra.db_tables import (
 )
 
 
+def _chunked(items: List[Any], size: int = 500):
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
 def document_code_set_ids(session: Session, document_id: str) -> set:
     block_ids = {
         row.id for row in session.query(RawBlockModel.id).filter(RawBlockModel.document_id == document_id).all()
@@ -41,6 +46,8 @@ def document_code_set_ids(session: Session, document_id: str) -> set:
         .filter(TableMetadataModel.document_id == document_id)
         .all()
     }
+    if not block_ids:
+        return referenced_ids
     sourced_ids = {
         code_set_id
         for code_set_id, source_locator in session.query(
@@ -69,11 +76,13 @@ def document_code_set_ordinals(session: Session, document_id: str, code_set_ids:
         .all()
     }
     located: set = set()
-    value_rows = (
-        session.query(CodeValueModel.code_set_id, CodeValueModel.source_locator)
-        .filter(CodeValueModel.code_set_id.in_(code_set_ids))
-        .all()
-    )
+    value_rows = []
+    for chunk in _chunked(list(code_set_ids)):
+        value_rows.extend(
+            session.query(CodeValueModel.code_set_id, CodeValueModel.source_locator)
+            .filter(CodeValueModel.code_set_id.in_(chunk))
+            .all()
+        )
     for code_set_id, source_locator in value_rows:
         block_id = (source_locator or {}).get("block_id")
         if block_id in block_ordinal:
@@ -110,6 +119,8 @@ def refresh_reference_status(session: Session, code_set_id: str) -> None:
     ).count() > 0
     references = session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.code_set_id == code_set_id).all()
     for reference in references:
+        if reference.status == "EXTERNAL" and not has_values:
+            continue
         reference.status = "RESOLVED" if has_values else "UNRESOLVED"
     session.flush()
 
@@ -262,23 +273,24 @@ def _fill_code_values(
     source_text: str,
 ) -> int:
     """把解析出来的内联枚举补进已有码表（通常是由引用原文建的占位表）。"""
-    existing = {
-        row.value
+    existing_ci = {
+        (row.value or "").strip().upper()
         for row in session.query(CodeValueModel)
         .filter(CodeValueModel.code_set_id == code_set.id)
         .all()
     }
-    order = len(existing)
+    order = len(existing_ci)
     added = 0
     for item in enum_values:
-        if item["value"] in existing:
+        val_clean = str(item["value"] or "").strip()[:128]
+        if not val_clean or val_clean.upper() in existing_ci:
             continue
         session.add(
             CodeValueModel(
                 id=str(uuid.uuid4()),
                 code_set_id=code_set.id,
-                value=item["value"][:128],
-                label_cn=item["label_cn"][:255],
+                value=val_clean,
+                label_cn=str(item["label_cn"] or "").strip()[:255],
                 label_en="",
                 definition="",
                 sort_order=order,
@@ -286,7 +298,7 @@ def _fill_code_values(
                 source_locator={},
             )
         )
-        existing.add(item["value"])
+        existing_ci.add(val_clean.upper())
         order += 1
         added += 1
     if not added:
@@ -415,20 +427,27 @@ def ensure_field_reference(
                 session.add(code_set)
                 session.flush()
                 _stamp_field_ordinal(session, code_set, field)
-                for index, item in enumerate(enum_values):
+                seen_vals_ci = set()
+                sort_idx = 0
+                for item in enum_values:
+                    val_clean = str(item["value"] or "").strip()[:128]
+                    if not val_clean or val_clean.upper() in seen_vals_ci:
+                        continue
+                    seen_vals_ci.add(val_clean.upper())
                     session.add(
                         CodeValueModel(
                             id=str(uuid.uuid4()),
                             code_set_id=code_set.id,
-                            value=item["value"],
-                            label_cn=item["label_cn"],
+                            value=val_clean,
+                            label_cn=str(item["label_cn"] or "").strip()[:255],
                             label_en="",
                             definition="",
-                            sort_order=index,
+                            sort_order=sort_idx,
                             enabled=True,
                             source_locator={},
                         )
                     )
+                    sort_idx += 1
                 if by_code is not None:
                     by_code[code] = code_set
                 if sets_with_values is not None:
@@ -440,12 +459,12 @@ def ensure_field_reference(
                     sets_with_values.add(code_set.id)
                 session.flush()
         else:
-            code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())
+            code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())[:96]
             code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
             if not code_set:
                 code_set = CodeSetModel(
                     id=str(uuid.uuid4()),
-                    code=code[:96],
+                    code=code,
                     name=text[:255],
                     definition=f"由字段 {field.field_en} 的校验引用自动建立",
                     source_type="DOCUMENT_REFERENCE",
@@ -556,6 +575,8 @@ def auto_link_all_references(session: Session) -> int:
         )
 
     for ref in session.query(FieldCodeReferenceModel).all():
+        if ref.status == "EXTERNAL" and ref.code_set_id not in sets_with_values:
+            continue
         ref.status = "RESOLVED" if ref.code_set_id in sets_with_values else "UNRESOLVED"
 
     session.flush()
@@ -567,8 +588,14 @@ def generation_blockers(session: Session, table: TableMetadataModel) -> List[Dic
     fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).all()
     for field in fields:
         references = session.query(FieldCodeReferenceModel).filter(FieldCodeReferenceModel.field_id == field.id).all()
-        text = field.code_reference_text.strip()
-        if text and text.upper() not in {"无", "N/A", "NONE", "无引用"} and not references:
+        text = (field.code_reference_text or "").strip()
+        if (
+            text
+            and text.upper() not in {"无", "N/A", "NONE", "无引用"}
+            and not parse_fixed_value(text)
+            and not is_rule_reference(text)
+            and not references
+        ):
             blockers.append({"field_en": field.field_en, "reason": "CODE_REFERENCE_NOT_BOUND"})
         for reference in references:
             if reference.status == "UNRESOLVED" and field.required:

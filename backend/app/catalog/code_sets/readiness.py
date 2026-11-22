@@ -164,33 +164,40 @@ def summarize_code_sets(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _chunked(items: List[Any], size: int = 500):
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
 def evaluate_code_sets(
     session: Session,
     *,
     document_id: Optional[str] = None,
     referenced_only: bool = False,
 ) -> Dict[str, Any]:
-    query = session.query(CodeSetModel)
     if document_id:
         from app.catalog.code_sets.linking import document_code_set_ids
 
-        ids = document_code_set_ids(session, document_id)
-        query = query.filter(CodeSetModel.id.in_(ids))
-    rows = query.order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
+        ids = list(document_code_set_ids(session, document_id))
+        if not ids:
+            return {"summary": summarize_code_sets([]), "code_sets": []}
+        rows = []
+        for chunk in _chunked(ids):
+            rows.extend(session.query(CodeSetModel).filter(CodeSetModel.id.in_(chunk)).all())
+        rows.sort(key=lambda r: (r.source_ordinal is None, r.source_ordinal or 0, r.code or ""))
+    else:
+        rows = session.query(CodeSetModel).order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
     row_ids = [row.id for row in rows]
-    values = (
-        session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(row_ids)).all()
-        if row_ids
-        else []
-    )
-    refs = (
-        session.query(FieldCodeReferenceModel, FieldMetadataModel)
-        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
-        .filter(FieldCodeReferenceModel.code_set_id.in_(row_ids))
-        .all()
-        if row_ids
-        else []
-    )
+    values: List[CodeValueModel] = []
+    refs: List = []
+    for chunk in _chunked(row_ids):
+        values.extend(session.query(CodeValueModel).filter(CodeValueModel.code_set_id.in_(chunk)).all())
+        refs.extend(
+            session.query(FieldCodeReferenceModel, FieldMetadataModel)
+            .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+            .filter(FieldCodeReferenceModel.code_set_id.in_(chunk))
+            .all()
+        )
     values_by_set: Dict[str, List[CodeValueModel]] = {}
     for value in values:
         values_by_set.setdefault(value.code_set_id, []).append(value)
@@ -233,11 +240,13 @@ def auto_publish_referenced_code_sets(session: Session, table) -> Dict[str, List
     ]
     if not field_ids:
         return {"published": published, "skipped": skipped}
-    references = (
-        session.query(FieldCodeReferenceModel)
-        .filter(FieldCodeReferenceModel.field_id.in_(field_ids))
-        .all()
-    )
+    references: List[FieldCodeReferenceModel] = []
+    for chunk in _chunked(field_ids):
+        references.extend(
+            session.query(FieldCodeReferenceModel)
+            .filter(FieldCodeReferenceModel.field_id.in_(chunk))
+            .all()
+        )
     seen = set()
     for reference in references:
         if not reference.code_set_id or reference.code_set_id in seen:

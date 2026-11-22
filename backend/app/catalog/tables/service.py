@@ -53,7 +53,8 @@ from app.catalog.tables.views import (
     type_basis_for,
 )
 from app.infra.llm import RealDesignLlm
-from app.infra.llm.guard import call_llm_validated
+from app.infra.llm.guard import call_llm_validated, submit_with_context
+from app.kernel.run import BudgetExceededError, RunCancelledError
 from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
@@ -118,13 +119,15 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
             .first()
         )
 
+    safe_code = (draft.table_code or "").strip()[:96]
+    safe_name = (draft.table_name or "").strip()[:255]
     if existing and not preserve_existing:
         for field in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == existing.id).all():
             session.delete(field)
         session.flush()
         table = existing
-        table.table_code = draft.table_code
-        table.table_name = draft.table_name
+        table.table_code = safe_code
+        table.table_name = safe_name
         table.table_definition = draft.table_definition
         table.current_version += 1
     else:
@@ -133,8 +136,8 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
             id=str(uuid.uuid4()),
             document_id=block.document_id,
             block_id=block.id,
-            table_code=draft.table_code,
-            table_name=draft.table_name,
+            table_code=safe_code,
+            table_name=safe_name,
             table_definition=draft.table_definition,
             status="DRAFT",
             current_version=next_ver,
@@ -150,6 +153,8 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
 
     for index, field in enumerate(draft.fields):
         values = field.model_dump()
+        values["field_cn"] = str(values.get("field_cn") or "").strip()[:255]
+        values["field_en"] = str(values.get("field_en") or "").strip()[:128]
         if not values["evidence_json"]:
             values["evidence_json"] = block.source_locator
         session.add(
@@ -178,6 +183,94 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
     return table
 
 
+_TABULAR_COL_ALIASES = {
+    "field_cn": ("字段中文名", "中文名", "数据项名称", "数据项中文名", "字段名称", "指标名称", "中文名称", "内容"),
+    "field_en": ("字段英文名", "英文名", "字段名", "字段代码", "数据项代码", "英文代码", "field_en", "name"),
+    "data_type": ("数据类型", "类型（长度）", "类型(长度)", "字段类型", "类型", "格式", "data_type"),
+    "length": ("数据长度", "字段长度", "长度", "length"),
+    "decimal_places": ("小数位", "小数位数", "精度", "decimal_places"),
+    "required": ("是否必填", "必填", "是否可空", "可空", "required"),
+    "check_text": ("字段校验", "校验要求", "校验规则", "校验", "业务口径", "说明", "填报说明", "备注", "check_text"),
+}
+
+
+def _map_tabular_row(row: List[str], headers: List[str]) -> Dict[str, str]:
+    """按 Word/Excel 表头别名动态映射各列，避免 4+/5+ 列规范丢列或把序号当字段名。"""
+    norm_headers = [re.sub(r"\s+", "", str(h or "")).lower() for h in headers]
+    col_idx: Dict[str, int] = {}
+    for role, aliases in _TABULAR_COL_ALIASES.items():
+        for idx, h in enumerate(norm_headers):
+            if idx in col_idx.values():
+                continue
+            if any(h == a.lower() for a in aliases):
+                col_idx[role] = idx
+                break
+        if role not in col_idx:
+            for idx, h in enumerate(norm_headers):
+                if idx in col_idx.values():
+                    continue
+                if any(a.lower() in h for a in aliases):
+                    col_idx[role] = idx
+                    break
+
+    def _get(role: str, fallback_idx: int = -1) -> str:
+        idx = col_idx.get(role, fallback_idx)
+        return row[idx] if 0 <= idx < len(row) else ""
+
+    # 无表头命中时保留原 3 列位置回退（[field_cn, field_en, check_text]）
+    if "field_cn" not in col_idx and "field_en" not in col_idx:
+        return {
+            "field_cn": row[0] if len(row) > 0 else "",
+            "field_en": row[1] if len(row) > 1 else "",
+            "data_type_raw": "",
+            "length_raw": "",
+            "dec_raw": "",
+            "required_raw": "",
+            "check_text": row[2] if len(row) > 2 else "",
+        }
+    return {
+        "field_cn": _get("field_cn"),
+        "field_en": _get("field_en"),
+        "data_type_raw": _get("data_type"),
+        "length_raw": _get("length"),
+        "dec_raw": _get("decimal_places"),
+        "required_raw": _get("required"),
+        "check_text": _get("check_text"),
+    }
+
+
+def _parse_tabular_type(
+    type_raw: str,
+    length_raw: str,
+    dec_raw: str,
+    check_text: str,
+    field_cn: str,
+):
+    """兼容 SQL/EAST 类型（VARCHAR(40)/DECIMAL(20,2)/C..30/DATE）与外管局中文类型。"""
+    source = (type_raw or "").strip()
+    if source:
+        upper = source.upper()
+        m_sql = re.match(r"^(VARCHAR2?|CHAR|NUMBER|DECIMAL|NUMERIC|INT|INTEGER)\s*(?:[(（]\s*(\d+)(?:\s*[,，.]\s*(\d+))?\s*[)）])?$", upper)
+        if m_sql:
+            kind, g_len, g_dec = m_sql.group(1), m_sql.group(2), m_sql.group(3)
+            is_num = kind in {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER"}
+            data_type = "NUMBER" if is_num else "VARCHAR"
+            length = int(g_len or length_raw or (10 if "INT" in kind else (22 if is_num else 128)))
+            dec = int(g_dec or dec_raw or 0) if is_num else 0
+            return data_type, max(1, length), max(0, dec), []
+        m_c = re.fullmatch(r"C\.{0,2}(\d+)", upper)
+        if m_c:
+            return "VARCHAR", int(m_c.group(1)), 0, []
+        m_n = re.fullmatch(r"N\.{0,2}(\d+)(?:[.,](\d+))?", upper)
+        if m_n:
+            return "NUMBER", int(m_n.group(1)), int(m_n.group(2) or 0), []
+        if upper in {"DATE", "TIMESTAMP"}:
+            return "VARCHAR", 8 if upper == "DATE" else 19, 0, []
+    combined = f"{source}{('，' + length_raw) if length_raw else ''}{('.' + dec_raw) if dec_raw else ''} {check_text}".strip()
+    _, data_type, length, parsed_dec, _, type_warnings = _parse_type_from_entry(combined, field_cn)
+    return data_type, max(1, int(length or 128)), max(0, int(parsed_dec or 0)), type_warnings
+
+
 def _field_needs_ai(raw_field: Dict[str, Any]) -> bool:
     """判断字段是否需要 AI 补全：要素齐全的结构化字段走确定性提取即可。
 
@@ -195,12 +288,20 @@ def _field_needs_ai(raw_field: Dict[str, Any]) -> bool:
         return False
     if "row" in raw_field:
         row = [str(cell or "").strip() for cell in raw_field["row"]]
-        field_cn = row[0] if row else ""
-        check_text = row[2] if len(row) > 2 else ""
+        headers = [str(h or "").strip() for h in raw_field.get("headers", [])]
+        mapped = _map_tabular_row(row, headers)
+        field_cn = mapped["field_cn"]
+        field_en = mapped["field_en"]
         # 英文名缺失时确定性路径只能编造哈希名，交给 AI 从上下文推断
-        if len(row) < 2 or not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1] or ""):
+        if not field_en or not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", field_en):
             return True
-        _, data_type, _length, _dec, _, type_warnings = _parse_type_from_entry(check_text, field_cn)
+        data_type, _length, _dec, type_warnings = _parse_tabular_type(
+            mapped["data_type_raw"],
+            mapped["length_raw"],
+            mapped["dec_raw"],
+            mapped["check_text"],
+            field_cn,
+        )
         if type_warnings or not data_type:
             return True
         return False
@@ -214,6 +315,7 @@ def _deterministic_field_draft(
     fallback_reason: str = "",
 ) -> MetadataFieldDraft:
     # Support both structured spec field dicts and DOCX/XLSX table rows
+    required_col_hint = False
     if "name" in raw_field:
         field_en = str(raw_field["name"]).strip()
         field_cn = str(raw_field.get("content") or field_en).strip()
@@ -222,14 +324,29 @@ def _deterministic_field_draft(
         length = int(raw_field.get("length") or 128)
         dec = int(raw_field.get("decimal_places") or 0)
         page = raw_field.get("evidence_page") or locator.get("page", "")
+        type_warnings = []
     elif "row" in raw_field:
         row = [str(c or "").strip() for c in raw_field["row"]]
         headers = [str(h or "").strip() for h in raw_field.get("headers", [])]
-        field_cn = row[0] if len(row) > 0 else "字段"
-        field_en = row[1] if len(row) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", row[1]) else f"FIELD_{hashlib.sha1(field_cn.encode('utf-8')).hexdigest()[:8].upper()}"
-        check_text = row[2] if len(row) > 2 else ""
-        _, data_type, length, parsed_dec, _, type_warnings = _parse_type_from_entry(check_text, field_cn)
-        dec = parsed_dec or 0
+        mapped = _map_tabular_row(row, headers)
+        field_cn = mapped["field_cn"] or mapped["field_en"] or "字段"
+        raw_en = mapped["field_en"]
+        field_en = (
+            raw_en
+            if raw_en and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", raw_en)
+            else f"FIELD_{hashlib.sha1(field_cn.encode('utf-8')).hexdigest()[:8].upper()}"
+        )
+        check_text = mapped["check_text"]
+        req_text = mapped["required_raw"]
+        if req_text:
+            required_col_hint = req_text in {"是", "必填", "Y", "YES", "TRUE", "1", "非空", "否(不可空)"}
+        data_type, length, dec, type_warnings = _parse_tabular_type(
+            mapped["data_type_raw"],
+            mapped["length_raw"],
+            mapped["dec_raw"],
+            check_text,
+            field_cn,
+        )
         page = locator.get("table_index", locator.get("sheet", ""))
     else:
         raise ValueError("Cannot deterministically map unstructured raw_field without name or row")
@@ -240,7 +357,11 @@ def _deterministic_field_draft(
     if term_definition:
         field_def = term_definition[:500]
 
-    required = bool(raw_field.get("required_basis")) or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text)
+    required = (
+        required_col_hint
+        or bool(raw_field.get("required_basis"))
+        or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text)
+    )
     code_ref = extract_code_reference_from_text(check_text) or extract_code_reference_from_text(term_definition)
     if not code_ref:
         inline_enums = extract_inline_enum_values(check_text)
@@ -331,14 +452,19 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
 
         def bind_chunk(chunk_items):
             chunk = [raw_field for _, raw_field in chunk_items]
+            is_unstructured = len(chunk) == 1 and "raw_text" in chunk[0]
             if llm is not None:
                 payload = {
                     "source_locator": block.source_locator,
                     "table": {"table_code": fallback_code, "table_name": fallback_name},
                     "raw_fields": chunk,
-                    "raw_context": _excerpt_for_fields(
-                        block.raw_content,
-                        [item.get("name") or item.get("field_en") or "" for item in chunk],
+                    "raw_context": (
+                        (block.raw_content or "")[:CONTEXT_MAX_CHARS]
+                        if is_unstructured
+                        else _excerpt_for_fields(
+                            block.raw_content,
+                            [item.get("name") or item.get("field_en") or "" for item in chunk],
+                        )
                     ),
                 }
                 def _validate_meta_batch(args):
@@ -349,18 +475,28 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                         "fields": args.get("fields", []),
                     }
                     draft = MetadataTableDraft.model_validate(candidate)
-                    if len(draft.fields) != len(chunk):
+                    if is_unstructured:
+                        if not draft.fields:
+                            raise ValueError("Unstructured block LLM response returned zero fields")
+                    elif len(draft.fields) != len(chunk):
                         raise ValueError(
                             f"Field count mismatch in batch LLM response: expected {len(chunk)}, got {len(draft.fields)}"
                         )
                     require_valid_metadata(draft)
                     return draft
 
+                instruction = (
+                    "从输入非结构化原文块中提取该表的全部业务字段定义（字段英文名、中文名、类型、长度、小数位、是否必填、校验原文、码值引用等）。"
+                    "不得遗漏原文中的字段，也不得虚构原文未出现的字段；定义与长度仅在有明确依据时填写。"
+                    if is_unstructured
+                    else f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。"
+                )
+
                 try:
                     draft, trace = call_llm_validated(
                         llm,
                         "assign_metadata",
-                        f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。",
+                        instruction,
                         payload,
                         _validate_meta_batch,
                         timeout=120,
@@ -370,6 +506,8 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                     )
                     _apply_source_definitions(draft.fields, chunk, terms_text)
                     return draft.fields, draft.table_definition, trace
+                except (BudgetExceededError, RunCancelledError):
+                    raise
                 except Exception as exc:
                     err_msg = f"{type(exc).__name__}: {exc}"
             else:
@@ -389,23 +527,40 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
 
         if chunks:
             with ThreadPoolExecutor(max_workers=max(1, min(2, len(chunks)))) as executor:
-                chunk_results = list(executor.map(bind_chunk, chunks))
+                futures = [submit_with_context(executor, bind_chunk, chunk_items) for chunk_items in chunks]
+                chunk_results = []
+                for future in futures:
+                    try:
+                        chunk_results.append(future.result())
+                    except (BudgetExceededError, RunCancelledError):
+                        for f in futures:
+                            f.cancel()
+                        raise
         else:
             chunk_results = []
 
-        # 按原始字段顺序合并：确定性结果 + AI/兜底结果
-        field_by_index: Dict[int, MetadataFieldDraft] = dict(clean_drafts)
+        # 按原始字段顺序合并：确定性结果 + AI/兜底结果（支持非结构化 raw_text 展开为多字段）
+        fields_by_index: Dict[int, List[MetadataFieldDraft]] = {
+            index: [draft_field] for index, draft_field in clean_drafts.items()
+        }
         table_definition = ""
         batch_traces = []
         if clean_drafts:
             batch_traces.append({"strategy": "DETERMINISTIC_FIRST", "field_count": len(clean_drafts)})
         for chunk_items, (fields_part, t_def, tr) in zip(chunks, chunk_results):
-            for (index, _), draft_field in zip(chunk_items, fields_part):
-                field_by_index[index] = draft_field
+            if len(chunk_items) == 1 and "raw_text" in chunk_items[0][1]:
+                fields_by_index[chunk_items[0][0]] = list(fields_part)
+            else:
+                for (index, _), draft_field in zip(chunk_items, fields_part):
+                    fields_by_index[index] = [draft_field]
             if t_def and not table_definition:
                 table_definition = t_def
             batch_traces.append(tr)
-        all_fields: List[MetadataFieldDraft] = [field_by_index[index] for index in range(len(raw_fields))]
+        all_fields: List[MetadataFieldDraft] = [
+            draft_field
+            for index in range(len(raw_fields))
+            for draft_field in fields_by_index.get(index, [])
+        ]
 
         # 只有真调过 AI 赋值的批次才值得再做一次 AI 复核；全确定性提取走交叉核验即可
         ai_assignment_used = any(not str(trace.get("strategy", "")).startswith("DETERMINISTIC") for trace in batch_traces)
@@ -478,6 +633,8 @@ def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: boo
                     validation_attempts=2,
                 )
                 issues = args.get("issues", [])
+            except (BudgetExceededError, RunCancelledError):
+                raise
             except Exception as exc:
                 review_trace = {"error": f"{type(exc).__name__}: {exc}"}
                 issues = [

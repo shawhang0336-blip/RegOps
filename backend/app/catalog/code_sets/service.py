@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import case, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.catalog.code_sets.linking import (
@@ -98,34 +99,37 @@ def code_set_summary(session: Session, row: CodeSetModel, metrics: Optional[Tupl
 
 
 def code_set_summaries(session: Session, rows: List[CodeSetModel]) -> List[Dict[str, Any]]:
-    """列表页批量统计码值数和未决引用，避免每张码表执行三条 COUNT。"""
+    """列表页批量统计码值数和未决引用，按 500 条分片避免 Oracle ORA-01795（IN 列表超 1000 项）。"""
     if not rows:
         return []
     ids = [row.id for row in rows]
-    value_rows = (
-        session.query(
-            CodeValueModel.code_set_id,
-            func.count(CodeValueModel.id),
-            func.sum(case((CodeValueModel.enabled.is_(True), 1), else_=0)),
+    value_metrics: Dict[str, Tuple[int, int]] = {}
+    unresolved_metrics: Dict[str, int] = {}
+    for idx in range(0, len(ids), 500):
+        chunk = ids[idx : idx + 500]
+        value_rows = (
+            session.query(
+                CodeValueModel.code_set_id,
+                func.count(CodeValueModel.id),
+                func.sum(case((CodeValueModel.enabled.is_(True), 1), else_=0)),
+            )
+            .filter(CodeValueModel.code_set_id.in_(chunk))
+            .group_by(CodeValueModel.code_set_id)
+            .all()
         )
-        .filter(CodeValueModel.code_set_id.in_(ids))
-        .group_by(CodeValueModel.code_set_id)
-        .all()
-    )
-    value_metrics = {
-        code_set_id: (int(total or 0), int(enabled or 0))
-        for code_set_id, total, enabled in value_rows
-    }
-    unresolved_rows = (
-        session.query(FieldCodeReferenceModel.code_set_id, func.count(FieldCodeReferenceModel.id))
-        .filter(
-            FieldCodeReferenceModel.code_set_id.in_(ids),
-            FieldCodeReferenceModel.status == "UNRESOLVED",
+        for code_set_id, total, enabled in value_rows:
+            value_metrics[code_set_id] = (int(total or 0), int(enabled or 0))
+        unresolved_rows = (
+            session.query(FieldCodeReferenceModel.code_set_id, func.count(FieldCodeReferenceModel.id))
+            .filter(
+                FieldCodeReferenceModel.code_set_id.in_(chunk),
+                FieldCodeReferenceModel.status == "UNRESOLVED",
+            )
+            .group_by(FieldCodeReferenceModel.code_set_id)
+            .all()
         )
-        .group_by(FieldCodeReferenceModel.code_set_id)
-        .all()
-    )
-    unresolved_metrics = {code_set_id: int(total or 0) for code_set_id, total in unresolved_rows}
+        for code_set_id, total in unresolved_rows:
+            unresolved_metrics[code_set_id] = int(total or 0)
     return [
         code_set_summary(
             session,
@@ -163,14 +167,17 @@ def _upsert_code_set_draft(
     draft: CodeSetDraft,
     locator: Dict[str, Any],
 ) -> Tuple[CodeSetModel, bool]:
+    """幂等写入或补充码表草稿：使用数据库原生 SAVEPOINT 兜底并发唯一键竞争，彻底避免进程内锁与 DB 写锁形成 AB-BA 死锁。"""
+    safe_code = draft.code.upper()[:96]
+    safe_name = draft.name[:255]
     existing = (
         session.query(CodeSetModel)
-        .filter(CodeSetModel.code == draft.code.upper()[:96])
+        .filter(CodeSetModel.code == safe_code)
         .order_by(CodeSetModel.current_version.desc())
         .first()
     )
     if not existing:
-        existing = session.query(CodeSetModel).filter(CodeSetModel.name == draft.name[:255]).first()
+        existing = session.query(CodeSetModel).filter(CodeSetModel.name == safe_name).first()
     changed = False
     if existing:
         row = existing
@@ -184,23 +191,36 @@ def _upsert_code_set_draft(
         has_errors = any(issue["severity"] == "ERROR" for issue in validate_code_set_draft(draft))
         row = CodeSetModel(
             id=str(uuid.uuid4()),
-            code=draft.code.upper()[:96],
-            name=draft.name[:255],
+            code=safe_code,
+            name=safe_name,
             definition=draft.definition,
             source_type=draft.source_type,
             status="NEEDS_REVIEW" if has_errors else ("AI_SELF_VALIDATED" if draft.values else "DRAFT"),
             current_version=1,
         )
-        session.add(row)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(row)
+                session.flush()
+        except IntegrityError:
+            existing = (
+                session.query(CodeSetModel)
+                .filter(CodeSetModel.code == safe_code)
+                .order_by(CodeSetModel.current_version.desc())
+                .first()
+            )
+            if not existing:
+                raise
+            row = existing
 
     # 记下码表在原文里的位置，左侧列表才能按出现顺序排（×1000 给同块内留出插入空间）
     if row.source_ordinal is None and locator.get("block_id"):
         source_block = session.get(RawBlockModel, locator["block_id"])
         if source_block is not None:
             row.source_ordinal = source_block.ordinal * 1000
+    # 按大小写不敏感索引已有码值，防止 MySQL 8 utf8mb4_0900_ai_ci 唯一键 uq_code_value 撞车
     existing_vals = {
-        item.value: item
+        (item.value or "").strip().upper(): item
         for item in session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).all()
     }
     sort_order = len(existing_vals)
@@ -208,8 +228,9 @@ def _upsert_code_set_draft(
         code_val = item.value.strip()[:128]
         if not code_val:
             continue
-        if code_val in existing_vals:
-            cur = existing_vals[code_val]
+        code_val_key = code_val.upper()
+        if code_val_key in existing_vals:
+            cur = existing_vals[code_val_key]
             if item.label_cn and not cur.label_cn:
                 cur.label_cn = item.label_cn[:255]
                 changed = True
@@ -231,10 +252,22 @@ def _upsert_code_set_draft(
                 enabled=True,
                 source_locator=locator,
             )
-            session.add(new_val)
-            existing_vals[code_val] = new_val
-            sort_order += 1
-            changed = True
+            try:
+                with session.begin_nested():
+                    session.add(new_val)
+                    session.flush()
+                existing_vals[code_val_key] = new_val
+                sort_order += 1
+                changed = True
+            except IntegrityError:
+                # 并发写入同一码值时跳过重复插入，回读已有记录
+                existing_val = (
+                    session.query(CodeValueModel)
+                    .filter(CodeValueModel.code_set_id == row.id, func.upper(CodeValueModel.value) == code_val_key)
+                    .first()
+                )
+                if existing_val is not None:
+                    existing_vals[code_val_key] = existing_val
 
     if not existing:
         return row, True
@@ -248,6 +281,42 @@ def _upsert_code_set_draft(
     return row, changed
 
 
+def enforce_code_set_review_evidence(
+    issues: List[Dict[str, Any]],
+    draft: CodeSetDraft,
+    raw_content: str,
+) -> List[Dict[str, Any]]:
+    """码表 AI 复核防幻觉护栏：校验 AI 报出的 ERROR，杜绝虚构码值或截断误判把干净码表整表标红。"""
+    known_values = {(item.value or "").strip().upper() for item in draft.values}
+    compact_source = re.sub(r"\s+", "", raw_content or "").upper()
+    truncated = len(raw_content or "") > 6000
+    result: List[Dict[str, Any]] = []
+    for issue in issues:
+        item = dict(issue)
+        code = str(item.get("code") or "AI_REVIEW")
+        severity = str(item.get("severity") or "WARNING").upper()
+        val = str(item.get("value") or "").strip()
+        msg = str(item.get("message") or "")
+        reason = ""
+        if severity == "ERROR":
+            is_missing_issue = any(kw in code.upper() for kw in ("MISSING", "OMIT", "INCOMPLETE"))
+            if val and not is_missing_issue:
+                val_up = val.upper()
+                if val_up not in known_values and val_up not in compact_source:
+                    reason = "所引码值既不在当前码表也不在来源原文中"
+            elif truncated and is_missing_issue:
+                reason = "来源原文超过 6000 字已截断，不能仅凭前段判定尾部遗漏"
+        if reason:
+            severity = "WARNING"
+            code = f"UNVERIFIED_{code}"[:64]
+            msg = f"{msg}（{reason}，已降级为提示）"
+        item["severity"] = severity
+        item["code"] = code
+        item["message"] = msg
+        result.append(item)
+    return result
+
+
 def _record_code_set_validation(
     session: Session,
     row: CodeSetModel,
@@ -255,15 +324,16 @@ def _record_code_set_validation(
     block: RawBlockModel,
     settings: Settings,
     content_changed: bool,
-    review_with_ai: Any = True,
+    review_with_ai: Any = "adaptive",
+    extra_program_issues: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    program_issues = validate_code_set_draft(draft)
+    program_issues = validate_code_set_draft(draft) + list(extra_program_issues or [])
     session.add(
         CodeSetValidationModel(
             id=str(uuid.uuid4()),
             code_set_id=row.id,
             validator_kind="PROGRAM",
-            status="NEEDS_REVIEW" if program_issues else "PASSED",
+            status="NEEDS_REVIEW" if _has_error_issues(program_issues) else ("WARNING" if program_issues else "PASSED"),
             issues_json=program_issues,
             trace_json={"value_count": len(draft.values)},
         )
@@ -271,7 +341,7 @@ def _record_code_set_validation(
     if row.status == "PUBLISHED":
         return
     if review_with_ai in {False, "never"}:
-        row.status = "NEEDS_REVIEW" if program_issues else "PROGRAM_VALIDATED"
+        row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "PROGRAM_VALIDATED"
         return
 
     # adaptive 模式：对齐 metadata_service，仅对 AI 抽取或程序检查有告警的码表做 AI 复核；
@@ -303,7 +373,7 @@ def _record_code_set_validation(
         CodeSetValidationModel.validator_kind == "AI_REVIEW",
     ).first()
     if llm is None:
-        row.status = "NEEDS_REVIEW" if program_issues else "PROGRAM_VALIDATED"
+        row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "PROGRAM_VALIDATED"
         return
     if not content_changed and existing_review:
         return
@@ -324,6 +394,8 @@ def _record_code_set_validation(
             validation_attempts=2,
         )
         issues = args.get("issues", [])
+    except (BudgetExceededError, RunCancelledError):
+        raise
     except Exception as exc:
         trace = {"error": f"{type(exc).__name__}: {exc}"}
         issues = [{
@@ -332,6 +404,7 @@ def _record_code_set_validation(
             "value": "",
             "message": f"AI 复核不可用：{trace['error']}",
         }]
+    issues = enforce_code_set_review_evidence(issues, draft, block.raw_content)
     session.add(
         CodeSetValidationModel(
             id=str(uuid.uuid4()),
@@ -348,7 +421,7 @@ def _record_code_set_validation(
     row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) or _has_error_issues(issues) else "AI_SELF_VALIDATED"
 
 
-def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: Any = True) -> List[str]:
+def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: Any = "adaptive") -> List[str]:
     """Extract standalone CodeSets or inline field enum CodeSets from a RawBlockModel (Track B)."""
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
@@ -406,7 +479,17 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
             code_id = content.get("table_code") or re.sub(r"[^A-Z0-9_]", "_", f"CS_{block.id[:8]}".upper())
             pairs = extract_code_pairs_from_section(block.raw_content, str(block.source_locator.get("section", "")), title)
             valid_vals = _clean_value_drafts(pairs)
+            extra_warnings: List[Dict[str, Any]] = []
             if not valid_vals:
+                if len(block.raw_content or "") > 6000:
+                    extra_warnings.append(
+                        {
+                            "severity": "WARNING",
+                            "code": "RAW_CONTENT_TRUNCATED",
+                            "value": "",
+                            "message": f"原文长 {len(block.raw_content)} 字，AI 兜底抽取仅读取前 6000 字，请核对尾部码值是否完整",
+                        }
+                    )
                 try:
                     llm = RealDesignLlm(settings)
                     args, _ = call_llm_validated(
@@ -427,6 +510,8 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                         source_type="AI_EXTRACTED",
                         values=valid_vals,
                     )
+                except (BudgetExceededError, RunCancelledError):
+                    raise
                 except Exception:
                     draft = CodeSetDraft(code=code_id, name=title, definition="待补充码值项", source_type="DOCUMENT_TABLE", values=[])
             else:
@@ -439,7 +524,16 @@ def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bo
                 )
             if draft.values:
                 row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
-                _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
+                _record_code_set_validation(
+                    session,
+                    row,
+                    draft,
+                    block,
+                    settings,
+                    changed,
+                    review_with_ai=review_with_ai,
+                    extra_program_issues=extra_warnings,
+                )
                 created_ids.append(row.id)
 
         if auto_link:
@@ -467,6 +561,10 @@ def remove_code_set(session: Session, row) -> Dict[str, Any]:
             "删掉会让这些字段的码值引用悬空。先处理引用再删。"
         )
     value_count = session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).count()
+    # 校验记录挂在 code_set_id 外键上，不先删会在 MySQL 8 报 1451 / Oracle 23 报 ORA-02292
+    session.query(CodeSetValidationModel).filter(CodeSetValidationModel.code_set_id == row.id).delete(
+        synchronize_session=False
+    )
     session.query(CodeValueModel).filter(CodeValueModel.code_set_id == row.id).delete(synchronize_session=False)
     code = row.code
     code_set_id = row.id

@@ -6,9 +6,11 @@
 - 批量修正字段类型 `apply_field_type_import`（支持 CSV/XLSX 导入与 dry-run 预检）。
 """
 
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.catalog.tables.domain import MetadataTableDraft, require_valid_metadata
@@ -63,13 +65,46 @@ def update_field(
         TYPE_BASIS_MANUAL,
     }:
         raise ValueError("INVALID_TYPE_BASIS")
+    normalized_changes = dict(changes)
+    if "data_type" in normalized_changes:
+        dt = str(normalized_changes["data_type"] or "").strip().upper()
+        if dt not in {"VARCHAR", "NUMBER"}:
+            raise ValueError(f"INVALID_DATA_TYPE: {normalized_changes['data_type']}")
+        normalized_changes["data_type"] = dt
+    if "field_en" in normalized_changes:
+        new_en = str(normalized_changes["field_en"] or "").strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", new_en):
+            raise ValueError(f"INVALID_FIELD_NAME: {new_en}")
+        dup = (
+            session.query(FieldMetadataModel)
+            .filter(
+                FieldMetadataModel.table_id == table.id,
+                FieldMetadataModel.id != field.id,
+                func.upper(FieldMetadataModel.field_en) == new_en.upper(),
+            )
+            .first()
+        )
+        if dup:
+            raise ValueError(f"DUPLICATE_FIELD: {new_en}")
+        normalized_changes["field_en"] = new_en[:128]
+    if "field_cn" in normalized_changes:
+        normalized_changes["field_cn"] = str(normalized_changes["field_cn"] or "").strip()[:255]
+    eff_type = str(normalized_changes.get("data_type", field.data_type) or "VARCHAR").upper()
+    eff_length = int(normalized_changes.get("length", field.length) or 0)
+    eff_dec = int(normalized_changes.get("decimal_places", field.decimal_places) or 0)
+    if "length" in normalized_changes and eff_length <= 0:
+        raise ValueError("INVALID_LENGTH")
+    if "decimal_places" in normalized_changes and eff_dec < 0:
+        raise ValueError("INVALID_DECIMAL_PLACES")
+    if ({"data_type", "length", "decimal_places"} & set(normalized_changes)) and eff_type == "NUMBER" and eff_dec > eff_length:
+        raise ValueError("INVALID_PRECISION")
     old = _field_view(field)
-    for key, value in changes.items():
+    for key, value in normalized_changes.items():
         setattr(field, key, value)
     # 人工改过类型/长度，就不再是"原文声明"或"AI 推断"，标成人工口径
-    if {"data_type", "length", "decimal_places"} & set(changes) and "type_basis" not in changes:
+    if {"data_type", "length", "decimal_places"} & set(normalized_changes) and "type_basis" not in normalized_changes:
         field.type_basis = TYPE_BASIS_MANUAL
-    if "code_reference_text" in changes:
+    if "code_reference_text" in normalized_changes:
         from app.catalog.code_sets.linking import ensure_field_reference
 
         ensure_field_reference(session, field)
@@ -284,12 +319,14 @@ def apply_field_type_import(
     updated: List[Dict[str, Any]] = []
     unchanged: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
+    from app.catalog.tables.readiness import latest_table_rows
+
     tables = {
         table.table_code.upper(): table
-        for table in session.query(TableMetadataModel).all()
-        if not document_id or table.document_id == document_id
+        for table in latest_table_rows(session, document_id=document_id)
     }
     versions: Dict[str, int] = {}
+    dry_run_state: Dict[str, Dict[str, Any]] = {}
     for line_no, values in enumerate(rows[1:], start=2):
         if not any(str(item or "").strip() for item in values):
             continue
@@ -309,14 +346,30 @@ def apply_field_type_import(
         except ValueError:
             errors.append({"line": line_no, "message": "长度/小数位必须是整数"})
             continue
+        if target_length is not None and target_length <= 0:
+            errors.append({"line": line_no, "message": f"长度必须大于 0：{target_length}"})
+            continue
+        if target_dec is not None and target_dec < 0:
+            errors.append({"line": line_no, "message": f"小数位不能为负数：{target_dec}"})
+            continue
 
-        candidates = [tables[table_code]] if table_code and table_code in tables else list(tables.values())
+        # 显式写了报表代码但找不到时直接报错跳过，严禁静默回退去篡改其他无关报表！
+        if table_code:
+            if table_code not in tables:
+                errors.append({"line": line_no, "message": f"找不到报表 {table_code}"})
+                continue
+            candidates = [tables[table_code]]
+        else:
+            candidates = list(tables.values())
         field = None
         table = None
         for candidate in candidates:
             field = (
                 session.query(FieldMetadataModel)
-                .filter(FieldMetadataModel.table_id == candidate.id, FieldMetadataModel.field_en == field_en)
+                .filter(
+                    FieldMetadataModel.table_id == candidate.id,
+                    func.upper(FieldMetadataModel.field_en) == field_en,
+                )
                 .first()
             )
             if field:
@@ -331,12 +384,28 @@ def apply_field_type_import(
             )
             continue
 
+        cur_state = dry_run_state.get(
+            field.id,
+            {
+                "data_type": (field.data_type or "").upper(),
+                "length": int(field.length or 0),
+                "decimal_places": int(field.decimal_places or 0),
+                "type_basis": field.type_basis,
+            },
+        )
+        eff_type = target_type or cur_state["data_type"]
+        eff_len = target_length if target_length is not None else cur_state["length"]
+        eff_dec = target_dec if target_dec is not None else cur_state["decimal_places"]
+        if eff_type == "NUMBER" and eff_dec >= eff_len:
+            errors.append({"line": line_no, "message": f"NUMBER({eff_len},{eff_dec}) 小数位必须小于总长度"})
+            continue
+
         changes: Dict[str, Any] = {}
-        if target_type and (field.data_type or "").upper() != target_type:
+        if target_type and cur_state["data_type"] != target_type:
             changes["data_type"] = target_type
-        if target_length is not None and int(field.length or 0) != target_length:
+        if target_length is not None and cur_state["length"] != target_length:
             changes["length"] = target_length
-        if target_dec is not None and int(field.decimal_places or 0) != target_dec:
+        if target_dec is not None and cur_state["decimal_places"] != target_dec:
             changes["decimal_places"] = target_dec
         if not changes:
             unchanged.append({"line": line_no, "table_code": table.table_code, "field_en": field_en})
@@ -345,15 +414,16 @@ def apply_field_type_import(
             errors.append({"line": line_no, "message": f"{table.table_code}.{field_en} 已发布，不可直接修改"})
             continue
         old = {
-            "data_type": field.data_type,
-            "length": field.length,
-            "decimal_places": field.decimal_places,
-            "type_basis": field.type_basis,
+            "data_type": cur_state["data_type"],
+            "length": cur_state["length"],
+            "decimal_places": cur_state["decimal_places"],
+            "type_basis": cur_state["type_basis"],
         }
-        for key, value in changes.items():
-            setattr(field, key, value)
-        field.type_basis = TYPE_BASIS_MANUAL
+        dry_run_state[field.id] = {**old, **changes, "type_basis": TYPE_BASIS_MANUAL}
         if not dry_run:
+            for key, value in changes.items():
+                setattr(field, key, value)
+            field.type_basis = TYPE_BASIS_MANUAL
             versions.setdefault(table.id, table.current_version)
             table.current_version = versions[table.id] + 1
             versions[table.id] += 1
@@ -371,9 +441,7 @@ def apply_field_type_import(
                 )
             )
         updated.append({"line": line_no, "table_code": table.table_code, "field_en": field_en, "changes": changes})
-    if dry_run:
-        session.rollback()
-    else:
+    if not dry_run:
         session.commit()
     return {
         "updated": len(updated),
@@ -396,6 +464,8 @@ def merge_metadata_tables(session: Session, parent_id: str, table_ids: List[str]
     }
     tables.sort(key=lambda table: priority.get(blocks[table.block_id].block_type, 0))
     canonical = tables[-1]
+    # 必须在覆盖子表状态为 MERGED 之前记录任意子表是否需要人工复核
+    had_needs_review = any(table.status == "NEEDS_REVIEW" for table in tables)
     merged = {}
     for table in tables:
         block = blocks[table.block_id]
@@ -414,6 +484,7 @@ def merge_metadata_tables(session: Session, parent_id: str, table_ids: List[str]
                     "required",
                     "code_reference_text",
                     "confidence",
+                    "type_basis",
                     "ai_value_json",
                 ]
             }
@@ -422,8 +493,22 @@ def merge_metadata_tables(session: Session, parent_id: str, table_ids: List[str]
                 "segments": (field.evidence_json.get("segments") or []) + [{"block_id": block.id, "segment_type": block.block_type}],
             }
             merged[field.field_en.upper()] = values
-    for field in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == canonical.id).all():
-        session.delete(field)
+
+    # 先清理 canonical 旧字段挂接的外键（FieldCodeReference / MetadataRevision.field_id），防 MySQL 1451 / Oracle ORA-02292
+    old_canonical_field_ids = [
+        row[0]
+        for row in session.query(FieldMetadataModel.id).filter(FieldMetadataModel.table_id == canonical.id).all()
+    ]
+    if old_canonical_field_ids:
+        session.query(FieldCodeReferenceModel).filter(
+            FieldCodeReferenceModel.field_id.in_(old_canonical_field_ids)
+        ).delete(synchronize_session=False)
+        session.query(MetadataRevisionModel).filter(
+            MetadataRevisionModel.field_id.in_(old_canonical_field_ids)
+        ).update({"field_id": None}, synchronize_session=False)
+        session.query(FieldMetadataModel).filter(
+            FieldMetadataModel.id.in_(old_canonical_field_ids)
+        ).delete(synchronize_session=False)
     session.flush()
     for index, values in enumerate(merged.values()):
         session.add(FieldMetadataModel(id=str(uuid.uuid4()), table_id=canonical.id, sort_order=index, **values))
@@ -432,7 +517,15 @@ def merge_metadata_tables(session: Session, parent_id: str, table_ids: List[str]
             table.status = "MERGED"
             session.query(MetadataValidationModel).filter(MetadataValidationModel.table_id == table.id).update({"table_id": canonical.id})
             session.query(MetadataRevisionModel).filter(MetadataRevisionModel.table_id == table.id).update({"table_id": canonical.id})
+    # 防止重提父块时 (parent_id, current_version) 撞 uq_table_block_version 唯一键
+    existing_parent_max = (
+        session.query(func.max(TableMetadataModel.current_version))
+        .filter(TableMetadataModel.block_id == parent_id, TableMetadataModel.id != canonical.id)
+        .scalar()
+    )
+    if existing_parent_max is not None and canonical.current_version <= existing_parent_max:
+        canonical.current_version = int(existing_parent_max) + 1
     canonical.block_id = parent_id
-    canonical.status = "NEEDS_REVIEW" if any(table.status == "NEEDS_REVIEW" for table in tables) else "AI_SELF_VALIDATED"
+    canonical.status = "NEEDS_REVIEW" if had_needs_review else "AI_SELF_VALIDATED"
     session.flush()
     return canonical.id
