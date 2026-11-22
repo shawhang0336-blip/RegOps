@@ -9,7 +9,7 @@ from app.engine.workflow.runtime import _call_validated, _emit, _fanout
 from app.infra.models import GenerationPlanModel, SchemaDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import canonical_json
-from app.infra.llm_schemas import spec_payload
+from app.infra.llm.schemas import spec_payload
 
 
 def _provider_name(llm, trace: Optional[Dict[str, Any]] = None) -> str:

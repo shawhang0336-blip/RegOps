@@ -710,7 +710,7 @@ def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
     import threading
     import time
     import pytest
-    from app.infra.llm_guard import backoff_wait
+    from app.infra.llm.guard import backoff_wait
 
     # 1) RetryPolicy 指数退避 + Jitter 边界校验
     no_jitter = kernel.RetryPolicy(max_attempts=3, base_delay=0.1, factor=2.0, jitter=0.0)
@@ -721,7 +721,7 @@ def test_kernel_resilience_jitter_dual_ids_and_cooperative_cancellation():
     assert all(1.6 <= d <= 2.1 for d in samples)
     assert len(set(round(d, 6) for d in samples)) > 1
 
-    # 2) infra.llm_guard.backoff_wait 在长退避期间收到取消信号立即唤醒并抛 RunCancelledError（不傻等 10s）
+    # 2) infra.llm.guard.backoff_wait 在长退避期间收到取消信号立即唤醒并抛 RunCancelledError（不傻等 10s）
     cancel_tok = kernel.CancellationToken()
     threading.Timer(0.03, lambda: cancel_tok.cancel("stop during backoff")).start()
     t0 = time.monotonic()
@@ -1380,7 +1380,7 @@ def test_policy_structure_clean_three_modules_and_infra_llm_guard():
     """
     import time
     import pytest
-    from app.infra.llm_guard import call_llm_validated
+    from app.infra.llm.guard import call_llm_validated
 
     # 1) policy 目录收敛为精准 3 策略模块 + __init__.py，且 __all__ 全部可解析
     policy_dir = Path(policy.__file__).resolve().parent
@@ -1449,20 +1449,20 @@ def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
     from app.infra.db import _build_engine_kwargs
 
     infra_dir = Path(infra_pkg.__file__).resolve().parent
-    actual_infra_files = {p.name for p in infra_dir.glob("*.py")}
-    assert actual_infra_files == {
+    actual_infra_entries = {p.name for p in infra_dir.iterdir() if p.name != "__pycache__"}
+    assert actual_infra_entries == {
         "__init__.py",
         "blob_store.py",
         "config.py",
         "db.py",
         "domain.py",
         "errors.py",
-        "llm.py",
-        "llm_guard.py",
-        "llm_schemas.py",
+        "llm",
         "models.py",
         "task_runner.py",
     }
+    actual_llm_files = {p.name for p in (infra_dir / "llm").glob("*.py")}
+    assert actual_llm_files == {"__init__.py", "client.py", "guard.py", "schemas.py"}
 
     mysql_kwargs = _build_engine_kwargs("mysql+pymysql://user:pw@127.0.0.1:3306/regops")
     assert mysql_kwargs["pool_pre_ping"] is True

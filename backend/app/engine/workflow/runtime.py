@@ -21,7 +21,7 @@ from app.kernel.bus import global_bus
 from app.kernel.event_log import append_event
 from app.kernel.run import BudgetExceededError
 from app.kernel.scheduler import execute_wave
-from app.infra.llm_guard import (
+from app.infra.llm.guard import (
     DEFAULT_BACKOFF_SECONDS as _BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_ATTEMPTS as _TRANSIENT_ATTEMPTS,
     DEFAULT_VALIDATION_ATTEMPTS as _VALIDATION_ATTEMPTS,

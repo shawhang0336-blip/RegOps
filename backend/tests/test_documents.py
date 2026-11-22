@@ -293,7 +293,7 @@ def test_ingestion_run_persists_eventlog_budget_cancel_recovery_and_isolates_fro
     )
     from app.ingestion.import_progress import forget as progress_forget
     from app.kernel.run import create_run as kernel_create_run
-    from app.infra.llm_guard import call_llm_validated
+    from app.infra.llm.guard import call_llm_validated
 
     session = make_session()
     monkeypatch.setattr(documents, "SessionLocal", lambda: session)

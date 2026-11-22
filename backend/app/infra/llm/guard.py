@@ -1,7 +1,7 @@
 """统一受控大模型调用守卫（基础设施层 Layer 0，跨阶段复用）。
 
 职责边界：
-- 位于 Layer 0（infra），紧邻 `infra/llm.py`，零依赖 `kernel` 与 `policy`，可供 ingestion / assets / engine 三阶段共同复用；
+- 位于 Layer 0（infra），紧邻 `infra/llm/client.py`，零依赖 `kernel` 与 `policy`，可供 ingestion / assets / engine 三阶段共同复用；
 - 通过鸭子类型无缝配合上层通过 `llm_execution_scope` 或 `bus=` 参数注入的 Bus（门禁裁决 / 预算熔断 / 生命周期广播）与 CancellationToken（协作式取消）；
 - 按错误性质分轨容错：
   1. 网络/超时/5xx 瞬时错误：消耗 `transient_attempts`，按带抖动退避序列重试并逐次放宽超时窗口，不向模型注入无关 feedback；
@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from app.infra.errors import WorkflowError
-from app.infra.llm import LlmTimeoutError
+from app.infra.llm.client import LlmTimeoutError
 
 _ACTIVE_BUS: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_bus", default=None)
 _ACTIVE_CANCEL: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_cancel", default=None)

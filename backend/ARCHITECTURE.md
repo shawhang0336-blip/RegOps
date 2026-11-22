@@ -15,34 +15,31 @@ infra (0) ← kernel (1) ← policy (2) ← ingestion (3) ← assets (4) ← eng
 backend/app/
 ├── main.py                      # 极简 FastAPI 启动入口（lifespan / CORS / 挂载路由）
 │
-├── infra/                       # 层 0：基础设施与跨层共享契约（零上层依赖）
-│   ├── config.py                #    环境配置 Settings（MySQL / Oracle / LLM / Blob / 规范路径）
-│   ├── db.py                    #    SQLAlchemy Engine / SessionLocal / Alembic 初始化
-│   ├── blob_store.py            #    SHA-256 内容寻址不可变大对象本地存储（LocalBlobStore）
-│   ├── errors.py                #    统一领域异常 WorkflowError
-│   ├── identity.py              #    操作人身份占位符
-│   ├── domain.py                #    跨层共享值对象（FieldSpec / SpecDocument / RuleDefinition / Binding / field_map）
-│   ├── sql.py                   #    跨方言 SQL 安全标识符转义（quote_identifier）
-│   ├── llm.py                   #    受控 Tool-Call 大模型客户端与并发限流
-│   ├── settings_store.py        #    运行时执行预算配置读取（DEFAULT_BUDGET / get_budget）
-│   ├── task_runner.py           #    带任务键去重的进程内有界后台任务执行器（TaskRunner）
-│   ├── models.py                #    核心运行时表（runs / events / rules / specifications）
-│   └── asset_models.py          #    资产表（文档 / 原始块 / 元数据 / 码表 / 审批 / 产物 / 系统设置）
+├── infra/                       # 层 0：基础设施与跨层共享契约（7 模块 + llm/ 子包，零上层依赖）
+│   ├── config.py                #    环境配置 Settings、运行预算（DEFAULT_BUDGET / get_budget）与操作人占位常量
+│   ├── db.py                    #    MySQL/Oracle 生产连接池、Base / SessionLocal / Alembic 初始化与 SQL 安全转义（quote_identifier）
+│   ├── models.py                #    全部 20 张 ORM 表统一定义（运行时账本 / 文档与资产元数据 / 生成规划与产物）
+│   ├── domain.py                #    跨层共享 Pydantic 值对象（FieldSpec / SpecDocument / RuleDefinition / Binding / LLM_OPERATORS）
+│   ├── errors.py                #    统一领域异常 WorkflowError（携带结构化错误定位 context）
+│   ├── blob_store.py            #    SHA-256 内容寻址不可变大对象存储（原子临时文件替换，并发零竞态）
+│   ├── task_runner.py           #    带任务键去重的进程内有界后台线程池（TaskRunner）
+│   └── llm/                     #    受控大模型子包
+│       ├── client.py            #      OpenAI 兼容 HTTP 客户端（httpx 连接池复用、并发信号量、502/504 非 JSON 容错）
+│       ├── schemas.py           #      12 个受控工具 JSON Schema、spec_payload 与作用域 Prompt 契约
+│       └── guard.py             #      跨三阶段受控 LLM 调用守卫（分轨退避重试、上下文作用域透传、鸭子类型 Bus 门禁回喂）
 │
 ├── kernel/                      # 层 1：ProdAgent 六大核心微内核（仅依赖 infra，零业务依赖）
 │   ├── plan.py                  #    静态只读工作流蓝图（PlanNode / PlanEdge / RetryPolicy / timeout / WorkflowPlan）
 │   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播 + node.retry + 预算检查钩子）
-│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 状态折叠引擎 + 零成本 Trace/Span 瀑布折叠
+│   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 按 reducer 隔离的投影缓存 + 零成本 Trace/Span 瀑布折叠
 │   ├── interrupt.py             #    一等人工中断协议（Interrupt / answer_interrupt / record_interrupt_answer）
 │   ├── run.py                   #    Run 控制面（RunContext / ChannelSpec / AmbiguousWriteError / BudgetGuard / CancellationToken / 生命周期原语）
 │   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / 节点级 Retry+Timeout / 屏障冲突校验）
 │
-├── policy/                      # 层 2：RegOps 领域策略层（仅依赖 infra + kernel，以插件方式装配到 kernel）
-│   ├── regops_plan.py           #    18 节点真 BSP 装配流水线拓扑（含单表 Send Worker/Join 与三路自愈回边）与状态折叠
-│   ├── ingestion_plan.py        #    Step 1 文档导入与解析 Run 的事件折叠策略（重启可从 EventLog 无损还原）
-│   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）
-│   ├── regops_channels.py       #    24 个命名数据通道（含单表增量检查点）与 EventLog + BlobStore 断点折叠恢复
-│   └── llm_guard.py             #    跨三阶段统一受控模型调用守卫（退避重试 + Bus 门禁 + 作用域 Budget/Cancel 透传）
+├── policy/                      # 层 2：RegOps 领域策略层（3 模块，严格一一对应 kernel 插槽，零 import 期全局副作用）
+│   ├── regops_plan.py           #    Step 2 18 节点拓扑 + 人工中断门协议 + Step 1 / Step 2 统一事件状态折叠（显式 reducer）
+│   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）与 default_bus
+│   └── regops_channels.py       #    24 个命名数据通道（含单表增量检查点）与 EventLog + BlobStore 单次查询断点恢复
 │
 ├── ingestion/                   # 层 3：监管文档接入与结构解析（阶段一）
 │   ├── extractors.py            #    PDF / Word / Excel 原始块提取
@@ -108,12 +105,13 @@ backend/app/
 
 ## 二、核心架构红线（自动化测试守卫）
 
-[`tests/test_kernel_policy_isolation.py`](tests/test_kernel_policy_isolation.py) 在每次回归中强制守卫以下四条红线：
+[`tests/test_kernel_policy_isolation.py`](tests/test_kernel_policy_isolation.py) 在每次回归中强制守卫以下五条红线：
 
 1. **内核纯净度与六模块边界**：`app/kernel/` 严格收敛为六大核心模块（`plan` / `bus` / `event_log` / `interrupt` / `run` / `scheduler`），严禁 `import` 任何业务层或策略层（`policy` / `ingestion` / `assets` / `engine` / `delivery` / `api`）；
-2. **内核独立可运行**：仅依赖 `app.kernel` 即可编排、门禁拦截、归约 Channel 并驱动非监管工作流；
-3. **根目录不退化**：`backend/app/` 根目录只允许 `main.py` 与上述 8 个架构包，禁止重新平铺散落业务文件；
-4. **全层严格单向 DAG**：AST 静态扫描 `backend/app/**/*.py`，确保所有跨层引用严格从高层指向低层（`infra < kernel < policy < ingestion < assets < engine < delivery < api < main`），零倒挂、零循环依赖。
+2. **策略层三模块与零全局污染**：`app/policy/` 严格收敛为三大插槽模块（`regops_plan` / `regops_bus` / `regops_channels`），严禁在 import 期污染 `global_bus()` 或隐式绑定全局默认 reducer；
+3. **底座层收口边界**：`app/infra/` 收敛为 7 个核心底座模块 + `llm/` 子包（`client` / `schemas` / `guard`），零上层依赖；
+4. **内核独立可运行**：仅依赖 `app.kernel` 即可编排、门禁拦截、归约 Channel 并驱动非监管工作流；
+5. **根目录整洁与全层严格单向 DAG**：`backend/app/` 根目录只允许 `main.py` 与 8 个架构包，AST 静态扫描确保所有跨层引用严格从高层指向低层（`infra < kernel < policy < ingestion < assets < engine < delivery < api < main`），零倒挂、零循环依赖。
 
 ---
 

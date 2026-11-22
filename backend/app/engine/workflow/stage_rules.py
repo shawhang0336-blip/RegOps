@@ -31,7 +31,7 @@ from app.infra.models import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import RuleDefinition, calculate_rule_hash, canonical_json
 from app.infra.errors import WorkflowError
-from app.infra.llm_schemas import spec_payload
+from app.infra.llm.schemas import spec_payload
 from app.infra.models import EventModel, RuleModel, RunModel
 from app.policy.regops_plan import project
 

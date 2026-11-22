@@ -19,7 +19,7 @@ from app.infra.models import AuditCaseDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import AuditCaseBinding, RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError
-from app.infra.llm_schemas import spec_payload
+from app.infra.llm.schemas import spec_payload
 
 
 def bind_table_audit_worker(

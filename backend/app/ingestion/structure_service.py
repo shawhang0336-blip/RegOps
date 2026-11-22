@@ -11,7 +11,7 @@ from app.infra.config import Settings
 from app.infra.db import SessionLocal
 from app.ingestion.extractors import extract_document, survey_document
 from app.infra.llm import RealDesignLlm
-from app.infra.llm_guard import call_llm_validated, current_llm_bus, submit_with_context
+from app.infra.llm.guard import call_llm_validated, current_llm_bus, submit_with_context
 from app.policy.regops_bus import default_bus
 
 

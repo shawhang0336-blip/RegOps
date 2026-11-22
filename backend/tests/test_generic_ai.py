@@ -39,7 +39,7 @@ def test_default_omits_thinking_and_records_call_timing(monkeypatch):
         captured["timeout"] = timeout
         return _ok_response()
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
     _, trace = RealDesignLlm(Settings(llm_api_key="offline-test")).assign(
         "assign_generation_plan", "test", {}, timeout=12
     )
@@ -57,7 +57,7 @@ def test_configured_thinking_is_sent(monkeypatch):
         captured["json"] = json
         return _ok_response()
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
     RealDesignLlm(Settings(llm_api_key="offline-test", llm_thinking="low")).assign(
         "assign_generation_plan", "test", {}, timeout=12
     )
@@ -72,7 +72,7 @@ def test_assign_defaults_to_configured_timeout(monkeypatch):
         captured["timeout"] = timeout
         return _ok_response()
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
     RealDesignLlm(Settings(llm_api_key="offline-test", llm_timeout=77)).assign(
         "assign_generation_plan", "test", {}
     )
@@ -84,7 +84,7 @@ def test_timeout_raises_llm_timeout_error(monkeypatch):
     def post(url, headers, json, timeout):
         raise httpx.ReadTimeout("read timeout")
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
     with pytest.raises(LlmTimeoutError):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
@@ -101,7 +101,7 @@ def test_missing_tool_call_records_response_diagnostics(monkeypatch):
                 "usage": {"prompt_tokens": 100, "completion_tokens": 0},
             }
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", lambda *args, **kwargs: Response())
     with pytest.raises(RuntimeError) as error:
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
@@ -119,14 +119,14 @@ def test_http_error_includes_model_error_code(monkeypatch):
         def json(self):
             return {"error": {"code": "1210", "message": "thinking setting rejected"}}
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", lambda *args, **kwargs: Response())
     with pytest.raises(RuntimeError, match="1210"):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 
 
 def test_http_502_html_error_triggers_transient_retry_not_json_decode_error(monkeypatch):
     """回归：网关 502/504 返回 HTML 页时不抛 JSONDecodeError（防误判为校验失败），正确走瞬时退避重试。"""
-    from app.infra.llm_guard import call_llm_validated
+    from app.infra.llm.guard import call_llm_validated
 
     calls = {"n": 0}
 
@@ -144,7 +144,7 @@ def test_http_502_html_error_triggers_transient_retry_not_json_decode_error(monk
             return Html502Response()
         return _ok_response()
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
     args, _ = call_llm_validated(
         RealDesignLlm(Settings(llm_api_key="offline-test")),
         "assign_generation_plan",
@@ -158,7 +158,7 @@ def test_http_502_html_error_triggers_transient_retry_not_json_decode_error(monk
 
 def test_non_dict_repaired_arguments_raises_value_error_and_rule_prompt_complete(monkeypatch):
     """回归：repair_json 返回非 dict 时抛 ValueError 而非 AttributeError；规则 Prompt 覆盖全部监管算子。"""
-    from app.infra.llm_schemas import tool_prompt_preamble
+    from app.infra.llm.schemas import tool_prompt_preamble
 
     class BadArgsResponse:
         status_code = 200
@@ -176,7 +176,7 @@ def test_non_dict_repaired_arguments_raises_value_error_and_rule_prompt_complete
                 }],
             }
 
-    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: BadArgsResponse())
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", lambda *args, **kwargs: BadArgsResponse())
     with pytest.raises(ValueError, match="JSON 对象"):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
 

@@ -2,7 +2,7 @@
 
 职责边界：
 - 仅负责底层 HTTP 传输、TCP/TLS 连接池复用、并发信号量控制、非 JSON 网关错误页（502/503/504）安全包装与参数 JSON 修复；
-- 业务 Tool JSON Schema 与作用域 Prompt 契约已独立拆至 `app.infra.llm_schemas`。
+- 业务 Tool JSON Schema 与作用域 Prompt 契约已独立拆至 `app.infra.llm.schemas`。
 """
 
 import json
@@ -14,7 +14,7 @@ import httpx
 from json_repair import repair_json
 
 from app.infra.config import Settings
-from app.infra.llm_schemas import TOOL_SCHEMAS, tool_prompt_preamble
+from app.infra.llm.schemas import TOOL_SCHEMAS, tool_prompt_preamble
 
 # LLM 并发闸门：默认值只是兜底，实际宽度由系统设置的 max_llm_concurrency 决定，
 # 生成批次启动时通过 configure_llm_concurrency 调整。

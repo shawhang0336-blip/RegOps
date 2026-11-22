@@ -1,6 +1,6 @@
 """受控 Tool-Call 业务契约与作用域前置说明（基础设施层 Layer 0）。
 
-从 `llm.py`（纯 HTTP 协议传输与连接池）剥离出的全部 12 个受控工具 JSON Schema 与最小前置 Prompt，
+从 `client.py`（纯 HTTP 协议传输与连接池）剥离出的全部 12 个受控工具 JSON Schema 与最小前置 Prompt，
 便于按算子/业务契约独立演进并与 `domain.py` 的 `LLM_OPERATORS` 严格对齐。
 """
 
