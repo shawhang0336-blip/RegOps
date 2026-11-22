@@ -13,7 +13,7 @@ from app.catalog.code_sets.readiness import auto_publish_referenced_code_sets
 from app.catalog.tables.readiness import evaluate_table, split_preflight_issues
 from app.catalog.tables.service import metadata_to_spec, publish_table
 from app.delivery.production_service import build_production_bundle
-from app.engine.workflow import _create_run
+from app.generation.workflow import _create_run
 from app.infra.db_tables import GenerationPlanModel, TableMetadataModel
 from app.infra.config import get_settings
 from app.infra.contracts import canonical_json

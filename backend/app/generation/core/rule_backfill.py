@@ -10,8 +10,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.infra.contracts import RuleDefinition, calculate_rule_hash
 from app.infra.errors import WorkflowError
-from app.engine.binding import bind_rules
-from app.engine.rules import RuleValidationError
+from app.generation.core.binding import bind_rules
+from app.generation.core.rules import RuleValidationError
 
 
 def _required_backfill_candidates(specs, rules) -> List[tuple]:

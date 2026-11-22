@@ -16,25 +16,25 @@ from app.catalog.code_sets.bindings import (
     load_published_code_sets,
     validate_code_set_usage,
 )
-from app.engine.code_set_sql import (
+from app.generation.sql.code_set_sql import (
     compile_code_set_oracle_ddl,
     sandbox_code_set_table,
 )
-from app.engine.binding import GeneratorBinding, SchemaBinding
-from app.engine.compiler import compile_rule_query
-from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
-from app.engine.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
-from app.engine.workflow.runtime import _emit, _latest_payload, _pending_rules, _upsert_rule
-from app.engine.workflow.stage_audit import bind_table_audit_worker, join_table_audit_barrier
-from app.engine.workflow.stage_data import (
+from app.generation.core.binding import GeneratorBinding, SchemaBinding
+from app.generation.sql.compiler import compile_rule_query
+from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
+from app.generation.core.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
+from app.generation.workflow.runtime import _emit, _latest_payload, _pending_rules, _upsert_rule
+from app.generation.workflow.stage_audit import bind_table_audit_worker, join_table_audit_barrier
+from app.generation.workflow.stage_data import (
     _backfill_fixed_value_rules,
     _backfill_length_rules,
     _backfill_required_rules,
     bind_table_data_worker,
     join_table_data_barrier,
 )
-from app.engine.workflow.stage_plan_schema import _plan_stage, _schema_stage
-from app.engine.workflow.stage_rules import (
+from app.generation.workflow.stage_plan_schema import _plan_stage, _schema_stage
+from app.generation.workflow.stage_rules import (
     _ensure_oracle_assets,
     _rebind_failed_rules,
     bind_table_rules_worker,

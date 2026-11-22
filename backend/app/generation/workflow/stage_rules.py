@@ -10,16 +10,16 @@ from app.catalog.code_sets.bindings import (
     code_set_compile_bindings,
     load_published_code_sets,
 )
-from app.engine.code_set_sql import (
+from app.generation.sql.code_set_sql import (
     compile_code_set_oracle_ddl,
     sandbox_code_set_table,
 )
-from app.engine.binding import SchemaBinding, bind_rules, violates_single_field_rule
-from app.engine.compiler import compile_rule_query
-from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
-from app.engine.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
-from app.engine.rules import RuleValidationError
-from app.engine.workflow.runtime import (
+from app.generation.core.binding import SchemaBinding, bind_rules, violates_single_field_rule
+from app.generation.sql.compiler import compile_rule_query
+from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_mysql_ddl, compile_ai_schema_oracle_ddl
+from app.generation.core.rule_backfill import derive_deterministic_rules as _policy_derive_deterministic_rules
+from app.generation.core.rules import RuleValidationError
+from app.generation.workflow.runtime import (
     _call_validated,
     _code_set_context,
     _emit,
@@ -28,7 +28,7 @@ from app.engine.workflow.runtime import (
     _pending_rules,
     _upsert_rule,
 )
-from app.engine.workflow.stage_plan_schema import _provider_name
+from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import RuleDefinition, calculate_rule_hash, canonical_json

@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from app.catalog.version_diff import diff_documents
-from app.engine.binding import (
+from app.generation.core.binding import (
     GeneratorBinding,
     SchemaBinding,
     bind_audit_cases,
@@ -23,12 +23,12 @@ from app.engine.binding import (
     violates_arithmetic_balance,
     violates_cond_value,
 )
-from app.engine.compiler import compile_rule_query, compile_where
-from app.engine.mutations import build_deterministic_mutations, build_golden_audit_case
-from app.engine.oracle import GenericOracleExecutor
-from app.engine.run_diff import diff_runs
-from app.engine.rules import RuleValidationError, validate_rule
-from app.engine.workflow.stage_data import _coupled_field_names, _partition_coupled_chunks
+from app.generation.sql.compiler import compile_rule_query, compile_where
+from app.generation.core.mutations import build_deterministic_mutations, build_golden_audit_case
+from app.generation.sql.oracle import GenericOracleExecutor
+from app.generation.run_diff import diff_runs
+from app.generation.core.rules import RuleValidationError, validate_rule
+from app.generation.workflow.stage_data import _coupled_field_names, _partition_coupled_chunks
 from app.infra.db_tables import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
 from app.infra.contracts import FieldSpec, RuleDefinition, SpecDocument
 from app.infra.db_tables import RuleModel, RunModel
@@ -339,7 +339,7 @@ def test_complex_operators_deterministic_mutations_and_sandbox_execution():
             f'"{f.name}" {"REAL" if f.data_type == "NUMBER" else "TEXT"}' for f in spec.fields
         ]
         conn.execute(text(f'CREATE TABLE "T_SANDBOX" ({", ".join(cols)})'))
-        from app.engine.mutations import make_distinct_key_value
+        from app.generation.core.mutations import make_distinct_key_value
 
         for idx, case in enumerate(cases):
             rec = dict(golden)
@@ -578,8 +578,8 @@ def test_policy_rules_compiler_deep_audit_fixes():
     """回归：Layer 2 policy + Layer 5 rules/compiler/binding + Layer 6 production 深审修复。"""
     import sqlite3
     from app.delivery.production import compile_production_rule_query, sql_literal
-    from app.engine.binding import violates_arithmetic_balance
-    from app.engine.compiler import compile_where
+    from app.generation.core.binding import violates_arithmetic_balance
+    from app.generation.sql.compiler import compile_where
     from app.infra.contracts import Evidence
     from app.kernel.event_log import RunState
     from app.policy.regops_bus import (
@@ -711,8 +711,8 @@ def test_oracle_module_deep_audit_fixes(monkeypatch):
     """回归：oracle.py 深审修复（128 字节表名截断防 ORA-00972、Oracle/MySQL 精度与宽表 Error 1118 保护、Decimal(38,s)/NUMBER(4,4) 与 AL32UTF8 4000 字节防 ORA-01438/ORA-12899、Oracle 幂等重试 + executemany 批量写入 + CLOB preview）。"""
     from decimal import Decimal
     from types import SimpleNamespace
-    import app.engine.oracle as oracle_mod
-    from app.engine.oracle import (
+    import app.generation.sql.oracle as oracle_mod
+    from app.generation.sql.oracle import (
         GenericOracleExecutor,
         OracleSandbox,
         _fit_number,

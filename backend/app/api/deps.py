@@ -5,7 +5,7 @@ from typing import Dict, Iterable, List, Optional
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.engine.workflow import submit_generic_run
+from app.generation.workflow import submit_generic_run
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.config import OPERATOR_PLACEHOLDER

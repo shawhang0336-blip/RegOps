@@ -9,6 +9,101 @@ class RuleValidationError(ValueError):
     pass
 
 
+_BRACKET_LITERAL_ESCAPES = set(r".+/()_*?,;:@#$!~=%")
+
+
+def normalize_oracle_regexp(pattern: str) -> str:
+    r"""将正则字符类 [...] 规范化为 Oracle POSIX REGEXP_LIKE 兼容写法（同时保持 Python re 语义完全等价）。
+
+    Oracle POSIX 字符类内反斜杠不作转义：
+    - `\-` 会被解析为从 `\` 到后续字符的非法范围（ORA-12728），需将 `-` 移至字符类末尾；
+    - `\d`/`\s`/`\w` 在 [...] 内会被当成字面反斜杠和字母，需展开为 `0-9`/` `/`A-Za-z0-9_`；
+    - `\.` / `\+` 等多余转义在 [...] 内会多匹配反斜杠本身，需去反斜杠。
+    """
+    if not pattern or "[" not in pattern:
+        return pattern
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if ch != "[":
+            out.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        negated = False
+        if j < n and pattern[j] == "^":
+            negated = True
+            j += 1
+        leading_rbracket = False
+        if j < n and pattern[j] == "]":
+            leading_rbracket = True
+            j += 1
+        body = []
+        trailing_hyphen = False
+        closed = False
+        while j < n:
+            c = pattern[j]
+            if c == "[" and j + 1 < n and pattern[j + 1] in (":", ".", "="):
+                delim = pattern[j + 1]
+                end = pattern.find(f"{delim}]", j + 2)
+                if end != -1:
+                    body.append(pattern[j : end + 2])
+                    j = end + 2
+                    continue
+            if c == "]":
+                closed = True
+                j += 1
+                break
+            if c == "\\" and j + 1 < n:
+                nxt = pattern[j + 1]
+                if nxt == "-":
+                    trailing_hyphen = True
+                    j += 2
+                    continue
+                if nxt == "d":
+                    body.append("0-9")
+                    j += 2
+                    continue
+                if nxt == "w":
+                    body.append("A-Za-z0-9_")
+                    j += 2
+                    continue
+                if nxt == "s":
+                    body.append(" ")
+                    j += 2
+                    continue
+                if nxt in _BRACKET_LITERAL_ESCAPES:
+                    body.append(nxt)
+                    j += 2
+                    continue
+                body.append(pattern[j : j + 2])
+                j += 2
+                continue
+            body.append(c)
+            j += 1
+        if not closed:
+            out.append(pattern[i:])
+            break
+        rebuilt = "["
+        if negated:
+            rebuilt += "^"
+        if leading_rbracket:
+            rebuilt += "]"
+        rebuilt += "".join(body)
+        if trailing_hyphen:
+            rebuilt += "-"
+        rebuilt += "]"
+        out.append(rebuilt)
+        i = j
+    return "".join(out)
+
+
 def _explicit_rule(
     spec: SpecDocument,
     rule_key: str,

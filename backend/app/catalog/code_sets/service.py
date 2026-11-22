@@ -67,7 +67,7 @@ from app.infra.db_tables import (
 )
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.catalog.ingestion.parsers.pdf_catalog import extract_code_pairs_from_section
+from app.ingestion.parsers.pdf_catalog import extract_code_pairs_from_section
 
 
 def code_set_summary(session: Session, row: CodeSetModel, metrics: Optional[Tuple[int, int, int]] = None) -> Dict[str, Any]:

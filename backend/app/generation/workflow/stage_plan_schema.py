@@ -3,9 +3,9 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
-from app.engine.binding import compile_schema_bindings
-from app.engine.rules import RuleValidationError
-from app.engine.workflow.runtime import _call_validated, _emit, _fanout
+from app.generation.core.binding import compile_schema_bindings
+from app.generation.core.rules import RuleValidationError
+from app.generation.workflow.runtime import _call_validated, _emit, _fanout
 from app.infra.db_tables import GenerationPlanModel, SchemaDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import canonical_json

@@ -1,4 +1,4 @@
-"""验证批次跨版本规则与 Oracle SQL 差异对比引擎（Layer 5: engine）。
+"""验证批次跨版本规则与 Oracle SQL 差异对比引擎（Layer 5: generation）。
 
 支持任选两个历史验证批次（base_run_id vs target_run_id），逐条对比：
 - 新增规则（ADDED）、移除规则（REMOVED）、参数/状态/来源变更规则（MODIFIED）、未变更规则（UNCHANGED）；
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.engine.compiler import compile_where
+from app.generation.sql.compiler import compile_where
 from app.infra.contracts import RuleDefinition, canonical_json
 from app.infra.db_tables import RuleModel, RunModel
 from app.policy.regops_plan import project

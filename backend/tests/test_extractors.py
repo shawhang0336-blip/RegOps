@@ -2,10 +2,10 @@ from pathlib import Path
 from docx import Document
 from openpyxl import Workbook
 
-from app.catalog.ingestion.parsers import extractors
-from app.catalog.ingestion.parsers.pdf_catalog import parse_document_catalog
+from app.ingestion.parsers import extractors
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog
 from app.infra.config import get_settings
-from app.catalog.ingestion.parsers.extractors import extract_document, extract_docx, extract_pdf, extract_xlsx, survey_document
+from app.ingestion.parsers.extractors import extract_document, extract_docx, extract_pdf, extract_xlsx, survey_document
 
 
 def test_docx_tables_become_raw_blocks(tmp_path):

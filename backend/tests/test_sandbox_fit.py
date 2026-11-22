@@ -7,7 +7,7 @@
 """
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.engine.oracle import SANDBOX_TEXT_LIMIT, fit_sandbox_values
+from app.generation.sql.oracle import SANDBOX_TEXT_LIMIT, fit_sandbox_values
 
 SPEC = SpecDocument(
     version="TEST",

@@ -7,7 +7,7 @@
 """
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.engine.workflow import _required_backfill_candidates
+from app.generation.workflow import _required_backfill_candidates
 
 SPEC = SpecDocument(
     version="TEST",

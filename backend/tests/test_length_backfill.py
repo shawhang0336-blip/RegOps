@@ -11,7 +11,7 @@ LENGTH 已从模型算子白名单移除（列宽是上限，不是定长），�
 """
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.engine.workflow import _length_backfill_candidates
+from app.generation.workflow import _length_backfill_candidates
 
 
 def _field(name, length, data_type="VARCHAR"):

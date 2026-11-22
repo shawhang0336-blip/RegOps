@@ -31,7 +31,7 @@ from app.infra.db_tables import (
 )
 from app.infra.config import get_settings
 from app.infra.config import OPERATOR_PLACEHOLDER
-from app.catalog.ingestion.structure_service import analyze_document_structure
+from app.ingestion.structure_service import analyze_document_structure
 
 router = APIRouter(prefix="/code-sets", tags=["code-sets"])
 

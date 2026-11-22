@@ -11,8 +11,8 @@
 import pytest
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.engine.binding import bind_generators, materialize_golden_record
-from app.engine.rules import RuleValidationError
+from app.generation.core.binding import bind_generators, materialize_golden_record
+from app.generation.core.rules import RuleValidationError
 
 SPEC = SpecDocument(
     version="TEST",

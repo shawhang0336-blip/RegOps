@@ -1,7 +1,7 @@
 import pytest
 
 from app.infra.config import get_settings
-from app.catalog.ingestion.parsers.pdf_parser import parse_safe_13_organization_spec, parse_safe_chapter6_slice
+from app.ingestion.parsers.pdf_parser import parse_safe_13_organization_spec, parse_safe_chapter6_slice
 
 
 @pytest.fixture(scope="session")

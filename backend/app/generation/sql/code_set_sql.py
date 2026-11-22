@@ -1,6 +1,6 @@
-"""码表物理表命名与数据库 DDL / MERGE / INSERT 编译（Layer 5: Engine）。
+"""码表物理表命名与数据库 DDL / MERGE / INSERT 编译（Layer 5: generation/sql）。
 
-从原 `assets/code_sets/oracle.py` 剥离下沉至引擎层，确保 Layer 4 `catalog/` 彻底脱离数据库 SQL 方言。
+从原 `assets/code_sets/oracle.py` 剥离下沉至生成验证层，确保 Layer 4 `catalog/` 彻底脱离数据库 SQL 方言。
 """
 
 import hashlib

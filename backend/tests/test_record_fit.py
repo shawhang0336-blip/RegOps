@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.engine.oracle import fit_record_values
+from app.generation.sql.oracle import fit_record_values
 
 SPEC = SpecDocument(
     version="TEST",

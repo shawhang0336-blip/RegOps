@@ -5,7 +5,7 @@ import pytest
 
 from app.infra.config import Settings
 from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
-from app.catalog.ingestion.structure_service import _apply_plan, _validate_plan, latest_document_architecture
+from app.ingestion.structure_service import _apply_plan, _validate_plan, latest_document_architecture
 from .helpers import make_session
 
 
@@ -70,8 +70,8 @@ def test_structure_plan_rejects_uncovered_source_block():
 import uuid
 
 from app.infra.db_tables import RawBlockModel, SourceDocumentModel
-from app.catalog.ingestion.structure_service import analyze_document_structure
-import app.catalog.ingestion.structure_service as structure_service
+from app.ingestion.structure_service import analyze_document_structure
+import app.ingestion.structure_service as structure_service
 from .helpers import make_session
 
 
@@ -126,10 +126,10 @@ def make_document(session, eligible):
 
 def test_ambiguous_structure_uses_single_short_llm_call(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document, _ = make_document(session, eligible=False)
     llm = SingleCallLlm()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
     architecture_id = analyze_document_structure(document.id, __import__('app.infra.config', fromlist=['Settings']).Settings())
     assert llm.calls == [structure_service.STRUCTURE_PLAN_TIMEOUT]
     assert architecture_id
@@ -139,14 +139,14 @@ def test_ambiguous_structure_uses_single_short_llm_call(monkeypatch):
 
 def test_structured_block_skips_llm_architecture_call(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document, _ = make_document(session, eligible=True)
 
     class NoCallLlm:
         def assign(self, *args, **kwargs):
             raise AssertionError("Structured block should not call LLM")
 
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: NoCallLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: NoCallLlm())
     architecture_id = analyze_document_structure(document.id, __import__('app.infra.config', fromlist=['Settings']).Settings())
     assert architecture_id
 
@@ -263,7 +263,7 @@ class _CountingLlm:
 
 def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document = SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="only.xlsx", file_type="xlsx", sha256=uuid.uuid4().hex,
         blob_uri="blob://only", spec_version="TEST", status="UPLOADED", block_count=1,
@@ -273,7 +273,7 @@ def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
     _block_with_spec(session, document, 0, "SAFE_6_1", ["CUSTNAME"])
 
     llm = _CountingLlm()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
     structure_service.analyze_document_structure(document.id, Settings())
 
     # 自适模式下，已完成结构化解析、又没有任何告警的单块章节不需要再问 AI
@@ -282,7 +282,7 @@ def test_adaptive_scope_skips_ai_for_single_parsed_block(monkeypatch):
 
 def test_all_scope_sends_every_block_to_ai(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     document = SourceDocumentModel(
         id=str(uuid.uuid4()), file_name="only.xlsx", file_type="xlsx", sha256=uuid.uuid4().hex,
         blob_uri="blob://only", spec_version="TEST", status="UPLOADED", block_count=1,
@@ -311,7 +311,7 @@ def test_all_scope_sends_every_block_to_ai(monkeypatch):
                 "global_warnings": [],
             }, {"arguments": {}}
 
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: PassingLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: PassingLlm())
     structure_service.analyze_document_structure(document.id, Settings(structure_ai_scope="all"))
 
     candidates = calls["payload"]["candidate_blocks"]
@@ -331,8 +331,8 @@ def test_ingestion_deep_audit_ordinal_collision_split_preserve_cancel_and_progre
     """
     from pathlib import Path
     from app.infra.llm.guard import llm_execution_scope
-    from app.catalog.ingestion import import_progress
-    from app.catalog.ingestion.parsers import extractors
+    from app.ingestion import import_progress
+    from app.ingestion.parsers import extractors
     from app.kernel.run import CancellationToken, RunCancelledError
 
     # 1) 多章节合并/拆分不撞 uq_raw_block_order，且 split_markers 保留表头文本
@@ -376,8 +376,8 @@ def test_ingestion_deep_audit_ordinal_collision_split_preserve_cancel_and_progre
     assert new_blocks[1].raw_content.startswith("6.2 涉外收支")
 
     # 2) 切块阶段收到 CancellationToken 取消信号时立即向上抛 RunCancelledError（不被吞为 DEFAULT）
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda s: SingleCallLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda s: SingleCallLlm())
     tok = CancellationToken()
     tok.cancel("operator stopped")
     with pytest.raises(RunCancelledError):
@@ -424,14 +424,14 @@ def test_overview_preserves_valid_ai_strategy_filters_hallucinations_and_feeds_s
     2. 虚构的 section_regions 标题被防幻觉护栏自动剔除并记入 warnings，真实标题被保留；
     3. latest_chunking_plan / reextract_document_blocks 把蓝图透传给 extract_document。
     """
-    from app.catalog.ingestion.structure_service import (
+    from app.ingestion.structure_service import (
         inspect_document_overview,
         latest_chunking_plan,
         reextract_document_blocks,
     )
 
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     uploads = tmp_path / "uploads"
     uploads.mkdir()
     sha = uuid.uuid4().hex
@@ -452,7 +452,7 @@ def test_overview_preserves_valid_ai_strategy_filters_hallucinations_and_feeds_s
     session.commit()
 
     monkeypatch.setattr(
-        "app.catalog.ingestion.structure_service.survey_document",
+        "app.ingestion.structure_service.survey_document",
         lambda _p, _ft: {
             "file_type": "pdf",
             "page_count": 12,
@@ -480,7 +480,7 @@ def test_overview_preserves_valid_ai_strategy_filters_hallucinations_and_feeds_s
                 "warnings": [],
             }, {"arguments": {"chunking_strategy": "HEADING_SECTIONS"}}
 
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda s: OverviewLlm())
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda s: OverviewLlm())
 
     settings = Settings(blob_dir=str(tmp_path))
     arch_id = inspect_document_overview(doc.id, settings)
@@ -509,7 +509,7 @@ def test_overview_preserves_valid_ai_strategy_filters_hallucinations_and_feeds_s
             }
         ]
 
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.extract_document", spy_extract)
+    monkeypatch.setattr("app.ingestion.structure_service.extract_document", spy_extract)
     count = reextract_document_blocks(doc.id, settings)
     assert count == 1
     assert captured["chunking_plan"]["chunking_strategy"] == "HEADING_SECTIONS"

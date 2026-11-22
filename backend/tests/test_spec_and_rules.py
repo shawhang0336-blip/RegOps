@@ -1,7 +1,7 @@
 import pytest
 
 from app.infra.contracts import Evidence, RuleDefinition, calculate_rule_hash
-from app.engine.rules import RuleValidationError, build_explicit_rules, validate_rule
+from app.generation.core.rules import RuleValidationError, build_explicit_rules, validate_rule
 
 
 def test_real_pdf_yields_field_whitelist_and_evidence(organization_spec):

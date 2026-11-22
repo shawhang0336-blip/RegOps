@@ -2,13 +2,13 @@ import uuid
 
 import pytest
 
-from app.catalog.ingestion.parsers.pdf_catalog import parse_document_catalog
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog
 from app.infra.config import Settings, get_settings
-from app.engine.binding import bind_generators, bind_rules, bind_schema
-from app.engine.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
+from app.generation.core.binding import bind_generators, bind_rules, bind_schema
+from app.generation.sql.oracle import GenericOracleExecutor, compile_ai_schema_oracle_ddl, compile_sandbox_oracle_ddl
 from app.infra.llm import LlmTimeoutError
 from app.policy.regops_plan import project
-from app.engine.workflow import (
+from app.generation.workflow import (
     _call_validated,
     _create_run,
     _dedupe_approved_rules,
@@ -19,7 +19,7 @@ from app.engine.workflow import (
 )
 from app.delivery.production_service import build_production_bundle
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
-from app.engine.rules import RuleValidationError
+from app.generation.core.rules import RuleValidationError
 from app.infra.errors import WorkflowError
 from .helpers import make_session
 

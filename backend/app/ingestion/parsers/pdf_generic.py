@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.infra.contracts import FieldSpec, SpecDocument
-from app.catalog.ingestion.parsers.pdf_catalog import extract_code_pairs_from_section
-from app.catalog.ingestion.parsers.pdf_parser import (
+from app.ingestion.parsers.pdf_catalog import extract_code_pairs_from_section
+from app.ingestion.parsers.pdf_parser import (
     _parse_type_from_entry,
     extract_inline_enum_values,
     reflow_dictionary_rows,

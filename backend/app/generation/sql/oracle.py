@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 
-from app.engine.code_set_sql import compile_code_set_oracle_ddl, sandbox_code_set_table
-from app.engine.binding import materialize_golden_record
-from app.engine.compiler import compile_rule_query
+from app.generation.sql.code_set_sql import compile_code_set_oracle_ddl, sandbox_code_set_table
+from app.generation.core.binding import materialize_golden_record
+from app.generation.sql.compiler import compile_rule_query
 from app.infra.contracts import AuditCaseBinding, GeneratorBinding, RuleDefinition, SchemaBinding, SpecDocument
 from app.infra.db import quote_identifier
 
@@ -177,9 +177,8 @@ def fit_record_values(
     return fitted
 
 
-# 沙箱表（变异用例落地的表）字符列是 VARCHAR2(4000)，只有这一个物理上限；
-# 数值列是裸 NUMBER（38 位），保证数值比较语义与生产一致
-SANDBOX_TEXT_LIMIT = 4000
+# 沙箱表（变异用例落地的表）字符列是 VARCHAR2(4000)，常量由 generation.core.mutations 统一定义避免反向依赖
+from app.generation.core.mutations import SANDBOX_TEXT_LIMIT
 
 
 def _truncate_utf8_bytes(text_value: str, max_bytes: int) -> str:
@@ -388,7 +387,7 @@ class GenericOracleExecutor:
             target_tables = prepared_assets["target_tables"]
             code_set_tables = prepared_assets["code_set_tables"]
         records: Dict[str, List[Dict[str, Any]]] = {}
-        from app.engine.mutations import make_distinct_key_value
+        from app.generation.core.mutations import make_distinct_key_value
 
         for spec in specs:
             records[spec.table_code] = []

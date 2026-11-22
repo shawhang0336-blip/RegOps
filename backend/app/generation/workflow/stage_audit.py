@@ -5,16 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.catalog.code_sets.bindings import load_published_code_sets
-from app.engine.binding import bind_audit_cases, normalize_case_id
-from app.engine.mutations import (
+from app.generation.core.binding import bind_audit_cases, normalize_case_id
+from app.generation.core.mutations import (
     build_deterministic_mutations,
     build_golden_audit_case,
     build_regexp_fallback_mutation,
 )
-from app.engine.rules import RuleValidationError
-from app.engine.workflow.runtime import _call_validated, _code_set_context, _emit, _fanout, _inner_width
-from app.engine.workflow.stage_data import _next_asset_version
-from app.engine.workflow.stage_plan_schema import _provider_name
+from app.generation.core.rules import RuleValidationError
+from app.generation.workflow.runtime import _call_validated, _code_set_context, _emit, _fanout, _inner_width
+from app.generation.workflow.stage_data import _next_asset_version
+from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import AuditCaseDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import AuditCaseBinding, RuleDefinition, canonical_json

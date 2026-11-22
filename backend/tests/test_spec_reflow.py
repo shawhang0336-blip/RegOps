@@ -1,4 +1,4 @@
-from app.catalog.ingestion.parsers.pdf_parser import lookup_term_definition, reflow_dictionary_rows, reflow_spec_terms
+from app.ingestion.parsers.pdf_parser import lookup_term_definition, reflow_dictionary_rows, reflow_spec_terms
 
 WRAPPED_DICTIONARY = """字段         内容     类型（长度）             校验
 ACTIONTYPE   操作类型      字符型，1       必填项。

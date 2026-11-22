@@ -1,9 +1,9 @@
 """ProdAgent 架构分层边界测试：验证「机制在内（app.kernel），策略在外（app.policy）」与整洁目录边界。
 
 核心断言：
-1. `app/kernel/*.py` 通过 AST 静态依赖检查，零引用任何业务域（catalog / engine / delivery / api）或策略层（policy）；
+1. `app/kernel/*.py` 通过 AST 静态依赖检查，零引用任何业务域（ingestion / catalog / generation / delivery / api）或策略层（policy）；
 2. 仅依赖 `app.kernel` 即可独立定义并驱动一个与监管业务完全无关的通用工作流；
-3. `backend/app/` 根目录保持整洁，只允许入口 `main.py` 与七大分层包（infra / kernel / policy / catalog / engine / delivery / api），其中三大业务包与前端 01 / 02 / 03 三步严格 1:1 对齐。
+3. `backend/app/` 根目录保持整洁，只允许入口 `main.py` 与八大分层包（infra / kernel / policy / ingestion[Step 0] / catalog[Step 1] / generation[Step 2] / delivery[Step 3] / api）。
 """
 
 import ast
@@ -19,8 +19,9 @@ from .helpers import make_session
 
 FORBIDDEN_LAYERS_FOR_KERNEL = {
     "policy",
+    "ingestion",
     "catalog",
-    "engine",
+    "generation",
     "delivery",
     "api",
 }
@@ -31,23 +32,25 @@ ALLOWED_ROOT_ENTRIES = {
     "kernel",
     "policy",
     "infra",
+    "ingestion",
     "catalog",
-    "engine",
+    "generation",
     "delivery",
     "api",
 }
 
-# 严格单向七层拓扑序（3 层通用底座 + 3 层业务域与前端三步 1:1 对应 + 1 层 HTTP 接口）：
+# 严格单向八层拓扑序（3 层通用底座 + Step 0/1/2/3 四业务层 + 1 层 HTTP 接口）：
 # 任意跨层 import 必须满足 LAYER_RANK[target] < LAYER_RANK[source]，彻底杜绝倒挂与循环依赖。
 LAYER_RANK = {
     "infra": 0,
     "kernel": 1,
     "policy": 2,
-    "catalog": 3,
-    "engine": 4,
-    "delivery": 5,
-    "api": 6,
-    "main": 7,
+    "ingestion": 3,
+    "catalog": 4,
+    "generation": 5,
+    "delivery": 6,
+    "api": 7,
+    "main": 8,
 }
 
 
@@ -1507,39 +1510,32 @@ def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
     assert budget["max_retries"] == 5
 
 
-def test_catalog_clean_structure_and_internal_dag_boundaries():
-    """验证 Layer 3 catalog（统一第 1 步业务域）归类与内部单向红线：
-    1. 根目录收敛为三子域（ingestion/ + tables/ + code_sets/）+ 三顶层协同（extraction.py / pipeline_run.py / version_diff.py）；
-    2. catalog/ingestion/ 严禁反向依赖 tables/ 或 code_sets/；
-    3. catalog/code_sets/ 严禁反向依赖 tables/；
-    4. 纯解析与纯契约叶模块（ingestion/parsers/*.py、tables/domain.py、code_sets/parser.py）零 DB/LLM/kernel/policy 依赖；
-    5. catalog/ 整体零 SQL 方言编译器（Oracle DDL 编译位于 Layer 4 engine/code_set_sql.py）。
+def _ast_imported_modules(py_file: Path) -> list:
+    tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    mods = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.extend(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mods.append(node.module)
+    return mods
+
+
+def test_ingestion_clean_structure_and_pure_parsers_boundary():
+    """验证 Layer 3 (Step 0) ingestion 归类红线：
+    1. 根目录收敛为 parsers/ 纯解析子包 + structure_service.py + import_progress.py；
+    2. parsers/*.py 严格零依赖 DB / LLM / kernel / policy。
     """
-    import app.catalog as catalog_pkg
+    import app.ingestion as ingestion_pkg
 
-    catalog_dir = Path(catalog_pkg.__file__).resolve().parent
-    actual_entries = {p.name for p in catalog_dir.iterdir() if p.name != "__pycache__"}
-    assert actual_entries == {
-        "__init__.py",
-        "code_sets",
-        "extraction.py",
-        "ingestion",
-        "pipeline_run.py",
-        "tables",
-        "version_diff.py",
-    }
-
-    ingestion_dir = catalog_dir / "ingestion"
-    parsers_dir = ingestion_dir / "parsers"
-    tables_dir = catalog_dir / "tables"
-    code_sets_dir = catalog_dir / "code_sets"
-
+    ingestion_dir = Path(ingestion_pkg.__file__).resolve().parent
     assert {p.name for p in ingestion_dir.iterdir() if p.name != "__pycache__"} == {
         "__init__.py",
         "import_progress.py",
         "parsers",
         "structure_service.py",
     }
+    parsers_dir = ingestion_dir / "parsers"
     assert {p.name for p in parsers_dir.glob("*.py")} == {
         "__init__.py",
         "extractors.py",
@@ -1548,6 +1544,35 @@ def test_catalog_clean_structure_and_internal_dag_boundaries():
         "pdf_parser.py",
         "quality.py",
     }
+    forbidden = ("app.infra.db", "app.infra.db_tables", "app.infra.llm", "app.kernel", "app.policy")
+    violations = [
+        f"{p.name}: {m}"
+        for p in sorted(parsers_dir.glob("*.py"))
+        for m in _ast_imported_modules(p)
+        if any(m == bad or m.startswith(bad + ".") for bad in forbidden)
+    ]
+    assert violations == [], f"ingestion/parsers 必须保持纯解析零 DB/LLM 依赖：{violations}"
+
+
+def test_catalog_clean_structure_and_boundaries():
+    """验证 Layer 4 (Step 1) catalog 归类红线：
+    1. 根目录收敛为对称双子域（tables/ + code_sets/）+ 三顶层协同（extraction.py / pipeline_run.py / version_diff.py）；
+    2. code_sets/ 严禁反向依赖 tables/；
+    3. 纯叶模块（tables/domain.py、code_sets/parser.py）零 DB/LLM/kernel/policy 依赖。
+    """
+    import app.catalog as catalog_pkg
+
+    catalog_dir = Path(catalog_pkg.__file__).resolve().parent
+    assert {p.name for p in catalog_dir.iterdir() if p.name != "__pycache__"} == {
+        "__init__.py",
+        "code_sets",
+        "extraction.py",
+        "pipeline_run.py",
+        "tables",
+        "version_diff.py",
+    }
+    tables_dir = catalog_dir / "tables"
+    code_sets_dir = catalog_dir / "code_sets"
     assert {p.name for p in tables_dir.glob("*.py")} == {
         "__init__.py",
         "domain.py",
@@ -1564,45 +1589,70 @@ def test_catalog_clean_structure_and_internal_dag_boundaries():
         "readiness.py",
         "service.py",
     }
-
-    def _imported_mods(py_file: Path) -> list:
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-        mods = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                mods.extend(a.name for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                mods.append(node.module)
-        return mods
-
-    # 1) ingestion/ 绝不反向依赖 tables/ 或 code_sets/
-    ingestion_reverse = [
-        f"{p.relative_to(catalog_dir)}: {m}"
-        for p in sorted(ingestion_dir.rglob("*.py"))
-        for m in _imported_mods(p)
-        if any(m == bad or m.startswith(bad + ".") for bad in ("app.catalog.tables", "app.catalog.code_sets"))
-    ]
-    assert ingestion_reverse == [], f"catalog/ingestion 不得反向依赖 tables/code_sets：{ingestion_reverse}"
-
-    # 2) code_sets/ 绝不反向依赖 tables/
     code_set_reverse = [
         f"{p.name}: {m}"
         for p in sorted(code_sets_dir.glob("*.py"))
-        for m in _imported_mods(p)
+        for m in _ast_imported_modules(p)
         if m == "app.catalog.tables" or m.startswith("app.catalog.tables.")
     ]
     assert code_set_reverse == [], f"catalog/code_sets 不得反向依赖 catalog/tables：{code_set_reverse}"
 
-    # 3) 纯解析与纯契约叶模块零 DB / LLM / kernel / policy 依赖
     forbidden_pure = ("app.infra.db", "app.infra.db_tables", "app.infra.llm", "app.kernel", "app.policy")
-    pure_files = list(sorted(parsers_dir.glob("*.py"))) + [tables_dir / "domain.py", code_sets_dir / "parser.py"]
     pure_violations = [
         f"{p.relative_to(catalog_dir)}: {m}"
-        for p in pure_files
-        for m in _imported_mods(p)
+        for p in (tables_dir / "domain.py", code_sets_dir / "parser.py")
+        for m in _ast_imported_modules(p)
         if any(m == bad or m.startswith(bad + ".") for bad in forbidden_pure)
     ]
     assert pure_violations == [], f"catalog 纯解析/纯契约叶模块必须零 DB/LLM 依赖：{pure_violations}"
+
+
+def test_generation_clean_structure_and_core_boundary():
+    """验证 Layer 5 (Step 2) generation 归类红线：
+    1. 根目录收敛为三大正交子包（core/ + sql/ + workflow/）+ run_diff.py；
+    2. generation/core/*.py 严格零依赖 DB / LLM / kernel / policy / engine.sql / engine.workflow（纯离线领域内核）。
+    """
+    import app.generation as generation_pkg
+
+    generation_dir = Path(generation_pkg.__file__).resolve().parent
+    assert {p.name for p in generation_dir.iterdir() if p.name != "__pycache__"} == {
+        "__init__.py",
+        "core",
+        "run_diff.py",
+        "sql",
+        "workflow",
+    }
+    core_dir = generation_dir / "core"
+    sql_dir = generation_dir / "sql"
+    assert {p.name for p in core_dir.glob("*.py")} == {
+        "__init__.py",
+        "binding.py",
+        "mutations.py",
+        "rule_backfill.py",
+        "rules.py",
+    }
+    assert {p.name for p in sql_dir.glob("*.py")} == {
+        "__init__.py",
+        "code_set_sql.py",
+        "compiler.py",
+        "oracle.py",
+    }
+    forbidden_core = (
+        "app.infra.db",
+        "app.infra.db_tables",
+        "app.infra.llm",
+        "app.kernel",
+        "app.policy",
+        "app.generation.sql",
+        "app.generation.workflow",
+    )
+    core_violations = [
+        f"{p.name}: {m}"
+        for p in sorted(core_dir.glob("*.py"))
+        for m in _ast_imported_modules(p)
+        if any(m == bad or m.startswith(bad + ".") for bad in forbidden_core)
+    ]
+    assert core_violations == [], f"generation/core 必须保持纯离线领域内核，严禁依赖 DB/LLM/SQL/Workflow：{core_violations}"
 
 
 

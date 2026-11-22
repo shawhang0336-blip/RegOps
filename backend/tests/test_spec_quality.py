@@ -1,4 +1,4 @@
-from app.catalog.ingestion.parsers.quality import inspect_block, inspect_spec
+from app.ingestion.parsers.quality import inspect_block, inspect_spec
 
 
 def _spec(fields):

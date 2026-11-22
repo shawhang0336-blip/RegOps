@@ -7,7 +7,7 @@
 - `entrypoints.py`：`drive` / `start_generic_run` / `approve_generic_rules` / `confirm_generic_test_results` / `retry_generic_run`。
 """
 
-from app.engine.workflow.entrypoints import (
+from app.generation.workflow.entrypoints import (
     _create_run,
     active_generic_runs,
     approve_generic_rules,
@@ -26,8 +26,8 @@ from app.engine.workflow.entrypoints import (
     start_generic_run,
     submit_generic_run,
 )
-from app.engine.workflow.nodes import _back_bodies, _front_bodies
-from app.engine.workflow.runtime import (
+from app.generation.workflow.nodes import _back_bodies, _front_bodies
+from app.generation.workflow.runtime import (
     ERROR_SUGGESTIONS,
     STAGE_BY_TOOL,
     _call_validated,
@@ -42,7 +42,7 @@ from app.engine.workflow.runtime import (
     _specs,
     _upsert_rule,
 )
-from app.engine.workflow.stages import (
+from app.generation.workflow.stages import (
     _audit_stage,
     _backfill_fixed_value_rules,
     _backfill_length_rules,

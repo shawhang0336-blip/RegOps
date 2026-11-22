@@ -14,8 +14,7 @@ from app.infra.contracts import (
     calculate_rule_hash,
     field_map,
 )
-from app.engine.compiler import normalize_oracle_regexp
-from app.engine.rules import RuleValidationError, validate_rule
+from app.generation.core.rules import RuleValidationError, normalize_oracle_regexp, validate_rule
 
 
 def compile_schema_bindings(spec: SpecDocument) -> List[SchemaBinding]:

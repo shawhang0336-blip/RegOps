@@ -5,7 +5,7 @@ import uuid
 import pytest
 
 from app.catalog.code_sets.service import extract_code_sets_for_block
-from app.engine.binding import (
+from app.generation.core.binding import (
     GeneratorBinding,
     bind_rules,
     compile_schema_bindings,
@@ -13,23 +13,23 @@ from app.engine.binding import (
     violates_field_compare,
     violates_single_field_rule,
 )
-from app.engine.compiler import compile_rule_query
-from app.engine.mutations import (
+from app.generation.sql.compiler import compile_rule_query
+from app.generation.core.mutations import (
     build_deterministic_mutations,
     build_golden_audit_case,
     build_regexp_fallback_mutation,
 )
-from app.engine.oracle import GenericOracleExecutor
-from app.engine.rule_backfill import _code_set_enum_backfill_candidates
-from app.engine.rules import RuleValidationError
-from app.engine.workflow import start_generic_run
-from app.engine.workflow.stages import _audit_stage, _data_stage
+from app.generation.sql.oracle import GenericOracleExecutor
+from app.generation.core.rule_backfill import _code_set_enum_backfill_candidates
+from app.generation.core.rules import RuleValidationError
+from app.generation.workflow import start_generic_run
+from app.generation.workflow.stages import _audit_stage, _data_stage
 from app.infra.db_tables import CodeSetValidationModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument
 from app.infra.llm.schemas import _tool_prompt_preamble
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
-from app.catalog.ingestion.structure_service import analyze_document_structure
+from app.ingestion.structure_service import analyze_document_structure
 from app.infra.llm.guard import call_llm_validated
 from app.policy.regops_bus import code_set_values_adjudicator, cross_table_adjudicator
 from app.policy.regops_plan import DEFAULT_PLAN, project, self_heal_cases_target, self_heal_data_target
@@ -442,7 +442,7 @@ def test_call_llm_validated_fails_fast_on_fatal_runtime_error():
 
 def test_structure_service_recovers_after_bus_block_id_rejection(monkeypatch):
     session = make_session()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.SessionLocal", lambda: session)
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
     doc = SourceDocumentModel(
         id=str(uuid.uuid4()),
         file_name="sample.docx",
@@ -486,7 +486,7 @@ def test_structure_service_recovers_after_bus_block_id_rejection(monkeypatch):
             }, {"provider": "test"}
 
     llm = BusRecoverLlm()
-    monkeypatch.setattr("app.catalog.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda settings: llm)
     analyze_document_structure(doc.id, Settings())
     assert llm.calls == 2
     assert llm.feedbacks[1] and "块 ID 幻觉拦截" in llm.feedbacks[1]
@@ -657,7 +657,7 @@ def test_metadata_extraction_with_zero_suspect_fields_succeeds_without_zero_work
 
 
 def test_long_case_id_is_normalized_within_oracle_record_id_limit():
-    from app.engine.binding import MAX_CASE_ID_LENGTH, bind_audit_cases, normalize_case_id
+    from app.generation.core.binding import MAX_CASE_ID_LENGTH, bind_audit_cases, normalize_case_id
 
     long_id = "TABLE_2915CE84B85B_START_DATE_DATE_VALID_MUT_03_YEAR_PREFIX_OUT_OF_RANGE"
     assert len(long_id) > MAX_CASE_ID_LENGTH
@@ -676,7 +676,7 @@ def test_long_case_id_is_normalized_within_oracle_record_id_limit():
 
 
 def test_rule_binder_drops_cross_field_bleed_and_dedupes_pending_rules():
-    from app.engine.workflow.stages import _dedupe_approved_rules, _rules_stage
+    from app.generation.workflow.stages import _dedupe_approved_rules, _rules_stage
 
     session = make_session()
     spec = _sample_spec().model_copy(update={"fields": _sample_spec().fields[:2]})  # ORG_ID, TYPE_CODE
@@ -879,7 +879,7 @@ def test_delete_run_rows_collects_oracle_tables_from_failed_and_multi_attempt_ev
 
 def test_partition_coupled_chunks_keeps_distant_field_compare_cluster_together():
     """回归：相隔超过 12 个字段的 FIELD_COMPARE 关联字段（如 TXCCY 与 INCHARGECCY/OUTCHARGECCY）必须在同一批联合造数。"""
-    from app.engine.workflow.stages import _partition_coupled_chunks
+    from app.generation.workflow.stages import _partition_coupled_chunks
 
     fields = [
         FieldSpec(name=f"F_{i:02d}", content=f"字段{i}", data_type="VARCHAR", length=8, check_text="必填", evidence_page="1")
@@ -901,7 +901,7 @@ def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbi
     from app.catalog.code_sets.linking import ensure_field_reference
     from app.catalog.tables.service import _deterministic_field_draft
     from app.infra.db_tables import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel
-    from app.catalog.ingestion.parsers.pdf_parser import lookup_term_definition
+    from app.ingestion.parsers.pdf_parser import lookup_term_definition
 
     flattened = "金融机构标识码 国家外汇管理局签发的12位标识码。 发生日期 账户收支余发生变动日期。 币种 币种代码，见币种代码表。"
     assert lookup_term_definition(flattened, "发生日期") == "账户收支余发生变动日期。"
@@ -943,7 +943,7 @@ def test_flattened_terms_text_does_not_smear_neighbor_code_set_and_clearing_unbi
 
 def test_fullwidth_unicode_digits_rejected_on_number_field_and_large_num_range_precision():
     """回归：拦截全角数字 '１００' 避免 Oracle ORA-01722；22 位金额大边界（±1e20）不因 float64 精度丢失导致漏变异。"""
-    from app.engine.binding import bind_audit_cases
+    from app.generation.core.binding import bind_audit_cases
 
     spec = _sample_spec()
     with pytest.raises(RuleValidationError, match="非法数值"):
@@ -984,8 +984,8 @@ def test_call_llm_validated_retries_wrapped_httpx_connect_error():
 
 def test_backfilled_length_max_rule_remains_editable_and_impossible_field_compare_is_rejected():
     """回归：确定性补齐的 LENGTH_MAX 规则在人工修改参数后仍能通过 validate_rule；单字符 vs 长编码的 FIELD_COMPARE(EQ) 被硬拦截。"""
-    from app.engine.rule_backfill import _backfill_length_rules
-    from app.engine.rules import validate_rule
+    from app.generation.core.rule_backfill import _backfill_length_rules
+    from app.generation.core.rules import validate_rule
 
     session = make_session()
     spec = _sample_spec().model_copy(
@@ -1043,7 +1043,7 @@ def test_backfilled_length_max_rule_remains_editable_and_impossible_field_compar
 def test_oracle_regexp_normalization_and_mysql8_large_int_event_hash_stability():
     """回归：Oracle POSIX 字符类 [...] 内规范化 \\- / \\d / \\. 防止 ORA-12728；超大整数事件在 MySQL 8 JSON 往返后哈希链仍有效。"""
     import re
-    from app.engine.compiler import normalize_oracle_regexp
+    from app.generation.sql.compiler import normalize_oracle_regexp
     from app.kernel.event_log import canonical_event_json
 
     assert normalize_oracle_regexp(r"^[0-9+\-() ]+$") == r"^[0-9+() -]+$"
@@ -1075,7 +1075,7 @@ def test_oracle_regexp_normalization_and_mysql8_large_int_event_hash_stability()
 
 def test_cond_required_blank_sentinel_compiles_for_oracle_without_null_trap():
     """回归：COND_REQUIRED 的 if_values 含空串/None（如「某字段非空时本字段必填」）不得编译出 Oracle 恒假谓词 <> '' / NOT IN (NULL, '')。"""
-    from app.engine.binding import violates_cond_required
+    from app.generation.core.binding import violates_cond_required
 
     spec = _sample_spec()
     rule_ne_blank = _make_rule(
@@ -1110,7 +1110,7 @@ def test_cond_required_blank_sentinel_compiles_for_oracle_without_null_trap():
 
 def test_audit_binding_rejects_empty_string_and_canonical_number_noops_for_oracle_regexp():
     """回归：Oracle 中 '' 等同于 NULL（不触发 REGEXP），且 NUMBER 列将 '100.00'/'00100' 规范化为 '100'，绑定阶段必须拦截此类空转反例。"""
-    from app.engine.binding import bind_audit_cases
+    from app.generation.core.binding import bind_audit_cases
 
     spec = _sample_spec()
     # 空串 '' 期望命中 REGEXP 必须被拦下
@@ -1141,7 +1141,7 @@ def test_audit_binding_rejects_empty_string_and_canonical_number_noops_for_oracl
 
 def test_regops_centralized_run_cancel_resume_recover_and_active_guard(tmp_path):
     """回归：P0 收口后，RegOps 的取消、断点续跑、启动恢复、活跃删除守卫全部经由 kernel.run 统一驱动。"""
-    from app.engine.workflow import (
+    from app.generation.workflow import (
         _create_run,
         cancel_generic_run,
         delete_generic_run,
@@ -1255,8 +1255,8 @@ def test_regops_budget_guard_tracks_usage_and_trips_on_exceeded_limit():
 
 def test_bsp_send_partial_wave_checkpoint_and_per_table_incremental_resume(monkeypatch, tmp_path):
     """P3 回归：多表真 BSP Send 波次中表 1 成功、表 2 失败时，表 1 检查点先落 EventLog；断点续跑时表 1 零重跑，仅补跑表 2。"""
-    from app.engine.oracle import GenericOracleExecutor
-    from app.engine.workflow import drive, retry_generic_run, start_generic_run
+    from app.generation.sql.oracle import GenericOracleExecutor
+    from app.generation.workflow import drive, retry_generic_run, start_generic_run
     from app.infra.db_tables import EventModel, SpecificationModel
     from app.policy.regops_plan import project
 

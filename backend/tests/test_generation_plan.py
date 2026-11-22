@@ -1,8 +1,8 @@
 import pytest
 
-from app.engine.binding import GeneratorBinding, materialize_golden_record
-from app.engine.workflow import _validate_plan
-from app.engine.rules import RuleValidationError
+from app.generation.core.binding import GeneratorBinding, materialize_golden_record
+from app.generation.workflow import _validate_plan
+from app.generation.core.rules import RuleValidationError
 
 
 def test_ai_generation_plan_respects_budget():

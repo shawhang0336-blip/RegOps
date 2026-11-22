@@ -6,27 +6,27 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import func
 
 from app.catalog.code_sets.bindings import load_published_code_sets
-from app.engine.binding import (
+from app.generation.core.binding import (
     GeneratorBinding,
     _validate_generator_item,
     bind_generators,
     find_golden_rule_violations,
     materialize_golden_record,
 )
-from app.engine.rule_backfill import (
+from app.generation.core.rule_backfill import (
     _backfill_fixed_value_rules as _policy_backfill_fixed_value_rules,
     _backfill_length_rules as _policy_backfill_length_rules,
     _backfill_required_rules as _policy_backfill_required_rules,
 )
-from app.engine.rules import RuleValidationError
-from app.engine.workflow.runtime import (
+from app.generation.core.rules import RuleValidationError
+from app.generation.workflow.runtime import (
     _call_validated,
     _code_set_context,
     _emit,
     _fanout,
     _upsert_rule,
 )
-from app.engine.workflow.stage_plan_schema import _provider_name
+from app.generation.workflow.stage_plan_schema import _provider_name
 from app.infra.db_tables import GeneratorDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import RuleDefinition, canonical_json

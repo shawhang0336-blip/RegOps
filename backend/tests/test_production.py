@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from app.engine.binding import bind_schema
+from app.generation.core.binding import bind_schema
 from app.kernel.event_log import append_event
 from app.infra.db_tables import RunModel
 from app.delivery.production import (
@@ -12,7 +12,7 @@ from app.delivery.production import (
     inline_sql_literals,
 )
 from app.delivery.production_service import build_production_bundle
-from app.engine.rules import build_explicit_rules
+from app.generation.core.rules import build_explicit_rules
 from app.infra.errors import WorkflowError
 from .helpers import make_session
 

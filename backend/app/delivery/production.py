@@ -2,9 +2,9 @@ import math
 import re
 from typing import Any, Dict, List, Optional
 
-from app.engine.compiler import compile_where, quote_identifier
+from app.generation.sql.compiler import compile_where, quote_identifier
 from app.infra.contracts import RuleDefinition
-from app.engine.binding import SchemaBinding
+from app.generation.core.binding import SchemaBinding
 
 
 def compile_production_oracle_ddl(table: str, schema: List[SchemaBinding]) -> str:

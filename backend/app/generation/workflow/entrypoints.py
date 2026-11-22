@@ -18,9 +18,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.engine.oracle import OracleSandbox
-from app.engine.workflow.nodes import _back_bodies, _front_bodies
-from app.engine.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
+from app.generation.sql.oracle import OracleSandbox
+from app.generation.workflow.nodes import _back_bodies, _front_bodies
+from app.generation.workflow.runtime import _error_details, _pending_rules, _resolve_budget, _specs
 from app.infra.db_tables import (
     ApprovalModel,
     ArtifactModel,

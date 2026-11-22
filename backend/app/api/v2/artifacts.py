@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
 from app.catalog.code_sets.bindings import code_set_compile_bindings, load_published_code_sets
-from app.engine.compiler import compile_where
-from app.engine.rules import RuleValidationError, validate_rule
+from app.generation.sql.compiler import compile_where
+from app.generation.core.rules import RuleValidationError, validate_rule
 from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
