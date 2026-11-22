@@ -356,6 +356,8 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             status="FAILED",
             current_node=payload.get("node", state.current_node),
             result_json=payload.get("result"),
+            resume_from_node=payload.get("resume_from_node") or state.resume_from_node,
+            resume_when=payload.get("resume_when") or state.resume_when,
         )
     if kind == "RUN_CANCELLED":
         return replace(
@@ -363,6 +365,8 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             status="FAILED",
             current_node=payload.get("node", state.current_node),
             result_json=payload.get("result") or {"error": payload.get("reason", "Run cancelled"), "cancelled": True},
+            resume_from_node=payload.get("resume_from_node") or state.resume_from_node,
+            resume_when=payload.get("resume_when") or state.resume_when,
         )
     if kind == "RUN_RESUMED":
         resume_node = payload.get("resume_from_node") or state.resume_from_node

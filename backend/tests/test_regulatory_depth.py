@@ -568,7 +568,330 @@ def test_version_diff_documents_and_run_rules_diff():
     rdiff = diff_runs(session, r1.id, r2.id)
     assert rdiff["summary"] == {"added": 1, "removed": 1, "modified": 1, "unchanged": 0}
     assert rdiff["added"][0]["rule_key"] == "R_RPTNO_UNIQ"
-    assert "EXISTS" in (rdiff["added"][0]["sql"] or "")
+    assert "COUNT(*)" in (rdiff["added"][0]["sql"] or "")
     assert rdiff["removed"][0]["rule_key"] == "R_LEGACY_REQ"
     assert rdiff["modified"][0]["rule_key"] == "R_AMT_RANGE"
     assert any(c["attr"] == "sql" for c in rdiff["modified"][0]["changes"])
+
+
+def test_policy_rules_compiler_deep_audit_fixes():
+    """回归：Layer 2 policy + Layer 5 rules/compiler/binding + Layer 6 production 深审修复。"""
+    import sqlite3
+    from app.delivery.production import compile_production_rule_query, sql_literal
+    from app.engine.binding import violates_arithmetic_balance
+    from app.engine.compiler import compile_where
+    from app.infra.domain import Evidence
+    from app.kernel.event_log import RunState
+    from app.policy.regops_bus import (
+        code_set_values_adjudicator,
+        cross_table_adjudicator,
+    )
+    from app.policy.regops_plan import _apply
+
+    spec = _account_balance_spec()
+    ev = Evidence(section="6.1", page="1", field="RPTNO", quote="申报号码")
+
+    # 1) UNIQUE_KEY 生产 SQL 绝不引用沙箱专属的 record_id 列，可在无 record_id 的真实生产表上直接执行
+    uniq_rule = RuleDefinition(
+        rule_key="R_PROD_UNIQ",
+        table_code=spec.table_code,
+        field="RPTNO",
+        operator="UNIQUE_KEY",
+        params={"key_fields": ["RPTNO"]},
+        source="DOC_EXPLICIT",
+        evidence=ev,
+        rationale="主键唯一",
+    )
+    prod_sql = compile_production_rule_query(uniq_rule, "oracle")
+    assert "record_id" not in prod_sql.lower()
+    assert "COUNT(*)" in prod_sql
+    # 在没有 record_id 列的真 SQLite 生产结构表上执行验证
+    conn = sqlite3.connect(":memory:")
+    conn.execute(f'CREATE TABLE "{spec.table_code}" ("RPTNO" TEXT)')
+    conn.executemany(f'INSERT INTO "{spec.table_code}" ("RPTNO") VALUES (?)', [("OK1",), ("DUP",), ("DUP",)])
+    rows = conn.execute(prod_sql).fetchall()
+    assert len(rows) == 2 and all(r[1] == "DUP" for r in rows)
+
+    # 2) ARITHMETIC_BALANCE GT / LT 容差方向：tol=0.01 放宽浮点误差而非收紧导致误报
+    gt_params = {"terms": [{"field": "OPEN_BAL", "coef": 1}], "operator": "GT", "target_field": "CLOSE_BAL", "tolerance": 0.01}
+    assert violates_arithmetic_balance(gt_params, {"OPEN_BAL": 100.005, "CLOSE_BAL": 100.0}) is False
+    assert violates_arithmetic_balance(gt_params, {"OPEN_BAL": 99.98, "CLOSE_BAL": 100.0}) is True
+    lt_params = {"terms": [{"field": "OPEN_BAL", "coef": 1}], "operator": "LT", "target_field": "CLOSE_BAL", "tolerance": 0.01}
+    assert violates_arithmetic_balance(lt_params, {"OPEN_BAL": 99.995, "CLOSE_BAL": 100.0}) is False
+    assert violates_arithmetic_balance(lt_params, {"OPEN_BAL": 100.02, "CLOSE_BAL": 100.0}) is True
+    gt_where, _ = compile_where(
+        RuleDefinition(
+            rule_key="R_GT", table_code=spec.table_code, field="OPEN_BAL",
+            operator="ARITHMETIC_BALANCE", params=gt_params, source="AI_EXPANDED",
+            evidence=Evidence(section="6.1", page="1", field="OPEN_BAL", quote="期初余额"), rationale="gt",
+        ),
+        "oracle",
+    )
+    assert "<= ((t.\"CLOSE_BAL\") - :bal_tol)" in gt_where
+
+    # 3) COND_VALUE(ENUM) 在 Oracle 下超过 1000 项自动切片避开 ORA-01795
+    big_cond = RuleDefinition(
+        rule_key="R_BIG_COND",
+        table_code=spec.table_code,
+        field="TXCCY",
+        operator="COND_VALUE",
+        params={
+            "if_field": "IS_DOMESTIC",
+            "if_operator": "EQ",
+            "if_values": ["Y"],
+            "then_operator": "ENUM",
+            "then_values": [f"C{i:04d}" for i in range(1205)],
+        },
+        source="AI_EXPANDED",
+        evidence=Evidence(section="6.1", page="1", field="TXCCY", quote="币种"),
+        rationale="big enum",
+    )
+    big_where, big_params = compile_where(big_cond, "oracle")
+    assert big_where.count("NOT IN (") == 2
+    assert len(big_params) == 1206  # 1205 then_val + 1 if_value_0
+
+    # 4) rules.py 严格校验：非数字 length、非有限 NaN/Inf、空区间 10 < x < 10、自引用 COND_REQUIRED、非数值列 NUM_RANGE
+    for bad_op, bad_field, bad_params in [
+        ("LENGTH_MAX", "TXCCY", {"length": "not_int"}),
+        ("COND_REQUIRED", "TXCCY", {"if_field": "TXCCY", "if_operator": "EQ", "if_values": ["CNY"]}),
+        ("NUM_RANGE", "TXCCY", {"min": 0, "max": 10}),
+        ("NUM_RANGE", "OPEN_BAL", {"min": 10, "max": 10, "min_inclusive": False}),
+        ("NUM_RANGE", "OPEN_BAL", {"min": float("nan")}),
+    ]:
+        with pytest.raises(RuleValidationError):
+            validate_rule(
+                RuleDefinition(
+                    rule_key="R_BAD",
+                    table_code=spec.table_code,
+                    field=bad_field,
+                    operator=bad_op,
+                    params=bad_params,
+                    source="AI_EXPANDED",
+                    evidence=Evidence(section="6.1", page="1", field=bad_field, quote="q"),
+                    rationale="bad",
+                ),
+                spec,
+            )
+    with pytest.raises(ValueError, match="Non-finite"):
+        sql_literal(float("inf"))
+
+    # 5) regops_bus.py：published_code_sets 映射覆盖 assign_rules（含 COND_VALUE.ENUM）+ golden_overrides 跨表字段拦截
+    cs_reason = code_set_values_adjudicator(
+        "assign_rules",
+        {
+            "rules": [
+                {
+                    "field": "TXCCY",
+                    "operator": "COND_VALUE",
+                    "params": {"if_field": "IS_DOMESTIC", "if_operator": "EQ", "if_values": ["Y"], "then_operator": "ENUM", "then_values": ["FAKE_CCY"]},
+                }
+            ]
+        },
+        {"published_code_sets": {"TXCCY": {"code": "CCY", "values": ["CNY", "USD"]}}},
+    )
+    assert cs_reason is not None and "FAKE_CCY" in cs_reason
+
+    ct_reason = cross_table_adjudicator(
+        "assign_rules",
+        {"rules": [], "golden_overrides": {"T1": {"GHOST_COL": "1"}}},
+        {"table_codes": ["T1"], "table_fields": {"T1": ["REAL_COL"]}},
+    )
+    assert ct_reason is not None and "GHOST_COL" in ct_reason
+
+    # 6) regops_plan._apply：RUN_FAILED / RUN_CANCELLED 保留显式传入的 resume_from_node 与 resume_when
+    st = _apply(
+        RunState(status="RUNNING", current_node="rule_binder", resume_from_node="created", resume_when="always"),
+        "RUN_FAILED",
+        {"node": "rule_binder", "result": {"error": "boom"}, "resume_from_node": "schema_mapper", "resume_when": "always"},
+    )
+    assert st.status == "FAILED" and st.resume_from_node == "schema_mapper"
+
+
+def test_oracle_module_deep_audit_fixes(monkeypatch):
+    """回归：oracle.py 深审修复（128 字节表名截断防 ORA-00972、Oracle/MySQL 精度与宽表 Error 1118 保护、Decimal(38,s)/NUMBER(4,4) 与 AL32UTF8 4000 字节防 ORA-01438/ORA-12899、Oracle 幂等重试 + executemany 批量写入 + CLOB preview）。"""
+    from decimal import Decimal
+    from types import SimpleNamespace
+    import app.engine.oracle as oracle_mod
+    from app.engine.oracle import (
+        GenericOracleExecutor,
+        OracleSandbox,
+        _fit_number,
+        compile_ai_schema_mysql_ddl,
+        compile_ai_schema_oracle_ddl,
+        fit_record_values,
+        fit_sandbox_values,
+        physical_table_name,
+    )
+    from app.infra.domain import AuditCaseBinding, FieldSpec, SchemaBinding, SpecDocument
+
+    # 1) 超长表名自动哈希压缩，拼接 _TARGET 后仍严格 <= 128 字节（防 ORA-00972）
+    long_code = "SAFE_" + "A" * 130
+    phys = physical_table_name("12345678-1234-1234-1234-1234567890ab", 1, long_code)
+    assert len(phys) <= 120
+    assert len(f"{phys}_TARGET") <= 128
+    assert phys != physical_table_name("12345678-1234-1234-1234-1234567890ab", 1, long_code[:-1] + "B")
+
+    # 2) Oracle NUMBER(p,s) / VARCHAR2(>4000 -> CLOB) 与 MySQL DECIMAL(65,30) / VARCHAR(>16383 -> TEXT) + 宽表防 Error 1118
+    schemas = [
+        SchemaBinding(field="HUGE_NUM", storage_type="NUMBER", length=50, decimal_places=40),
+        SchemaBinding(field="HUGE_TXT", storage_type="TEXT", length=5000, decimal_places=0),
+    ]
+    o_ddl = compile_ai_schema_oracle_ddl("T_O", schemas)
+    assert "NUMBER(38,38)" in o_ddl
+    assert '"HUGE_TXT" CLOB NULL' in o_ddl
+    m_ddl = compile_ai_schema_mysql_ddl("T_M", [
+        SchemaBinding(field="HUGE_NUM", storage_type="NUMBER", length=80, decimal_places=40),
+        SchemaBinding(field="HUGE_TXT", storage_type="TEXT", length=20000, decimal_places=0),
+    ])
+    assert "DECIMAL(65,30)" in m_ddl
+    assert "`HUGE_TXT` TEXT NULL" in m_ddl
+    # 40 列 VARCHAR(500) 在 utf8mb4 下 80000B > 65535B，自动把超预算宽列升格 TEXT 防 MySQL Error 1118
+    wide_mysql_ddl = compile_ai_schema_mysql_ddl(
+        "T_WIDE",
+        [SchemaBinding(field=f"COL_{i}", storage_type="TEXT", length=500, decimal_places=0) for i in range(40)],
+    )
+    assert "TEXT NULL" in wide_mysql_ddl
+
+    # 3) _fit_number：千分位逗号、NUMBER(4,4) 零整数位不超 0.9999、NUMBER(38,2) 超 28 位 Decimal 精度不炸 ORA-01438
+    assert _fit_number("1,234.56", 12, 2) == Decimal("1234.56")
+    assert _fit_number("5.1234", 4, 4) == Decimal("0.9999")
+    huge_val = _fit_number("9" * 40 + ".99", 50, 2)
+    assert huge_val == Decimal("9" * 36 + ".99")
+
+    # 4) fit_record_values：spec.length 为 None 时按 schema_length 截断；_fit_text 与 fit_sandbox_values 均守 AL32UTF8 4000 字节上限
+    spec = _account_balance_spec()
+    no_len_spec = SpecDocument(
+        version="TEST",
+        table_code="T_NOLEN",
+        table_name="无长度测试",
+        source_name="s.pdf",
+        source_sha256="0" * 64,
+        section="1",
+        fields=[
+            FieldSpec(name="NOTE", content="备注", data_type="VARCHAR", length=0, evidence_page="1"),
+            FieldSpec(name="CN_BIG", content="大中文", data_type="VARCHAR", length=2000, evidence_page="1"),
+        ],
+        terms_text="",
+        dictionary_text="",
+    )
+    fitted_rec = fit_record_values(no_len_spec, {"NOTE": 10, "CN_BIG": 2000}, {"NOTE": "a" * 30, "CN_BIG": "中" * 1800})
+    assert len(fitted_rec["NOTE"]) == 10
+    assert len(fitted_rec["CN_BIG"].encode("utf-8")) <= 4000
+    fitted_cn = fit_sandbox_values(spec, {"RPTNO": "中" * 2000})["RPTNO"]
+    assert len(fitted_cn.encode("utf-8")) <= 4000
+
+    # 5) 模拟真实 Oracle 方言：验证 prepare_assets / execute 幂等 DROP TABLE ... PURGE（忽略 ORA-00942）、
+    #    DELETE FROM 清旧行（防 ORA-00001）以及码表/黄金/变异全部走 executemany 批量列表，加上 CLOB preview 自动 read()
+    executed_log = []
+
+    class _FakeResult:
+        def __init__(self, rows=None):
+            self._rows = rows or []
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def mappings(self):
+            return SimpleNamespace(all=lambda: list(self._rows))
+
+    class _FakeOracleConn:
+        dialect = SimpleNamespace(name="oracle")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            executed_log.append((sql, params))
+            if sql.startswith("DROP TABLE") and len(executed_log) == 1:
+                raise RuntimeError("ORA-00942: table or view does not exist")
+            if sql.startswith("SELECT * FROM"):
+                fake_lob = SimpleNamespace(read=lambda: "clob-text")
+                return _FakeResult([{"record_id": "R1", "HUGE_TXT": fake_lob}])
+            return _FakeResult([])
+
+    class _FakeOracleEngine:
+        def begin(self):
+            return _FakeOracleConn()
+
+        def connect(self):
+            return _FakeOracleConn()
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(oracle_mod, "create_engine", lambda *a, **kw: _FakeOracleEngine())
+    executor = GenericOracleExecutor("oracle+oracledb://mock")
+    table_schemas = {
+        spec.table_code: [
+            SchemaBinding(
+                field=f.name,
+                storage_type="NUMBER" if f.data_type == "NUMBER" else "TEXT",
+                length=f.length or 64,
+                decimal_places=f.decimal_places or 0,
+            )
+            for f in spec.fields
+        ]
+    }
+    code_sets = [
+        {
+            "code": "CCY",
+            "version": "v1",
+            "values": [
+                {"value": "CNY", "label_cn": "人民币"},
+                {"value": "USD", "label_cn": "美元"},
+                {"value": "EUR", "label_cn": "欧元"},
+            ],
+        }
+    ]
+    prepared = executor.prepare_assets("run-idem-001", 1, [spec], table_schemas, code_sets=code_sets, rules=[])
+    drop_stmts = [sql for sql, _ in executed_log if sql.startswith("DROP TABLE") and sql.endswith("PURGE")]
+    assert len(drop_stmts) == 3  # 码表 + TARGET + 沙箱表，且首次 ORA-00942 被安全忽略
+    cs_inserts = [params for sql, params in executed_log if sql.startswith("INSERT INTO") and isinstance(params, list)]
+    assert len(cs_inserts) == 1 and len(cs_inserts[0]) == 3  # 码表一次性 executemany 批量写入
+
+    executed_log.clear()
+    golden = {
+        spec.table_code: {
+            "RPTNO": "20260101000001",
+            "CUSTYPE": "D",
+            "IDCODE": "110101199001011234",
+            "TXCCY": "USD",
+            "IS_DOMESTIC": "N",
+            "OPEN_BAL": 1000,
+            "CREDIT_AMT": 500,
+            "DEBIT_AMT": 200,
+            "CLOSE_BAL": 1300,
+        }
+    }
+    cases = {
+        spec.table_code: [
+            AuditCaseBinding(case_id="GOLDEN_BASELINE", overrides={}, expected_rule_keys=[]),
+            AuditCaseBinding(case_id="MUT_1", overrides={"TXCCY": "CNY"}, expected_rule_keys=[]),
+        ]
+    }
+    rep = executor.execute(
+        "run-idem-001",
+        1,
+        [spec],
+        table_schemas,
+        golden,
+        cases,
+        [],
+        golden_counts={spec.table_code: 3},
+        prepared_assets=prepared,
+    )
+    assert rep["all_passed"] is True
+    delete_stmts = [sql for sql, _ in executed_log if sql.startswith("DELETE FROM")]
+    assert len(delete_stmts) == 2  # TARGET + 沙箱表均先清旧行，重复 execute 幂等防 ORA-00001
+    batch_inserts = [params for sql, params in executed_log if sql.startswith("INSERT INTO") and isinstance(params, list)]
+    assert [len(b) for b in batch_inserts] == [3, 2]  # 3 条黄金 + 2 条审计用例分别单次批量 executemany
+
+    # CLOB preview 自动 read()
+    preview_rows = OracleSandbox("oracle+oracledb://mock").preview("T_CLOB", limit=5)
+    assert preview_rows == [{"record_id": "R1", "HUGE_TXT": "clob-text"}]
+
+

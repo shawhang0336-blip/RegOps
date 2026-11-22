@@ -150,6 +150,38 @@ def _compile_condition_predicate(
     return f"({condition_field} IS NOT NULL AND {cmp_expr})"
 
 
+def _compile_in_list(
+    field: str,
+    values: list,
+    *,
+    negate: bool,
+    dialect: str,
+    params: Dict[str, Any],
+    key_prefix: str,
+) -> str:
+    """编译 IN / NOT IN 列表条件：Oracle 超过 1000 项自动切片（避开 ORA-01795）并加括号保优先级。"""
+    operator = "NOT IN" if negate else "IN"
+    chunk_size = 1000
+    if dialect == "oracle" and len(values) > chunk_size:
+        chunks = [values[index : index + chunk_size] for index in range(0, len(values), chunk_size)]
+        parts = []
+        for chunk_index, chunk in enumerate(chunks):
+            names = []
+            for value_index, value in enumerate(chunk):
+                key = f"{key_prefix}_{chunk_index}_{value_index}"
+                params[key] = value
+                names.append(f":{key}")
+            parts.append(f"{field} {operator} ({', '.join(names)})")
+        joiner = " AND " if negate else " OR "
+        return f"({joiner.join(parts)})"
+    names = []
+    for index, value in enumerate(values):
+        key = f"{key_prefix}_{index}"
+        params[key] = value
+        names.append(f":{key}")
+    return f"{field} {operator} ({', '.join(names)})"
+
+
 def compile_where(
     rule: RuleDefinition,
     dialect: str = "mysql",
@@ -178,28 +210,10 @@ def compile_where(
                     f"WHERE c.{code_value_col} = {field} AND c.{enabled_col} = 1))",
                     params,
                 )
-        operator = "NOT IN" if rule.operator == "ENUM" else "IN"
-        null_guard = f"{field} IS NOT NULL AND " if rule.operator == "ENUM" else ""
-        # Oracle IN 列表硬上限 1000 项：超出时按 1000 切片，用 AND/OR 连接
-        chunk_size = 1000
-        if dialect == "oracle" and len(values) > chunk_size:
-            chunks = [values[index : index + chunk_size] for index in range(0, len(values), chunk_size)]
-            parts = []
-            for chunk_index, chunk in enumerate(chunks):
-                names = []
-                for value_index, value in enumerate(chunk):
-                    key = f"value_{chunk_index}_{value_index}"
-                    params[key] = value
-                    names.append(f":{key}")
-                parts.append(f"{field} {operator} ({', '.join(names)})")
-            joiner = " AND " if rule.operator == "ENUM" else " OR "
-            return f"({null_guard}{joiner.join(parts)})", params
-        names = []
-        for index, value in enumerate(values):
-            key = f"value_{index}"
-            params[key] = value
-            names.append(f":{key}")
-        return f"({null_guard}{field} {operator} ({', '.join(names)}))", params
+        negate = rule.operator == "ENUM"
+        null_guard = f"{field} IS NOT NULL AND " if negate else ""
+        in_expr = _compile_in_list(field, values, negate=negate, dialect=dialect, params=params, key_prefix="value")
+        return f"({null_guard}{in_expr})", params
     if rule.operator == "COND_REQUIRED":
         cond_expr = _compile_condition_predicate(params, rule.params, dialect)
         return f"({cond_expr} AND {missing_text(field, dialect)})", params
@@ -210,14 +224,15 @@ def compile_where(
             return f"({cond_expr} AND NOT {missing_text(field, dialect)})", params
         if then_op in {"ENUM", "NOT_IN"}:
             then_vals = list(rule.params.get("then_values") or rule.params.get("values") or [])
-            names = []
-            for idx, val in enumerate(then_vals):
-                key = f"then_val_{idx}"
-                params[key] = val
-                names.append(f":{key}")
-            if then_op == "ENUM":
-                return f"({cond_expr} AND {field} IS NOT NULL AND {field} NOT IN ({', '.join(names)}))", params
-            return f"({cond_expr} AND {field} IS NOT NULL AND {field} IN ({', '.join(names)}))", params
+            in_expr = _compile_in_list(
+                field,
+                then_vals,
+                negate=(then_op == "ENUM"),
+                dialect=dialect,
+                params=params,
+                key_prefix="then_val",
+            )
+            return f"({cond_expr} AND {field} IS NOT NULL AND {in_expr})", params
         if then_op == "NUM_RANGE":
             bounds = []
             min_v = rule.params.get("min")
@@ -264,9 +279,9 @@ def compile_where(
         elif balance_op == "LE":
             breach = f"({lhs_expr}) > (({rhs_expr}) + :bal_tol)"
         elif balance_op == "GT":
-            breach = f"({lhs_expr}) <= (({rhs_expr}) + :bal_tol)"
+            breach = f"({lhs_expr}) <= (({rhs_expr}) - :bal_tol)"
         elif balance_op == "LT":
-            breach = f"({lhs_expr}) >= (({rhs_expr}) - :bal_tol)"
+            breach = f"({lhs_expr}) >= (({rhs_expr}) + :bal_tol)"
         else:
             raise ValueError(f"Unsupported ARITHMETIC_BALANCE operator: {balance_op}")
         guard_expr = (" AND ".join(dict.fromkeys(guards)) + " AND ") if guards else ""
@@ -275,14 +290,14 @@ def compile_where(
         key_fields = list(dict.fromkeys(rule.params.get("key_fields") or [rule.field]))
         table = (physical_tables or {}).get(rule.table_code, rule.table_code)
         table_ident = quote_identifier(table, dialect)
-        rec_col = quote_identifier("record_id", dialect)
         not_null_guards = " AND ".join(f"t.{quote_identifier(kf, dialect)} IS NOT NULL" for kf in key_fields)
         join_conds = " AND ".join(
             f"d.{quote_identifier(kf, dialect)} = t.{quote_identifier(kf, dialect)}" for kf in key_fields
         )
+        # 使用标准 COUNT(*) > 1 判重，不依赖沙箱专属的 record_id 列，确保导出的生产 SQL 可直接跑在银行真实业务表上
         return (
-            f"({not_null_guards} AND EXISTS "
-            f"(SELECT 1 FROM {table_ident} d WHERE {join_conds} AND d.{rec_col} <> t.{rec_col}))",
+            f"({not_null_guards} AND "
+            f"(SELECT COUNT(*) FROM {table_ident} d WHERE {join_conds}) > 1)",
             params,
         )
     if rule.operator in {"LENGTH", "LENGTH_MAX"}:

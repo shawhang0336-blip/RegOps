@@ -1,3 +1,4 @@
+import math
 import re
 from typing import Any, Dict, Iterable, List
 
@@ -120,8 +121,11 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
     if rule.field not in fields:
         raise RuleValidationError(f"Unknown field: {rule.field}")
     if rule.operator == "COND_REQUIRED":
-        if rule.params.get("if_field") not in fields:
+        if_field = rule.params.get("if_field")
+        if if_field not in fields:
             raise RuleValidationError("Unknown condition field")
+        if if_field == rule.field:
+            raise RuleValidationError("COND_REQUIRED cannot condition a field on itself")
         if rule.params.get("if_operator") not in {"EQ", "NE"}:
             raise RuleValidationError("Unsupported condition operator")
         if not rule.params.get("if_values"):
@@ -157,8 +161,13 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
                 max_f = float(max_v) if max_v is not None else None
             except (TypeError, ValueError) as exc:
                 raise RuleValidationError("COND_VALUE(NUM_RANGE) bounds must be numeric") from exc
-            if min_f is not None and max_f is not None and min_f > max_f:
-                raise RuleValidationError("COND_VALUE(NUM_RANGE) min cannot exceed max")
+            if (min_f is not None and not math.isfinite(min_f)) or (max_f is not None and not math.isfinite(max_f)):
+                raise RuleValidationError("COND_VALUE(NUM_RANGE) bounds must be finite numbers")
+            if min_f is not None and max_f is not None:
+                min_inc = bool(rule.params.get("min_inclusive", True))
+                max_inc = bool(rule.params.get("max_inclusive", True))
+                if min_f > max_f or (min_f == max_f and (not min_inc or not max_inc)):
+                    raise RuleValidationError("COND_VALUE(NUM_RANGE) interval is empty or min exceeds max")
     if rule.operator == "ARITHMETIC_BALANCE":
         terms = rule.params.get("terms")
         if not isinstance(terms, list) or not terms:
@@ -179,8 +188,8 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
                 coef = float(term.get("coef", 1))
             except (TypeError, ValueError) as exc:
                 raise RuleValidationError(f"Invalid coef for term {tf}") from exc
-            if coef == 0:
-                raise RuleValidationError(f"ARITHMETIC_BALANCE term coef cannot be 0: {tf}")
+            if not math.isfinite(coef) or coef == 0:
+                raise RuleValidationError(f"ARITHMETIC_BALANCE term coef must be finite and non-zero: {tf}")
             term_fields.add(tf)
         target_field = rule.params.get("target_field")
         target_value = rule.params.get("target_value")
@@ -195,16 +204,18 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
                 raise RuleValidationError("ARITHMETIC_BALANCE single-term 1*X vs X is trivial")
         if target_value is not None:
             try:
-                float(target_value)
+                tv_f = float(target_value)
             except (TypeError, ValueError) as exc:
                 raise RuleValidationError("ARITHMETIC_BALANCE target_value must be numeric") from exc
+            if not math.isfinite(tv_f):
+                raise RuleValidationError("ARITHMETIC_BALANCE target_value must be finite")
         if rule.params.get("tolerance") is not None:
             try:
                 tol = float(rule.params["tolerance"])
             except (TypeError, ValueError) as exc:
                 raise RuleValidationError("ARITHMETIC_BALANCE tolerance must be numeric") from exc
-            if tol < 0:
-                raise RuleValidationError("ARITHMETIC_BALANCE tolerance cannot be negative")
+            if not math.isfinite(tol) or tol < 0:
+                raise RuleValidationError("ARITHMETIC_BALANCE tolerance must be finite and non-negative")
         participants = set(term_fields)
         if target_field:
             participants.add(target_field)
@@ -221,9 +232,16 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
             raise RuleValidationError("UNIQUE_KEY rule.field must be included in key_fields")
     if rule.operator in {"ENUM", "NOT_IN"} and not rule.params.get("values"):
         raise RuleValidationError("Enum values cannot be empty")
-    if rule.operator in {"LENGTH", "LENGTH_MAX"} and int(rule.params.get("length", 0)) <= 0:
-        raise RuleValidationError("Length must be positive")
+    if rule.operator in {"LENGTH", "LENGTH_MAX"}:
+        try:
+            length_val = int(rule.params.get("length", 0))
+        except (TypeError, ValueError) as exc:
+            raise RuleValidationError("Length must be a positive integer") from exc
+        if length_val <= 0:
+            raise RuleValidationError("Length must be positive")
     if rule.operator == "NUM_RANGE":
+        if (fields[rule.field].data_type or "").upper() != "NUMBER":
+            raise RuleValidationError(f"NUM_RANGE requires numeric field: {rule.field}")
         min_value = rule.params.get("min")
         max_value = rule.params.get("max")
         if min_value is None and max_value is None:
@@ -233,8 +251,15 @@ def validate_rule(rule: RuleDefinition, spec: SpecDocument) -> None:
             max_float = float(max_value) if max_value is not None else None
         except (TypeError, ValueError) as exc:
             raise RuleValidationError("NUM_RANGE bounds must be numeric") from exc
-        if min_float is not None and max_float is not None and min_float > max_float:
-            raise RuleValidationError("NUM_RANGE min cannot exceed max")
+        if (min_float is not None and not math.isfinite(min_float)) or (
+            max_float is not None and not math.isfinite(max_float)
+        ):
+            raise RuleValidationError("NUM_RANGE bounds must be finite numbers")
+        if min_float is not None and max_float is not None:
+            min_inc = bool(rule.params.get("min_inclusive", True))
+            max_inc = bool(rule.params.get("max_inclusive", True))
+            if min_float > max_float or (min_float == max_float and (not min_inc or not max_inc)):
+                raise RuleValidationError("NUM_RANGE interval is empty or min exceeds max")
     if rule.operator == "FIELD_COMPARE":
         right_name = rule.params.get("right_field")
         if right_name not in fields:

@@ -1,3 +1,4 @@
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,8 @@ def sql_literal(value: Any) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"Non-finite numeric SQL literal is not allowed: {value}")
         return str(value)
     return "'" + str(value).replace("'", "''") + "'"
 

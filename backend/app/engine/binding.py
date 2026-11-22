@@ -421,9 +421,9 @@ def violates_arithmetic_balance(params: Dict[str, Any], record: Dict[str, Any]) 
     if balance_op == "LE":
         return lhs > (rhs + tol)
     if balance_op == "GT":
-        return lhs <= (rhs + tol)
+        return lhs <= (rhs - tol)
     if balance_op == "LT":
-        return lhs >= (rhs - tol)
+        return lhs >= (rhs + tol)
     return None
 
 

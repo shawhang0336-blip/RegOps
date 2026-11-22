@@ -30,7 +30,11 @@ def field_whitelist_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """字段名白名单门禁：所有字段名槽位必须来自 payload.field_names（或 payload.table.field_names）。"""
-    allowed = payload.get("field_names") or (payload.get("table") or {}).get("field_names")
+    safe_payload = payload if isinstance(payload, dict) else {}
+    table_obj = safe_payload.get("table")
+    allowed = safe_payload.get("field_names") or (
+        table_obj.get("field_names") if isinstance(table_obj, dict) else None
+    )
     if not allowed:
         return None
     allowed_set = set(allowed)
@@ -53,7 +57,7 @@ def field_whitelist_adjudicator(
         for scope in scopes:
             for key in _FIELD_ARG_KEYS:
                 value = scope.get(key)
-                if value is not None and value not in allowed_set:
+                if value is not None and (not isinstance(value, str) or value not in allowed_set):
                     return (
                         f"字段幻觉拦截：参数 `{key}='{value}'` 不在字段白名单 "
                         f"{sorted(allowed_set)} 中"
@@ -62,7 +66,11 @@ def field_whitelist_adjudicator(
             terms = scope.get("terms")
             if isinstance(terms, list):
                 for term in terms:
-                    if isinstance(term, dict) and term.get("field") is not None and term.get("field") not in allowed_set:
+                    if (
+                        isinstance(term, dict)
+                        and term.get("field") is not None
+                        and (not isinstance(term.get("field"), str) or term.get("field") not in allowed_set)
+                    ):
                         return (
                             f"字段幻觉拦截：算术项 `terms.field='{term.get('field')}'` "
                             f"不在字段白名单 {sorted(allowed_set)} 中"
@@ -70,7 +78,7 @@ def field_whitelist_adjudicator(
             key_fields = scope.get("key_fields")
             if isinstance(key_fields, list):
                 for kf in key_fields:
-                    if kf is not None and kf not in allowed_set:
+                    if kf is not None and (not isinstance(kf, str) or kf not in allowed_set):
                         return (
                             f"字段幻觉拦截：唯一键字段 `key_fields` 包含不在白名单中的 `{kf}` "
                             f"{sorted(allowed_set)}"
@@ -94,20 +102,22 @@ def cross_table_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
     """跨表引用门禁：references_table / references_field / table_code / golden_overrides 必须在已确认表与字段白名单内。"""
-    allowed = payload.get("table_codes") or payload.get("selected_table_codes")
+    safe_payload = payload if isinstance(payload, dict) else {}
+    allowed = safe_payload.get("table_codes") or safe_payload.get("selected_table_codes")
     if not allowed:
         return None
     allowed_set = set(allowed)
-    table_fields = payload.get("table_fields") or {}
+    table_fields = safe_payload.get("table_fields") or {}
     for candidate in args.get("rules", []) or []:
         if not isinstance(candidate, dict):
             continue
-        params = candidate.get("params") or {}
-        for key in ("references_table", "table_code"):
-            value = candidate.get(key) or (params.get(key) if isinstance(params, dict) else None)
-            if value is not None and value not in allowed_set:
-                return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {sorted(allowed_set)} 中"
-        if isinstance(params, dict) and table_fields:
+        params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+        for scope in (candidate, params):
+            for key in ("references_table", "table_code"):
+                value = scope.get(key)
+                if value is not None and value not in allowed_set:
+                    return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {sorted(allowed_set)} 中"
+        if params and table_fields:
             ref_table = params.get("references_table")
             ref_field = params.get("references_field")
             if ref_table in table_fields and ref_field is not None and ref_field not in set(table_fields[ref_table]):
@@ -117,9 +127,17 @@ def cross_table_adjudicator(
                 )
     overrides = args.get("golden_overrides")
     if isinstance(overrides, dict):
-        for table_code in overrides:
+        for table_code, field_overrides in overrides.items():
             if table_code not in allowed_set:
                 return f"跨表引用拦截：golden_overrides 表 `{table_code}` 不在已确认表集合 {sorted(allowed_set)} 中"
+            if isinstance(field_overrides, dict) and table_code in table_fields:
+                allowed_cols = set(table_fields[table_code])
+                for col in field_overrides:
+                    if col not in allowed_cols:
+                        return (
+                            f"跨表字段幻觉拦截：golden_overrides[{table_code}] 包含不在目标表白名单中的字段 "
+                            f"`{col}`（允许：{sorted(allowed_cols)}）"
+                        )
     return None
 
 
@@ -145,34 +163,51 @@ def operator_whitelist_adjudicator(
 def code_set_values_adjudicator(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[str]:
-    """已发布码表值域门禁：当 payload 携带 published_code_set 或 published_code_sets 时，ENUM 规则与生成器取值不得越界。"""
-    published = payload.get("published_code_set")
-    published_map = payload.get("published_code_sets")
+    """已发布码表值域门禁：覆盖 assign_rules（ENUM 与 COND_VALUE.ENUM）与 assign_generators（单码表与多字段码表映射）。"""
+    safe_payload = payload if isinstance(payload, dict) else {}
+    published = safe_payload.get("published_code_set")
+    published_map = safe_payload.get("published_code_sets")
 
-    if tool_name == "assign_rules" and isinstance(published, dict) and published.get("values"):
-        allowed_values = {str(v) for v in published["values"]}
-        code_name = published.get("code") or "PUBLISHED_CODE_SET"
+    def _resolve_target_code_set(field_name: Any) -> Optional[Dict[str, Any]]:
+        target_cs = None
+        # 存在多字段映射 published_code_sets 时严禁把单字段 published_code_set 误套到未关联码表的其他字段
+        if isinstance(published_map, dict):
+            target_cs = published_map.get(field_name) if field_name is not None else None
+        elif isinstance(published, dict):
+            target_cs = published
+        if isinstance(target_cs, dict) and target_cs.get("values"):
+            return target_cs
+        return None
+
+    if tool_name == "assign_rules":
         for candidate in args.get("rules", []) or []:
-            if not isinstance(candidate, dict) or candidate.get("operator") != "ENUM":
+            if not isinstance(candidate, dict):
                 continue
-            params = candidate.get("params")
-            values = (params.get("values") if isinstance(params, dict) else None) or []
-            if values:
-                invalid = sorted({str(v) for v in values} - allowed_values)
-                if invalid:
-                    return f"码值白名单拦截：ENUM 参数包含不在已发布码表 {code_name} 中的取值 {invalid}"
+            op = candidate.get("operator")
+            params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+            if op == "ENUM":
+                values = params.get("values") or []
+                label = "ENUM 参数"
+            elif op == "COND_VALUE" and params.get("then_operator") == "ENUM":
+                values = params.get("then_values") or params.get("values") or []
+                label = "COND_VALUE(ENUM) 参数"
+            else:
+                continue
+            target_cs = _resolve_target_code_set(candidate.get("field"))
+            if not target_cs or not values:
+                continue
+            allowed_values = {str(v) for v in target_cs["values"]}
+            code_name = target_cs.get("code") or "PUBLISHED_CODE_SET"
+            invalid = sorted({str(v) for v in values} - allowed_values)
+            if invalid:
+                return f"码值白名单拦截：{label}包含不在已发布码表 {code_name} 中的取值 {invalid}"
 
     if tool_name == "assign_generators":
         for candidate in args.get("generators", []) or []:
             if not isinstance(candidate, dict) or candidate.get("generator") != "ENUM":
                 continue
-            field_name = candidate.get("field")
-            target_cs = None
-            if isinstance(published_map, dict):
-                target_cs = published_map.get(field_name)
-            elif isinstance(published, dict):
-                target_cs = published
-            if not isinstance(target_cs, dict) or not target_cs.get("values"):
+            target_cs = _resolve_target_code_set(candidate.get("field"))
+            if not target_cs:
                 continue
             allowed_values = {str(v) for v in target_cs["values"]}
             code_name = target_cs.get("code") or "PUBLISHED_CODE_SET"
