@@ -110,13 +110,6 @@ class AuditCaseBinding(BaseModel):
     expected_rule_keys: List[str] = Field(default_factory=list)
 
 
-class AuditCase(BaseModel):
-    case_id: str
-    record: Dict[str, Any]
-    expected_rules: List[str]
-    expanded_expectations: Dict[str, List[str]] = Field(default_factory=dict)
-
-
 def field_map(spec: SpecDocument) -> Dict[str, FieldSpec]:
     return {field.name: field for field in spec.fields}
 

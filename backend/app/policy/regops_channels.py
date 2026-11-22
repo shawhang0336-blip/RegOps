@@ -177,40 +177,15 @@ def recover_channels(
         elif kind == "GO_REDIRECT":
             shared["approval_origin"] = payload.get("origin") or "self_heal"
             target_node = payload.get("target") or "rule_binder"
+            # 清理之前方向遗留的自愈报告，避免连续不同方向跳转串味
+            shared.pop("self_heal_report", None)
+            shared.pop("heal_data_report", None)
+            shared.pop("heal_cases_report", None)
             report_uri = (payload.get("failed_result") or {}).get("audit_report_blob") or payload.get("audit_report_blob")
+            loaded_report = None
             if report_uri and blob_store is not None:
                 try:
                     loaded_report = json.loads(blob_store.get(report_uri).decode("utf-8"))
-                    if target_node == "data_generator_binder":
-                        shared["heal_data_report"] = loaded_report
-                        affected = {
-                            c.get("table_code")
-                            for c in loaded_report.get("cases", [])
-                            if c.get("case_kind") == "GOLDEN" and c.get("unexpected_rules") and c.get("table_code")
-                        }
-                        if affected:
-                            for tcode in affected:
-                                shared["table_generators_done"].pop(tcode, None)
-                                shared["table_audit_cases_done"].pop(tcode, None)
-                        else:
-                            shared["table_generators_done"] = {}
-                            shared["table_audit_cases_done"] = {}
-                    elif target_node == "audit_case_binder":
-                        shared["heal_cases_report"] = loaded_report
-                        affected = {
-                            c.get("table_code")
-                            for c in loaded_report.get("cases", [])
-                            if c.get("missing_rules") and c.get("table_code")
-                        }
-                        if affected:
-                            for tcode in affected:
-                                shared["table_audit_cases_done"].pop(tcode, None)
-                        else:
-                            shared["table_audit_cases_done"] = {}
-                    else:
-                        shared["self_heal_report"] = loaded_report
-                        shared["table_generators_done"] = {}
-                        shared["table_audit_cases_done"] = {}
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "断点恢复读取自愈报告失败（run=%s, target=%s, uri=%s）: %s",
@@ -219,6 +194,45 @@ def recover_channels(
                         report_uri,
                         exc,
                     )
+            if target_node == "data_generator_binder":
+                if isinstance(loaded_report, dict):
+                    shared["heal_data_report"] = loaded_report
+                    affected = {
+                        c.get("table_code")
+                        for c in loaded_report.get("cases", [])
+                        if c.get("case_kind") == "GOLDEN" and c.get("unexpected_rules") and c.get("table_code")
+                    }
+                    if affected:
+                        for tcode in affected:
+                            shared["table_generators_done"].pop(tcode, None)
+                            shared["table_audit_cases_done"].pop(tcode, None)
+                    else:
+                        shared["table_generators_done"] = {}
+                        shared["table_audit_cases_done"] = {}
+                else:
+                    # 报告缺失或读取失败时保守清空下游单表缓存，绝不误走 skip_fanout 跳过重造
+                    shared["table_generators_done"] = {}
+                    shared["table_audit_cases_done"] = {}
+            elif target_node == "audit_case_binder":
+                if isinstance(loaded_report, dict):
+                    shared["heal_cases_report"] = loaded_report
+                    affected = {
+                        c.get("table_code")
+                        for c in loaded_report.get("cases", [])
+                        if c.get("missing_rules") and c.get("table_code")
+                    }
+                    if affected:
+                        for tcode in affected:
+                            shared["table_audit_cases_done"].pop(tcode, None)
+                    else:
+                        shared["table_audit_cases_done"] = {}
+                else:
+                    shared["table_audit_cases_done"] = {}
+            else:
+                if isinstance(loaded_report, dict):
+                    shared["self_heal_report"] = loaded_report
+                shared["table_generators_done"] = {}
+                shared["table_audit_cases_done"] = {}
 
     approved_rows = (
         session.query(RuleModel)

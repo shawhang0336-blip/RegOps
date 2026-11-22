@@ -14,14 +14,14 @@ from typing import Any, Dict, List, Optional
 from app.infra.contracts import LLM_OPERATORS
 from app.kernel.bus import Bus, global_bus
 
-# 字段名参数：模型在这些槽位上填错/编造会导致规则、生成器或表结构绑定到不存在的列
+# 单表字段名参数：模型在这些槽位上填错/编造会导致规则、生成器或表结构绑定到不存在的列。
+# 注意：references_field 属于目标表字段，严禁在此用当前表白名单校验（由 cross_table_adjudicator 按目标表白名单裁决）。
 _FIELD_ARG_KEYS = (
     "field",
     "if_field",
     "then_field",
     "right_field",
     "target_field",
-    "references_field",
     "lhs_field",
     "rhs_field",
 )
@@ -117,10 +117,22 @@ def cross_table_adjudicator(
                 value = scope.get(key)
                 if value is not None and value not in allowed_set:
                     return f"跨表引用拦截：{key}='{value}' 不在已确认表集合 {allowed_sorted} 中"
+        if table_fields:
+            src_table = candidate.get("table_code")
+            src_field = candidate.get("field")
+            if src_table in table_fields and src_field is not None and (
+                not isinstance(src_field, str) or src_field not in set(table_fields[src_table])
+            ):
+                return (
+                    f"跨表字段幻觉拦截：源字段 field='{src_field}' "
+                    f"不在源表 {src_table} 字段白名单 {sorted(table_fields[src_table])} 中"
+                )
         if params and table_fields:
             ref_table = params.get("references_table")
             ref_field = params.get("references_field")
-            if ref_table in table_fields and ref_field is not None and ref_field not in set(table_fields[ref_table]):
+            if ref_table in table_fields and ref_field is not None and (
+                not isinstance(ref_field, str) or ref_field not in set(table_fields[ref_table])
+            ):
                 return (
                     f"跨表字段幻觉拦截：references_field='{ref_field}' "
                     f"不在目标表 {ref_table} 字段白名单 {sorted(table_fields[ref_table])} 中"
@@ -206,19 +218,27 @@ def code_set_values_adjudicator(
 
     if tool_name == "assign_generators":
         for candidate in args.get("generators", []) or []:
-            if not isinstance(candidate, dict) or candidate.get("generator") != "ENUM":
+            if not isinstance(candidate, dict):
+                continue
+            gen_kind = candidate.get("generator")
+            if gen_kind not in {"ENUM", "FIXED"}:
                 continue
             target_cs = _resolve_target_code_set(candidate.get("field"))
             if not target_cs:
                 continue
             allowed_values = {str(v) for v in target_cs["values"]}
             code_name = target_cs.get("code") or "PUBLISHED_CODE_SET"
-            params = candidate.get("params")
-            values = (params.get("values") if isinstance(params, dict) else None) or []
-            if values:
-                invalid = sorted({str(v) for v in values} - allowed_values)
-                if invalid:
-                    return f"码值白名单拦截：ENUM 生成器包含不在已发布码表 {code_name} 中的取值 {invalid}"
+            params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+            if gen_kind == "ENUM":
+                values = params.get("values") or []
+                if values:
+                    invalid = sorted({str(v) for v in values} - allowed_values)
+                    if invalid:
+                        return f"码值白名单拦截：ENUM 生成器包含不在已发布码表 {code_name} 中的取值 {invalid}"
+            elif gen_kind == "FIXED":
+                fixed_val = params.get("value")
+                if fixed_val is not None and fixed_val != "" and str(fixed_val) not in allowed_values:
+                    return f"码值白名单拦截：FIXED 生成器取值 '{fixed_val}' 不在已发布码表 {code_name} 中"
     return None
 
 

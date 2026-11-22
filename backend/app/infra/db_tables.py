@@ -13,9 +13,14 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infra.db import Base
+
+# MySQL 8 的普通 TEXT 上限仅 65,535 字节（约 2 万汉字），大码表与整章原文必触发 Error 1406；
+# 使用方言变体在 MySQL 下映射为 LONGTEXT（4GB 上限），Oracle/SQLite 保持原方言大文本类型。
+_LONG_TEXT = Text().with_variant(LONGTEXT(), "mysql")
 
 
 # =============================================================================
@@ -28,7 +33,7 @@ class SpecificationModel(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     version: Mapped[str] = mapped_column(String(32), index=True)
-    table_code: Mapped[str] = mapped_column(String(64), index=True)
+    table_code: Mapped[str] = mapped_column(String(96), index=True)
     source_name: Mapped[str] = mapped_column(String(255))
     source_sha256: Mapped[str] = mapped_column(String(64), index=True)
     content_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
@@ -42,8 +47,8 @@ class RuleModel(Base):
     row_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(36), index=True)
     spec_id: Mapped[str] = mapped_column(String(36), index=True)
-    table_code: Mapped[str] = mapped_column(String(64), index=True)
-    rule_key: Mapped[str] = mapped_column(String(96), index=True)
+    table_code: Mapped[str] = mapped_column(String(96), index=True)
+    rule_key: Mapped[str] = mapped_column(String(192), index=True)
     rule_hash: Mapped[str] = mapped_column(String(64))
     source: Mapped[str] = mapped_column(String(24))
     status: Mapped[str] = mapped_column(String(24), index=True)
@@ -126,7 +131,7 @@ class RawBlockModel(Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
     ordinal: Mapped[int] = mapped_column(Integer)
     block_type: Mapped[str] = mapped_column(String(32))
-    raw_content: Mapped[str] = mapped_column(Text)
+    raw_content: Mapped[str] = mapped_column(_LONG_TEXT)
     source_locator: Mapped[Dict[str, Any]] = mapped_column(JSON)
     content_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
     raw_hash: Mapped[str] = mapped_column(String(64))
@@ -142,7 +147,7 @@ class TableMetadataModel(Base):
     block_id: Mapped[str] = mapped_column(ForeignKey("raw_blocks.id"), index=True)
     table_code: Mapped[str] = mapped_column(String(96), index=True)
     table_name: Mapped[str] = mapped_column(String(255))
-    table_definition: Mapped[str] = mapped_column(Text)
+    table_definition: Mapped[str] = mapped_column(_LONG_TEXT)
     status: Mapped[str] = mapped_column(String(32), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     published_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -160,8 +165,8 @@ class FieldMetadataModel(Base):
     table_id: Mapped[str] = mapped_column(ForeignKey("table_metadata.id"), index=True)
     field_cn: Mapped[str] = mapped_column(String(255))
     field_en: Mapped[str] = mapped_column(String(128))
-    field_definition: Mapped[str] = mapped_column(Text)
-    check_text_raw: Mapped[str] = mapped_column(Text)
+    field_definition: Mapped[str] = mapped_column(_LONG_TEXT)
+    check_text_raw: Mapped[str] = mapped_column(_LONG_TEXT)
     # SOURCE=原文声明了类型 / INFERRED=推断或默认 / MANUAL=人工确认过 / UNKNOWN=历史数据
     type_basis: Mapped[str] = mapped_column(String(16), default="UNKNOWN", server_default="UNKNOWN")
     data_type: Mapped[str] = mapped_column(String(32))
@@ -209,7 +214,7 @@ class CodeSetModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     code: Mapped[str] = mapped_column(String(96), index=True)
     name: Mapped[str] = mapped_column(String(255))
-    definition: Mapped[str] = mapped_column(Text, default="")
+    definition: Mapped[str] = mapped_column(_LONG_TEXT, default="")
     source_type: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)

@@ -225,7 +225,11 @@ TOOL_SCHEMAS = {
                     "properties": RULE_PROPERTIES,
                     "required": ["rule_key", "field", "operator", "params", "evidence_kind", "rationale"],
                 },
-            }
+            },
+            "golden_overrides": {
+                "type": "object",
+                "description": "跨表外键场景下按 {table_code: {field: value}} 对齐各表黄金样本引用值（单表场景可省略）。",
+            },
         },
         "required": ["rules"],
     },

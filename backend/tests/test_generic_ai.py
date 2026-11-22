@@ -183,3 +183,78 @@ def test_non_dict_repaired_arguments_raises_value_error_and_rule_prompt_complete
     rule_prompt = tool_prompt_preamble("assign_rules")
     for op in ("COND_VALUE", "ARITHMETIC_BALANCE", "UNIQUE_KEY"):
         assert op in rule_prompt
+
+
+def test_http_200_disguised_error_dict_args_unknown_tool_and_golden_overrides_schema(monkeypatch):
+    """回归：HTTP 200 伪装错误/空 choices 走瞬时重试而非 KeyError；预解析 dict 参数正常；未知工具名快失败；assign_rules 声明 golden_overrides。"""
+    from app.infra.errors import WorkflowError
+    from app.infra.llm.guard import call_llm_validated
+    from app.infra.llm.schemas import TOOL_SCHEMAS
+
+    # 1) assign_rules schema 必须声明可选 golden_overrides（跨表外键黄金值对齐）
+    assert "golden_overrides" in TOOL_SCHEMAS["assign_rules"]["properties"]
+    assert "golden_overrides" not in TOOL_SCHEMAS["assign_rules"]["required"]
+
+    # 2) HTTP 200 返回 {"error": ...} 或 {"choices": []} 触发瞬时退避重试，而非 KeyError/IndexError
+    calls = {"n": 0}
+
+    class DisguisedErrorResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {"error": {"code": "429", "message": "upstream rate limit"}}
+
+    class DictArgsResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {
+                "id": "dict-args",
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "function": {
+                                "name": "assign_generation_plan",
+                                "arguments": {
+                                    "mandatory_rule_target": 2,
+                                    "expanded_rule_target": 1,
+                                    "golden_count": 1,
+                                    "mutations_per_rule": 1,
+                                    "rationale": "pre-parsed dict",
+                                },
+                            }
+                        }]
+                    }
+                }],
+            }
+
+    def post(url, headers, json, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return DisguisedErrorResponse()
+        return DictArgsResponse()
+
+    monkeypatch.setattr("app.infra.llm.client.httpx.post", post)
+    args, _ = call_llm_validated(
+        RealDesignLlm(Settings(llm_api_key="offline-test")),
+        "assign_generation_plan",
+        "test",
+        {},
+        backoff=(0,),
+    )
+    assert calls["n"] == 2
+    assert args["mandatory_rule_target"] == 2
+
+    # 3) 未知 tool_name 直接快速失败（fatal_model_error），不白白重试 3 次
+    with pytest.raises(WorkflowError) as err:
+        call_llm_validated(
+            RealDesignLlm(Settings(llm_api_key="offline-test")),
+            "ghost_tool_name",
+            "test",
+            {},
+            backoff=(0,),
+        )
+    assert err.value.context["error_kind"] == "model_error"
+    assert err.value.context["retried"] is False

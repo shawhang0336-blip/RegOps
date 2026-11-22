@@ -9,7 +9,7 @@
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, List, Set
+from typing import Any, Callable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class TaskRunner:
         self._inline = inline
         self._lock = threading.Lock()
         self._active: Set[str] = set()
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:

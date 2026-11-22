@@ -50,10 +50,15 @@ class Base(DeclarativeBase):
 
 
 def quote_identifier(name: str, dialect: str = "mysql") -> str:
-    """跨方言安全 SQL 标识符转义（Oracle 双引号 / MySQL 反引号），防 SQL 注入。"""
-    if not name or not name.replace("_", "").isalnum() or not name.isascii():
+    """跨方言安全 SQL 标识符转义（Oracle 双引号 / MySQL 反引号），防 SQL 注入与方言大小写错配。"""
+    if not isinstance(name, str) or not name or not name.replace("_", "").isalnum() or not name.isascii():
         raise ValueError(f"Unsafe SQL identifier: {name}")
-    return f'"{name}"' if dialect == "oracle" else f"`{name}`"
+    normalized = (dialect or "mysql").strip().lower()
+    if normalized.startswith("oracle"):
+        return f'"{name}"'
+    if normalized.startswith("mysql") or normalized.startswith("sqlite"):
+        return f"`{name}`"
+    raise ValueError(f"Unsupported SQL dialect: {dialect}")
 
 
 def init_db() -> None:

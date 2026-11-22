@@ -1479,6 +1479,36 @@ def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
     with pytest.raises(ValueError, match="Invalid blob URI"):
         store.get(uris[0].removeprefix("blob://"))
 
+    # 4) MySQL 8 表列宽与 LONGTEXT 变体、quote_identifier 大小写方言安全、get_budget 忽略 None 脏配置
+    from sqlalchemy.dialects import mysql
+    from sqlalchemy.schema import CreateTable
+    from app.infra.config import DEFAULT_BUDGET, get_budget
+    from app.infra.db import quote_identifier
+    from app.infra.db_tables import RawBlockModel, RuleModel, SpecificationModel, SystemSettingModel
+
+    mysql_dialect = mysql.dialect()
+    raw_block_ddl = str(CreateTable(RawBlockModel.__table__).compile(dialect=mysql_dialect))
+    assert "LONGTEXT" in raw_block_ddl.upper()
+    spec_ddl = str(CreateTable(SpecificationModel.__table__).compile(dialect=mysql_dialect))
+    assert "VARCHAR(96)" in spec_ddl.upper()
+    rule_ddl = str(CreateTable(RuleModel.__table__).compile(dialect=mysql_dialect))
+    assert "VARCHAR(192)" in rule_ddl.upper()
+
+    assert quote_identifier("RPTNO", "ORACLE") == '"RPTNO"'
+    assert quote_identifier("RPTNO", "oracle+oracledb") == '"RPTNO"'
+    assert quote_identifier("RPTNO", "MYSQL") == "`RPTNO`"
+    with pytest.raises(ValueError, match="Unsupported SQL dialect"):
+        quote_identifier("RPTNO", "postgres")
+    with pytest.raises(ValueError, match="Unsafe SQL identifier"):
+        quote_identifier(123, "oracle")  # type: ignore[arg-type]
+
+    s = make_session()
+    s.add(SystemSettingModel(key="execution_budget", value_json={"max_llm_concurrency": None, "max_retries": 5}))
+    s.commit()
+    budget = get_budget(s)
+    assert budget["max_llm_concurrency"] == DEFAULT_BUDGET["max_llm_concurrency"]
+    assert budget["max_retries"] == 5
+
 
 
 

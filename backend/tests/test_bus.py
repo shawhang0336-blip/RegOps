@@ -234,3 +234,102 @@ def test_bus_full_lifecycle_fire_subscribe_isolation_and_global_bubbling():
     assert len(doc_events) == 3
     assert [e["stage"] for e in doc_events] == [1, 2, 4]
     assert doc_events[-1]["status"] == "DONE"
+
+
+def test_policy_deep_audit_cross_fk_fixed_code_set_and_channel_redirect_recovery():
+    """回归：policy 深审 5 项修复：
+    1. field_whitelist_adjudicator 不误拦异名跨表外键的 references_field；
+    2. cross_table_adjudicator 拦截跨表规则源字段 field 幻觉；
+    3. code_set_values_adjudicator 拦截 FIXED 生成器编造非法码值（允许可选空串）；
+    4. recover_channels 在 GO_REDIRECT 缺少/读取失败报告时保守清空下游单表缓存，且清理前序自愈报告；
+    5. regops_plan 折叠防缺 target KeyError、支持 ORACLE_ASSETS_PREPARED.pending_count、防 ingestion 非 dict result 崩溃。
+    """
+    import uuid
+    import pytest
+    from app.infra.db_tables import RunModel
+    from app.kernel.event_log import RunState, append_event
+    from app.policy.regops_channels import recover_channels
+    from app.policy.regops_plan import _apply, fold_ingestion_event
+    from .helpers import make_session
+
+    # 1) 异名外键 CUST_ID -> T_PARENT.ID 不被当前表 field_whitelist 误拦
+    assert (
+        field_whitelist_adjudicator(
+            "assign_rules",
+            {
+                "rules": [
+                    {
+                        "field": "CUST_ID",
+                        "operator": "FOREIGN_KEY",
+                        "params": {"references_table": "T_PARENT", "references_field": "ID"},
+                    }
+                ]
+            },
+            {"field_names": ["CUST_ID", "AMT"]},
+        )
+        is None
+    )
+
+    # 2) cross_table_adjudicator 拦截跨表规则源字段幻觉
+    bad_src = cross_table_adjudicator(
+        "assign_rules",
+        {
+            "rules": [
+                {
+                    "table_code": "T_CHILD",
+                    "field": "GHOST_SRC",
+                    "operator": "FOREIGN_KEY",
+                    "params": {"references_table": "T_PARENT", "references_field": "ID"},
+                }
+            ]
+        },
+        {"table_codes": ["T_CHILD", "T_PARENT"], "table_fields": {"T_CHILD": ["CUST_ID"], "T_PARENT": ["ID"]}},
+    )
+    assert bad_src is not None and "GHOST_SRC" in bad_src
+
+    # 3) code_set_values_adjudicator 拦截 FIXED 生成器非法码值，允许合规值与空串
+    cs_payload = {"published_code_sets": {"TXCCY": {"code": "CCY", "values": ["CNY", "USD"]}}}
+    bad_fixed = code_set_values_adjudicator(
+        "assign_generators",
+        {"generators": [{"field": "TXCCY", "generator": "FIXED", "params": {"value": "RMB"}}]},
+        cs_payload,
+    )
+    assert bad_fixed is not None and "RMB" in bad_fixed
+    assert (
+        code_set_values_adjudicator(
+            "assign_generators",
+            {"generators": [{"field": "TXCCY", "generator": "FIXED", "params": {"value": "CNY"}}]},
+            cs_payload,
+        )
+        is None
+    )
+    assert (
+        code_set_values_adjudicator(
+            "assign_generators",
+            {"generators": [{"field": "TXCCY", "generator": "FIXED", "params": {"value": ""}}]},
+            cs_payload,
+        )
+        is None
+    )
+
+    # 4) recover_channels：GO_REDIRECT 无报告时仍清空下游单表缓存防误跳重造
+    session = make_session()
+    run = RunModel(id=str(uuid.uuid4()), spec_id="spec-policy-audit")
+    session.add(run)
+    session.flush()
+    append_event(session, run, "TABLE_GENERATORS_ASSIGNED", "data_table_worker", {"table_code": "T1", "generators": [{"field": "A"}]})
+    append_event(session, run, "TABLE_AUDIT_CASES_ASSIGNED", "audit_table_worker", {"table_code": "T1", "cases": [{"case_id": "C1"}]})
+    append_event(session, run, "GO_REDIRECT", "oracle_executor", {"target": "data_generator_binder"})
+    session.commit()
+    shared = recover_channels(session, run, settings=None)
+    assert shared["table_generators_done"] == {}
+    assert shared["table_audit_cases_done"] == {}
+
+    # 5) regops_plan 折叠健壮性
+    st_assets = _apply(RunState(status="RUNNING"), "ORACLE_ASSETS_PREPARED", {"pending_count": 2})
+    assert st_assets.when == "pending_rules"
+    with pytest.raises(ValueError, match="GO_REDIRECT"):
+        _apply(RunState(), "GO_REDIRECT", {})
+    st_ing = fold_ingestion_event(RunState(), "RUN_FAILED", {"node": "extract", "result": "plain-string-error"})
+    assert st_ing.status == "FAILED" and st_ing.result_json["error"] == "plain-string-error"
+

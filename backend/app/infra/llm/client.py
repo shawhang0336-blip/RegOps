@@ -85,6 +85,8 @@ class RealDesignLlm:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if timeout is None:
             timeout = self.settings.llm_timeout
+        if tool_name not in TOOL_SCHEMAS:
+            raise RuntimeError(f"Unknown LLM tool: {tool_name}")
         schema = TOOL_SCHEMAS[tool_name]
         prompt = (
             f"{tool_prompt_preamble(tool_name)}\n"
@@ -143,8 +145,21 @@ class RealDesignLlm:
         except Exception as exc:  # noqa: BLE001
             elapsed = round(time.monotonic() - started_at, 2)
             raise RuntimeError(f"LLM HTTP 502 invalid JSON response: {exc}; elapsed={elapsed}s") from exc
-        choice = body["choices"][0]
-        message = choice["message"]
+        if not isinstance(body, dict):
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"LLM HTTP 502 non-object JSON response; elapsed={elapsed}s")
+        # 部分企业网关/聚合代理在限流或上游异常时返回 HTTP 200 + {"error": ...} 或空 choices
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            elapsed = round(time.monotonic() - started_at, 2)
+            err = body.get("error") if isinstance(body.get("error"), dict) else {}
+            if err:
+                raise RuntimeError(
+                    f"LLM HTTP 502 upstream error {err.get('code', '')}: {err.get('message', '')}; elapsed={elapsed}s"
+                )
+            raise RuntimeError(f"LLM HTTP 502 empty choices in response; elapsed={elapsed}s")
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
         calls = message.get("tool_calls") or []
         if not calls:
             diagnostic = {
@@ -160,14 +175,20 @@ class RealDesignLlm:
         arguments: Dict[str, Any] = {}
         json_repaired = False
         for call in calls:
-            if call["function"]["name"] != tool_name:
+            fn_obj = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn_obj, dict) or fn_obj.get("name") != tool_name:
                 raise RuntimeError("Model returned an unexpected tool")
-            raw_arguments = call["function"]["arguments"]
-            try:
-                current = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                current = repair_json(raw_arguments, return_objects=True)
-                json_repaired = True
+            raw_arguments = fn_obj.get("arguments")
+            if isinstance(raw_arguments, dict):
+                current = raw_arguments
+            elif isinstance(raw_arguments, str):
+                try:
+                    current = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    current = repair_json(raw_arguments, return_objects=True)
+                    json_repaired = True
+            else:
+                raise ValueError(f"工具 {tool_name} 返回的参数不是有效 JSON 字符串或对象")
             if not isinstance(current, dict):
                 raise ValueError(f"工具 {tool_name} 返回的参数无法解析为 JSON 对象")
             for key, value in current.items():

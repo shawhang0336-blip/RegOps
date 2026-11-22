@@ -225,7 +225,10 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             resume_when="direct",
         )
     if kind == "ORACLE_ASSETS_PREPARED":
-        when = "pending_rules" if state.status == "WAITING_APPROVAL" else "no_pending_rules"
+        has_pending = (
+            bool(payload["pending_count"]) if "pending_count" in payload else (state.status == "WAITING_APPROVAL")
+        )
+        when = "pending_rules" if has_pending else "no_pending_rules"
         return replace(
             state,
             current_node="oracle_asset_builder",
@@ -317,8 +320,8 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
             pending_target=None,
         )
     if kind == "GO_REDIRECT":
-        target = payload["target"]
-        if not any(node.name == target for node in DEFAULT_PLAN.nodes):
+        target = payload.get("target")
+        if not target or not any(node.name == target for node in DEFAULT_PLAN.nodes):
             raise ValueError(f"GO_REDIRECT 目标 {target} 不在 Plan 中")
         return replace(
             state,
@@ -483,8 +486,9 @@ def fold_ingestion_event(state: RunState, kind: str, payload: Dict[str, Any]) ->
             when="always",
         )
     if kind == "RUN_CANCELLED":
-        reason = payload.get("reason") or (payload.get("result") or {}).get("error") or "Run cancelled by operator"
-        res_patch = dict(payload.get("result") or {})
+        raw_res = payload.get("result")
+        res_patch = dict(raw_res) if isinstance(raw_res, dict) else ({"error": str(raw_res)} if raw_res else {})
+        reason = payload.get("reason") or res_patch.get("error") or "Run cancelled by operator"
         res_patch.setdefault("error", reason)
         res_patch["cancelled"] = True
         res_patch["progress_status"] = "FAILED"
@@ -497,7 +501,8 @@ def fold_ingestion_event(state: RunState, kind: str, payload: Dict[str, Any]) ->
             result_json=merged,
         )
     if kind == "RUN_FAILED":
-        res_patch = dict(payload.get("result") or {})
+        raw_res = payload.get("result")
+        res_patch = dict(raw_res) if isinstance(raw_res, dict) else ({"error": str(raw_res)} if raw_res else {})
         res_patch["progress_status"] = "FAILED"
         if res_patch.get("error") and not res_patch.get("detail"):
             res_patch["detail"] = str(res_patch["error"])
