@@ -1,17 +1,17 @@
+"""码表资产查询、编辑、引用对齐、上传解析与 Excel 导入应用服务。"""
+
 import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import HTTPException
 from openpyxl import load_workbook
-from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session
-from app.api.documents import ingest_uploaded_file
-from app.catalog.code_sets.readiness import evaluate_code_set, evaluate_code_sets, is_reference_placeholder
+from app.api.catalog.documents_service import ingest_uploaded_file
+from app.catalog.code_sets.readiness import evaluate_code_set, is_reference_placeholder
 from app.catalog.code_sets.service import (
     auto_link_all_references,
     code_set_summaries,
@@ -19,7 +19,6 @@ from app.catalog.code_sets.service import (
     document_code_set_ids,
     document_code_set_ordinals,
     refresh_reference_status,
-    remove_code_set,
 )
 from app.catalog.extraction import extract_parallel_for_blocks
 from app.infra.db_tables import (
@@ -32,46 +31,12 @@ from app.infra.db_tables import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.infra.config import get_settings
-from app.infra.config import OPERATOR_PLACEHOLDER
 from app.ingestion.structure_service import analyze_document_structure
 
-router = APIRouter(prefix="/code-sets", tags=["code-sets"])
-
-_MAX_IMPORT_BYTES = 30 * 1024 * 1024
+MAX_IMPORT_BYTES = 30 * 1024 * 1024
 
 
-class CodeSetRequest(BaseModel):
-    code: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    definition: str = ""
-    source_type: str = "MANUAL"
-
-
-class VersionRequest(BaseModel):
-    expected_version: int
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    reason: str = ""
-    changes: Dict[str, Any] = {}
-
-
-class CodeValueRequest(BaseModel):
-    expected_version: int
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    value: str = Field(min_length=1)
-    label_cn: str = Field(min_length=1)
-    label_en: str = ""
-    definition: str = ""
-
-
-class PublishBatchRequest(BaseModel):
-    document_id: Optional[str] = None
-    code_set_ids: Optional[List[str]] = None
-    referenced_only: bool = True
-    dry_run: bool = False
-
-
-def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
+def code_set_detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     values = (
         session.query(CodeValueModel)
         .filter(CodeValueModel.code_set_id == row.id)
@@ -113,11 +78,11 @@ def detail(session: Session, row: CodeSetModel) -> Dict[str, Any]:
     }
 
 
-@router.get("")
-def list_code_sets(
+def list_code_sets_view(
+    session: Session,
+    *,
     document_id: Optional[str] = None,
     include_placeholders: bool = False,
-    session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
     query = session.query(CodeSetModel)
     local_ordinals: Dict[str, int] = {}
@@ -144,25 +109,31 @@ def list_code_sets(
     return result
 
 
-@router.post("", status_code=201)
-def create_code_set(request: CodeSetRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    code = request.code.strip().upper()
-    name = request.name.strip()
-    if not code or not name:
+def create_code_set_record(
+    session: Session,
+    *,
+    code: str,
+    name: str,
+    definition: str,
+    source_type: str,
+) -> Dict[str, Any]:
+    clean_code = code.strip().upper()
+    clean_name = name.strip()
+    if not clean_code or not clean_name:
         raise HTTPException(status_code=422, detail="码表代码与名称不能为空")
     existing = (
         session.query(CodeSetModel.id)
-        .filter(func.upper(CodeSetModel.code) == code, CodeSetModel.current_version == 1)
+        .filter(func.upper(CodeSetModel.code) == clean_code, CodeSetModel.current_version == 1)
         .first()
     )
     if existing:
-        raise HTTPException(status_code=409, detail=f"码表代码 {code} 已存在")
+        raise HTTPException(status_code=409, detail=f"码表代码 {clean_code} 已存在")
     row = CodeSetModel(
         id=str(uuid.uuid4()),
-        code=code,
-        name=name,
-        definition=request.definition,
-        source_type=request.source_type,
+        code=clean_code,
+        name=clean_name,
+        definition=definition,
+        source_type=source_type,
         status="DRAFT",
         current_version=1,
     )
@@ -171,20 +142,20 @@ def create_code_set(request: CodeSetRequest, session: Session = Depends(db_sessi
         session.commit()
     except IntegrityError as exc:
         session.rollback()
-        raise HTTPException(status_code=409, detail=f"码表代码 {code} 已存在") from exc
-    return detail(session, row)
+        raise HTTPException(status_code=409, detail=f"码表代码 {clean_code} 已存在") from exc
+    return code_set_detail(session, row)
 
 
-@router.post("/upload-file", status_code=201)
-async def upload_code_set_document(
-    file: UploadFile = File(...),
-    include_inline: bool = Form(default=True),
-    session: Session = Depends(db_session),
+def upload_and_extract_code_sets(
+    session: Session,
+    *,
+    filename: str,
+    content: bytes,
+    include_inline: bool,
+    settings: Any,
 ) -> Dict[str, Any]:
-    """Upload PDF/DOCX/XLSX document directly in CodeSetsPage and extract all code sets in parallel."""
-    content = await file.read()
-    document = ingest_uploaded_file(file.filename, content)
-    settings = get_settings()
+    """直接上传文档并并行抽取其中的码值表与内联枚举项。"""
+    document = ingest_uploaded_file(filename, content)
     if document.status == "UPLOADED":
         analyze_document_structure(document.id, settings)
 
@@ -232,12 +203,11 @@ async def upload_code_set_document(
     }
 
 
-@router.get("/references/unresolved")
-def unresolved_references(
+def list_unresolved_code_references(
+    session: Session,
+    *,
     document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
-    """返回尚未解析到码表的字段引用（附带所属报表与字段信息）。"""
     query = (
         session.query(FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel)
         .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
@@ -269,9 +239,7 @@ def unresolved_references(
     ]
 
 
-@router.post("/references/relink")
-def relink_references(session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """重新对齐“字段引用 → 码值表”，并把引用原文里自带的内联枚举补成码值。"""
+def relink_all_code_references(session: Session) -> Dict[str, Any]:
     resolved = auto_link_all_references(session)
     session.commit()
     total = session.query(FieldCodeReferenceModel).count()
@@ -283,34 +251,26 @@ def relink_references(session: Session = Depends(db_session)) -> Dict[str, Any]:
     return {"total": total, "resolved": resolved, "unresolved": unresolved}
 
 
-@router.get("/readiness")
-def code_set_readiness(
-    document_id: Optional[str] = None,
-    referenced_only: bool = False,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """码表发布前的检查：空表、缺中文含义、码值超过字段长度。"""
-    return evaluate_code_sets(session, document_id=document_id, referenced_only=referenced_only)
-
-
-@router.post("/publish-batch")
 def publish_code_sets_batch(
-    request: PublishBatchRequest,
-    session: Session = Depends(db_session),
+    session: Session,
+    *,
+    document_id: Optional[str],
+    code_set_ids: Optional[List[str]],
+    referenced_only: bool,
+    dry_run: bool,
 ) -> Dict[str, Any]:
-    """批量发布码表（仅发布检查通过项，其余连原因一起返回）。"""
     published: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     query = session.query(CodeSetModel)
-    if request.code_set_ids:
-        query = query.filter(CodeSetModel.id.in_(request.code_set_ids))
-    elif request.document_id:
-        ids = document_code_set_ids(session, request.document_id)
+    if code_set_ids:
+        query = query.filter(CodeSetModel.id.in_(code_set_ids))
+    elif document_id:
+        ids = document_code_set_ids(session, document_id)
         query = query.filter(CodeSetModel.id.in_(ids))
     rows = query.order_by(CodeSetModel.source_ordinal.asc(), CodeSetModel.code.asc()).all()
     for row in rows:
         result = evaluate_code_set(session, row)
-        if request.referenced_only and result["reference_count"] == 0:
+        if referenced_only and result["reference_count"] == 0:
             skipped.append({"code": row.code, "reason": "NOT_REFERENCED"})
             continue
         if row.status == "PUBLISHED" and row.published_version == row.current_version:
@@ -325,11 +285,11 @@ def publish_code_sets_batch(
                 }
             )
             continue
-        if not request.dry_run:
+        if not dry_run:
             row.status = "PUBLISHED"
             row.published_version = row.current_version
         published.append({"code": row.code, "value_count": result["value_count"], "referenced": result["reference_count"]})
-    if request.dry_run:
+    if dry_run:
         session.rollback()
     else:
         session.commit()
@@ -338,32 +298,25 @@ def publish_code_sets_batch(
         "skipped": len(skipped),
         "details": published[:100],
         "skipped_details": skipped[:100],
-        "dry_run": request.dry_run,
+        "dry_run": dry_run,
     }
 
 
-@router.get("/{code_set_id}")
-def get_code_set(code_set_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    row = session.get(CodeSetModel, code_set_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Code set not found")
-    return detail(session, row)
-
-
-@router.patch("/{code_set_id}")
-def edit_code_set(
+def edit_code_set_record(
+    session: Session,
     code_set_id: str,
-    request: VersionRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    changes: Dict[str, Any],
 ) -> Dict[str, Any]:
     row = session.get(CodeSetModel, code_set_id)
     if not row:
         raise HTTPException(status_code=404, detail="Code set not found")
-    if row.current_version != request.expected_version:
+    if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     for key in ["code", "name", "definition"]:
-        if key in request.changes:
-            val = request.changes[key]
+        if key in changes:
+            val = changes[key]
             if key == "code":
                 cleaned = str(val or "").strip().upper()
                 if not cleaned:
@@ -383,40 +336,28 @@ def edit_code_set(
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=f"码表代码 {row.code} 与当前版本冲突") from exc
-    return detail(session, row)
+    return code_set_detail(session, row)
 
 
-@router.delete("/{code_set_id}")
-def delete_code_set(code_set_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """删掉一张未被字段引用的码表。"""
-    row = session.get(CodeSetModel, code_set_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Code set not found")
-    try:
-        result = remove_code_set(session, row)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "CODE_SET_IN_USE", "message": str(exc)},
-        ) from exc
-    session.commit()
-    return result
-
-
-@router.post("/{code_set_id}/values")
-def add_value(
+def add_code_value_record(
+    session: Session,
     code_set_id: str,
-    request: CodeValueRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    editor: str,
+    value: str,
+    label_cn: str,
+    label_en: str,
+    definition: str,
 ) -> Dict[str, Any]:
     row = session.get(CodeSetModel, code_set_id)
     if not row:
         raise HTTPException(status_code=404, detail="Code set not found")
-    if row.current_version != request.expected_version:
+    if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    code_val = request.value.strip()
-    label_cn = request.label_cn.strip()
-    if not code_val or not label_cn:
+    code_val = value.strip()
+    clean_label_cn = label_cn.strip()
+    if not code_val or not clean_label_cn:
         raise HTTPException(status_code=422, detail="码值和中文含义不能为空")
     existing_ci = {
         (val or "").strip().upper()
@@ -435,12 +376,12 @@ def add_value(
             id=str(uuid.uuid4()),
             code_set_id=row.id,
             value=code_val,
-            label_cn=label_cn,
-            label_en=request.label_en.strip(),
-            definition=request.definition.strip(),
+            label_cn=clean_label_cn,
+            label_en=label_en.strip(),
+            definition=definition.strip(),
             sort_order=sort_order,
             enabled=True,
-            source_locator={"editor": request.editor},
+            source_locator={"editor": editor},
         )
     )
     row.current_version += 1
@@ -451,24 +392,25 @@ def add_value(
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=f"码值 {code_val} 已存在") from exc
-    return detail(session, row)
+    return code_set_detail(session, row)
 
 
-@router.patch("/{code_set_id}/values/{value_id}")
-def edit_value(
+def edit_code_value_record(
+    session: Session,
     code_set_id: str,
     value_id: str,
-    request: VersionRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    changes: Dict[str, Any],
 ) -> Dict[str, Any]:
     row = session.get(CodeSetModel, code_set_id)
     value = session.get(CodeValueModel, value_id)
     if not row or not value or value.code_set_id != row.id:
         raise HTTPException(status_code=404, detail="Code value not found")
-    if row.current_version != request.expected_version:
+    if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    if "value" in request.changes:
-        new_val = str(request.changes["value"] or "").strip()
+    if "value" in changes:
+        new_val = str(changes["value"] or "").strip()
         if not new_val:
             raise HTTPException(status_code=422, detail="码值不能为空")
         other_ci = {
@@ -481,14 +423,14 @@ def edit_value(
         if new_val.upper() in other_ci:
             raise HTTPException(status_code=409, detail=f"码值 {new_val} 已存在（忽略大小写重复）")
         value.value = new_val
-    if "label_cn" in request.changes:
-        new_label = str(request.changes["label_cn"] or "").strip()
+    if "label_cn" in changes:
+        new_label = str(changes["label_cn"] or "").strip()
         if not new_label:
             raise HTTPException(status_code=422, detail="中文含义不能为空")
         value.label_cn = new_label
     for key in ["label_en", "definition", "enabled", "sort_order"]:
-        if key in request.changes:
-            setattr(value, key, request.changes[key])
+        if key in changes:
+            setattr(value, key, changes[key])
     row.current_version += 1
     row.status = "DRAFT"
     refresh_reference_status(session, row.id)
@@ -497,19 +439,19 @@ def edit_value(
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=f"码值 {value.value} 已存在") from exc
-    return detail(session, row)
+    return code_set_detail(session, row)
 
 
-@router.post("/{code_set_id}/publish")
-def publish_code_set(
+def publish_code_set_record(
+    session: Session,
     code_set_id: str,
-    request: VersionRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
 ) -> Dict[str, Any]:
     row = session.get(CodeSetModel, code_set_id)
     if not row:
         raise HTTPException(status_code=404, detail="Code set not found")
-    if row.current_version != request.expected_version:
+    if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     result = evaluate_code_set(session, row)
     if not result["ready"]:
@@ -522,7 +464,7 @@ def publish_code_set(
     row.published_version = row.current_version
     auto_link_all_references(session)
     session.commit()
-    return detail(session, row)
+    return code_set_detail(session, row)
 
 
 def _cell_text(values: tuple, idx: Optional[int]) -> str:
@@ -531,14 +473,14 @@ def _cell_text(values: tuple, idx: Optional[int]) -> str:
     return str(values[idx]).strip()
 
 
-@router.post("/{code_set_id}/import")
-async def import_values(
+def import_code_values_xlsx(
+    session: Session,
     code_set_id: str,
-    expected_version: int = Form(...),
-    file: UploadFile = File(...),
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    filename: str,
+    content: bytes,
 ) -> Dict[str, Any]:
-    filename = file.filename or ""
     if not filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=422, detail="Code import requires XLSX")
     row = session.get(CodeSetModel, code_set_id)
@@ -546,8 +488,7 @@ async def import_values(
         raise HTTPException(status_code=404, detail="Code set not found")
     if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    content = await file.read()
-    if len(content) > _MAX_IMPORT_BYTES:
+    if len(content) > MAX_IMPORT_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds the 30 MB limit")
     try:
         workbook = load_workbook(BytesIO(content), data_only=True)
@@ -623,5 +564,5 @@ async def import_values(
         "imported": imported,
         "skipped_duplicate": skipped_duplicate,
         "skipped_empty_label": skipped_empty_label,
-        "code_set": detail(session, row),
+        "code_set": code_set_detail(session, row),
     }

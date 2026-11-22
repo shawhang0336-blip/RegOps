@@ -1,86 +1,32 @@
+"""发起规则生成前的两遍预检、自动定稿发布与元数据快照冻结（供 `api/generation/generation.py` 调用）。"""
+
 import hashlib
-import re
 import uuid
 from typing import Any, Dict, List, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session, run_view, spawn_run_driver
 from app.catalog.code_sets.linking import generation_blockers
 from app.catalog.code_sets.readiness import auto_publish_referenced_code_sets
 from app.catalog.tables.readiness import evaluate_table, split_preflight_issues
 from app.catalog.tables.service import metadata_to_spec, publish_table
-from app.delivery.production_service import build_production_bundle
 from app.delivery.workflow import _create_run
-from app.infra.db_tables import GenerationPlanModel, TableMetadataModel
-from app.infra.config import get_settings
-from app.infra.contracts import canonical_json
-from app.infra.errors import WorkflowError
-from app.infra.config import OPERATOR_PLACEHOLDER
-from app.infra.db_tables import RunModel, SpecificationModel
 from app.infra.config import get_budget
-
-router = APIRouter(prefix="/generation", tags=["generation"])
-
-
-class GenerationRequest(BaseModel):
-    table_ids: List[str]
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    provider: str = "live"
-    # 规则/码值不就绪时默认拒绝；确认过风险才允许推进
-    accept_warnings: bool = False
+from app.infra.contracts import canonical_json
+from app.infra.db_tables import RunModel, SpecificationModel, TableMetadataModel
 
 
-@router.get("/blockers/{table_id}")
-def blockers(table_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    table = session.get(TableMetadataModel, table_id)
-    if not table:
-        raise HTTPException(status_code=404, detail="Metadata table not found")
-    return {"table_id": table_id, "blockers": generation_blockers(session, table)}
-
-
-@router.get("/plans/{run_id}")
-def generation_plans(run_id: str, session: Session = Depends(db_session)) -> List[Dict[str, Any]]:
-    rows = session.query(GenerationPlanModel).filter(GenerationPlanModel.run_id == run_id).all()
-    return [
-        {
-            "table_code": row.table_code,
-            "plan": row.plan_json,
-            "trace": row.trace_json,
-            "created_at": row.created_at.isoformat(),
-        }
-        for row in rows
-    ]
-
-
-@router.get("/runs/{run_id}/production-bundle")
-def download_production_bundle(run_id: str, session: Session = Depends(db_session)):
-    run = session.get(RunModel, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Generation run not found")
-    try:
-        _, content = build_production_bundle(session, run, get_settings().blob_dir)
-    except WorkflowError as exc:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    safe_stem = re.sub(r"[^A-Za-z0-9_-]", "", run_id[:8]) or "bundle"
-    return StreamingResponse(
-        iter([content]),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="production_{safe_stem}.zip"'},
-    )
-
-
-def _prepare_generation_run(
+def prepare_generation_run(
     session: Session,
-    request: GenerationRequest,
+    *,
+    table_ids: List[str],
+    approver: str,
+    accept_warnings: bool,
     settings,
 ) -> Tuple[RunModel, Dict[str, int], Dict[str, List[Dict[str, Any]]], List[str]]:
     """两遍预检：去重并拦截 MERGED → 自动定稿并发布关联码表 → 校验就绪度 → 冻结元数据快照并创建 Run。"""
-    unique_ids = list(dict.fromkeys(tid for tid in request.table_ids if tid))
+    unique_ids = list(dict.fromkeys(tid for tid in table_ids if tid))
     if not unique_ids:
         raise HTTPException(status_code=422, detail="Select at least one published table")
     tables = [session.get(TableMetadataModel, table_id) for table_id in unique_ids]
@@ -92,7 +38,6 @@ def _prepare_generation_run(
     auto_published: Dict[str, List[Dict[str, Any]]] = {}
     auto_finalized: List[str] = []
 
-    # 第一遍：自动定稿 + 取规格 + 自动发布码表（拦截 MERGED / NEEDS_REVIEW）
     for table in tables:
         if table.status == "MERGED":
             raise HTTPException(
@@ -117,7 +62,7 @@ def _prepare_generation_run(
             )
         if not (table.status == "PUBLISHED" and table.published_version == table.current_version):
             try:
-                finalized = publish_table(session, table, request.approver, table.current_version)
+                finalized = publish_table(session, table, approver, table.current_version)
             except ValueError as exc:
                 raise HTTPException(
                     status_code=409,
@@ -134,11 +79,9 @@ def _prepare_generation_run(
         if auto["published"]:
             auto_published[table.table_code] = auto["published"]
 
-    # 先落库：避免后续 409 回滚丢失已定稿的表与自动发布的码表
     if auto_published or auto_finalized:
         session.commit()
 
-    # 第二遍：就绪度硬/软门禁检查
     for table in tables:
         readiness = evaluate_table(session, table)
         if not readiness["ddl"]["ready"]:
@@ -175,7 +118,7 @@ def _prepare_generation_run(
         if table_blockers:
             raise HTTPException(status_code=409, detail={"table_code": table.table_code, "blockers": table_blockers})
 
-    if pending_warnings and not request.accept_warnings:
+    if pending_warnings and not accept_warnings:
         raise HTTPException(
             status_code=409,
             detail={
@@ -200,30 +143,13 @@ def _prepare_generation_run(
         content_json={
             "selection_confirmed": True,
             "table_name": f"已发布元数据 · {len(specs)} 张表",
-            "confirmation": {"approver": request.approver, "tables": snapshot_material},
+            "confirmation": {"approver": approver, "tables": snapshot_material},
             "tables": [spec.model_dump() for spec in specs],
         },
     )
     session.add(snapshot)
     session.flush()
-    run = _create_run(session, snapshot.id, settings, operator=request.approver.strip())
+    run = _create_run(session, snapshot.id, settings, operator=approver.strip())
     budget = get_budget(session)
     session.commit()
     return run, budget, auto_published, auto_finalized
-
-
-@router.post("/runs", status_code=202)
-def create_generation(request: GenerationRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    if request.provider != "live":
-        raise HTTPException(status_code=422, detail="Production generation requires provider=live")
-    if not request.table_ids:
-        raise HTTPException(status_code=422, detail="Select at least one published table")
-    settings = get_settings()
-    run, budget, auto_published, auto_finalized = _prepare_generation_run(session, request, settings)
-    payload = run_view(session, run)
-    if auto_published:
-        payload["auto_published_code_sets"] = auto_published
-    if auto_finalized:
-        payload["auto_finalized_tables"] = auto_finalized
-    spawn_run_driver(run.id, settings, generation_budget=budget, allowed_statuses=("RUNNING",))
-    return payload

@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from app.api.system import stream_bus_events
+from app.api.platform.system import stream_bus_events
 from app.kernel.bus import Bus
 
 

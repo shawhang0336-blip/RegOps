@@ -1,29 +1,22 @@
+"""报表与字段元数据查询、批量类型导入、草稿克隆与批量发布应用服务。"""
+
 import csv
 import io
 import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import HTTPException
 from openpyxl import load_workbook
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session
 from app.catalog.extraction import extract_parallel_for_blocks
 from app.catalog.tables.domain import MetadataFieldDraft
-from app.catalog.tables.service import (
-    apply_field_type_import,
-    metadata_to_spec,
-    publish_table,
-    remove_table,
-    table_detail,
-    table_summary,
-    update_field,
-)
-from app.catalog.tables.readiness import evaluate_document, evaluate_table, latest_table_rows
+from app.catalog.tables.readiness import evaluate_table, latest_table_rows
+from app.catalog.tables.service import publish_table, table_detail, table_summary
 from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
@@ -33,60 +26,20 @@ from app.infra.db_tables import (
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.infra.config import get_settings
-from app.infra.config import OPERATOR_PLACEHOLDER
 from app.ingestion.structure_service import analyze_document_structure
 
-router = APIRouter(prefix="/metadata", tags=["metadata"])
-
-_MAX_IMPORT_BYTES = 30 * 1024 * 1024
+MAX_IMPORT_BYTES = 30 * 1024 * 1024
 
 
-class ExtractRequest(BaseModel):
-    block_ids: List[str]
-    targets: Optional[List[str]] = None
-
-
-class EditRequest(BaseModel):
-    expected_version: int
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    reason: str = ""
-    changes: Dict[str, Any]
-
-
-class FieldCreateRequest(BaseModel):
-    expected_version: int
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    reason: str = ""
-    field: Dict[str, Any]
-
-
-class PublishRequest(BaseModel):
-    expected_version: int
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-
-
-class DeleteRequest(BaseModel):
-    expected_version: Optional[int] = None
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    reason: str = ""
-
-
-class PublishBatchRequest(BaseModel):
-    document_id: Optional[str] = None
-    table_ids: Optional[List[str]] = None
-    # all_ready = 三项都就绪才发；ddl_only = 只要 DDL 能落地就发（规则/码值问题写进快照）
-    scope: str = "all_ready"
-    dry_run: bool = False
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-
-
-@router.post("/extract", status_code=202)
-def extract_metadata(request: ExtractRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    if not request.block_ids:
+def extract_metadata_for_blocks(
+    session: Session,
+    block_ids: List[str],
+    targets: Optional[List[str]],
+    settings: Any,
+) -> Dict[str, Any]:
+    if not block_ids:
         raise HTTPException(status_code=422, detail="Select at least one raw block")
-    settings = get_settings()
-    blocks = session.query(RawBlockModel).filter(RawBlockModel.id.in_(request.block_ids)).all()
+    blocks = session.query(RawBlockModel).filter(RawBlockModel.id.in_(block_ids)).all()
     if any(block.content_json.get("superseded") for block in blocks):
         raise HTTPException(status_code=409, detail="Superseded raw blocks cannot be extracted")
     doc_ids_to_analyze = set()
@@ -97,7 +50,7 @@ def extract_metadata(request: ExtractRequest, session: Session = Depends(db_sess
     for doc_id in doc_ids_to_analyze:
         analyze_document_structure(doc_id, settings)
 
-    result = extract_parallel_for_blocks(request.block_ids, settings, request.targets or ["metadata", "code_sets"])
+    result = extract_parallel_for_blocks(block_ids, settings, targets or ["metadata", "code_sets"])
     return {
         "table_ids": result["table_ids"],
         "code_set_ids": result["code_set_ids"],
@@ -107,11 +60,11 @@ def extract_metadata(request: ExtractRequest, session: Session = Depends(db_sess
     }
 
 
-@router.get("/tables")
-def list_tables(
+def list_tables_with_stats(
+    session: Session,
+    *,
     status: Optional[str] = None,
     document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
     rows = latest_table_rows(session, document_id=document_id, status=status)
     table_ids = [row.id for row in rows]
@@ -195,39 +148,7 @@ def list_tables(
     return result
 
 
-@router.get("/tables/{table_id}")
-def get_table(table_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    table = session.get(TableMetadataModel, table_id)
-    if not table:
-        raise HTTPException(status_code=404, detail="Metadata table not found")
-    return table_detail(session, table)
-
-
-@router.patch("/tables/{table_id}/fields/{field_id}")
-def edit_field(
-    table_id: str,
-    field_id: str,
-    request: EditRequest,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    table = session.get(TableMetadataModel, table_id)
-    field = session.get(FieldMetadataModel, field_id)
-    if not table or not field or field.table_id != table_id:
-        raise HTTPException(status_code=404, detail="Field not found")
-    try:
-        update_field(session, table, field, request.changes, request.expected_version, request.editor, request.reason)
-        session.commit()
-    except ValueError as exc:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return table_detail(session, table)
-
-
-@router.get("/types/template")
-def download_type_template(
-    document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
-) -> Response:
+def build_type_template_csv(session: Session, *, document_id: Optional[str] = None) -> str:
     """导出类型修正模板（CSV）：仅导出当前有效最新版本表（排除 MERGED），严格 RFC 4180 转义。"""
     tables = latest_table_rows(session, document_id=document_id)
     table_ids = [table.id for table in tables]
@@ -260,16 +181,11 @@ def download_type_template(
                     "",
                 ]
             )
-    body = "\ufeff" + buf.getvalue()
-    return Response(
-        content=body,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="field_type_template.csv"'},
-    )
+    return "\ufeff" + buf.getvalue()
 
 
-def _read_import_rows(filename: str, content: bytes) -> List[List[str]]:
-    if len(content) > _MAX_IMPORT_BYTES:
+def read_import_rows(filename: str, content: bytes) -> List[List[str]]:
+    if len(content) > MAX_IMPORT_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds the 30 MB limit")
     lowered = (filename or "").lower()
     if lowered.endswith((".xlsx", ".xlsm")):
@@ -293,46 +209,24 @@ def _read_import_rows(filename: str, content: bytes) -> List[List[str]]:
     return [[cell.strip() for cell in row] for row in csv.reader(io.StringIO(text))]
 
 
-@router.post("/types/import")
-async def import_field_types(
-    file: UploadFile = File(...),
-    editor: str = Form(default=OPERATOR_PLACEHOLDER),
-    reason: str = Form(default="批量导入类型修正"),
-    document_id: Optional[str] = Form(default=None),
-    dry_run: bool = Form(default=False),
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """批量修正字段类型。一行一个字段，只写要改的列；导入的行标成 MANUAL。"""
-    rows = _read_import_rows(file.filename or "", await file.read())
-    try:
-        return apply_field_type_import(
-            session,
-            rows,
-            editor=editor,
-            reason=reason,
-            document_id=document_id or None,
-            dry_run=dry_run,
-        )
-    except ValueError as exc:
-        session.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/tables/{table_id}/fields")
-def add_field(
+def create_table_field(
+    session: Session,
     table_id: str,
-    request: FieldCreateRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    field_payload: Dict[str, Any],
+    editor: str,
+    reason: str,
 ) -> Dict[str, Any]:
     table = session.get(TableMetadataModel, table_id)
     if not table:
         raise HTTPException(status_code=404, detail="Metadata table not found")
     if table.status == "MERGED":
         raise HTTPException(status_code=409, detail="MERGED table cannot be edited")
-    if table.current_version != request.expected_version:
+    if table.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     try:
-        draft = MetadataFieldDraft.model_validate(request.field)
+        draft = MetadataFieldDraft.model_validate(field_payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     existing_ens = {
@@ -368,8 +262,8 @@ def add_field(
             revision_kind="HUMAN_ADD",
             old_value_json=None,
             new_value_json=draft.model_dump(),
-            editor=request.editor,
-            reason=request.reason,
+            editor=editor,
+            reason=reason,
         )
     )
     try:
@@ -380,12 +274,14 @@ def add_field(
     return table_detail(session, table)
 
 
-@router.delete("/tables/{table_id}/fields/{field_id}")
-def delete_field(
+def delete_table_field(
+    session: Session,
     table_id: str,
     field_id: str,
-    request: EditRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    editor: str,
+    reason: str,
 ) -> Dict[str, Any]:
     table = session.get(TableMetadataModel, table_id)
     field = session.get(FieldMetadataModel, field_id)
@@ -393,7 +289,7 @@ def delete_field(
         raise HTTPException(status_code=404, detail="Field not found")
     if table.status == "MERGED":
         raise HTTPException(status_code=409, detail="MERGED table cannot be edited")
-    if table.current_version != request.expected_version:
+    if table.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     old = {"field_id": field.id, "field_en": field.field_en, "field_cn": field.field_cn}
     # MySQL 8 强外键顺序：先清子表引用与历史修订的 field_id 外键，再删字段本身，最后落一条 field_id=None 的删除审计记录
@@ -416,43 +312,27 @@ def delete_field(
             revision_kind="HUMAN_DELETE",
             old_value_json=old,
             new_value_json={"deleted": True},
-            editor=request.editor,
-            reason=request.reason,
+            editor=editor,
+            reason=reason,
         )
     )
     session.commit()
     return table_detail(session, table)
 
 
-@router.delete("/tables/{table_id}")
-def delete_table(
+def clone_table_draft(
+    session: Session,
     table_id: str,
-    request: DeleteRequest,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """删掉一张不想要的报表（硬删除，历史 run 快照不受影响）。"""
-    table = session.get(TableMetadataModel, table_id)
-    if not table:
-        raise HTTPException(status_code=404, detail="Metadata table not found")
-    if request.expected_version is not None and table.current_version != request.expected_version:
-        raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-    result = remove_table(session, table)
-    session.commit()
-    return {**result, "editor": request.editor, "reason": request.reason}
-
-
-@router.post("/tables/{table_id}/draft")
-def create_draft(
-    table_id: str,
-    request: PublishRequest,
-    session: Session = Depends(db_session),
+    *,
+    expected_version: int,
+    approver: str,
 ) -> Dict[str, Any]:
     source = session.get(TableMetadataModel, table_id)
     if not source:
         raise HTTPException(status_code=404, detail="Metadata table not found")
     if source.status == "MERGED":
         raise HTTPException(status_code=409, detail="MERGED table cannot create draft")
-    if source.current_version != request.expected_version:
+    if source.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     target = TableMetadataModel(
         id=str(uuid.uuid4()),
@@ -529,7 +409,7 @@ def create_draft(
             revision_kind="DRAFT_CREATED",
             old_value_json={"source_table_id": source.id},
             new_value_json={"version": target.current_version},
-            editor=request.approver,
+            editor=approver,
             reason="Create editable draft from published version",
         )
     )
@@ -541,51 +421,28 @@ def create_draft(
     return table_detail(session, target)
 
 
-@router.post("/tables/{table_id}/publish")
-def publish(
-    table_id: str,
-    request: PublishRequest,
-    session: Session = Depends(db_session),
+def publish_tables_batch(
+    session: Session,
+    *,
+    document_id: Optional[str],
+    table_ids: Optional[List[str]],
+    scope: str,
+    dry_run: bool,
+    approver: str,
 ) -> Dict[str, Any]:
-    table = session.get(TableMetadataModel, table_id)
-    if not table:
-        raise HTTPException(status_code=404, detail="Metadata table not found")
-    if table.status == "MERGED":
-        raise HTTPException(status_code=409, detail="MERGED table cannot be published")
-    try:
-        publish_table(session, table, request.approver, request.expected_version)
-        session.commit()
-    except ValueError as exc:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return table_detail(session, table)
-
-
-@router.get("/readiness")
-def metadata_readiness(
-    document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """每张表能出哪些产物：DDL / 规则 / 码值，以及卡在哪一项。"""
-    return evaluate_document(session, document_id)
-
-
-@router.post("/tables/publish-batch")
-def publish_batch(request: PublishBatchRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """批量发布：按就绪度一次推进（自动排除 MERGED 碎片表与历史旧版本）。"""
-    if request.scope not in {"all_ready", "ddl_only"}:
+    if scope not in {"all_ready", "ddl_only"}:
         raise HTTPException(status_code=422, detail="scope 只支持 all_ready / ddl_only")
     published: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
-    if request.table_ids:
+    if table_ids:
         tables = (
             session.query(TableMetadataModel)
-            .filter(TableMetadataModel.id.in_(list(dict.fromkeys(request.table_ids))))
+            .filter(TableMetadataModel.id.in_(list(dict.fromkeys(table_ids))))
             .order_by(TableMetadataModel.source_ordinal.asc())
             .all()
         )
     else:
-        tables = latest_table_rows(session, document_id=request.document_id)
+        tables = latest_table_rows(session, document_id=document_id)
     for table in tables:
         if table.status == "MERGED":
             skipped.append({"table_code": table.table_code, "reason": "MERGED_TABLE"})
@@ -607,18 +464,18 @@ def publish_batch(request: PublishBatchRequest, session: Session = Depends(db_se
             item["code"]
             for item in result["rule_materials"]["blockers"] + result["code_sets"]["defects"]
         ]
-        if request.scope == "all_ready" and pending:
+        if scope == "all_ready" and pending:
             skipped.append({"table_code": table.table_code, "reason": "RULE_OR_CODE_NOT_READY", "detail": "、".join(pending[:3])})
             continue
-        if request.dry_run:
+        if dry_run:
             published.append({"table_code": table.table_code, "warnings": pending})
             continue
         try:
-            publish_table(session, table, request.approver, table.current_version)
+            publish_table(session, table, approver, table.current_version)
             published.append({"table_code": table.table_code, "warnings": pending})
         except ValueError as exc:
             skipped.append({"table_code": table.table_code, "reason": "PUBLISH_FAILED", "detail": str(exc)})
-    if request.dry_run:
+    if dry_run:
         session.rollback()
     else:
         session.commit()
@@ -627,16 +484,5 @@ def publish_batch(request: PublishBatchRequest, session: Session = Depends(db_se
         "skipped": len(skipped),
         "details": published,
         "skipped_details": skipped[:50],
-        "dry_run": request.dry_run,
+        "dry_run": dry_run,
     }
-
-
-@router.get("/tables/{table_id}/spec")
-def published_spec(table_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    table = session.get(TableMetadataModel, table_id)
-    if not table:
-        raise HTTPException(status_code=404, detail="Metadata table not found")
-    try:
-        return metadata_to_spec(session, table).model_dump()
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc

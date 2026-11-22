@@ -99,35 +99,47 @@ backend/app/
 │   ├── production_service.py    #    Step 3.3 生产部署 ZIP 包打包与完整性门禁
 │   └── business_db.py           #    业务库只读抽样探查连接器
 │
-└── api/                         # 层 7：HTTP 接口层（统一收口全部 /api/* 路由）
-    ├── deps.py                  #    公共 Session 依赖（db_session）、spawn_run_driver 与视图序列化
-    ├── system.py                #    /api/health / /api/events/stream（SSE） / /api/blobs/* / /api/business/preview
-    ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / trace 耗时瀑布 / bus-events）
-    ├── documents.py             #    /api/documents/*（Step 0/1 文档上传、切块、提取与进度）
-    ├── metadata.py              #    /api/metadata/*（Step 1 报表字段、就绪度与批量类型修正）
-    ├── code_sets.py             #    /api/code-sets/*（Step 1 码值表、引用对齐与导入）
-    ├── generation.py            #    /api/generation/*（Step 2/3 发起生成、规划与生产部署 ZIP 打包）
-    ├── artifacts.py             #    /api/artifacts/*（Step 2 报表产物聚合、规则总览与手工改参）
-    └── settings.py              #    /api/settings/*（连接探活与执行预算配置）
+└── api/                         # 层 7：HTTP 接口层（按 4 个业务域分组 + 薄路由/服务分离，统一由 register_routers 挂载 /api/*）
+    ├── __init__.py              #    唯一路由装配入口 register_routers(app)
+    ├── common.py                #    跨域公共依赖（db_session）、spawn_run_driver 与通用 Run 视图序列化
+    ├── platform/                #    域 1：平台底座与配置
+    │   ├── system.py            #      /api/health、/api/events/stream（SSE）、/api/blobs/*、/api/business/preview
+    │   └── settings.py          #      /api/settings/*（连接探活与执行预算校验/持久化）
+    ├── catalog/                 #    域 2：监管资产目录（文档 / 表字段元数据 / 码表）
+    │   ├── documents.py         #      /api/documents/* 薄路由（上传、切块、提取、进度、版本对比）
+    │   ├── documents_service.py #      文档接入、原子落盘、初始切块与状态校验服务
+    │   ├── metadata.py          #      /api/metadata/* 薄路由（报表字段、就绪度、类型修正与发布）
+    │   ├── metadata_service.py  #      表字段统计聚合、CSV/XLSX 导入、强外键删除、草稿克隆与批量发布服务
+    │   ├── code_sets.py         #      /api/code-sets/* 薄路由（码表、码值、引用对齐与导入）
+    │   └── code_sets_service.py #      码表明细、直传文档抽取、引用对齐与大小写去重导入服务
+    ├── generation/              #    域 3：规则与产物装配
+    │   ├── generation.py        #      /api/generation/* 薄路由（发起生成、规划与生产部署 ZIP 打包）
+    │   ├── generation_service.py#      生成前置阻断检查、快照装配与自动发布服务
+    │   ├── artifacts.py         #      /api/artifacts/* 薄路由（产物状态、规则总览与手工改参）
+    │   └── artifacts_service.py #      产物批量聚合（防 N+1）、规则改参校验与 EventLog 留痕服务
+    └── delivery/                #    域 4：运行批次控制与审计交付
+        ├── runs.py              #      /api/runs/* 薄路由（生命周期、审批、测试确认、重试、回放、trace、bus-events）
+        └── runs_service.py      #      批次列表批量折叠、多轮 Oracle 沙箱表清理与校验明细拼装服务
 ```
 
 ---
 
 ## 二、核心架构红线（自动化测试守卫）
 
-[`tests/test_kernel_policy_isolation.py`](tests/test_kernel_policy_isolation.py) 在每次回归中强制守卫以下五条红线：
+[`tests/test_kernel_policy_isolation.py`](tests/test_kernel_policy_isolation.py) 在每次回归中强制守卫以下六条红线：
 
 1. **内核纯净度与六模块边界**：`app/kernel/` 严格收敛为六大核心模块（`plan` / `bus` / `event_log` / `interrupt` / `run` / `scheduler`），严禁 `import` 任何业务层或策略层（`policy` / `ingestion` / `catalog` / `engine` / `delivery` / `api`）；
 2. **策略层三模块与零全局污染**：`app/policy/` 严格收敛为三大插槽模块（`regops_plan` / `regops_bus` / `regops_channels`），严禁在 import 期污染 `global_bus()` 或隐式绑定全局默认 reducer；
 3. **四业务阶段纯离线边界**：`app/infra/` 收敛为 7 个核心底座模块 + `llm/` 子包；`app/ingestion/parsers/`、`app/catalog/tables/domain.py`、`app/catalog/code_sets/parser.py`、`app/generation/core/` 均零 DB/LLM 依赖（且 `catalog/code_sets/` 严禁反调 `tables/`，`generation/core/` 严禁反调 `generation/sql/` 或 `generation/workflow/`）；
-4. **内核独立可运行**：仅依赖 `app.kernel` 即可编排、门禁拦截、归约 Channel 并驱动非监管工作流；
-5. **根目录整洁与全层严格单向八层 DAG**：`backend/app/` 根目录只允许 `main.py` 与 8 个架构包，AST 静态扫描确保所有跨层引用严格从高层指向低层（`infra < kernel < policy < ingestion < catalog < generation < delivery < api < main`），零倒挂、零循环依赖。
+4. **API 域隔离与零跨路由依赖**：`app/api/` 严格收敛为 `common.py` + 四大业务域子包（`platform/` / `catalog/` / `generation/` / `delivery/`），路由文件严禁彼此 `import`，服务文件严禁反调路由文件；
+5. **内核独立可运行**：仅依赖 `app.kernel` 即可编排、门禁拦截、归约 Channel 并驱动非监管工作流；
+6. **根目录整洁与全层严格单向八层 DAG**：`backend/app/` 根目录只允许 `main.py` 与 8 个架构包，AST 静态扫描确保所有跨层引用严格从高层指向低层（`infra < kernel < policy < ingestion < catalog < generation < delivery < api < main`），零倒挂、零循环依赖。
 
 ---
 
 ## 三、看代码推荐阅读顺序
 
-1. **看启动与路由**：[`app/main.py`](app/main.py) → [`app/api/runs.py`](app/api/runs.py) → [`app/api/generation.py`](app/api/generation.py)
+1. **看启动与路由**：[`app/main.py`](app/main.py) → [`app/api/__init__.py`](app/api/__init__.py) → [`app/api/delivery/runs.py`](app/api/delivery/runs.py) → [`app/api/generation/generation.py`](app/api/generation/generation.py)
 2. **看微内核机制**：[`app/kernel/plan.py`](app/kernel/plan.py) → [`app/kernel/bus.py`](app/kernel/bus.py) → [`app/kernel/event_log.py`](app/kernel/event_log.py) → [`app/kernel/interrupt.py`](app/kernel/interrupt.py) → [`app/kernel/run.py`](app/kernel/run.py) → [`app/kernel/scheduler.py`](app/kernel/scheduler.py)
 3. **看 RegOps 策略装配**：[`app/policy/regops_plan.py`](app/policy/regops_plan.py) → [`app/policy/regops_bus.py`](app/policy/regops_bus.py) → [`app/policy/regops_channels.py`](app/policy/regops_channels.py)
-4. **看阶段二流水线执行**：[`app/generation/workflow/entrypoints.py`](app/generation/workflow/entrypoints.py) → [`app/generation/workflow/nodes.py`](app/generation/workflow/nodes.py) → [`app/generation/workflow/runtime.py`](app/generation/workflow/runtime.py) → [`app/generation/workflow/stages.py`](app/generation/workflow/stages.py)
+4. **看阶段二/三流水线执行**：[`app/delivery/workflow/entrypoints.py`](app/delivery/workflow/entrypoints.py) → [`app/generation/workflow/nodes_front.py`](app/generation/workflow/nodes_front.py) → [`app/delivery/testing/nodes_back.py`](app/delivery/testing/nodes_back.py) → [`app/generation/workflow/runtime.py`](app/generation/workflow/runtime.py)

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import artifacts, code_sets, documents, generation, metadata, runs, settings as settings_api, system
+from app.api import register_routers
 from app.catalog.pipeline_run import recover_interrupted_ingestion_runs
 from app.delivery.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
@@ -15,7 +15,7 @@ from app.infra.task_runner import task_runner
 
 
 def _mark_interrupted_runs() -> None:
-    """进程重启后把仍在运行态的 Step 1 / Step 2 批次统一记为失败（基于 kernel.run）。"""
+    """进程重启后把仍在运行态的文档解析 / 规则生成批次统一记为失败（基于 kernel.run）。"""
     recover_interrupted_generic_runs()
     recover_interrupted_ingestion_runs()
 
@@ -41,12 +41,4 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 统一挂载全量 /api/* 路由（底座 / 运行批次 / 工作台资产与生成）
-app.include_router(system.router)
-app.include_router(runs.router)
-app.include_router(settings_api.router, prefix="/api")
-app.include_router(documents.router, prefix="/api")
-app.include_router(metadata.router, prefix="/api")
-app.include_router(code_sets.router, prefix="/api")
-app.include_router(generation.router, prefix="/api")
-app.include_router(artifacts.router, prefix="/api")
+register_routers(app)

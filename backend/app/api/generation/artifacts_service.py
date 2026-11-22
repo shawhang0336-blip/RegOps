@@ -1,24 +1,20 @@
-"""按报表聚合最近一次生成的产物。
-
-第二步的核心产物是**校验规则**，但之前的界面只让用户「选表」，生成完
-看不到结果。这里按表聚合最近一次 run 的规则、表结构、码表迁移和验证结果，
-让「这张表最终产出了什么」一眼可见。
-"""
+"""规则工作台聚合查询与改参编排服务（供 `api/generation/artifacts.py` 调用）。"""
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session
 from app.catalog.code_sets.bindings import code_set_compile_bindings, load_published_code_sets
 from app.catalog.tables.readiness import latest_table_rows
-from app.generation.sql.compiler import compile_where
 from app.generation.core.rules import RuleValidationError, normalize_oracle_regexp, validate_rule
+from app.generation.sql.compiler import compile_where
+from app.infra.blob_store import LocalBlobStore
+from app.infra.config import Settings
+from app.infra.contracts import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
@@ -29,17 +25,12 @@ from app.infra.db_tables import (
     SpecificationModel,
     TableMetadataModel,
 )
-from app.infra.blob_store import LocalBlobStore
-from app.infra.config import OPERATOR_PLACEHOLDER, get_settings
-from app.infra.contracts import RuleDefinition, SpecDocument, calculate_rule_hash
 from app.kernel.event_log import append_event
 from app.kernel.run import run_registry
 from app.policy.regops_bus import default_bus
 from app.policy.regops_plan import ACTIVE_RUN_STATUSES, project, project_many
 
-router = APIRouter(prefix="/artifacts", tags=["artifacts"])
-
-_OPERATOR_LABELS = {
+OPERATOR_LABELS = {
     "REQUIRED": "必填",
     "ENUM": "枚举",
     "NOT_IN": "排除",
@@ -66,16 +57,28 @@ def _blob_text(store: LocalBlobStore, uri: Optional[str]) -> Optional[str]:
 
 
 def _latest_run_for_table(session: Session, table_code: str) -> Optional[RunModel]:
-    """找这张表参与过、且确实产出了规则的最近一次 run。"""
     row = (
         session.query(RuleModel.run_id)
         .filter(RuleModel.table_code == table_code)
         .order_by(RuleModel.created_at.desc())
         .first()
     )
-    if not row:
-        return None
-    return session.get(RunModel, row[0])
+    return session.get(RunModel, row[0]) if row else None
+
+
+def _latest_run_ids_by_table(session: Session) -> Dict[str, str]:
+    candidates = (
+        session.query(RuleModel.table_code, RuleModel.run_id, func.max(RuleModel.created_at))
+        .group_by(RuleModel.table_code, RuleModel.run_id)
+        .all()
+    )
+    latest: Dict[str, str] = {}
+    newest_at: Dict[str, Any] = {}
+    for table_code, run_id, newest in candidates:
+        if table_code not in newest_at or (newest or datetime.min) > newest_at[table_code]:
+            newest_at[table_code] = newest or datetime.min
+            latest[table_code] = run_id
+    return latest
 
 
 def _rules_payload(
@@ -87,7 +90,6 @@ def _rules_payload(
     run_state: Any = None,
     spec_model: Optional[SpecificationModel] = None,
 ) -> List[Dict[str, Any]]:
-    """一张表在某次 run 里的规则列表，带编译后的 SQL；明细和总览共用它。"""
     if rows is None:
         rows = (
             session.query(RuleModel)
@@ -96,7 +98,6 @@ def _rules_payload(
             .all()
         )
     physical = {table.table_code: table.table_code}
-    # 尽力还原执行时的码表子查询形态：码表版本漂移或老批次缺上下文时回退为内联列表
     code_set_bindings = None
     try:
         resolved_spec = spec_model if spec_model is not None else session.get(SpecificationModel, run.spec_id)
@@ -126,7 +127,7 @@ def _rules_payload(
                 "rule_key": definition.rule_key,
                 "field": definition.field,
                 "operator": definition.operator,
-                "operator_label": _OPERATOR_LABELS.get(definition.operator, definition.operator),
+                "operator_label": OPERATOR_LABELS.get(definition.operator, definition.operator),
                 "params": definition.params,
                 "source": definition.source,
                 "status": row.status,
@@ -138,27 +139,7 @@ def _rules_payload(
     return rules
 
 
-def _latest_run_ids_by_table(session: Session) -> Dict[str, str]:
-    candidates = (
-        session.query(RuleModel.table_code, RuleModel.run_id, func.max(RuleModel.created_at))
-        .group_by(RuleModel.table_code, RuleModel.run_id)
-        .all()
-    )
-    latest: Dict[str, str] = {}
-    newest_at: Dict[str, Any] = {}
-    for table_code, run_id, newest in candidates:
-        if table_code not in newest_at or (newest or datetime.min) > newest_at[table_code]:
-            newest_at[table_code] = newest or datetime.min
-            latest[table_code] = run_id
-    return latest
-
-
-@router.get("/rules")
-def all_table_rules(
-    document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """所有已生成表的规则总览：按表分组（排除 DELETED 文档、MERGED 与历史旧版本），批量查询避免 N+1。"""
+def list_all_table_rules(session: Session, *, document_id: Optional[str] = None) -> Dict[str, Any]:
     tables = latest_table_rows(session, document_id=document_id)
     latest = _latest_run_ids_by_table(session)
     table_codes_with_runs = {table.table_code for table in tables if table.table_code in latest}
@@ -224,12 +205,7 @@ def all_table_rules(
     return {"tables": items}
 
 
-@router.get("")
-def artifacts_status(
-    document_id: Optional[str] = None,
-    session: Session = Depends(db_session),
-) -> Dict[str, Any]:
-    """每张表最近一次生成的状态（排除 DELETED 文档、MERGED 碎片表与旧版本，批量折叠状态防 N+1）。"""
+def list_artifacts_status(session: Session, *, document_id: Optional[str] = None) -> Dict[str, Any]:
     latest = _latest_run_ids_by_table(session)
     count_rows = (
         session.query(RuleModel.run_id, RuleModel.table_code, func.count())
@@ -283,14 +259,7 @@ def artifacts_status(
     return {"tables": result}
 
 
-class RuleEditRequest(BaseModel):
-    params: Dict[str, Any] = Field(default_factory=dict)
-    editor: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    reason: str = ""
-
-
 def _spec_bundle_for_rule(session: Session, rule: RuleModel) -> Tuple[SpecDocument, Dict[str, SpecDocument]]:
-    """规则改 params 前拿所属表及同快照全部表的 spec 做合法性校验（含 FOREIGN_KEY 跨表校验）。"""
     spec_model = session.get(SpecificationModel, rule.spec_id)
     if not spec_model:
         raise HTTPException(status_code=404, detail="Rule spec not found")
@@ -335,8 +304,7 @@ def _validate_edited_rule_references(
             raise HTTPException(status_code=422, detail="FOREIGN_KEY 需要非空的 references_table 和 references_field")
         target_spec = all_specs.get(ref_table)
         if target_spec is not None:
-            target_fields = {f.name for f in target_spec.fields}
-            if ref_field not in target_fields:
+            if ref_field not in {f.name for f in target_spec.fields}:
                 raise HTTPException(status_code=422, detail=f"外键目标字段不存在：{ref_table}.{ref_field}")
         else:
             meta_table = (
@@ -356,9 +324,14 @@ def _validate_edited_rule_references(
                 raise HTTPException(status_code=422, detail=f"外键目标字段不存在：{ref_table}.{ref_field}")
 
 
-@router.patch("/rules/{rule_row_id}")
-def edit_rule(rule_row_id: str, request: RuleEditRequest, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    """改一条规则的参数（校验活跃运行锁、Oracle 正则、外键/码表、哈希冲突并落 EventLog 留痕）。"""
+def update_rule_params(
+    session: Session,
+    rule_row_id: str,
+    *,
+    params: Dict[str, Any],
+    editor: str,
+    reason: str,
+) -> Dict[str, Any]:
     row = session.get(RuleModel, rule_row_id)
     if not row:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -370,7 +343,7 @@ def edit_rule(rule_row_id: str, request: RuleEditRequest, session: Session = Dep
     definition = RuleDefinition.model_validate(row.definition_json)
     spec, all_specs = _spec_bundle_for_rule(session, row)
     previous = definition.model_dump()
-    new_params = dict(request.params)
+    new_params = dict(params)
     if definition.operator == "REGEXP" and isinstance(new_params.get("pattern"), str):
         new_params["pattern"] = normalize_oracle_regexp(new_params["pattern"])
     definition.params = new_params
@@ -409,8 +382,8 @@ def edit_rule(rule_row_id: str, request: RuleEditRequest, session: Session = Dep
                 "new_rule_hash": new_hash,
                 "previous_params": previous.get("params"),
                 "params": definition.params,
-                "editor": request.editor,
-                "reason": request.reason,
+                "editor": editor,
+                "reason": reason,
             },
             bus=default_bus(),
         )
@@ -428,14 +401,12 @@ def edit_rule(rule_row_id: str, request: RuleEditRequest, session: Session = Dep
             "rule_hash": definition.rule_hash,
         },
         "previous_params": previous.get("params"),
-        "editor": request.editor,
-        "reason": request.reason,
+        "editor": editor,
+        "reason": reason,
     }
 
 
-@router.get("/{table_id}")
-def table_artifacts(table_id: str, session: Session = Depends(db_session)) -> Dict[str, Any]:
-    settings = get_settings()
+def get_table_artifacts_detail(session: Session, table_id: str, settings: Settings) -> Dict[str, Any]:
     store = LocalBlobStore(settings.blob_dir)
     table = session.get(TableMetadataModel, table_id)
     if not table:
@@ -447,7 +418,6 @@ def table_artifacts(table_id: str, session: Session = Depends(db_session)) -> Di
         .all()
     )
     run = _latest_run_for_table(session, table.table_code)
-
     payload: Dict[str, Any] = {
         "table": {
             "id": table.id,
@@ -474,8 +444,7 @@ def table_artifacts(table_id: str, session: Session = Depends(db_session)) -> Di
         "current_node": state.current_node,
         "created_at": run.created_at.isoformat() if run.created_at else None,
     }
-
-    rules = _rules_payload(session, table, run)
+    rules = _rules_payload(session, table, run, run_state=state)
     groups: Dict[str, int] = {}
     for rule in rules:
         groups[rule["operator"]] = groups.get(rule["operator"], 0) + 1

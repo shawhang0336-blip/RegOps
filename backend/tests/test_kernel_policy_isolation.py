@@ -668,7 +668,7 @@ def test_kernel_node_retry_policy_timeout_and_eventlog_trace():
 
 def test_runs_trace_api_projects_regops_eventlog_without_extra_tables():
     """验证 /api/runs/{run_id}/trace 直接从 RegOps EventLog 折叠耗时瀑布与分片维度。"""
-    from app.api.runs import trace_run
+    from app.api.delivery.runs import trace_run
 
     session = make_session()
     run = kernel.create_run(session, "regops-trace-spec", initial_node="created")
@@ -1689,6 +1689,77 @@ def test_generation_clean_structure_and_core_boundary():
         "__init__.py",
         "entrypoints.py",
     }
+
+
+def test_api_clean_structure_and_router_isolation():
+    """验证 Layer 7 (api) 按业务域清晰分层与零跨路由依赖红线：
+    1. api/ 根目录收敛为 __init__.py（register_routers）、common.py 与四大业务域子包（platform / catalog / generation / delivery）；
+    2. 严禁路由文件之间互相 import（公共编排必须下沉到同域 *_service.py）；
+    3. *_service.py 严禁反向 import 任何路由文件。
+    """
+    import app.api as api_pkg
+
+    api_dir = Path(api_pkg.__file__).resolve().parent
+    assert {p.name for p in api_dir.iterdir() if p.name != "__pycache__"} == {
+        "__init__.py",
+        "catalog",
+        "common.py",
+        "delivery",
+        "generation",
+        "platform",
+    }
+    expected_subpackages = {
+        "platform": {"__init__.py", "settings.py", "system.py"},
+        "catalog": {
+            "__init__.py",
+            "code_sets.py",
+            "code_sets_service.py",
+            "documents.py",
+            "documents_service.py",
+            "metadata.py",
+            "metadata_service.py",
+        },
+        "generation": {
+            "__init__.py",
+            "artifacts.py",
+            "artifacts_service.py",
+            "generation.py",
+            "generation_service.py",
+        },
+        "delivery": {"__init__.py", "runs.py", "runs_service.py"},
+    }
+    router_modules = set()
+    for pkg_name, expected_files in expected_subpackages.items():
+        sub_dir = api_dir / pkg_name
+        assert {p.name for p in sub_dir.glob("*.py")} == expected_files
+        for fname in expected_files:
+            if fname != "__init__.py" and not fname.endswith("_service.py"):
+                router_modules.add(f"app.api.{pkg_name}.{fname[:-3]}")
+
+    # 校验所有域内 *.py：严禁路由互调，严禁 service 反向依赖路由
+    violations = []
+    for pkg_name in expected_subpackages:
+        sub_dir = api_dir / pkg_name
+        for py_file in sorted(sub_dir.glob("*.py")):
+            if py_file.name == "__init__.py":
+                continue
+            current_mod = f"app.api.{pkg_name}.{py_file.stem}"
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in router_modules and alias.name != current_mod:
+                            violations.append(f"{current_mod} -> {alias.name}")
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module in router_modules and node.module != current_mod:
+                        violations.append(f"{current_mod} -> {node.module}")
+                    if node.module.startswith("app.api."):
+                        for alias in node.names:
+                            candidate = f"{node.module}.{alias.name}"
+                            if candidate in router_modules and candidate != current_mod:
+                                violations.append(f"{current_mod} -> {candidate}")
+    assert violations == [], f"api/ 层严禁路由互调或 service 反向依赖路由：{violations}"
+
 
 
 

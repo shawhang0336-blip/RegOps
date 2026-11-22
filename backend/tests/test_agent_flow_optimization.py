@@ -829,7 +829,7 @@ def test_data_stage_filters_extra_ai_fields_and_aligns_cross_table_fk_golden_val
 
 def test_delete_run_rows_collects_oracle_tables_from_failed_and_multi_attempt_events():
     """回归：失败批次或经历多轮自愈/重审的批次，删除时必须收集所有历史 attempt 的 Oracle 沙箱表。"""
-    from app.api.runs import _delete_run_rows
+    from app.api.delivery.runs import _delete_run_rows
     from app.kernel.event_log import append_event
 
     session = make_session()

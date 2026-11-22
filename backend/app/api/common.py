@@ -1,31 +1,14 @@
-"""API 公共依赖、请求契约与视图序列化器（所有 `/api/*` 路由共享）。"""
+"""API 层跨域公共依赖与 Run 视图序列化（`platform` / `catalog` / `generation` / `delivery` 共享）。"""
 
 from typing import Dict, Iterable, List, Optional
 
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.delivery.workflow import submit_generic_run
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
-from app.infra.config import OPERATOR_PLACEHOLDER
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
-from app.policy.regops_plan import ACTIVE_RUN_STATUSES, project
-
-
-def spawn_run_driver(
-    run_id: str,
-    settings=None,
-    generation_budget=None,
-    allowed_statuses: Iterable[str] = ("RUNNING", "READY_TO_AUDIT"),
-) -> bool:
-    """兼容薄壳：统一委托至 `delivery.workflow.submit_generic_run`（底层基于 `kernel.run.submit_run`）。"""
-    return submit_generic_run(
-        run_id,
-        settings=settings if settings is not None else get_settings(),
-        generation_budget=generation_budget,
-        allowed_statuses=allowed_statuses,
-    )
+from app.policy.regops_plan import project
 
 
 def db_session():
@@ -37,30 +20,19 @@ def db_session():
         session.close()
 
 
-# ── 请求体契约 ────────────────────────────────────────────────────────────────
-
-
-class RunRequest(BaseModel):
-    spec_id: str
-    provider: str = "live"
-
-
-class TestConfirmationRequest(BaseModel):
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-
-
-class Decision(BaseModel):
-    rule_hash: str
-    decision: str
-
-
-class ApprovalRequest(BaseModel):
-    approver: str = Field(default=OPERATOR_PLACEHOLDER, max_length=80)
-    decisions: List[Decision]
-    provider: str = "live"
-
-
-# ── 视图序列化 ────────────────────────────────────────────────────────────────
+def spawn_run_driver(
+    run_id: str,
+    settings=None,
+    generation_budget=None,
+    allowed_statuses: Iterable[str] = ("RUNNING", "READY_TO_AUDIT"),
+) -> bool:
+    """后台推进 Run 驱动（统一委托至 `delivery.workflow.submit_generic_run`）。"""
+    return submit_generic_run(
+        run_id,
+        settings=settings if settings is not None else get_settings(),
+        generation_budget=generation_budget,
+        allowed_statuses=allowed_statuses,
+    )
 
 
 def rule_view(row: RuleModel) -> Dict:

@@ -4,7 +4,7 @@ import uuid
 
 from openpyxl import Workbook
 
-from app.api import code_sets, documents, metadata
+from app.api.catalog import code_sets, documents, metadata
 from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,
@@ -285,7 +285,7 @@ def test_extraction_exception_does_not_leave_running_state(monkeypatch):
 
 def test_ingestion_run_persists_eventlog_budget_cancel_recovery_and_isolates_from_generation_runs(monkeypatch):
     """P2 回归：Step 1 文档解析纳入 kernel.run，支持 EventLog 重启还原、BudgetGuard 记账、取消/回收，且不污染 Step 2 批次列表。"""
-    from app.api.runs import list_runs
+    from app.api.delivery.runs import list_runs
     from app.catalog.pipeline_run import (
         cancel_document_run,
         list_document_runs,

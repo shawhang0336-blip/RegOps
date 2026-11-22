@@ -13,15 +13,15 @@ from openpyxl import Workbook
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
-from app.api import runs as runs_api
-from app.api import system as system_api
-from app.api.deps import RunRequest
-from app.api import artifacts as artifacts_api
-from app.api import code_sets as code_sets_api
-from app.api import documents as documents_api
-from app.api import generation as generation_api
-from app.api import metadata as metadata_api
-from app.api import settings as settings_api
+from app.api.catalog import code_sets as code_sets_api
+from app.api.catalog import documents as documents_api
+from app.api.catalog import metadata as metadata_api
+from app.api.delivery import runs as runs_api
+from app.api.delivery.runs import RunRequest
+from app.api.generation import artifacts as artifacts_api
+from app.api.generation import generation as generation_api
+from app.api.platform import settings as settings_api
+from app.api.platform import system as system_api
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
 from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument, calculate_rule_hash
