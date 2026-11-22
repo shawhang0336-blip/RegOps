@@ -87,7 +87,32 @@ TOOL_SCHEMAS = {
                 "enum": ["COLLECTION_SPEC", "STATISTICAL_SYSTEM", "RULE_DOCUMENT", "REVISION_DOCUMENT", "CODE_VALUES", "MIXED", "UNKNOWN"],
             },
             "summary": {"type": "string"},
-            "chunking_strategy": {"type": "string", "enum": ["DOCUMENT_CATALOG", "WORD_TABLE_AND_PARAGRAPH", "SHEET_PER_TABLE", "MANUAL_REVIEW"]},
+            "chunking_strategy": {
+                "type": "string",
+                "enum": [
+                    "SAFE_SPEC_PARSER",
+                    "HEADING_SECTIONS",
+                    "PAGE_WINDOWS",
+                    "DOCUMENT_CATALOG",
+                    "WORD_TABLE_AND_PARAGRAPH",
+                    "SHEET_PER_TABLE",
+                    "MANUAL_REVIEW",
+                ],
+            },
+            "section_regions": {
+                "type": "array",
+                "description": "可选切块导航区域：按 survey 中的真实标题或工作表名标注各段角色（TABLE_METADATA/CODE_SET/RULE_EVIDENCE/NARRATIVE/IGNORE），供程序精准切块并跳过目录封面等无效区。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start_heading": {"type": "string", "description": "必须逐字取自 survey.headings 或 sheet 名"},
+                        "end_heading": {"type": "string", "description": "可选，区域结束标题（不含该标题本身）"},
+                        "role": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "NARRATIVE", "IGNORE"]},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["start_heading", "role"],
+                },
+            },
             "expected_contents": {"type": "array", "items": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "REVISION_DIFF", "NARRATIVE"]}},
             "requires_human": {"type": "boolean"},
             "warnings": {"type": "array", "items": {"type": "string"}},

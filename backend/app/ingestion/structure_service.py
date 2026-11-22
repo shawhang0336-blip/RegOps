@@ -1,8 +1,10 @@
 import hashlib
+import inspect
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -10,7 +12,11 @@ from sqlalchemy.orm import Session
 from app.infra.db_tables import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.infra.config import Settings
 from app.infra.db import SessionLocal
-from app.ingestion.parsers.extractors import extract_document, survey_document
+from app.ingestion.parsers.extractors import (
+    ALLOWED_STRATEGIES_BY_FILE_TYPE,
+    extract_document,
+    survey_document,
+)
 from app.infra.llm import RealDesignLlm
 from app.infra.llm.guard import call_llm_validated, current_llm_bus, submit_with_context
 from app.kernel.run import BudgetExceededError, RunCancelledError
@@ -302,6 +308,67 @@ def latest_document_architecture(session, document_id: str, statuses=None):
     return session.get(DocumentArchitectureModel, latest_id)
 
 
+def latest_chunking_plan(session: Session, document_id: str) -> Optional[Dict[str, Any]]:
+    """读取最近一次有效的整文档体检结论，作为 Stage 3 初步拆箱抽块的切块蓝图。"""
+    latest = latest_document_architecture(
+        session,
+        document_id,
+        statuses={"OVERVIEW_REVIEWED", "OVERVIEW_NEEDS_REVIEW"},
+    )
+    if not latest or not isinstance(latest.plan_json, dict):
+        return None
+    result = latest.plan_json.get("result")
+    return result if isinstance(result, dict) and result else None
+
+
+def invoke_extract_document(
+    extract_fn,
+    source_path: Path,
+    file_type: str,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+):
+    """调用抽块入口并在函数支持 chunking_plan 参数时透传 Stage 2 切块蓝图（兼容 2 参数单测桩）。"""
+    try:
+        sig = inspect.signature(extract_fn)
+        accepts_plan = "chunking_plan" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_plan = False
+    if accepts_plan:
+        return extract_fn(source_path, file_type, chunking_plan=chunking_plan)
+    return extract_fn(source_path, file_type)
+
+
+def _sanitize_section_regions(regions: Any, survey: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """确定性防幻觉护栏：校验 AI ① 返回的 section_regions，剔除原文中不存在的虚构标题/工作表名。"""
+    if not isinstance(regions, list):
+        return [], []
+    known_raw = list(survey.get("headings") or []) + list(survey.get("sheet_names") or [])
+    known_norm = [re.sub(r"\s+", "", str(h)).lower() for h in known_raw if str(h or "").strip()]
+    valid: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    valid_roles = {"TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "NARRATIVE", "IGNORE"}
+    for item in regions:
+        if not isinstance(item, dict):
+            continue
+        start_h = str(item.get("start_heading") or "").strip()
+        role = str(item.get("role") or "").upper()
+        if not start_h or role not in valid_roles:
+            continue
+        norm_start = re.sub(r"\s+", "", start_h).lower()
+        if known_norm and not any(norm_start == kh or norm_start in kh or kh in norm_start for kh in known_norm):
+            warnings.append(f"AI 体检引用的区域标题「{start_h}」不在原文目录/工作表清单中，已自动忽略")
+            continue
+        cleaned_region: Dict[str, Any] = {"start_heading": start_h, "role": role}
+        if item.get("end_heading"):
+            cleaned_region["end_heading"] = str(item["end_heading"]).strip()
+        if item.get("reason"):
+            cleaned_region["reason"] = str(item["reason"]).strip()
+        valid.append(cleaned_region)
+    return valid, warnings
+
+
 def inspect_document_overview(document_id: str, settings: Settings, force: bool = False) -> str:
     with SessionLocal() as session:
         document = session.get(SourceDocumentModel, document_id)
@@ -323,7 +390,12 @@ def inspect_document_overview(document_id: str, settings: Settings, force: bool 
             result, trace = call_llm_validated(
                 llm,
                 "inspect_document_structure",
-                "在初步切块前检查整份文件的目录、章节、表格或工作表结构。判断文档类型、包含内容和适合的切块方式；只输出结构结论，不提取字段，不得虚构。",
+                (
+                    "在初步切块前体检整份监管文件，输出可执行的切块导航蓝图：\n"
+                    "1. 从 survey.allowed_chunk_strategies 中选择最合适的 chunking_strategy（PDF 若命中 SAFE_CHAPTER6/SAFE_FAL_2025 选 SAFE_SPEC_PARSER；其他有目录章节的监管 PDF 选 HEADING_SECTIONS；无章节标题的纯表格/扫描 PDF 选 PAGE_WINDOWS）；\n"
+                    "2. 可在 section_regions 中逐字引用 survey.headings 或 sheet_names，标出哪些区域是 TABLE_METADATA（数据字典）、CODE_SET（码表/附录）、RULE_EVIDENCE（核查规则）或 IGNORE（封面/目录/修订历史）；\n"
+                    "3. 只输出结构结论与导航蓝图，不提取具体字段，严禁虚构不存在的标题。"
+                ),
                 {"file_name": document.file_name, "survey": survey},
                 timeout=60,
                 backoff=(1.0,),
@@ -332,11 +404,29 @@ def inspect_document_overview(document_id: str, settings: Settings, force: bool 
                 validation_attempts=2,
             )
             warnings = list(result.get("warnings") or [])
-            expected_strategy = survey["available_chunk_strategy"]
-            if result.get("chunking_strategy") not in {expected_strategy, "MANUAL_REVIEW"}:
-                warnings.append("AI 建议的切块方式与文件类型不一致，程序将使用文件类型对应的安全切块方式")
-                result["requires_human"] = True
-            result["chunking_strategy"] = expected_strategy
+            default_strategy = survey["available_chunk_strategy"]
+            allowed_strategies = set(
+                survey.get("allowed_chunk_strategies")
+                or ALLOWED_STRATEGIES_BY_FILE_TYPE.get(document.file_type, (default_strategy,))
+            )
+            chosen_strategy = str(result.get("chunking_strategy") or "").strip().upper()
+            if chosen_strategy in allowed_strategies:
+                # 真正尊重 AI 在该文件类型合法策略集内作出的选择（例如 PDF 选择 HEADING_SECTIONS 或 PAGE_WINDOWS）
+                result["chunking_strategy"] = chosen_strategy
+            else:
+                if chosen_strategy != "MANUAL_REVIEW":
+                    warnings.append(
+                        f"AI 建议的切块方式 {chosen_strategy or '空'} 不适用于 {document.file_type}，程序已回退为 {default_strategy}"
+                    )
+                    result["requires_human"] = True
+                result["chunking_strategy"] = default_strategy
+
+            clean_regions, region_warnings = _sanitize_section_regions(result.get("section_regions"), survey)
+            if clean_regions:
+                result["section_regions"] = clean_regions
+            elif "section_regions" in result:
+                result["section_regions"] = []
+            warnings.extend(region_warnings)
             result["warnings"] = warnings
             status = "OVERVIEW_NEEDS_REVIEW" if result.get("requires_human") else "OVERVIEW_REVIEWED"
         except (BudgetExceededError, RunCancelledError):
@@ -370,11 +460,12 @@ def reextract_document_blocks(document_id: str, settings: Settings) -> int:
         document = session.get(SourceDocumentModel, document_id)
         if not document:
             raise ValueError("Document not found")
-        # 体检失败不再阻断切块：切块按文件类型走确定性路径，不依赖体检结论
+        # 体检成功则把 AI ① 产出的切块蓝图透传给抽块器；体检失败则 chunking_plan=None 走确定性通用路由
+        chunking_plan = latest_chunking_plan(session, document.id)
         source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
         if not source_path.is_file():
             raise ValueError("Original document blob not found")
-        _, new_blocks = extract_document(source_path, document.file_type)
+        _, new_blocks = invoke_extract_document(extract_document, source_path, document.file_type, chunking_plan)
         existing = session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).all()
         for block in existing:
             block.content_json = {**block.content_json, "superseded": True}

@@ -217,6 +217,7 @@ def start_document_prepare_run(
             from app.assets.code_sets.service import auto_link_all_references, extract_code_sets_for_block
             from app.ingestion.parsers.extractors import extract_document
             from app.ingestion.parsers.quality import inspect_block
+            from app.ingestion.structure_service import invoke_extract_document, latest_chunking_plan
 
             with sf() as s:
                 doc = s.get(SourceDocumentModel, doc_id)
@@ -225,7 +226,10 @@ def start_document_prepare_run(
                 if s.query(RawBlockModel).filter(RawBlockModel.document_id == doc.id).count():
                     return
                 source_path = Path(settings.blob_dir) / "uploads" / f"{doc.sha256}.{doc.file_type}"
-                version, blocks = extract_document(source_path, doc.file_type)
+                chunking_plan = latest_chunking_plan(s, doc.id)
+                version, blocks = invoke_extract_document(
+                    extract_document, source_path, doc.file_type, chunking_plan
+                )
                 if not blocks:
                     raise ValueError("No raw blocks were discovered")
                 doc.spec_version = version

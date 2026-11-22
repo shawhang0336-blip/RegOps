@@ -1523,7 +1523,7 @@ def test_ingestion_clean_structure_and_pure_parsers_boundary():
 
     parsers_dir = ingestion_dir / "parsers"
     actual_parsers = {p.name for p in parsers_dir.glob("*.py")}
-    assert actual_parsers == {"__init__.py", "extractors.py", "pdf_catalog.py", "pdf_parser.py", "quality.py"}
+    assert actual_parsers == {"__init__.py", "extractors.py", "pdf_catalog.py", "pdf_generic.py", "pdf_parser.py", "quality.py"}
 
     forbidden = ("app.infra.db", "app.infra.db_tables", "app.infra.llm", "app.kernel", "app.policy")
     violations = []

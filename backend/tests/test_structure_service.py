@@ -384,12 +384,12 @@ def test_ingestion_deep_audit_ordinal_collision_split_preserve_cancel_and_progre
         with llm_execution_scope(cancellation=tok):
             analyze_document_structure(doc.id, Settings())
 
-    # 3) extract_pdf 仅提取一次 PDF 文本
+    # 3) extract_pdf 仅提取一次 PDF 文本（SAFE 路由下不重复跑 pdftotext）
     calls = {"pdf": 0}
 
     def fake_extract_pdf_text(_p):
         calls["pdf"] += 1
-        return "fake pdf text"
+        return "第六章 数据接口格式\nfake pdf text"
 
     monkeypatch.setattr(extractors, "_extract_pdf_text", fake_extract_pdf_text)
     monkeypatch.setattr(extractors, "parse_document_catalog", lambda p, *, full_text=None, digest=None: [
@@ -416,3 +416,101 @@ def test_ingestion_deep_audit_ordinal_collision_split_preserve_cancel_and_progre
         assert "doc-done-1" not in import_progress._STATE
     finally:
         import_progress._STATE.clear()
+
+
+def test_overview_preserves_valid_ai_strategy_filters_hallucinations_and_feeds_stage3(monkeypatch, tmp_path):
+    """验证 Stage 2 AI ① 整文档体检结论真正赋能 Stage 3 切块：
+    1. PDF 在合法策略集内选择 HEADING_SECTIONS 时不再被程序粗暴覆写；
+    2. 虚构的 section_regions 标题被防幻觉护栏自动剔除并记入 warnings，真实标题被保留；
+    3. latest_chunking_plan / reextract_document_blocks 把蓝图透传给 extract_document。
+    """
+    from app.ingestion.structure_service import (
+        inspect_document_overview,
+        latest_chunking_plan,
+        reextract_document_blocks,
+    )
+
+    session = make_session()
+    monkeypatch.setattr("app.ingestion.structure_service.SessionLocal", lambda: session)
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    sha = uuid.uuid4().hex
+    pdf_path = uploads / f"{sha}.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake east")
+
+    doc = SourceDocumentModel(
+        id=str(uuid.uuid4()),
+        file_name="east_5.pdf",
+        file_type="pdf",
+        sha256=sha,
+        blob_uri=f"blob://{sha}",
+        spec_version="UNKNOWN",
+        status="UPLOADED",
+        block_count=0,
+    )
+    session.add(doc)
+    session.commit()
+
+    monkeypatch.setattr(
+        "app.ingestion.structure_service.survey_document",
+        lambda _p, _ft: {
+            "file_type": "pdf",
+            "page_count": 12,
+            "detected_profiles": ["GENERIC_PDF"],
+            "headings": ["修订记录", "第二章 数据字典", "第三章 码值表"],
+            "available_chunk_strategy": "PAGE_WINDOWS",
+            "allowed_chunk_strategies": ["SAFE_SPEC_PARSER", "HEADING_SECTIONS", "PAGE_WINDOWS", "DOCUMENT_CATALOG"],
+        },
+    )
+
+    class OverviewLlm:
+        def assign(self, tool_name, instruction, payload, feedback=None, timeout=None):
+            assert tool_name == "inspect_document_structure"
+            return {
+                "document_kind": "DATA_STANDARD",
+                "summary": "EAST 5.0 银行业监管数据标准化规范",
+                "expected_contents": ["TABLE_METADATA", "CODE_SET"],
+                "chunking_strategy": "HEADING_SECTIONS",
+                "section_regions": [
+                    {"start_heading": "修订记录", "role": "IGNORE", "reason": "封面修订页"},
+                    {"start_heading": "第二章 数据字典", "end_heading": "第三章 码值表", "role": "TABLE_METADATA"},
+                    {"start_heading": "第九十九章 不存在的幻觉章", "role": "CODE_SET"},
+                ],
+                "requires_human": False,
+                "warnings": [],
+            }, {"arguments": {"chunking_strategy": "HEADING_SECTIONS"}}
+
+    monkeypatch.setattr("app.ingestion.structure_service.RealDesignLlm", lambda s: OverviewLlm())
+
+    settings = Settings(blob_dir=str(tmp_path))
+    arch_id = inspect_document_overview(doc.id, settings)
+    assert arch_id
+
+    plan = latest_chunking_plan(session, doc.id)
+    assert plan is not None
+    # AI ① 选择的 HEADING_SECTIONS 被真实保留（即使 survey 默认是 PAGE_WINDOWS）
+    assert plan["chunking_strategy"] == "HEADING_SECTIONS"
+    # 真实标题被保留，幻觉标题被剔除且产生告警
+    assert [r["start_heading"] for r in plan["section_regions"]] == ["修订记录", "第二章 数据字典"]
+    assert any("第九十九章" in w for w in plan["warnings"])
+
+    captured = {}
+
+    def spy_extract(path, file_type, chunking_plan=None):
+        captured["chunking_plan"] = chunking_plan
+        return "GENERIC_PDF", [
+            {
+                "ordinal": 0,
+                "block_type": "TABLE_CANDIDATE",
+                "raw_content": "2.1 对公客户表\nKHBH 客户编号 VARCHAR(32)",
+                "source_locator": {"section": "2.1 对公客户表", "strategy": "HEADING_SECTIONS"},
+                "content_json": {"table_code": "DOC_2_1", "table_name": "2.1 对公客户表", "eligible": False},
+                "raw_hash": "hash1",
+            }
+        ]
+
+    monkeypatch.setattr("app.ingestion.structure_service.extract_document", spy_extract)
+    count = reextract_document_blocks(doc.id, settings)
+    assert count == 1
+    assert captured["chunking_plan"]["chunking_strategy"] == "HEADING_SECTIONS"
+    assert len(captured["chunking_plan"]["section_regions"]) == 2

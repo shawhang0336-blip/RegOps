@@ -320,8 +320,8 @@ def extract_inline_enum_values(text: str) -> List[Dict[str, str]]:
             seen.add(code)
             values.append({"value": code, "label_cn": label})
 
-    # Pattern 2: Code-Label pairs like "A-新建", "1-主体标识码", "110.内资-国有企业", "01 居民身份证"
-    for m in re.finditer(r"(?<![A-Za-z0-9])([A-Z]|\d{1,4})\s*[-—.．]\s*([\u4e00-\u9fa5][^\n；;。]{1,36})", text):
+    # Pattern 2: Code-Label pairs like "A-新建", "1-主体标识码", "1-正常，2-冻结，3-销户"
+    for m in re.finditer(r"(?<![A-Za-z0-9])([A-Z]|\d{1,4})\s*[-—.．]\s*([\u4e00-\u9fa5][^\n；;。，,]{1,36})", text):
         code = m.group(1).strip()
         label = m.group(2).strip().rstrip("，,。；; ")
         if any(bad in label for bad in ("位", "当", "如果", "必填", "选填", "格式", "大于", "小于")):

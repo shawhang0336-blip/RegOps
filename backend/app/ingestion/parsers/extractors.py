@@ -4,11 +4,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
-from app.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
-from app.ingestion.parsers.pdf_parser import _extract_pdf_text
 from app.infra.contracts import canonical_json
+from app.ingestion.parsers.pdf_catalog import parse_document_catalog, parse_document_code_sets
+from app.ingestion.parsers.pdf_generic import (
+    default_pdf_strategy,
+    detect_pdf_profiles,
+    extract_pdf_generic_sections,
+    extract_pdf_headings,
+    extract_pdf_page_windows,
+)
+from app.ingestion.parsers.pdf_parser import SpecParseError, _extract_pdf_text
 
 # 单 Sheet 行上限：20,000 行可完整覆盖行政区划（3,200+ 行）等大型监管码表，同时防百万行恶意表格撑爆内存
 MAX_XLSX_ROWS = 20000
@@ -26,6 +35,12 @@ CODE_HEADER_LABEL_ALIASES = {
 META_HEADER_ALIASES = {
     "field_en", "field_cn", "字段", "字段名", "英文名", "字段中文名",
     "类型（长度）", "数据类型", "字段校验", "校验", "数据长度",
+}
+
+ALLOWED_STRATEGIES_BY_FILE_TYPE: Dict[str, Tuple[str, ...]] = {
+    "pdf": ("SAFE_SPEC_PARSER", "HEADING_SECTIONS", "PAGE_WINDOWS", "DOCUMENT_CATALOG"),
+    "docx": ("WORD_TABLE_AND_PARAGRAPH",),
+    "xlsx": ("SHEET_PER_TABLE",),
 }
 
 
@@ -90,36 +105,74 @@ def _sniff_tabular_code_set(title: str, headers: List[str], rows: List[List[str]
     }
 
 
-def extract_pdf(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    # 同一份 PDF 只跑一次 pdftotext 与 SHA-256，共享给目录表与附录码表扫描
-    resolved = path.resolve()
-    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-    full_text = _extract_pdf_text(resolved)
+def _region_roles_map(chunking_plan: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """把 AI ① 产出的 section_regions 索引为 {归一化标题/Sheet名: role}。"""
+    if not isinstance(chunking_plan, dict):
+        return {}
+    regions = chunking_plan.get("section_regions")
+    if not isinstance(regions, list):
+        return {}
+    mapping: Dict[str, str] = {}
+    for item in regions:
+        if not isinstance(item, dict):
+            continue
+        heading = re.sub(r"\s+", "", str(item.get("start_heading") or "")).lower()
+        role = str(item.get("role") or "").upper()
+        if heading and role in {"TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "NARRATIVE", "IGNORE"}:
+            mapping[heading] = role
+    return mapping
+
+
+def _lookup_region_role(role_map: Dict[str, str], label: str) -> Optional[str]:
+    if not role_map or not label:
+        return None
+    norm = re.sub(r"\s+", "", label).lower()
+    if norm in role_map:
+        return role_map[norm]
+    for key, role in role_map.items():
+        if key in norm or norm in key:
+            return role
+    return None
+
+
+def _extract_safe_pdf_blocks(
+    resolved: Path,
+    full_text: str,
+    digest: str,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    role_map = _region_roles_map(chunking_plan)
     entries = parse_document_catalog(str(resolved), full_text=full_text, digest=digest)
-    blocks = []
-    for index, entry in enumerate(entries):
-        raw = ""
-        if entry.get("spec"):
-            raw = f"{entry['spec']['terms_text']}\n{entry['spec']['dictionary_text']}"
-        else:
-            raw = entry["reason"]
+    blocks: List[Dict[str, Any]] = []
+    for entry in entries:
+        sec_label = f"{entry.get('section', '')} {entry.get('table_name', '')}".strip()
+        if _lookup_region_role(role_map, sec_label) == "IGNORE":
+            continue
+        raw = (
+            f"{entry['spec']['terms_text']}\n{entry['spec']['dictionary_text']}"
+            if entry.get("spec")
+            else entry["reason"]
+        )
         blocks.append(
             _block(
-                index,
+                len(blocks),
                 entry.get("candidate_role", "TABLE_CANDIDATE"),
                 raw,
-                {"section": entry["section"], "table_code": entry["table_code"]},
+                {"section": entry["section"], "table_code": entry["table_code"], "strategy": "SAFE_SPEC_PARSER"},
                 entry,
             )
         )
     code_sets = parse_document_code_sets(str(resolved), full_text=full_text)
     for cs in code_sets:
+        cs_label = f"{cs.get('section', '')} {cs.get('name', '')}".strip()
+        if _lookup_region_role(role_map, cs_label) == "IGNORE":
+            continue
         blocks.append(
             _block(
                 len(blocks),
                 "CODE_SET_CANDIDATE",
                 cs["raw_content"],
-                {"section": cs["section"], "code_set_code": cs["code"], "page": cs["page"]},
+                {"section": cs["section"], "code_set_code": cs["code"], "page": cs["page"], "strategy": "SAFE_SPEC_PARSER"},
                 {
                     "table_code": cs["code"],
                     "table_name": cs["name"],
@@ -136,49 +189,157 @@ def extract_pdf(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
     return version, blocks
 
 
-def extract_docx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    document = Document(str(path))
-    blocks = []
-    for index, table in enumerate(document.tables):
-        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
-        if not rows or not any(any(cell for cell in row) for row in rows):
-            continue
-        raw = "\n".join(" | ".join(row) for row in rows)
-        code_spec = _sniff_tabular_code_set(f"{path.stem}_表{index + 1}", rows[0], rows)
-        payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "table_index": index}
-        if code_spec:
-            payload["candidate_role"] = "CODE_SET"
-            payload["code_set_spec"] = code_spec
-            payload["reason"] = f"DOCX 码值表候选（{len(code_spec['values'])} 项）"
-            payload["field_count"] = len(code_spec["values"])
-        blocks.append(
-            _block(
-                len(blocks),
-                "DOCX_TABLE",
-                raw,
-                {"table_index": index, "row_count": len(rows)},
-                payload,
-            )
+def extract_pdf(
+    path: Path,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """三级通用 PDF 抽块路由：高精已知规范插件 → 通用章节切块（支持 AI ① 蓝图）→ 分页窗口兜底。"""
+    resolved = path.resolve()
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    full_text = _extract_pdf_text(resolved)
+
+    requested = (
+        str((chunking_plan or {}).get("chunking_strategy") or "").strip().upper()
+        if isinstance(chunking_plan, dict)
+        else ""
+    )
+    if requested == "DOCUMENT_CATALOG":
+        requested = "SAFE_SPEC_PARSER"
+    if requested not in {"SAFE_SPEC_PARSER", "HEADING_SECTIONS", "PAGE_WINDOWS"}:
+        requested = default_pdf_strategy(full_text)
+
+    # 1) 一级：已知外管局高精解析器（未命中时优雅降级至通用章节/分页，绝不抛异常拒收陌生 PDF）
+    if requested == "SAFE_SPEC_PARSER":
+        try:
+            version, blocks = _extract_safe_pdf_blocks(resolved, full_text, digest, chunking_plan=chunking_plan)
+            if blocks:
+                return version, blocks
+        except SpecParseError:
+            pass
+
+    # 2) 二级：通用章节切块器（面向 EAST / 1104 / 人行征信 / 反洗钱等任意监管 PDF）
+    if requested in {"SAFE_SPEC_PARSER", "HEADING_SECTIONS"}:
+        generic_items = extract_pdf_generic_sections(full_text, resolved, digest, chunking_plan=chunking_plan)
+        if generic_items:
+            blocks = [
+                _block(idx, item["block_type"], item["raw_content"], item["source_locator"], item["content_json"])
+                for idx, item in enumerate(generic_items)
+            ]
+            return "GENERIC_PDF", blocks
+
+    # 3) 三级：无章节标题 PDF 分页窗口兜底
+    window_items = extract_pdf_page_windows(full_text, resolved, digest, chunking_plan=chunking_plan)
+    blocks = [
+        _block(idx, item["block_type"], item["raw_content"], item["source_locator"], item["content_json"])
+        for idx, item in enumerate(window_items)
+    ]
+    return "GENERIC_PDF", blocks
+
+
+def _iter_docx_body_items(document: Document):
+    """按文档真实阅读顺序依次产出 Paragraph 与 Table，使每个表格能精确绑定正上方最近的章节标题。"""
+    parent_elm = document.element.body
+    for child in parent_elm.iterchildren():
+        if child.tag.endswith("}p"):
+            yield Paragraph(child, document)
+        elif child.tag.endswith("}tbl"):
+            yield Table(child, document)
+
+
+def _looks_like_heading(paragraph: Paragraph, text: str) -> bool:
+    if not text or len(text) > 100:
+        return False
+    style_name = (getattr(paragraph.style, "name", "") or "").lower()
+    if "heading" in style_name or "标题" in style_name:
+        return True
+    return bool(
+        re.match(
+            r"^(?:第[一二三四五六七八九十百]+[章部分篇节]|[一二三四五六七八九十]+、|（[一二三四五六七八九十]+）|附[录表]|表\s*[A-Za-z0-9\-_.]+|\d+(?:\.\d+){1,4}\s+\S+|\d+[.、]\s*\S+)",
+            text,
         )
-    narrative = "\n".join(paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip())
+    )
+
+
+def extract_docx(
+    path: Path,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    document = Document(str(path))
+    role_map = _region_roles_map(chunking_plan)
+    blocks: List[Dict[str, Any]] = []
+    narrative_parts: List[str] = []
+    current_heading = ""
+    table_index = 0
+
+    for item in _iter_docx_body_items(document):
+        if isinstance(item, Paragraph):
+            text = item.text.strip()
+            if not text:
+                continue
+            if _looks_like_heading(item, text):
+                current_heading = text
+            if _lookup_region_role(role_map, current_heading) != "IGNORE":
+                narrative_parts.append(text)
+        elif isinstance(item, Table):
+            idx = table_index
+            table_index += 1
+            rows = [[cell.text.strip() for cell in row.cells] for row in item.rows]
+            if not rows or not any(any(cell for cell in row) for row in rows):
+                continue
+            region_role = _lookup_region_role(role_map, current_heading)
+            if region_role == "IGNORE":
+                continue
+            title = current_heading or f"{path.stem}_表{idx + 1}"
+            raw = "\n".join(" | ".join(row) for row in rows)
+            code_spec = _sniff_tabular_code_set(title, rows[0], rows)
+            payload: Dict[str, Any] = {
+                "headers": rows[0],
+                "rows": rows,
+                "table_index": idx,
+                "table_name": title,
+            }
+            if current_heading:
+                payload["section"] = current_heading[:64]
+            if code_spec or region_role == "CODE_SET":
+                payload["candidate_role"] = "CODE_SET"
+                if code_spec:
+                    payload["code_set_spec"] = code_spec
+                    payload["reason"] = f"DOCX 码值表候选（{len(code_spec['values'])} 项）"
+                    payload["field_count"] = len(code_spec["values"])
+            elif region_role in {"RULE_EVIDENCE", "NARRATIVE", "TABLE_METADATA"}:
+                payload["candidate_role"] = region_role
+            locator: Dict[str, Any] = {"table_index": idx, "row_count": len(rows)}
+            if current_heading:
+                locator["section"] = current_heading[:64]
+                locator["title"] = current_heading[:120]
+            blocks.append(_block(len(blocks), "DOCX_TABLE", raw, locator, payload))
+
+    narrative = "\n".join(narrative_parts)
     if narrative:
         blocks.append(
             _block(
                 len(blocks),
                 "NARRATIVE",
                 narrative[:50000],
-                {"paragraphs": len(document.paragraphs)},
+                {"paragraphs": len(narrative_parts)},
                 {"text": narrative[:50000]},
             )
         )
     return "UNKNOWN", blocks
 
 
-def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
+def extract_xlsx(
+    path: Path,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
     workbook = load_workbook(path, read_only=False, data_only=False)
-    blocks = []
+    role_map = _region_roles_map(chunking_plan)
+    blocks: List[Dict[str, Any]] = []
     try:
         for sheet in workbook.worksheets:
+            region_role = _lookup_region_role(role_map, sheet.title)
+            if region_role == "IGNORE":
+                continue
             sheet_max_row = int(sheet.max_row or 0)
             if sheet_max_row <= 0:
                 continue
@@ -194,11 +355,14 @@ def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
             raw = "\n".join(" | ".join(row) for row in rows)
             code_spec = _sniff_tabular_code_set(sheet.title, rows[0], rows)
             payload: Dict[str, Any] = {"headers": rows[0], "rows": rows, "sheet": sheet.title, "table_name": sheet.title}
-            if code_spec:
+            if code_spec or region_role == "CODE_SET":
                 payload["candidate_role"] = "CODE_SET"
-                payload["code_set_spec"] = code_spec
-                payload["reason"] = f"Excel 码值表候选（{len(code_spec['values'])} 项）"
-                payload["field_count"] = len(code_spec["values"])
+                if code_spec:
+                    payload["code_set_spec"] = code_spec
+                    payload["reason"] = f"Excel 码值表候选（{len(code_spec['values'])} 项）"
+                    payload["field_count"] = len(code_spec["values"])
+            elif region_role in {"RULE_EVIDENCE", "NARRATIVE", "TABLE_METADATA"}:
+                payload["candidate_role"] = region_role
             blocks.append(
                 _block(
                     len(blocks),
@@ -219,37 +383,66 @@ def extract_xlsx(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
 
 
 def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
+    """生成给 AI ① 整文档体检使用的结构化情报（带页码标题、结构指纹与中后段正文抽样）。"""
     if file_type == "pdf":
         text = _extract_pdf_text(path)
-        headings = []
-        for line in text.splitlines():
-            title = re.sub(r"\s+", " ", line).strip()
-            if not title or len(title) > 100:
-                continue
-            if re.match(r"^(?:第[一二三四五六七八九十百]+章|[一二三四五六七八九十]+、|\d+(?:\.\d+){0,4}\s+\S+)", title):
-                headings.append(title)
+        headings_info = extract_pdf_headings(text)
+        profiles = detect_pdf_profiles(text)
+        recommended = default_pdf_strategy(text, headings_info)
+        # 除封面/目录前 3000 字外，增补中段与后段抽样，避免 AI 只看到封面就盲判
+        mid_offset = len(text) // 3 if len(text) > 6000 else 0
+        tail_offset = max(0, len(text) - 2000) if len(text) > 8000 else 0
         return {
             "file_type": file_type,
-            "page_count": max(1, text.count("\f")),
-            "headings": headings[:300],
-            "heading_count": len(headings),
-            "content_preview": text[:5000],
-            "available_chunk_strategy": "DOCUMENT_CATALOG",
+            "page_count": max(1, text.count("\f") + (1 if text.strip() else 0)),
+            "detected_profiles": profiles,
+            "headings": [item["text"] for item in headings_info[:250]],
+            "headings_with_pages": [
+                {"text": item["text"], "page": item["page"]} for item in headings_info[:200]
+            ],
+            "heading_count": len(headings_info),
+            "content_preview": text[:3000],
+            "body_preview": text[mid_offset : mid_offset + 1500] if mid_offset else "",
+            "appendix_preview": text[tail_offset:] if tail_offset else "",
+            "available_chunk_strategy": recommended,
+            "allowed_chunk_strategies": list(ALLOWED_STRATEGIES_BY_FILE_TYPE["pdf"]),
         }
     if file_type == "docx":
         document = Document(str(path))
-        paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
-        tables = []
-        for index, table in enumerate(document.tables[:80]):
-            rows = [[cell.text.strip() for cell in row.cells] for row in table.rows[:4]]
-            tables.append({"table_index": index, "row_count": len(table.rows), "sample_rows": rows})
+        paragraphs: List[str] = []
+        headings: List[str] = []
+        tables: List[Dict[str, Any]] = []
+        current_heading = ""
+        table_index = 0
+        for item in _iter_docx_body_items(document):
+            if isinstance(item, Paragraph):
+                text = item.text.strip()
+                if not text:
+                    continue
+                paragraphs.append(text)
+                if _looks_like_heading(item, text):
+                    current_heading = text
+                    headings.append(text)
+            elif isinstance(item, Table):
+                if table_index < 80:
+                    rows = [[cell.text.strip() for cell in row.cells] for row in item.rows[:4]]
+                    tables.append(
+                        {
+                            "table_index": table_index,
+                            "nearest_heading": current_heading,
+                            "row_count": len(item.rows),
+                            "sample_rows": rows,
+                        }
+                    )
+                table_index += 1
         return {
             "file_type": file_type,
             "paragraph_count": len(paragraphs),
-            "headings": paragraphs[:160],
-            "table_count": len(document.tables),
+            "headings": (headings or paragraphs)[:160],
+            "table_count": table_index,
             "tables": tables,
             "available_chunk_strategy": "WORD_TABLE_AND_PARAGRAPH",
+            "allowed_chunk_strategies": list(ALLOWED_STRATEGIES_BY_FILE_TYPE["docx"]),
         }
     if file_type == "xlsx":
         workbook = load_workbook(path, read_only=False, data_only=False)
@@ -278,17 +471,24 @@ def survey_document(path: Path, file_type: str) -> Dict[str, Any]:
         return {
             "file_type": file_type,
             "sheet_count": len(sheets),
+            "sheet_names": [s["sheet"] for s in sheets],
+            "headings": [s["sheet"] for s in sheets],
             "sheets": sheets,
             "available_chunk_strategy": "SHEET_PER_TABLE",
+            "allowed_chunk_strategies": list(ALLOWED_STRATEGIES_BY_FILE_TYPE["xlsx"]),
         }
     raise ValueError(f"Unsupported file type: {file_type}")
 
 
-def extract_document(path: Path, file_type: str) -> Tuple[str, List[Dict[str, Any]]]:
+def extract_document(
+    path: Path,
+    file_type: str,
+    chunking_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
     if file_type == "pdf":
-        return extract_pdf(path)
+        return extract_pdf(path, chunking_plan=chunking_plan)
     if file_type == "docx":
-        return extract_docx(path)
+        return extract_docx(path, chunking_plan=chunking_plan)
     if file_type == "xlsx":
-        return extract_xlsx(path)
+        return extract_xlsx(path, chunking_plan=chunking_plan)
     raise ValueError(f"Unsupported file type: {file_type}")

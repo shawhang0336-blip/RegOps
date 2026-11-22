@@ -43,6 +43,8 @@ from app.ingestion.parsers.quality import inspect_block
 from app.ingestion.structure_service import (
     analyze_document_structure,
     inspect_document_overview,
+    invoke_extract_document,
+    latest_chunking_plan,
     latest_document_architecture,
     reextract_document_blocks,
 )
@@ -111,8 +113,9 @@ def store_initial_blocks(document_id: str) -> SourceDocumentModel:
             return document
         settings = get_settings()
         source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
+        chunking_plan = latest_chunking_plan(session, document.id)
         try:
-            version, blocks = extract_document(source_path, document.file_type)
+            version, blocks = invoke_extract_document(extract_document, source_path, document.file_type, chunking_plan)
             if not blocks:
                 raise ValueError("No raw blocks were discovered")
         except Exception as exc:
