@@ -4,7 +4,7 @@ import uuid
 
 from openpyxl import Workbook
 
-from app.api.v2 import code_sets, documents, metadata
+from app.api import code_sets, documents, metadata
 from app.infra.db_tables import (
     CodeSetModel,
     CodeValueModel,

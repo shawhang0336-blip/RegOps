@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
-from app.api.v2.documents import ingest_uploaded_file
+from app.api.documents import ingest_uploaded_file
 from app.catalog.code_sets.readiness import evaluate_code_set, evaluate_code_sets, is_reference_placeholder
 from app.catalog.code_sets.service import (
     auto_link_all_references,

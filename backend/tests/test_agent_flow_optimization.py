@@ -1012,7 +1012,7 @@ def test_backfilled_length_max_rule_remains_editable_and_impossible_field_compar
 
     added = _backfill_length_rules(session, run, [spec], [], lambda *a, **kw: None, lambda *a, **kw: None)
     rptno_len = next(r for r in added if r.field == "RPTNO" and r.operator == "LENGTH_MAX")
-    # 模拟前端 PATCH /api/v2/artifacts/rules/{row_id} 修改 length 参数
+    # 模拟前端 PATCH /api/artifacts/rules/{row_id} 修改 length 参数
     edited = rptno_len.model_copy(update={"params": {"length": 18}})
     validate_rule(edited, spec)  # 不得抛出 Explicit-rule evidence does not match
 

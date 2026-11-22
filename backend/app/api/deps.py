@@ -1,4 +1,4 @@
-"""API 公共依赖、请求契约与视图序列化器（v1 / v2 共享）。"""
+"""API 公共依赖、请求契约与视图序列化器（所有 `/api/*` 路由共享）。"""
 
 from typing import Dict, Iterable, List, Optional
 

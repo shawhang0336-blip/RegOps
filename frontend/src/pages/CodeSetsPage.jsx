@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { v2 } from '../api.js'
+import { api } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
@@ -50,9 +50,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     // 也要拿到每张码表自己的 blockers 才能显示「齐备 / 需补」
     const readinessQuery = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     const [setList, unresolvedList, readinessPayload] = await Promise.all([
-      v2(`/code-sets${scopeQuery}`),
-      v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
-      v2(`/code-sets/readiness${readinessQuery}`).catch(() => null),
+      api(`/api/code-sets${scopeQuery}`),
+      api(`/api/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
+      api(`/api/code-sets/readiness${readinessQuery}`).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setSets(setList)
@@ -106,7 +106,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setDetailLoading(true)
     setEditingValueId(null)
     try {
-      const data = await v2(`/code-sets/${id}`)
+      const data = await api(`/api/code-sets/${id}`)
       if (reqId === requestRef.current) setDetail(data)
     } catch (err) {
       if (reqId === requestRef.current) setError(err.message)
@@ -126,7 +126,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      await v2(`/code-sets/${set.id}`, { method: 'DELETE' })
+      await api(`/api/code-sets/${set.id}`, { method: 'DELETE' })
       setNotice(`已删除「${set.code}」。`)
       if (detail?.id === set.id) setDetail(null)
       await load()
@@ -145,7 +145,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const result = await v2('/code-sets/upload-file', { method: 'POST', body: form })
+      const result = await api('/api/code-sets/upload-file', { method: 'POST', body: form })
       const firstId = result.code_set_ids?.[0]
       if (onDocumentChange && result.document_id && result.document_id !== params.get('document_id')) {
         onDocumentChange(result.document_id)
@@ -187,7 +187,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await v2('/code-sets', {
+      const body = await api('/api/code-sets', {
         method: 'POST',
         body: JSON.stringify({ ...newSet, source_type: 'MANUAL' }),
       })
@@ -209,7 +209,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/code-sets/${detail.id}/values`, {
+      const body = await api(`/api/code-sets/${detail.id}/values`, {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
@@ -231,7 +231,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/code-sets/${detail.id}/values/${value.id}`, {
+      const body = await api(`/api/code-sets/${detail.id}/values/${value.id}`, {
         method: 'PATCH',
         body: JSON.stringify({
           expected_version: detail.current_version,
@@ -266,7 +266,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/code-sets/${detail.id}/values/${value.id}`, {
+      const body = await api(`/api/code-sets/${detail.id}/values/${value.id}`, {
         method: 'PATCH',
         body: JSON.stringify({
           expected_version: detail.current_version,
@@ -294,7 +294,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const result = await v2('/code-sets/references/relink', {
+      const result = await api('/api/code-sets/references/relink', {
         method: 'POST',
         body: JSON.stringify({}),
       })
@@ -329,7 +329,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/code-sets/${detail.id}/import`, { method: 'POST', body: form })
+      const body = await api(`/api/code-sets/${detail.id}/import`, { method: 'POST', body: form })
       setDetail(body.code_set)
       await load(body.code_set.id)
       const extras = []

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api, downloadFile, v2 } from '../api.js'
+import { api, downloadFile } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import { useEventStream } from '../hooks/useEventStream.js'
@@ -78,7 +78,7 @@ export default function RunsPage() {
       const [run, detail, planList, busData, replayData] = await Promise.all([
         api(`/api/runs/${id}`),
         api(`/api/runs/${id}/validation-detail`).catch(() => null),
-        v2(`/generation/plans/${id}`).catch(() => []),
+        api(`/api/generation/plans/${id}`).catch(() => []),
         api(`/api/runs/${id}/bus-events`).catch(() => ({ events: [] })),
         api(`/api/runs/${id}/replay`).catch(() => null),
       ])
@@ -121,7 +121,7 @@ export default function RunsPage() {
     load(runQueryParam)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-    v2('/artifacts').then((payload) => {
+    api('/api/artifacts').then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
   }, [])
@@ -211,7 +211,7 @@ export default function RunsPage() {
     setError('')
     try {
       const filename = await downloadFile(
-        `/api/v2/generation/runs/${active.id}/production-bundle`,
+        `/api/generation/runs/${active.id}/production-bundle`,
         `production_${active.id.slice(0, 8)}.zip`,
       )
       setNotice(`生产部署包「${filename}」已开始下载。`)

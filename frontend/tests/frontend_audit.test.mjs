@@ -62,7 +62,7 @@ test('downloadFile surfaces backend 409 tamper-gate error instead of navigating 
       json: async () => ({ detail: '规则在审计通过后被修改，必须重新审计后才能打包下载' }),
     })
     await assert.rejects(
-      () => downloadFile('/api/v2/generation/runs/abc/production-bundle', 'production_abc.zip'),
+      () => downloadFile('/api/generation/runs/abc/production-bundle', 'production_abc.zip'),
       (err) => {
         assert.equal(err.status, 409)
         assert.match(err.message, /规则在审计通过后被修改/)

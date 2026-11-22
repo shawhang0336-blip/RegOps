@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, v2 } from '../api.js'
+import { api } from '../api.js'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
@@ -67,7 +67,7 @@ export default function VersionsPage() {
     setSelectedId(id)
     setDetailLoading(true)
     try {
-      const data = await v2(`/metadata/tables/${id}`)
+      const data = await api(`/api/metadata/tables/${id}`)
       if (reqId === requestRef.current) setDetail(data)
     } catch (err) {
       if (reqId === requestRef.current) setError(err.message)
@@ -80,8 +80,8 @@ export default function VersionsPage() {
     let cancelled = false
     setLoading(true)
     Promise.all([
-      v2('/metadata/tables').catch(() => []),
-      v2('/documents').catch(() => []),
+      api('/api/metadata/tables').catch(() => []),
+      api('/api/documents').catch(() => []),
       api('/api/runs').catch(() => []),
     ])
       .then(async ([tableList, docList, runList]) => {
@@ -123,8 +123,7 @@ export default function VersionsPage() {
     setDiffBusy(true)
     setError('')
     try {
-      const data = await v2(
-        `/documents/diff?base_id=${encodeURIComponent(baseDocId)}&target_id=${encodeURIComponent(targetDocId)}`,
+      const data = await api(`/api/documents/diff?base_id=${encodeURIComponent(baseDocId)}&target_id=${encodeURIComponent(targetDocId)}`,
       )
       setDocDiff(data)
     } catch (err) {
@@ -140,7 +139,7 @@ export default function VersionsPage() {
     setGenBusy(true)
     setError('')
     try {
-      const created = await v2('/generation/runs', {
+      const created = await api('/api/generation/runs', {
         method: 'POST',
         body: JSON.stringify({ table_ids: affectedIds, provider: 'live', accept_warnings: true }),
       })

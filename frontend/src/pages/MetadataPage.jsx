@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { downloadFile, v2 } from '../api.js'
+import { api, downloadFile } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { DetailSkeleton, ListSkeleton } from '../components/Skeleton.jsx'
 import PageHeader from './PageHeader.jsx'
@@ -57,10 +57,10 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       return
     }
     const [tableList, unresolvedList, codeSetList, readinessPayload] = await Promise.all([
-      v2(`/metadata/tables${scopeQuery}`),
-      v2(`/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
-      v2(`/code-sets${scopeQuery}`).catch(() => []),
-      v2(`/metadata/readiness${scopeQuery}`).catch(() => null),
+      api(`/api/metadata/tables${scopeQuery}`),
+      api(`/api/code-sets/references/unresolved${scopeQuery}`).catch(() => []),
+      api(`/api/code-sets${scopeQuery}`).catch(() => []),
+      api(`/api/metadata/readiness${scopeQuery}`).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setTables(tableList)
@@ -114,7 +114,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setSelectedId(id)
     setDetailLoading(true)
     try {
-      const data = await v2(`/metadata/tables/${id}`)
+      const data = await api(`/api/metadata/tables/${id}`)
       if (reqId !== requestRef.current) return
       setDetail(data)
       setBaselineFields(Object.fromEntries((data.fields || []).map((field) => [field.id, { ...field }])))
@@ -157,7 +157,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      await v2(`/metadata/tables/${table.id}`, {
+      await api(`/api/metadata/tables/${table.id}`, {
         method: 'DELETE',
         body: JSON.stringify({ expected_version: table.current_version }),
       })
@@ -223,7 +223,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       setBusy(true)
       setError('')
       try {
-        const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, {
+        const body = await api(`/api/metadata/tables/${detail.id}/fields/${field.id}`, {
           method: 'PATCH',
           body: JSON.stringify({
             expected_version: detail.current_version,
@@ -361,7 +361,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/fields/${field.id}`, {
+      const body = await api(`/api/metadata/tables/${detail.id}/fields/${field.id}`, {
         method: 'DELETE',
         body: JSON.stringify({
           expected_version: detail.current_version,
@@ -398,7 +398,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     setBusy(true)
     setError('')
     try {
-      const body = await v2(`/metadata/tables/${detail.id}/fields`, {
+      const body = await api(`/api/metadata/tables/${detail.id}/fields`, {
         method: 'POST',
         body: JSON.stringify({
           expected_version: detail.current_version,
@@ -427,7 +427,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     const documentId = params.get('document_id')
     const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
     try {
-      await downloadFile(`/api/v2/metadata/types/template${query}`, '字段类型修正模板.csv')
+      await downloadFile(`/api/metadata/types/template${query}`, '字段类型修正模板.csv')
     } catch (err) {
       setError(err.message || '模板下载失败，请稍后重试。')
     }
@@ -447,7 +447,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
       form.append('dry_run', dryRun ? 'true' : 'false')
       const documentId = params.get('document_id')
       if (documentId) form.append('document_id', documentId)
-      const result = await v2('/metadata/types/import', { method: 'POST', body: form })
+      const result = await api('/api/metadata/types/import', { method: 'POST', body: form })
       setTypeImportResult(result)
       if (!dryRun) {
         setNotice(

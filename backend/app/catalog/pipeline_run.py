@@ -1,6 +1,6 @@
 """Step 1 文档导入与解析的统一 Run 控制面（Layer 5: engine）。
 
-将原本散落在 `api/v2/documents.py` 的后台线程与纯内存进度表统一收编至 ProdAgent 微内核 `kernel.run`：
+将原本散落在 `api/documents.py` 的后台线程与纯内存进度表统一收编至 ProdAgent 微内核 `kernel.run`：
 1. 每次 `prepare`（结构体检 + 初步切块）与 `extract`（多块并行元数据 + 码表提取）均创建独立 `RunModel(spec_id=document_id)`，
    通过 `RUN_CREATED(run_kind="INGESTION")` 写入 `EventLog` 不可变哈希链；
 2. 后台执行经由 `kernel.run.submit_run` 挂载 `CancellationToken` 注册到全局 `run_registry()`，

@@ -1,7 +1,3 @@
-export function v2(path, options = {}) {
-  return api(`/api/v2${path}`, options)
-}
-
 export function formatApiErrorDetail(detail, status) {
   if (typeof detail === 'string' && detail.trim()) return detail
   if (Array.isArray(detail) && detail.length > 0) {

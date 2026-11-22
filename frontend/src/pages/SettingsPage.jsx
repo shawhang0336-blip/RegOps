@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { v2 } from '../api.js'
+import { api } from '../api.js'
 import { BUDGET_META, validateBudgetInput } from '../utils/budget.js'
 import PageHeader from './PageHeader.jsx'
 import StatusMessage from './StatusMessage.jsx'
@@ -32,7 +32,7 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState('')
 
   async function load() {
-    const body = await v2('/settings')
+    const body = await api('/api/settings')
     setSettings(body)
     setBudget(body.execution_budget || {})
   }
@@ -45,7 +45,7 @@ export default function SettingsPage() {
     setError('')
     setTestingKind(kind)
     try {
-      const result = await v2(`/settings/test/${kind}`, {
+      const result = await api(`/api/settings/test/${kind}`, {
         method: 'POST',
         body: JSON.stringify({}),
       })
@@ -66,7 +66,7 @@ export default function SettingsPage() {
     }
     setSaving(true)
     try {
-      await v2('/settings/execution_budget', {
+      await api('/api/settings/execution_budget', {
         method: 'PUT',
         body: JSON.stringify({ value: checked.value }),
       })

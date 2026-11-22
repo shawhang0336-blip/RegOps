@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { v2 } from '../api.js'
+import { api } from '../api.js'
 
 const DEFAULT_BUS_TOPICS = [
   'run.created',
@@ -184,7 +184,7 @@ export function watchDocumentProgress(
       }
       fetching = true
       try {
-        const next = await v2(`/documents/${documentId}/progress`).catch(() => null)
+        const next = await api(`/api/documents/${documentId}/progress`).catch(() => null)
         if (next && !finished && !signal?.aborted) {
           latest = next
           onUpdate?.(next)

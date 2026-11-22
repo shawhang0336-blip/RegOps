@@ -99,17 +99,16 @@ backend/app/
 │   ├── production_service.py    #    Step 3.3 生产部署 ZIP 包打包与完整性门禁
 │   └── business_db.py           #    业务库只读抽样探查连接器
 │
-└── api/                         # 层 7：HTTP 接口层（v1 与 v2 统一收口）
+└── api/                         # 层 7：HTTP 接口层（统一收口全部 /api/* 路由）
     ├── deps.py                  #    公共 Session 依赖（db_session）、spawn_run_driver 与视图序列化
     ├── system.py                #    /api/health / /api/events/stream（SSE） / /api/blobs/* / /api/business/preview
     ├── runs.py                  #    /api/runs/*（生命周期 / 清理 / 审批 / 确认 / 重试 / 回放 / trace 耗时瀑布 / bus-events）
-    └── v2/                      #    /api/v2/* 工作台资产与生成路由
-        ├── documents.py
-        ├── metadata.py
-        ├── code_sets.py
-        ├── generation.py
-        ├── artifacts.py
-        └── settings.py
+    ├── documents.py             #    /api/documents/*（Step 0/1 文档上传、切块、提取与进度）
+    ├── metadata.py              #    /api/metadata/*（Step 1 报表字段、就绪度与批量类型修正）
+    ├── code_sets.py             #    /api/code-sets/*（Step 1 码值表、引用对齐与导入）
+    ├── generation.py            #    /api/generation/*（Step 2/3 发起生成、规划与生产部署 ZIP 打包）
+    ├── artifacts.py             #    /api/artifacts/*（Step 2 报表产物聚合、规则总览与手工改参）
+    └── settings.py              #    /api/settings/*（连接探活与执行预算配置）
 ```
 
 ---
@@ -128,7 +127,7 @@ backend/app/
 
 ## 三、看代码推荐阅读顺序
 
-1. **看启动与路由**：[`app/main.py`](app/main.py) → [`app/api/runs.py`](app/api/runs.py) → [`app/api/v2/generation.py`](app/api/v2/generation.py)
+1. **看启动与路由**：[`app/main.py`](app/main.py) → [`app/api/runs.py`](app/api/runs.py) → [`app/api/generation.py`](app/api/generation.py)
 2. **看微内核机制**：[`app/kernel/plan.py`](app/kernel/plan.py) → [`app/kernel/bus.py`](app/kernel/bus.py) → [`app/kernel/event_log.py`](app/kernel/event_log.py) → [`app/kernel/interrupt.py`](app/kernel/interrupt.py) → [`app/kernel/run.py`](app/kernel/run.py) → [`app/kernel/scheduler.py`](app/kernel/scheduler.py)
 3. **看 RegOps 策略装配**：[`app/policy/regops_plan.py`](app/policy/regops_plan.py) → [`app/policy/regops_bus.py`](app/policy/regops_bus.py) → [`app/policy/regops_channels.py`](app/policy/regops_channels.py)
 4. **看阶段二流水线执行**：[`app/generation/workflow/entrypoints.py`](app/generation/workflow/entrypoints.py) → [`app/generation/workflow/nodes.py`](app/generation/workflow/nodes.py) → [`app/generation/workflow/runtime.py`](app/generation/workflow/runtime.py) → [`app/generation/workflow/stages.py`](app/generation/workflow/stages.py)

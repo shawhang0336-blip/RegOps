@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { v2 } from '../api.js'
+import { api } from '../api.js'
 import { useFeedback } from '../context/FeedbackContext.jsx'
 import { useEventStream, watchDocumentProgress } from '../hooks/useEventStream.js'
 import PageHeader from './PageHeader.jsx'
@@ -66,7 +66,7 @@ export default function DocumentsPage({
   }
 
   async function load(preferredId) {
-    const list = await v2('/documents')
+    const list = await api('/api/documents')
     if (!mountedRef.current) return
     setDocuments(list)
     const extracting = list.find((doc) => doc.status === 'EXTRACTING')
@@ -129,7 +129,7 @@ export default function DocumentsPage({
   const syncDigestProgress = async () => {
     if (!importProgress?.digest) return
     try {
-      const list = await v2('/documents')
+      const list = await api('/api/documents')
       const document = list.find((item) => item.sha256 === importProgress.digest)
       if (document) setImportProgress((current) => updateImportProgress(current, document))
     } catch {
@@ -157,7 +157,7 @@ export default function DocumentsPage({
     if (!confirmed) return
     setError('')
     try {
-      await v2(`/documents/${docId}/cancel`, {
+      await api(`/api/documents/${docId}/cancel`, {
         method: 'POST',
         body: JSON.stringify({ reason: '由操作员在文档工作台主动中止' }),
       })
@@ -168,7 +168,7 @@ export default function DocumentsPage({
   }
 
   async function selectDocument(id) {
-    const doc = await v2(`/documents/${id}`)
+    const doc = await api(`/api/documents/${id}`)
     if (!mountedRef.current) return
     setDetail(doc)
     setShowUpload(false)
@@ -177,15 +177,15 @@ export default function DocumentsPage({
     setSelected(eligibleIds)
     setRaw(null)
     setArchitectureExpanded(false)
-    const arch = await v2(`/documents/${id}/architecture`).catch(() => null)
+    const arch = await api(`/api/documents/${id}/architecture`).catch(() => null)
     if (mountedRef.current) setArchitecture(arch)
   }
 
   async function extractPreparedDocument(documentId, signal) {
-    const prepared = await v2(`/documents/${documentId}`)
+    const prepared = await api(`/api/documents/${documentId}`)
     const blockIds = (prepared.blocks || []).filter((block) => block.eligible !== false && !block.superseded).map((block) => block.id)
     if (!blockIds.length) throw new Error('文件中没有可解析的内容')
-    await v2(`/documents/${documentId}/extract-parallel`, {
+    await api(`/api/documents/${documentId}/extract-parallel`, {
       method: 'POST',
       body: JSON.stringify({ block_ids: blockIds, targets: ['metadata', 'code_sets'] }),
     })
@@ -245,14 +245,14 @@ export default function DocumentsPage({
     try {
       const form = new FormData()
       form.append('file', file)
-      const document = await v2('/documents', { method: 'POST', body: form })
+      const document = await api('/api/documents', { method: 'POST', body: form })
       if (signal.aborted || !mountedRef.current) return
 
       let snapshot = null
       if (document.processing) {
         snapshot = await watchDocumentProgress(document.id, setImportProgress, { signal })
       } else {
-        snapshot = await v2(`/documents/${document.id}/progress`).catch(() => null)
+        snapshot = await api(`/api/documents/${document.id}/progress`).catch(() => null)
         if (mountedRef.current) setImportProgress(snapshot && snapshot.status !== 'IDLE' ? snapshot : null)
       }
       if (signal.aborted || !mountedRef.current) return
@@ -327,7 +327,7 @@ export default function DocumentsPage({
       logs: [],
     })
     try {
-      await v2(`/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
+      await api(`/api/documents/${detail.id}/prepare`, { method: 'POST', body: JSON.stringify({}) })
       const snapshot = await watchDocumentProgress(detail.id, setImportProgress, { signal })
       if (signal.aborted || !mountedRef.current) return
       await load(detail.id)
@@ -374,7 +374,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      await v2(`/documents/${detail.id}`, { method: 'DELETE' })
+      await api(`/api/documents/${detail.id}`, { method: 'DELETE' })
       await load()
       setNotice(`已移除「${detail.file_name}」，相关解析结果仍然保留。`)
     } catch (err) {
@@ -394,7 +394,7 @@ export default function DocumentsPage({
     if (!confirmed) return
     setBusy(true)
     try {
-      await v2(`/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
+      await api(`/api/documents/${detail.id}/reextract`, { method: 'POST', body: JSON.stringify({}) })
       await selectDocument(detail.id)
       setNotice('已重新识别文件内容，历史核对结果仍然保留。')
     } catch (err) {
@@ -409,7 +409,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      const result = await v2(`/documents/${detail.id}/analyze-structure`, { method: 'POST', body: JSON.stringify({}) })
+      const result = await api(`/api/documents/${detail.id}/analyze-structure`, { method: 'POST', body: JSON.stringify({}) })
       setArchitecture(result)
       await selectDocument(detail.id)
       setArchitectureExpanded(true)
@@ -425,7 +425,7 @@ export default function DocumentsPage({
     setMappingBlock(block)
     setMappingForm(block.column_mapping || {})
     try {
-      const rawBlock = await v2(`/documents/${detail.id}/blocks/${block.id}`)
+      const rawBlock = await api(`/api/documents/${detail.id}/blocks/${block.id}`)
       const content = rawBlock.content_json || {}
       const options = content.headers || content.rows?.[0] || []
       setMappingOptions(Array.from(new Set(options.map((item) => String(item).trim()).filter(Boolean))))
@@ -438,7 +438,7 @@ export default function DocumentsPage({
     setBusy(true)
     setError('')
     try {
-      await v2(`/documents/${detail.id}/blocks/${block.id}/structure`, {
+      await api(`/api/documents/${detail.id}/blocks/${block.id}/structure`, {
         method: 'PATCH',
         body: JSON.stringify({ human_required: false }),
       })
@@ -458,7 +458,7 @@ export default function DocumentsPage({
       const columnMapping = Object.fromEntries(
         Object.entries(mappingForm).filter(([, value]) => String(value).trim())
       )
-      await v2(`/documents/${detail.id}/blocks/${mappingBlock.id}/structure`, {
+      await api(`/api/documents/${detail.id}/blocks/${mappingBlock.id}/structure`, {
         method: 'PATCH',
         body: JSON.stringify({ column_mapping: columnMapping, human_required: true, editor: '结构调整人工确认' }),
       })
@@ -474,14 +474,14 @@ export default function DocumentsPage({
 
   async function viewArchitecture() {
     if (!architecture) {
-      setArchitecture(await v2(`/documents/${detail.id}/architecture`))
+      setArchitecture(await api(`/api/documents/${detail.id}/architecture`))
     }
     setArchitectureExpanded(!architectureExpanded)
   }
 
   async function showRaw(blockId) {
     if (!detail) return
-    setRaw(await v2(`/documents/${detail.id}/blocks/${blockId}`))
+    setRaw(await api(`/api/documents/${detail.id}/blocks/${blockId}`))
     window.setTimeout(() => document.getElementById('raw-content-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
   }
 
@@ -500,7 +500,7 @@ export default function DocumentsPage({
       logs: [],
     })
     try {
-      await v2(`/documents/${detail.id}/extract-parallel`, {
+      await api(`/api/documents/${detail.id}/extract-parallel`, {
         method: 'POST',
         body: JSON.stringify({ block_ids: selected, targets }),
       })

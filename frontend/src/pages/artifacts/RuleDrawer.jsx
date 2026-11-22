@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { v2 } from '../../api.js'
+import { api } from '../../api.js'
 import CopyButton from '../../components/CopyButton.jsx'
 import { StatusBadge } from '../SharedUI.jsx'
 import { formatValue, ruleStatusLabel } from './artifactHelpers.js'
@@ -74,7 +74,7 @@ function RuleEditForm({ rule, onCancel, onSaved }) {
         }
         delete payload._terms_json
       }
-      await v2(`/artifacts/rules/${rule.row_id}`, {
+      await api(`/api/artifacts/rules/${rule.row_id}`, {
         method: 'PATCH',
         body: JSON.stringify({ params: payload, reason }),
       })

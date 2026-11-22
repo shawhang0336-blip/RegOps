@@ -16,12 +16,12 @@ from sqlalchemy.orm import sessionmaker
 from app.api import runs as runs_api
 from app.api import system as system_api
 from app.api.deps import RunRequest
-from app.api.v2 import artifacts as artifacts_api
-from app.api.v2 import code_sets as code_sets_api
-from app.api.v2 import documents as documents_api
-from app.api.v2 import generation as generation_api
-from app.api.v2 import metadata as metadata_api
-from app.api.v2 import settings as settings_api
+from app.api import artifacts as artifacts_api
+from app.api import code_sets as code_sets_api
+from app.api import documents as documents_api
+from app.api import generation as generation_api
+from app.api import metadata as metadata_api
+from app.api import settings as settings_api
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
 from app.infra.contracts import Evidence, FieldSpec, RuleDefinition, SpecDocument, calculate_rule_hash

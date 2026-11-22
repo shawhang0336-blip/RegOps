@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api, v2 } from '../api.js'
+import { api } from '../api.js'
 import { useEventStream } from '../hooks/useEventStream.js'
 import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
 import PageHeader from './PageHeader.jsx'
@@ -63,9 +63,9 @@ export default function ArtifactsPage() {
 
   async function load(preferredId) {
     const [data, readinessPayload, rulesOverview] = await Promise.all([
-      v2('/artifacts'),
-      v2('/metadata/readiness').catch(() => null),
-      v2('/artifacts/rules').catch(() => null),
+      api('/api/artifacts'),
+      api('/api/metadata/readiness').catch(() => null),
+      api('/api/artifacts/rules').catch(() => null),
     ])
     const allTables = data.tables || []
     setTables(allTables)
@@ -109,7 +109,7 @@ export default function ArtifactsPage() {
       setArtifactView(null)
     }
     try {
-      const data = await v2(`/artifacts/${id}`)
+      const data = await api(`/api/artifacts/${id}`)
       if (requestId === requestRef.current) {
         setDetail(data)
         setRefreshedAt(new Date())
@@ -122,7 +122,7 @@ export default function ArtifactsPage() {
   }
 
   async function refreshSummary() {
-    const data = await v2('/artifacts').catch(() => null)
+    const data = await api('/api/artifacts').catch(() => null)
     if (data) {
       const nextTables = data.tables || []
       setTables(nextTables)
@@ -139,7 +139,7 @@ export default function ArtifactsPage() {
   }
 
   async function refreshOverview() {
-    const data = await v2('/artifacts/rules').catch(() => null)
+    const data = await api('/api/artifacts/rules').catch(() => null)
     if (data) {
       setOverview(data)
       setRefreshedAt(new Date())
@@ -313,7 +313,7 @@ export default function ArtifactsPage() {
     setBusy(true)
     setError('')
     try {
-      const run = await v2('/generation/runs', {
+      const run = await api('/api/generation/runs', {
         method: 'POST',
         body: JSON.stringify({ table_ids: ids, provider: 'live', accept_warnings: Boolean(options.acceptWarnings) }),
       })

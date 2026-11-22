@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { v2 } from '../api.js'
+import { api } from '../api.js'
 import { getSavedDocumentId, setSavedDocumentId } from '../utils/activeDocument.js'
 import PageHeader from './PageHeader.jsx'
 import DocumentsPage from './DocumentsPage.jsx'
@@ -19,7 +19,7 @@ export default function PreparationWorkspace() {
 
   useEffect(() => {
     let cancelled = false
-    v2('/documents').then((list) => {
+    api('/api/documents').then((list) => {
       if (cancelled || documentId) return
       const saved = getSavedDocumentId()
       const preferred = (saved && list.find((doc) => doc.id === saved)?.id) || list[0]?.id
@@ -38,7 +38,7 @@ export default function PreparationWorkspace() {
     if (!documentId || view !== 'codes' || readiness) return undefined
     let cancelled = false
     const query = `?document_id=${encodeURIComponent(documentId)}`
-    v2(`/metadata/readiness${query}`).then((payload) => {
+    api(`/api/metadata/readiness${query}`).then((payload) => {
       if (!cancelled) setReadiness(payload)
     }).catch(() => {})
     return () => { cancelled = true }
