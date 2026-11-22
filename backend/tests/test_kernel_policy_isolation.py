@@ -1436,6 +1436,51 @@ def test_policy_structure_clean_three_modules_and_infra_llm_guard():
     assert getattr(exc_info.value, "context", {}).get("error_kind") == "model_no_tool_call"
 
 
+def test_infra_clean_structure_mysql_pool_and_blob_concurrency(tmp_path):
+    """验证 infra 重构红线与生产加固：
+    1. app/infra/ 严格收敛为 10 个高内聚模块 + __init__.py（无碎片文件、models 统一收口、llm 与 llm_schemas 清晰解耦）；
+    2. db._build_engine_kwargs 为真实 MySQL/Oracle 配齐 pool_recycle/pool_size/max_overflow/pool_timeout；
+    3. LocalBlobStore 多线程并发写同一内容零竞态（唯一临时文件 + 原子 os.replace）且严校验 blob:// 前缀。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import pytest
+    import app.infra as infra_pkg
+    from app.infra.blob_store import LocalBlobStore
+    from app.infra.db import _build_engine_kwargs
+
+    infra_dir = Path(infra_pkg.__file__).resolve().parent
+    actual_infra_files = {p.name for p in infra_dir.glob("*.py")}
+    assert actual_infra_files == {
+        "__init__.py",
+        "blob_store.py",
+        "config.py",
+        "db.py",
+        "domain.py",
+        "errors.py",
+        "llm.py",
+        "llm_guard.py",
+        "llm_schemas.py",
+        "models.py",
+        "task_runner.py",
+    }
+
+    mysql_kwargs = _build_engine_kwargs("mysql+pymysql://user:pw@127.0.0.1:3306/regops")
+    assert mysql_kwargs["pool_pre_ping"] is True
+    assert mysql_kwargs["pool_recycle"] == 1800
+    assert mysql_kwargs["pool_size"] >= 10
+    assert mysql_kwargs["max_overflow"] >= 10
+
+    store = LocalBlobStore(str(tmp_path / "blobs"))
+    payload = b"concurrent-regops-blob-payload" * 100
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        uris = list(pool.map(lambda _: store.put(payload), range(24)))
+    assert len(set(uris)) == 1
+    assert store.get(uris[0]) == payload
+    with pytest.raises(ValueError, match="Invalid blob URI"):
+        store.get(uris[0].removeprefix("blob://"))
+
+
+
 
 
 

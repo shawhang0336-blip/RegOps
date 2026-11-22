@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional, Tuple
 
 from app.infra.domain import RuleDefinition, SpecDocument
-from app.infra.sql import quote_identifier
+from app.infra.db import quote_identifier
 
 _BRACKET_LITERAL_ESCAPES = set(r".+/()_*?,;:@#$!~=%")
 

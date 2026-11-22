@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,
@@ -14,7 +14,7 @@ from app.infra.asset_models import (
 )
 from app.infra.domain import GeneratorBinding, RuleDefinition, SpecDocument
 from app.infra.errors import WorkflowError
-from app.infra.sql import quote_identifier
+from app.infra.db import quote_identifier
 
 
 def stable_code_set_table(code: str) -> str:

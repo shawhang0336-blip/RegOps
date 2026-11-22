@@ -55,7 +55,7 @@ from app.assets.code_sets.parser import (
 from app.infra.llm import RealDesignLlm
 from app.kernel.run import BudgetExceededError, RunCancelledError
 from app.infra.llm_guard import call_llm_validated, current_cancellation, submit_with_context
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeSetValidationModel,
     CodeValueModel,
@@ -572,7 +572,7 @@ def remove_code_set(session: Session, row) -> Dict[str, Any]:
     被字段引用着的不能直接删——那会让字段的码值引用悬空，
     后面 readiness 报 UNRESOLVED 时已经晚了。要先解除引用。
     """
-    from app.infra.asset_models import CodeValueModel, FieldCodeReferenceModel
+    from app.infra.models import CodeValueModel, FieldCodeReferenceModel
 
     reference_count = (
         session.query(FieldCodeReferenceModel)

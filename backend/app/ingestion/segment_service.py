@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
-from app.infra.asset_models import (
+from app.infra.models import (
     DocumentArchitectureModel,
     FieldMetadataModel,
     MetadataRevisionModel,

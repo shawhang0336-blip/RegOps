@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,

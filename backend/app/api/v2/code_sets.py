@@ -20,7 +20,7 @@ from app.assets.code_sets.service import (
     refresh_reference_status,
     remove_code_set,
 )
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeSetValidationModel,
     CodeValueModel,
@@ -30,7 +30,7 @@ from app.infra.asset_models import (
     TableMetadataModel,
 )
 from app.infra.config import get_settings
-from app.infra.identity import OPERATOR_PLACEHOLDER
+from app.infra.config import OPERATOR_PLACEHOLDER
 from app.ingestion.structure_service import analyze_document_structure
 
 router = APIRouter(prefix="/code-sets", tags=["code-sets"])

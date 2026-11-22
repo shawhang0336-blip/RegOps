@@ -1,3 +1,10 @@
+"""受控 Tool-Call 大模型 HTTP 客户端与并发限流（基础设施层 Layer 0）。
+
+职责边界：
+- 仅负责底层 HTTP 传输、TCP/TLS 连接池复用、并发信号量控制、非 JSON 网关错误页（502/503/504）安全包装与参数 JSON 修复；
+- 业务 Tool JSON Schema 与作用域 Prompt 契约已独立拆至 `app.infra.llm_schemas`。
+"""
+
 import json
 import threading
 import time
@@ -7,13 +14,38 @@ import httpx
 from json_repair import repair_json
 
 from app.infra.config import Settings
-from app.infra.domain import LLM_OPERATORS, SpecDocument
+from app.infra.llm_schemas import TOOL_SCHEMAS, tool_prompt_preamble
 
 # LLM 并发闸门：默认值只是兜底，实际宽度由系统设置的 max_llm_concurrency 决定，
 # 生成批次启动时通过 configure_llm_concurrency 调整。
 _semaphore_lock = threading.Lock()
 _llm_semaphore = threading.BoundedSemaphore(4)
 _llm_semaphore_limit = 4
+
+# 复用进程级 httpx.Client 连接池（避免每次请求重新 TCP/TLS 握手），同时兼容单测对 httpx.post 的 monkeypatch
+_ORIGINAL_HTTPX_POST = httpx.post
+_http_client_lock = threading.Lock()
+_http_client: Optional[httpx.Client] = None
+
+
+def _get_http_client() -> httpx.Client:
+    global _http_client
+    with _http_client_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.Client(
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16)
+            )
+        return _http_client
+
+
+def close_http_client() -> None:
+    """应用关闭时释放共享 HTTP 连接池。"""
+    global _http_client
+    with _http_client_lock:
+        client = _http_client
+        _http_client = None
+    if client is not None and not client.is_closed:
+        client.close()
 
 
 def configure_llm_concurrency(limit: int) -> None:
@@ -37,310 +69,6 @@ class LlmTimeoutError(RuntimeError):
     """
 
 
-FIELD_PROPERTIES = {
-    "field": {"type": "string"},
-    "storage_type": {"type": "string", "enum": ["TEXT", "NUMBER"]},
-    "length": {"type": "integer"},
-    "decimal_places": {"type": "integer"},
-}
-
-RULE_PROPERTIES = {
-    "rule_key": {"type": "string"},
-    "table_code": {"type": "string"},
-    "field": {"type": "string"},
-    "operator": {
-        "type": "string",
-        # 只暴露 LLM_OPERATORS：不含 LENGTH（列宽是上限，不是定长）
-        "enum": list(LLM_OPERATORS),
-    },
-    "params": {"type": "object"},
-    "evidence_kind": {"type": "string", "enum": ["DICTIONARY", "TERM_INFERENCE"]},
-    "rationale": {"type": "string"},
-}
-
-METADATA_FIELD_PROPERTIES = {
-    "field_cn": {"type": "string"},
-    "field_en": {"type": "string"},
-    "field_definition": {"type": "string"},
-    "check_text_raw": {"type": "string"},
-    "data_type": {"type": "string", "enum": ["VARCHAR", "NUMBER"]},
-    "length": {"type": "integer"},
-    "decimal_places": {"type": "integer"},
-    "required": {"type": "boolean"},
-    "code_reference_text": {"type": "string"},
-    "confidence": {"type": "number"},
-    "evidence_json": {"type": "object"},
-}
-
-METADATA_TABLE_PROPERTIES = {
-    "table_code": {"type": "string"},
-    "table_name": {"type": "string"},
-    "table_definition": {"type": "string"},
-    "fields": {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": METADATA_FIELD_PROPERTIES,
-            "required": ["field_cn", "field_en", "data_type", "check_text_raw"],
-        },
-    },
-}
-
-CODE_VALUE_PROPERTIES = {
-    "value": {"type": "string"},
-    "label_cn": {"type": "string"},
-    "label_en": {"type": "string"},
-    "definition": {"type": "string"},
-}
-
-CODE_SET_PROPERTIES = {
-    "code": {"type": "string"},
-    "name": {"type": "string"},
-    "definition": {"type": "string"},
-    "values": {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": CODE_VALUE_PROPERTIES,
-            "required": ["value", "label_cn"],
-        },
-    },
-}
-
-TOOL_SCHEMAS = {
-    "inspect_document_structure": {
-        "type": "object",
-        "properties": {
-            "document_kind": {
-                "type": "string",
-                "enum": ["COLLECTION_SPEC", "STATISTICAL_SYSTEM", "RULE_DOCUMENT", "REVISION_DOCUMENT", "CODE_VALUES", "MIXED", "UNKNOWN"],
-            },
-            "summary": {"type": "string"},
-            "chunking_strategy": {"type": "string", "enum": ["DOCUMENT_CATALOG", "WORD_TABLE_AND_PARAGRAPH", "SHEET_PER_TABLE", "MANUAL_REVIEW"]},
-            "expected_contents": {"type": "array", "items": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "RULE_EVIDENCE", "REVISION_DIFF", "NARRATIVE"]}},
-            "requires_human": {"type": "boolean"},
-            "warnings": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["document_kind", "summary", "chunking_strategy", "expected_contents", "requires_human", "warnings"],
-    },
-    "assign_document_structure": {
-        "type": "object",
-        "properties": {
-            "blocks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "source_block_ids": {"type": "array", "items": {"type": "string"}},
-                        "role": {"type": "string", "enum": ["TABLE_METADATA", "CODE_SET", "NARRATIVE", "IGNORE"]},
-                        "title": {"type": "string"},
-                        "column_mapping": {"type": "object"},
-                        "human_required": {"type": "boolean"},
-                        "warnings": {"type": "array", "items": {"type": "string"}},
-                        "split_markers": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["source_block_ids", "role", "title", "column_mapping", "human_required", "warnings", "split_markers"],
-                },
-            },
-            "global_warnings": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["blocks", "global_warnings"],
-    },
-    "assign_block_segments": {
-        "type": "object",
-        "properties": {
-            "segments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "segment_type": {"type": "string", "enum": ["TERMINOLOGY", "XML_FORMAT", "DATA_DICTIONARY", "CODE_VALUES", "PRIMARY_KEY", "NARRATIVE", "IGNORE"]},
-                        "title": {"type": "string"},
-                        "start_marker": {"type": "string"},
-                        "end_marker": {"type": "string"},
-                        "requires_human": {"type": "boolean"},
-                        "warnings": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["segment_type", "title", "start_marker", "end_marker", "requires_human", "warnings"],
-                },
-            }
-        },
-        "required": ["segments"],
-    },
-    "assign_generation_plan": {
-        "type": "object",
-        "properties": {
-            "mandatory_rule_target": {"type": "integer"},
-            "expanded_rule_target": {"type": "integer"},
-            "golden_count": {"type": "integer"},
-            "mutations_per_rule": {"type": "integer"},
-            "rationale": {"type": "string"},
-        },
-        "required": ["mandatory_rule_target", "expanded_rule_target", "golden_count", "mutations_per_rule", "rationale"],
-    },
-    "assign_metadata": {
-        "type": "object",
-        "properties": METADATA_TABLE_PROPERTIES,
-        "required": ["table_code", "table_name", "fields"],
-    },
-    "review_metadata": {
-        "type": "object",
-        "properties": {
-            "issues": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "severity": {
-                            "type": "string",
-                            "enum": ["ERROR", "WARNING", "INFO"],
-                            "description": "只有来源原文明确写出该要求时才可用 ERROR；凭业务常识推断的一律用 WARNING。",
-                        },
-                        "code": {"type": "string"},
-                        "field_en": {"type": "string"},
-                        "message": {"type": "string"},
-                        "evidence": {
-                            "type": "string",
-                            "description": "支持这条判断的来源原文片段（逐字摘录）。原文没有相关内容时填 NO_SOURCE。",
-                        },
-                    },
-                    "required": ["severity", "code", "field_en", "message", "evidence"],
-                },
-            }
-        },
-        "required": ["issues"],
-    },
-    "assign_code_set": {
-        "type": "object",
-        "properties": CODE_SET_PROPERTIES,
-        "required": list(CODE_SET_PROPERTIES),
-    },
-    "review_code_set": {
-        "type": "object",
-        "properties": {
-            "issues": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "severity": {"type": "string", "enum": ["ERROR", "WARNING", "INFO"]},
-                        "code": {"type": "string"},
-                        "value": {"type": "string"},
-                        "message": {"type": "string"},
-                    },
-                    "required": ["severity", "code", "value", "message"],
-                },
-            }
-        },
-        "required": ["issues"],
-    },
-    "assign_schema": {
-        "type": "object",
-        "properties": {
-            "fields": {
-                "type": "array",
-                "items": {"type": "object", "properties": FIELD_PROPERTIES, "required": list(FIELD_PROPERTIES)},
-            }
-        },
-        "required": ["fields"],
-    },
-    "assign_rules": {
-        "type": "object",
-        "properties": {
-            "rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": RULE_PROPERTIES,
-                    "required": ["rule_key", "field", "operator", "params", "evidence_kind", "rationale"],
-                },
-            }
-        },
-        "required": ["rules"],
-    },
-    "assign_generators": {
-        "type": "object",
-        "properties": {
-            "generators": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "field": {"type": "string"},
-                        "generator": {"type": "string", "enum": ["FIXED", "ENUM", "SEQUENCE"]},
-                        "params": {"type": "object"},
-                    },
-                    "required": ["field", "generator", "params"],
-                },
-            }
-        },
-        "required": ["generators"],
-    },
-    "assign_audit_cases": {
-        "type": "object",
-        "properties": {
-            "cases": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "case_id": {"type": "string"},
-                        "overrides": {"type": "object"},
-                        "expected_rule_keys": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["case_id", "overrides", "expected_rule_keys"],
-                },
-            }
-        },
-        "required": ["cases"],
-    },
-}
-
-
-def spec_payload(spec: SpecDocument) -> Dict[str, Any]:
-    return {
-        "table_code": spec.table_code,
-        "table_name": spec.table_name,
-        "section": spec.section,
-        "fields": [field.model_dump() for field in spec.fields],
-        "field_names": [field.name for field in spec.fields],
-        "terms_text": spec.terms_text[:6000],
-    }
-
-
-_BASE_PROMPT = "你是监管报送装配器，只能调用指定工具进行结构化参数赋值，禁止输出 SQL 或自由文本。"
-
-_RULE_OPERATOR_PROMPT = (
-    "所有字段必须来自输入白名单。DICTIONARY 仅用于数据字典明确表达的规则；"
-    "术语推理、额外格式限制或不确定拓展必须使用 TERM_INFERENCE。"
-    "算子参数契约：REQUIRED={}；ENUM/NOT_IN={values:[...]}；"
-    "COND_REQUIRED={if_field,if_operator:EQ|NE,if_values:[...]}；"
-    "LENGTH_MAX={length:最大长度}；REGEXP={pattern:正则}；FOREIGN_KEY={references_table,references_field}；"
-    "NUM_RANGE={min,max,min_inclusive,max_inclusive}（数值上下限，边界默认含）；"
-    "FIELD_COMPARE={right_field,operator:LT|LE|GT|GE|EQ|NE}（左字段必须满足该关系，如到期日>=起息日写 GE）。"
-    "长度口径：字典或表结构里的「字符型，N」是列宽上限，只能推出「最多 N 位」，用 LENGTH_MAX。"
-    "不要用精确长度约束——变长字段填短值是合法的，卡成「必须正好 N 位」会把正常数据判成违规。"
-    "确实需要「必须正好 N 位」（如统一社会信用代码 18 位、YYYYMMDD 8 位）时，用 REGEXP 把格式写死。"
-)
-
-_DATA_AND_AUDIT_PROMPT = (
-    "所有字段名、规则键和码表取值必须严格来自输入白名单，禁止虚构字段、规则或 SQL。"
-)
-
-_INGESTION_AND_ASSET_PROMPT = (
-    "严格依据输入原文与结构化摘要进行判断，不得凭常识虚构原文未声明的字段、类型、长度或码值。"
-)
-
-
-def _tool_prompt_preamble(tool_name: str) -> str:
-    """按工具作用域拼装最小必要的前置契约，避免第二阶段的规则算子说明书污染第一阶段解析与复核。"""
-    if tool_name == "assign_rules":
-        return f"{_BASE_PROMPT}{_RULE_OPERATOR_PROMPT}"
-    if tool_name in {"assign_generation_plan", "assign_schema", "assign_generators", "assign_audit_cases"}:
-        return f"{_BASE_PROMPT}{_DATA_AND_AUDIT_PROMPT}"
-    return f"{_BASE_PROMPT}{_INGESTION_AND_ASSET_PROMPT}"
-
-
 class RealDesignLlm:
     def __init__(self, settings: Settings) -> None:
         if not settings.llm_api_key:
@@ -359,7 +87,7 @@ class RealDesignLlm:
             timeout = self.settings.llm_timeout
         schema = TOOL_SCHEMAS[tool_name]
         prompt = (
-            f"{_tool_prompt_preamble(tool_name)}\n"
+            f"{tool_prompt_preamble(tool_name)}\n"
             f"任务：{instruction}\n输入：{json.dumps(payload, ensure_ascii=False)}"
         )
         if feedback:
@@ -381,14 +109,14 @@ class RealDesignLlm:
             request_json["tool_choice"] = "auto"
         if self.settings.llm_thinking:
             request_json["thinking"] = {"type": self.settings.llm_thinking}
+        url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
         try:
             with llm_call_semaphore():
-                response = httpx.post(
-                    f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},
-                    json=request_json,
-                    timeout=timeout,
-                )
+                if httpx.post is _ORIGINAL_HTTPX_POST:
+                    response = _get_http_client().post(url, headers=headers, json=request_json, timeout=timeout)
+                else:
+                    response = httpx.post(url, headers=headers, json=request_json, timeout=timeout)
         except httpx.TimeoutException as exc:
             elapsed = round(time.monotonic() - started_at, 2)
             raise LlmTimeoutError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
@@ -396,12 +124,25 @@ class RealDesignLlm:
             elapsed = round(time.monotonic() - started_at, 2)
             raise RuntimeError(f"{type(exc).__name__} after {elapsed}s; request_chars={len(prompt)}") from exc
         if response.is_error:
-            error = response.json().get("error", {})
             elapsed = round(time.monotonic() - started_at, 2)
+            # 网关/反代 502/503/504 常返回 HTML 或纯文本而非 JSON，绝不能抛 JSONDecodeError 误导守卫层走校验分支
+            try:
+                parsed_err = response.json()
+                error = parsed_err.get("error", {}) if isinstance(parsed_err, dict) else {}
+                code = error.get("code", "")
+                msg = error.get("message", "")
+            except Exception:  # noqa: BLE001
+                code = ""
+                raw_text = (getattr(response, "text", "") or "").strip().replace("\n", " ")
+                msg = raw_text[:240] or "non-JSON error body"
             raise RuntimeError(
-                f"LLM HTTP {response.status_code} {error.get('code', '')}: {error.get('message', '')}; elapsed={elapsed}s"
+                f"LLM HTTP {response.status_code} {code}: {msg}; elapsed={elapsed}s"
             )
-        body = response.json()
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            elapsed = round(time.monotonic() - started_at, 2)
+            raise RuntimeError(f"LLM HTTP 502 invalid JSON response: {exc}; elapsed={elapsed}s") from exc
         choice = body["choices"][0]
         message = choice["message"]
         calls = message.get("tool_calls") or []
@@ -427,6 +168,8 @@ class RealDesignLlm:
             except json.JSONDecodeError:
                 current = repair_json(raw_arguments, return_objects=True)
                 json_repaired = True
+            if not isinstance(current, dict):
+                raise ValueError(f"工具 {tool_name} 返回的参数无法解析为 JSON 对象")
             for key, value in current.items():
                 if isinstance(value, list):
                     arguments.setdefault(key, []).extend(value)

@@ -3,7 +3,7 @@ from openpyxl import Workbook
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeSetValidationModel,
     CodeValueModel,

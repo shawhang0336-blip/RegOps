@@ -1,6 +1,6 @@
 import uuid
 
-from app.infra.asset_models import (
+from app.infra.models import (
     FieldMetadataModel,
     MetadataRevisionModel,
     RawBlockModel,

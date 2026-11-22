@@ -17,7 +17,7 @@ from app.assets.code_sets.oracle import compile_code_set_oracle_ddl, sandbox_cod
 from app.engine.binding import materialize_golden_record
 from app.engine.compiler import compile_rule_query
 from app.infra.domain import AuditCaseBinding, GeneratorBinding, RuleDefinition, SchemaBinding, SpecDocument
-from app.infra.sql import quote_identifier
+from app.infra.db import quote_identifier
 
 # Oracle 12cR2+/23 标识符硬上限 128 字节；预留 7 字节给 "_TARGET" 后缀
 _MAX_SANDBOX_TABLE_LEN = 120

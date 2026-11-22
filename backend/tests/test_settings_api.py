@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from app.api.v2 import settings as settings_api
 from app.infra.config import Settings
-from app.infra.settings_store import DEFAULT_BUDGET, get_budget
+from app.infra.config import DEFAULT_BUDGET, get_budget
 from .helpers import make_session
 
 

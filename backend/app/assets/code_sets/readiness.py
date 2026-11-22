@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.infra.asset_models import CodeSetModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel
+from app.infra.models import CodeSetModel, CodeValueModel, FieldCodeReferenceModel, FieldMetadataModel
 
 
 def _issue(severity: str, code: str, message: str, **extra: Any) -> Dict[str, Any]:
@@ -223,7 +223,7 @@ def auto_publish_referenced_code_sets(session: Session, table) -> Dict[str, List
     注意：发布只写 status/published_version，不动码值内容；产物包仍记录版本，
     事后能追溯用的是哪一版。
     """
-    from app.infra.asset_models import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel
+    from app.infra.models import CodeSetModel, FieldCodeReferenceModel, FieldMetadataModel
 
     published: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []

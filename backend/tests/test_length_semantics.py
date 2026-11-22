@@ -11,7 +11,7 @@
 
 import pytest
 
-from app.infra.llm import RULE_PROPERTIES, TOOL_SCHEMAS
+from app.infra.llm_schemas import RULE_PROPERTIES, TOOL_SCHEMAS
 
 
 def test_operator_enum_has_no_exact_length():
@@ -36,7 +36,7 @@ def test_prompt_no_longer_offers_exact_length():
     """提示词里不能再出现「精确长度」这种把模型往 LENGTH 上引的说法。"""
     import inspect
 
-    from app.infra import llm as generic_ai
+    from app.infra import llm_schemas as generic_ai
 
     source = inspect.getsource(generic_ai)
     assert "LENGTH={length:精确长度}" not in source

@@ -7,10 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
-from app.infra.asset_models import SystemSettingModel
+from app.infra.models import SystemSettingModel
 from app.infra.config import get_settings
 from app.infra.llm import RealDesignLlm
-from app.infra.settings_store import DEFAULT_BUDGET, get_budget
+from app.infra.config import DEFAULT_BUDGET, get_budget
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 

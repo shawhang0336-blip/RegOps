@@ -17,6 +17,7 @@ from app.engine.ingestion_run import recover_interrupted_ingestion_runs
 from app.engine.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
 from app.infra.db import init_db
+from app.infra.llm import close_http_client
 from app.infra.task_runner import task_runner
 
 
@@ -34,6 +35,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         task_runner().shutdown(wait=False)
+        close_http_client()
 
 
 settings = get_settings()

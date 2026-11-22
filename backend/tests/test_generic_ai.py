@@ -122,3 +122,64 @@ def test_http_error_includes_model_error_code(monkeypatch):
     monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: Response())
     with pytest.raises(RuntimeError, match="1210"):
         RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
+
+
+def test_http_502_html_error_triggers_transient_retry_not_json_decode_error(monkeypatch):
+    """回归：网关 502/504 返回 HTML 页时不抛 JSONDecodeError（防误判为校验失败），正确走瞬时退避重试。"""
+    from app.infra.llm_guard import call_llm_validated
+
+    calls = {"n": 0}
+
+    class Html502Response:
+        status_code = 502
+        is_error = True
+        text = "<html><body>502 Bad Gateway</body></html>"
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1")
+
+    def post(url, headers, json, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Html502Response()
+        return _ok_response()
+
+    monkeypatch.setattr("app.infra.llm.httpx.post", post)
+    args, _ = call_llm_validated(
+        RealDesignLlm(Settings(llm_api_key="offline-test")),
+        "assign_generation_plan",
+        "test",
+        {},
+        backoff=(0,),
+    )
+    assert calls["n"] == 2
+    assert args["golden_count"] == 1
+
+
+def test_non_dict_repaired_arguments_raises_value_error_and_rule_prompt_complete(monkeypatch):
+    """回归：repair_json 返回非 dict 时抛 ValueError 而非 AttributeError；规则 Prompt 覆盖全部监管算子。"""
+    from app.infra.llm_schemas import tool_prompt_preamble
+
+    class BadArgsResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {
+                "id": "bad-args",
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "function": {"name": "assign_generation_plan", "arguments": "not-an-object-just-text"}
+                        }]
+                    }
+                }],
+            }
+
+    monkeypatch.setattr("app.infra.llm.httpx.post", lambda *args, **kwargs: BadArgsResponse())
+    with pytest.raises(ValueError, match="JSON 对象"):
+        RealDesignLlm(Settings(llm_api_key="offline-test")).assign("assign_generation_plan", "test", {})
+
+    rule_prompt = tool_prompt_preamble("assign_rules")
+    for op in ("COND_VALUE", "ARITHMETIC_BALANCE", "UNIQUE_KEY"):
+        assert op in rule_prompt

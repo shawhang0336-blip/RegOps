@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.infra.config import Settings
-from app.infra.asset_models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
+from app.infra.models import DocumentArchitectureModel, RawBlockModel, SourceDocumentModel
 from app.ingestion.structure_service import _apply_plan, _validate_plan, latest_document_architecture
 from .helpers import make_session
 
@@ -69,7 +69,7 @@ def test_structure_plan_rejects_uncovered_source_block():
         _validate_plan({"blocks": [{"source_block_ids": [first.id], "role": "IGNORE"}]}, [first, second])
 import uuid
 
-from app.infra.asset_models import RawBlockModel, SourceDocumentModel
+from app.infra.models import RawBlockModel, SourceDocumentModel
 from app.ingestion.structure_service import analyze_document_structure
 import app.ingestion.structure_service as structure_service
 from .helpers import make_session

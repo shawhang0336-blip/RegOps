@@ -1,8 +1,11 @@
+"""运行配置、预算存储与身份占位常量（基础设施层 Layer 0）。"""
+
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.orm import Session
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_SPEC_PATH = (
@@ -11,6 +14,20 @@ DEFAULT_SPEC_PATH = (
     / "specs"
     / "金融机构外汇业务数据采集规范_1.3版_全文.pdf"
 )
+
+# 统一登录/工号尚未接入前的操作人审计字段占位值；接入鉴权后从会话上下文替换
+OPERATOR_PLACEHOLDER = "操作员"
+
+DEFAULT_BUDGET: Dict[str, int] = {
+    "max_rules_per_table": 50,
+    "max_cases_per_table": 1000,
+    "max_retries": 3,
+    "max_llm_concurrency": 4,
+    # ProdAgent BudgetGuard 成本熔断阈值（0 表示仅统计不熔断）
+    "max_llm_calls": 120,
+    "max_total_tokens": 1500000,
+    "max_elapsed_seconds": 900,
+}
 
 
 class Settings(BaseSettings):
@@ -50,3 +67,11 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_budget(session: Session) -> Dict[str, int]:
+    """读取确定性执行预算配置，缺失项以 DEFAULT_BUDGET 兜底。"""
+    from app.infra.models import SystemSettingModel
+
+    row = session.get(SystemSettingModel, "execution_budget")
+    return {**DEFAULT_BUDGET, **(row.value_json if row else {})}

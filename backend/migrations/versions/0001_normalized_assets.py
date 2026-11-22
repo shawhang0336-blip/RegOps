@@ -7,7 +7,7 @@ Revises:
 from alembic import op
 
 from app.infra.db import Base
-from app.infra import asset_models, models
+from app.infra import models  # noqa: F401
 
 revision = "0001_normalized_assets"
 down_revision = None

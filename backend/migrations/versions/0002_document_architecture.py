@@ -6,7 +6,7 @@ Revises: 0001_normalized_assets
 
 from alembic import op
 
-from app.infra.asset_models import DocumentArchitectureModel
+from app.infra.models import DocumentArchitectureModel
 
 revision = "0002_document_architecture"
 down_revision = "0001_normalized_assets"

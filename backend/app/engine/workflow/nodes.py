@@ -39,7 +39,7 @@ from app.engine.workflow.stage_rules import (
     join_table_rules_barrier,
     prepare_deterministic_rule_index,
 )
-from app.infra.asset_models import ArtifactModel
+from app.infra.models import ArtifactModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import RuleDefinition, canonical_json
 from app.infra.errors import WorkflowError

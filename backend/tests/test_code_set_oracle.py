@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from app.infra.asset_models import CodeSetModel, CodeValueModel
+from app.infra.models import CodeSetModel, CodeValueModel
 from app.assets.code_sets.oracle import (
     compile_code_set_oracle_ddl,
     compile_code_set_oracle_insert,

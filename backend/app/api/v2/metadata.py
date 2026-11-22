@@ -22,7 +22,7 @@ from app.assets.metadata_service import (
     update_field,
 )
 from app.assets.readiness import evaluate_document, evaluate_table, latest_table_rows
-from app.infra.asset_models import (
+from app.infra.models import (
     FieldMetadataModel,
     MetadataRevisionModel,
     MetadataValidationModel,
@@ -31,7 +31,7 @@ from app.infra.asset_models import (
     TableMetadataModel,
 )
 from app.infra.config import get_settings
-from app.infra.identity import OPERATOR_PLACEHOLDER
+from app.infra.config import OPERATOR_PLACEHOLDER
 from app.ingestion.structure_service import analyze_document_structure
 
 router = APIRouter(prefix="/metadata", tags=["metadata"])

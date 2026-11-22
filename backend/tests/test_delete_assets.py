@@ -6,7 +6,7 @@
 
 import pytest
 
-from app.infra.asset_models import (
+from app.infra.models import (
     CodeSetModel,
     CodeValueModel,
     FieldCodeReferenceModel,

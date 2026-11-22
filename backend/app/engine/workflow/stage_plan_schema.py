@@ -6,10 +6,10 @@ from typing import Any, Dict, List, Optional
 from app.engine.binding import compile_schema_bindings
 from app.engine.rules import RuleValidationError
 from app.engine.workflow.runtime import _call_validated, _emit, _fanout
-from app.infra.asset_models import GenerationPlanModel, SchemaDefinitionModel
+from app.infra.models import GenerationPlanModel, SchemaDefinitionModel
 from app.infra.blob_store import LocalBlobStore
 from app.infra.domain import canonical_json
-from app.infra.llm import spec_payload
+from app.infra.llm_schemas import spec_payload
 
 
 def _provider_name(llm, trace: Optional[Dict[str, Any]] = None) -> str:

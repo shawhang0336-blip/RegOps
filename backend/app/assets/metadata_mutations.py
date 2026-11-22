@@ -18,7 +18,7 @@ from app.assets.metadata_views import (
     TYPE_BASIS_SOURCE,
     _field_view,
 )
-from app.infra.asset_models import (
+from app.infra.models import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     MetadataRevisionModel,

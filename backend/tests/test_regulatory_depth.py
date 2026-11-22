@@ -29,7 +29,7 @@ from app.engine.oracle import GenericOracleExecutor
 from app.engine.run_diff import diff_runs
 from app.engine.rules import RuleValidationError, validate_rule
 from app.engine.workflow.stage_data import _coupled_field_names, _partition_coupled_chunks
-from app.infra.asset_models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
+from app.infra.models import FieldMetadataModel, RawBlockModel, SourceDocumentModel, TableMetadataModel
 from app.infra.domain import FieldSpec, RuleDefinition, SpecDocument
 from app.infra.models import RuleModel, RunModel
 from app.kernel.run import create_run

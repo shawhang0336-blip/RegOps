@@ -1,17 +1,14 @@
-"""基础设施层（Infra）：配置、数据库、共享领域契约、受控 LLM 客户端与 ORM 数据模型。
+"""基础设施层（Infra，Layer 0）：配置、数据库、ORM 模型、共享契约与受控 LLM 底座。
 
-本层为全后端最底层（严禁依赖其他任何业务或内核包）：
-- `config.py`：环境配置 `Settings` 与 `.env` 加载；
-- `db.py`：SQLAlchemy `Base`、`SessionLocal` 与表结构初始化；
-- `blob_store.py`：基于 SHA-256 内容寻址的不可变大对象本地存储（`LocalBlobStore`）；
-- `errors.py`：领域统一异常 `WorkflowError`；
-- `identity.py`：操作人身份占位符常量；
-- `domain.py`：跨层共享契约（`FieldSpec` / `SpecDocument` / `RuleDefinition` / Binding 模型 / `LLM_OPERATORS` / `field_map`）；
-- `sql.py`：跨方言（Oracle / MySQL）安全 SQL 标识符转义；
-- `llm.py`：受控 Tool-Call 大模型客户端与并发限流；
-- `llm_guard.py`：受控大模型调用守卫（分轨退避重试、上下文作用域透传与可插拔 Bus 门禁回喂）；
-- `settings_store.py`：运行时执行预算配置（`DEFAULT_BUDGET` / `get_budget`）；
+本层为全后端最底层（严禁依赖 kernel / policy 或任何上层业务包），共 10 个高内聚模块：
+- `config.py`：环境配置 `Settings`、运行预算 `DEFAULT_BUDGET`/`get_budget` 与操作人占位常量 `OPERATOR_PLACEHOLDER`；
+- `db.py`：MySQL/Oracle 生产连接池、`Base`/`SessionLocal`/`init_db` 与跨方言安全标识符转义 `quote_identifier`；
+- `models.py`：全部 20 张 ORM 表统一定义（运行时账本 / 文档与资产元数据 / 生成规划与产物）；
+- `domain.py`：跨层共享 Pydantic 契约（`FieldSpec` / `SpecDocument` / `RuleDefinition` / Binding / `LLM_OPERATORS`）；
+- `errors.py`：统一领域异常 `WorkflowError`；
+- `blob_store.py`：基于 SHA-256 内容寻址与原子临时文件替换的不可变大对象存储（`LocalBlobStore`）；
 - `task_runner.py`：带任务键去重的进程内有界后台任务执行器（`TaskRunner` / `task_runner`）；
-- `models.py`：核心运行时 ORM（`RunModel` / `EventModel` / `RuleModel` / `SpecificationModel`）；
-- `asset_models.py`：文档、元数据、码表、审批与产物资产 ORM。
+- `llm.py`：受控 Tool-Call 大模型 HTTP 客户端（连接池复用、并发限流、网关非 JSON 容错）；
+- `llm_schemas.py`：12 个受控工具的 JSON Schema 与作用域 Prompt 契约（`TOOL_SCHEMAS` / `spec_payload`）；
+- `llm_guard.py`：受控大模型调用守卫（分轨退避重试、上下文透传与可插拔 Bus 门禁回喂）。
 """

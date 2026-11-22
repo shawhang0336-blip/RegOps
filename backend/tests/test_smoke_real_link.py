@@ -21,7 +21,6 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import app.infra.asset_models
 from app.policy.regops_plan import project
 from app.infra.config import Settings
 from app.infra.db import Base
