@@ -10,12 +10,12 @@
 
 import hashlib
 import json
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
 from app.infra.models import EventModel, RunModel
@@ -85,8 +85,14 @@ def fold_with(events: Iterable[EventModel], reducer: Optional[StateReducer] = No
 
 
 def _state_cache(session: Session) -> Dict[str, RunState]:
-    """session 级投影缓存。同一请求内多次读取不重复折叠；append_event 会失效它。"""
+    """session 级投影缓存。同一请求内多次读取不重复折叠；append_event 或 rollback 会自动失效它。"""
     return session.info.setdefault("_run_state_cache", {})
+
+
+@sa_event.listens_for(Session, "after_soft_rollback")
+def _clear_state_cache_on_rollback(session: Session, _previous_transaction: Any) -> None:
+    """事务回滚后立即清空 session 级状态投影缓存，杜绝读到已回滚的幽灵脏状态。"""
+    session.info.pop("_run_state_cache", None)
 
 
 def project_with(
@@ -165,6 +171,8 @@ def append_event(
     bus: Any = None,
 ) -> EventModel:
     """追加一条不可变事件，并通过 Bus 广播 event.appended 生命周期信号。"""
+    # 快照化并按 canonical_event_json 归一化载荷：防止调用方事后修改原 dict 导致已计算的 SHA-256 哈希链断裂
+    stored_payload = json.loads(canonical_event_json(payload if payload is not None else {}))
     previous = (
         session.query(EventModel)
         .filter(EventModel.run_id == run.id)
@@ -172,12 +180,12 @@ def append_event(
         .first()
     )
     prev_hash = previous.event_hash if previous else GENESIS_HASH
-    event_hash = compute_event_hash(run.id, kind, node, payload, prev_hash)
+    event_hash = compute_event_hash(run.id, kind, node, stored_payload, prev_hash)
     event = EventModel(
         run_id=run.id,
         kind=kind,
         node=node,
-        payload_json=payload,
+        payload_json=stored_payload,
         prev_hash=prev_hash,
         event_hash=event_hash,
     )
@@ -472,6 +480,11 @@ def build_trace(
             current_span.status = "interrupted"
             trace.interrupt_count += 1
             trace.status = "interrupted"
+        elif kind in {"RUN_RESUMED", "REAUDIT_REQUESTED"} or kind.endswith(("_RECORDED", "_ANSWERED")):
+            if trace.status == "interrupted":
+                trace.status = "running"
+            if current_span.status == "retried":
+                current_span.status = "ok"
         elif kind in {"RUN_COMPLETED", "INGESTION_COMPLETED", "DONE"} or kind.endswith("_CONFIRMED"):
             if current_span.status == "retried":
                 current_span.status = "ok"

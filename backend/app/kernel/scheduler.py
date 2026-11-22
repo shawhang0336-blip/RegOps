@@ -536,6 +536,8 @@ class Scheduler:
         - 多前驱静态合流：传入 `{前驱节点名: output}` 字典；
         - 模板（`Send` 波次）前驱：传入该模板所有并发实例 `output` 组成的有序列表。
         """
+        if max_steps < 1:
+            raise ValueError("max_steps 必须 >= 1")
         executed: List[StepResult] = []
         cursor = ctx.state.current_node
         if initial_wave is not None:
@@ -632,6 +634,11 @@ class Scheduler:
                         ctx.check_wave_writes(
                             [(task.label or task.node, outcome.shared) for task, outcome, *_ in partial_outcomes]
                         )
+                        partial_rejections = (
+                            ctx.bus.drain_rejections() if hasattr(ctx.bus, "drain_rejections") else []
+                        )
+                        for rej in partial_rejections:
+                            append_event(ctx.session, ctx.run, "BUS_REJECTED", wave[-1].node, rej, bus=ctx.bus)
                         for task, outcome, retry_events, *_ in partial_outcomes:
                             for kind, ev_node, payload in [*retry_events, *outcome.events]:
                                 append_event(ctx.session, ctx.run, kind, ev_node, payload, bus=ctx.bus)
@@ -730,8 +737,9 @@ class Scheduler:
             last_wave_outputs = [(task.node, outcome.output) for task, outcome, *_ in wave_outcomes]
             last_wave_was_send = current_is_send_wave
 
-            # 1) 一等 Interrupt：同波全部工单落账后立即挂起并提交（落盘放手）
+            # 1) 一等 Interrupt：先提交事件真相，再广播 run.interrupted 并彻底放手
             if interrupts_hit:
+                ctx.session.commit()
                 if hasattr(ctx.bus, "fire"):
                     ctx.bus.fire(
                         "run.interrupted",
@@ -750,15 +758,22 @@ class Scheduler:
                             "status": ctx.state.status,
                         },
                     )
-                ctx.session.commit()
                 return executed
 
-            # 2) 动态扇出 Send：进入下一 BSP 波次
+            # 2) 终态优先止步：先提交真相再广播终态事件，且绝不被残留 Send/Goto 复活
+            if ctx.state.status in {"COMPLETED", "FAILED"}:
+                ctx.session.commit()
+                if hasattr(ctx.bus, "fire"):
+                    topic = "run.completed" if ctx.state.status == "COMPLETED" else "run.failed"
+                    ctx.bus.fire(topic, {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
+                return executed
+
+            # 3) 动态扇出 Send：进入下一 BSP 波次
             if next_sends:
                 pending_wave = next_sends
                 is_send_wave = True
                 cursor = wave[-1].node
-            # 3) 运行时跳转 Goto：落 GO_REDIRECT 并把 control/output 喂给重入目标节点
+            # 4) 运行时跳转 Goto：落 GO_REDIRECT 并把 control/output 喂给重入目标节点
             elif goto_outcome is not None:
                 from_node, out = goto_outcome
                 if out.goto not in self._node_names:
@@ -775,14 +790,6 @@ class Scheduler:
             else:
                 cursor = wave[-1].node
                 last_when = wave_outcomes[-1][1].when
-
-            # 终态停止
-            if ctx.state.status in {"COMPLETED", "FAILED"}:
-                if hasattr(ctx.bus, "fire"):
-                    topic = "run.completed" if ctx.state.status == "COMPLETED" else "run.failed"
-                    ctx.bus.fire(topic, {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
-                ctx.session.commit()
-                return executed
 
             # 波后取消 / 预算熔断：先提交已完成波次的检查点再抛出异常
             if ctx.is_cancelled:
@@ -811,7 +818,7 @@ class Scheduler:
                     ctx.session.commit()
                     raise MaxWavesExceededError(max_steps, cursor, runnable)
 
+        ctx.session.commit()
         if hasattr(ctx.bus, "fire") and ctx.state.status.startswith("WAITING_"):
             ctx.bus.fire("run.interrupted", {"run_id": ctx.run.id, "node": ctx.state.current_node, "status": ctx.state.status})
-        ctx.session.commit()
         return executed

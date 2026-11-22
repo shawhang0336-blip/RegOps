@@ -14,7 +14,7 @@ from app.policy.regops_plan import (
     is_gate,
     self_heal_target,
 )
-from app.kernel.plan import WorkflowPlan, PlanEdge, PlanNode
+from app.kernel.plan import PlanEdge, PlanNode, RetryPolicy, WorkflowPlan
 from app.kernel.event_log import append_event
 from app.infra.models import RunModel
 from .helpers import make_session
@@ -90,3 +90,45 @@ def test_go_redirect_rejects_node_outside_plan():
 
     with pytest.raises(ValueError, match="不在 Plan 中"):
         _apply(RunState(), "GO_REDIRECT", {"target": "ghost_node"})
+
+
+def test_plan_audit_guards_retry_on_empty_fields_duplicates_and_dead_ends():
+    """回归：plan.py 自审发现的 4 项静态校验缺口。"""
+    # 1) RetryPolicy.retry_on 误传单个异常类（漏逗号）须在构造期立即拦截
+    with pytest.raises(ValueError, match="单元素元组"):
+        RetryPolicy(retry_on=ConnectionError)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="元组必须非空"):
+        RetryPolicy(retry_on=())
+
+    # 2) 空节点名与空条件标签 when 须立即拦截
+    with pytest.raises(ValueError, match="节点名称不能为空"):
+        PlanNode("   ", "空节点", "stage")
+    with pytest.raises(ValueError, match="when 不能为空"):
+        PlanEdge("a", "b", "  ")
+
+    # 3) 重复边与无出边 stage 节点须在建图期拦截
+    with pytest.raises(ValueError, match="重复边"):
+        WorkflowPlan(
+            name="dup_edge",
+            nodes=(PlanNode("a", "起点", "stage"), PlanNode("b", "终点", "terminal")),
+            edges=(PlanEdge("a", "b", "always"), PlanEdge("a", "b", "always")),
+            entry="a",
+        )
+    with pytest.raises(ValueError, match="非终态阶段节点缺少出边"):
+        WorkflowPlan(
+            name="dead_stage",
+            nodes=(PlanNode("a", "起点", "stage"), PlanNode("b", "死胡同", "stage")),
+            edges=(PlanEdge("a", "b", "always"),),
+            entry="a",
+        )
+
+    # 4) 入口节点不存在时不应级联误报全部正常节点“不可达”
+    bad_entry = object.__new__(WorkflowPlan)
+    object.__setattr__(bad_entry, "name", "bad_entry")
+    object.__setattr__(bad_entry, "nodes", (PlanNode("a", "A", "stage"), PlanNode("b", "B", "terminal")))
+    object.__setattr__(bad_entry, "edges", (PlanEdge("a", "b", "always"),))
+    object.__setattr__(bad_entry, "entry", "missing_entry")
+    errs = bad_entry.validate()
+    assert any("入口节点" in e for e in errs)
+    assert not any("不可达" in e for e in errs)
+

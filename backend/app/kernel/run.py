@@ -362,7 +362,11 @@ class BudgetGuard:
         self._bus: Optional[Bus] = None
 
     def attach(self, bus: Bus) -> "BudgetGuard":
-        """挂载到指定 Bus：订阅工具/节点事件并注册为主动预算检查钩子。"""
+        """幂等挂载到指定 Bus：防止重复挂载导致双倍记账；换绑新 Bus 时自动从旧 Bus 卸载。"""
+        if self._bus is bus:
+            return self
+        if self._bus is not None:
+            self.detach()
         self._bus = bus
         bus.subscribe("tool.after", self._on_tool_after)
         bus.subscribe("tool.rejected", self._on_tool_rejected)
@@ -370,6 +374,18 @@ class BudgetGuard:
         if hasattr(bus, "attach_budget"):
             bus.attach_budget(self)
         return self
+
+    def detach(self) -> None:
+        """从当前 Bus 退订监听并解除挂载。"""
+        bus = self._bus
+        if bus is None:
+            return
+        self._bus = None
+        bus.unsubscribe("tool.after", self._on_tool_after)
+        bus.unsubscribe("tool.rejected", self._on_tool_rejected)
+        bus.unsubscribe("node.exit", self._on_node_exit)
+        if getattr(bus, "budget_guard", None) is self and hasattr(bus, "attach_budget"):
+            bus.attach_budget(None)
 
     def _on_tool_after(self, envelope: Dict[str, Any]) -> None:
         tool = str(envelope.get("tool") or "unknown")
@@ -566,10 +582,8 @@ def fail_run(
     bus: Any = None,
     commit: bool = True,
 ) -> EventModel:
-    """统一失败落账原语：排空 Bus 拦截 → 写 RUN_FAILED → 广播 node.error & run.failed。"""
+    """统一失败落账原语：排空 Bus 拦截 → 写 RUN_FAILED 并提交真相 → 再广播 node.error & run.failed。"""
     active_bus = bus if bus is not None else global_bus()
-    if hasattr(active_bus, "fire"):
-        active_bus.fire("node.error", {"run_id": run.id, "node": node, "error": error})
     if hasattr(active_bus, "drain_rejections"):
         for rej in active_bus.drain_rejections():
             append_event(session, run, "BUS_REJECTED", node, rej, bus=active_bus)
@@ -586,13 +600,14 @@ def fail_run(
         event_payload["resume_when"] = resume_when
 
     event = append_event(session, run, "RUN_FAILED", node, event_payload, bus=active_bus)
+    if commit:
+        session.commit()
     if hasattr(active_bus, "fire"):
+        active_bus.fire("node.error", {"run_id": run.id, "node": node, "error": error})
         active_bus.fire(
             "run.failed",
             {"run_id": run.id, "node": node, "status": "FAILED", "error": error},
         )
-    if commit:
-        session.commit()
     return event
 
 
@@ -608,7 +623,7 @@ def record_run_cancelled(
     bus: Any = None,
     commit: bool = True,
 ) -> EventModel:
-    """落账受控取消事件 RUN_CANCELLED 并广播 run.cancelled，保留检查点以支持后续断点续跑。"""
+    """落账受控取消事件 RUN_CANCELLED 并提交真相，再广播 run.cancelled（消除 SSE 与 DB 竞态）。"""
     active_bus = bus if bus is not None else global_bus()
     result_payload: Dict[str, Any] = {"error": reason, "cancelled": True}
     if extra_result:
@@ -623,13 +638,13 @@ def record_run_cancelled(
     if resume_when is not None:
         event_payload["resume_when"] = resume_when
     event = append_event(session, run, "RUN_CANCELLED", node, event_payload, bus=active_bus)
+    if commit:
+        session.commit()
     if hasattr(active_bus, "fire"):
         active_bus.fire(
             "run.cancelled",
             {"run_id": run.id, "node": node, "status": "FAILED", "reason": reason},
         )
-    if commit:
-        session.commit()
     return event
 
 

@@ -6,6 +6,7 @@
 - 机制层不定义任何业务节点名（业务拓扑位于 app/policy/regops_plan.py）。
 """
 
+from collections import deque
 import random
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
@@ -40,6 +41,18 @@ class RetryPolicy:
             raise ValueError("RetryPolicy.max_delay 不能为负数")
         if self.jitter < 0 or self.jitter > 1:
             raise ValueError("RetryPolicy.jitter 必须在 [0, 1] 之间")
+        if isinstance(self.retry_on, tuple):
+            if not self.retry_on or not all(
+                isinstance(item, type) and issubclass(item, BaseException) for item in self.retry_on
+            ):
+                raise ValueError("RetryPolicy.retry_on 元组必须非空且元素均为异常类型")
+        elif isinstance(self.retry_on, type) and issubclass(self.retry_on, BaseException):
+            raise ValueError(
+                f"RetryPolicy.retry_on 不能直接传单个异常类 {self.retry_on.__name__}，"
+                f"请改用单元素元组 ({self.retry_on.__name__},)"
+            )
+        elif not callable(self.retry_on):
+            raise ValueError("RetryPolicy.retry_on 须为异常类型元组或可调用谓词函数")
 
     def delay_for(
         self,
@@ -70,6 +83,8 @@ class PlanNode:
     retry: Optional[RetryPolicy] = None
 
     def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("节点名称不能为空")
         if self.kind not in {"stage", "gate", "terminal"}:
             raise ValueError(f"未知节点类型：{self.kind}")
         if self.timeout is not None and self.timeout <= 0:
@@ -83,8 +98,10 @@ class PlanEdge:
     when: str  # 条件标签，由执行器判定；"always" 为无条件边
 
     def __post_init__(self) -> None:
-        if not self.src or not self.dst:
+        if not self.src or not self.src.strip() or not self.dst or not self.dst.strip():
             raise ValueError("边不能有空端点")
+        if not self.when or not self.when.strip():
+            raise ValueError(f"边 {self.src} -> {self.dst} 的条件标签 when 不能为空")
 
 
 @dataclass(frozen=True)
@@ -100,7 +117,7 @@ class WorkflowPlan:
             raise ValueError("非法 Plan：" + "；".join(errors))
 
     def validate(self) -> List[str]:
-        """静态校验：悬空边、重复节点、入口缺失、终态出边、不可达节点。"""
+        """静态校验：重名节点、入口缺失、悬空边、重复边、终态出边、无出边阶段节点、不可达节点。"""
         errors: List[str] = []
         names = [node.name for node in self.nodes]
         if len(names) != len(set(names)):
@@ -108,31 +125,43 @@ class WorkflowPlan:
         name_set = set(names)
         if self.entry not in name_set:
             errors.append(f"入口节点 {self.entry} 不存在")
+        seen_edges = set()
         for edge in self.edges:
             if edge.src not in name_set:
                 errors.append(f"悬空边：{edge.src} -[{edge.when}]-> {edge.dst} 的起点不存在")
             if edge.dst not in name_set:
                 errors.append(f"悬空边：{edge.src} -[{edge.when}]-> {edge.dst} 的终点不存在")
+            edge_key = (edge.src, edge.dst, edge.when)
+            if edge_key in seen_edges:
+                errors.append(f"重复边：{edge.src} -[{edge.when}]-> {edge.dst}")
+            else:
+                seen_edges.add(edge_key)
         terminals = {node.name for node in self.nodes if node.kind == "terminal"}
+        outgoing: Dict[str, List[str]] = {}
         for edge in self.edges:
             if edge.src in terminals:
                 errors.append(f"终态节点 {edge.src} 不应有出边")
-
-        # 从入口做可达性分析
-        outgoing: Dict[str, List[str]] = {}
-        for edge in self.edges:
             outgoing.setdefault(edge.src, []).append(edge.dst)
-        seen = {self.entry}
-        queue = [self.entry]
-        while queue:
-            current = queue.pop(0)
-            for dst in outgoing.get(current, []):
-                if dst not in seen:
-                    seen.add(dst)
-                    queue.append(dst)
-        unreachable = name_set - seen
-        if unreachable:
-            errors.append(f"不可达节点：{sorted(unreachable)}")
+
+        dead_end_stages = [
+            node.name for node in self.nodes if node.kind == "stage" and not outgoing.get(node.name)
+        ]
+        if dead_end_stages:
+            errors.append(f"非终态阶段节点缺少出边：{sorted(dead_end_stages)}")
+
+        # 仅当入口节点合法时做可达性分析，避免入口写错时把所有正常节点误报为不可达
+        if self.entry in name_set:
+            seen = {self.entry}
+            queue: deque[str] = deque([self.entry])
+            while queue:
+                current = queue.popleft()
+                for dst in outgoing.get(current, []):
+                    if dst in name_set and dst not in seen:
+                        seen.add(dst)
+                        queue.append(dst)
+            unreachable = name_set - seen
+            if unreachable:
+                errors.append(f"不可达节点：{sorted(unreachable)}")
         return errors
 
     def node(self, name: str) -> PlanNode:
@@ -155,13 +184,14 @@ class WorkflowPlan:
         """渲染成 Mermaid flowchart，便于可视化与人工核对拓扑。"""
         lines = ["flowchart TD"]
         for node in self.nodes:
+            safe_label = node.label.replace('"', "'")
             if node.kind == "gate":
-                lines.append(f'  {node.name}{{{{"{node.name} {node.label}"}}}}')
+                lines.append(f'  {node.name}{{{{"{node.name} {safe_label}"}}}}')
             elif node.kind == "terminal":
-                lines.append(f'  {node.name}(( "{node.name} {node.label}" ))')
+                lines.append(f'  {node.name}(( "{node.name} {safe_label}" ))')
             else:
-                lines.append(f'  {node.name}["{node.name} {node.label}"]')
+                lines.append(f'  {node.name}["{node.name} {safe_label}"]')
         for edge in self.edges:
-            label = "" if edge.when == "always" else edge.when
+            label = "" if edge.when == "always" else edge.when.replace("|", "/")
             lines.append(f"  {edge.src} -->|{label}| {edge.dst}")
         return "\n".join(lines)

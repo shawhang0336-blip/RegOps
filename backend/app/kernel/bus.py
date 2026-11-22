@@ -132,6 +132,8 @@ class Bus:
     """全生命周期总线内核：事前门禁裁决（adjudicate/check）+ 事后主题广播（fire/subscribe）。"""
 
     def __init__(self, parent: Optional["Bus"] = None) -> None:
+        if parent is self:
+            raise ValueError("Bus.parent 不能指向自身")
         self._adjudicators: List[Adjudicator] = []
         self._observers: List[Subscriber] = []
         self._subscribers: Dict[str, List[Subscriber]] = defaultdict(list)
@@ -205,17 +207,18 @@ class Bus:
         """向外广播一条生命周期事件。旁观者抛出的任何异常均被吞掉隔离，绝不阻断主流程。"""
         with self._lock:
             self._seq += 1
+            # 核心信封字段（seq / topic / timestamp）后写入，防止业务 payload 中的同名字段篡改总线元数据
             envelope: Dict[str, Any] = {
+                **(payload or {}),
                 "seq": self._seq,
                 "topic": topic,
                 "timestamp": time.time(),
-                **(payload or {}),
             }
             self._history.append(envelope)
             if len(self._history) > MAX_BUS_HISTORY:
                 del self._history[:-MAX_BUS_HISTORY]
             topic_handlers = list(self._subscribers.get(topic, []))
-            wildcard_handlers = list(self._subscribers.get("*", []))
+            wildcard_handlers = [] if topic == "*" else list(self._subscribers.get("*", []))
             parent = self._parent
 
         for handler in topic_handlers + wildcard_handlers:
@@ -230,7 +233,7 @@ class Bus:
         return envelope
 
     def _forward(self, envelope: Dict[str, Any]) -> None:
-        """子 Bus（如单次 Run 的 ctx.bus）向父 Bus 冒泡广播。"""
+        """子 Bus（如单次 Run 的 ctx.bus）向父 Bus 逐级冒泡广播。"""
         topic = envelope.get("topic", "")
         with self._lock:
             self._seq += 1
@@ -239,18 +242,29 @@ class Bus:
             if len(self._history) > MAX_BUS_HISTORY:
                 del self._history[:-MAX_BUS_HISTORY]
             topic_handlers = list(self._subscribers.get(topic, []))
-            wildcard_handlers = list(self._subscribers.get("*", []))
+            wildcard_handlers = [] if topic == "*" else list(self._subscribers.get("*", []))
+            parent = self._parent
         for handler in topic_handlers + wildcard_handlers:
             try:
                 handler(forwarded)
             except Exception:
                 pass
+        if parent is not None:
+            parent._forward(forwarded)
 
     def adjudicate(self, tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
         """事前门禁裁决：先发 tool.before 广播，再逐个跑裁决器；拒绝时发 tool.rejected 广播并返回原因。"""
-        table_code = payload.get("table_code") or (payload.get("table") or {}).get("table_code")
-        fields = payload.get("fields") or []
-        field_name = fields[0].get("name") if len(fields) == 1 and isinstance(fields[0], dict) else None
+        safe_payload = payload if isinstance(payload, dict) else {}
+        table_obj = safe_payload.get("table")
+        table_code = safe_payload.get("table_code") or (
+            table_obj.get("table_code") if isinstance(table_obj, dict) else None
+        )
+        fields = safe_payload.get("fields") or []
+        field_name = (
+            fields[0].get("name")
+            if isinstance(fields, list) and len(fields) == 1 and isinstance(fields[0], dict)
+            else None
+        )
 
         before_meta: Dict[str, Any] = {"tool": tool_name, "args": args}
         if table_code:

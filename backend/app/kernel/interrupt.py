@@ -30,15 +30,21 @@ class Interrupt:
     resume_node: Optional[str] = None
     identity: Optional[Dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        if not self.kind or not self.kind.strip():
+            raise ValueError("Interrupt.kind 不能为空")
+
     def to_payload(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "question": self.question,
-            "resume_node": self.resume_node or self.node,
-            "pending_input": dict(self.pending_input),
-            "interrupt_id": uuid.uuid4().hex,
-        }
-        if self.identity:
-            payload.update(self.identity)
+        payload: Dict[str, Any] = dict(self.identity) if isinstance(self.identity, dict) else {}
+        # 核心协议字段放在最后覆盖，防止 identity 中的同名键意外污染中断工单
+        payload.update(
+            {
+                "question": self.question,
+                "resume_node": self.resume_node or self.node,
+                "pending_input": dict(self.pending_input),
+                "interrupt_id": uuid.uuid4().hex,
+            }
+        )
         return payload
 
 
@@ -52,14 +58,15 @@ def make_interrupt_payload(
     """构造一条通用 Interrupt 事件的 payload（question / resume_node / pending_input / interrupt_id）。"""
     if kind not in resume_nodes:
         raise ValueError(f"未知中断类型：{kind}")
-    payload: Dict[str, Any] = {
-        "question": question,
-        "resume_node": resume_nodes[kind],
-        "pending_input": pending_input,
-        "interrupt_id": uuid.uuid4().hex,
-    }
-    if identity:
-        payload.update(identity)
+    payload: Dict[str, Any] = dict(identity) if isinstance(identity, dict) else {}
+    payload.update(
+        {
+            "question": question,
+            "resume_node": resume_nodes[kind],
+            "pending_input": pending_input,
+            "interrupt_id": uuid.uuid4().hex,
+        }
+    )
     return payload
 
 
@@ -139,12 +146,15 @@ def answer_interrupt(
     - 若同一中断已被不同内容回答且 `reject_conflict=True`，抛出 `ValueError`。
     """
     latest = latest_interrupt(session, run, interrupt_kind)
+    mapping = answer_kinds if answer_kinds is not None else {interrupt_kind: answer_kind}
+    pending = pending_interrupt_with(session, run, interrupt_kind, mapping)
     if latest and (latest.payload_json or {}).get("interrupt_id"):
         interrupt_id = latest.payload_json["interrupt_id"]
         prior = matching_answer(session, run, answer_kind, interrupt_id, answer_fingerprint)
         if prior:
             return "REPLAY", prior
-        if reject_conflict:
+        # 若同波次还有其他未回答的同类型中断工单（pending is not None），优先交由调用方回答，不误判为冲突
+        if pending is None and reject_conflict:
             answered = [
                 event
                 for event in session.query(EventModel)
@@ -154,8 +164,6 @@ def answer_interrupt(
             ]
             if answered:
                 raise ValueError("This interrupt was already answered with different decisions")
-    mapping = answer_kinds if answer_kinds is not None else {interrupt_kind: answer_kind}
-    pending = pending_interrupt_with(session, run, interrupt_kind, mapping)
     return "PENDING", pending
 
 

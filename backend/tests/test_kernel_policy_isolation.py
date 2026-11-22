@@ -1236,6 +1236,135 @@ def test_kernel_bus_fail_closed_check_and_bounded_stream_subscription():
     assert received_indices == [0, 1, 2]
 
 
+def test_kernel_deep_audit_fixes_across_all_five_modules():
+    """回归：针对 interrupt / bus / event_log / run / scheduler 深度自审发现的全部暗坑。"""
+    import pytest
+
+    session = make_session()
+
+    # 1) interrupt.py：identity 不能覆盖 interrupt_id；空 kind 拦截；同波双中断逐个回答不误报冲突
+    with pytest.raises(ValueError, match="Interrupt.kind 不能为空"):
+        kernel.Interrupt(kind="  ", node="gate", question="q")
+    intr_obj = kernel.Interrupt(
+        kind="APPROVAL_REQUIRED",
+        node="gate",
+        question="real_q",
+        identity={"operator": "alice", "interrupt_id": "forged", "question": "forged_q"},
+    )
+    intr_payload = intr_obj.to_payload()
+    assert intr_payload["operator"] == "alice"
+    assert intr_payload["question"] == "real_q"
+    assert intr_payload["interrupt_id"] != "forged"
+
+    run_multi = kernel.create_run(session, "multi-intr-spec", initial_node="start")
+    ev1 = kernel.append_event(session, run_multi, "NEED_INPUT", "n1", kernel.Interrupt("NEED_INPUT", "n1", "q1").to_payload())
+    ev2 = kernel.append_event(session, run_multi, "NEED_INPUT", "n2", kernel.Interrupt("NEED_INPUT", "n2", "q2").to_payload())
+    session.commit()
+    st_first, target_first = kernel.answer_interrupt(session, run_multi, "NEED_INPUT", "INPUT_GIVEN", "fp_n2")
+    assert st_first == "PENDING" and target_first.seq == ev2.seq
+    kernel.record_interrupt_answer(session, run_multi, "INPUT_GIVEN", "n2", {"v": 2}, interrupt=ev2, answer_fingerprint="fp_n2")
+    session.commit()
+    # 重复提交 fp_n2 -> 幂等重放
+    st_rep, _ = kernel.answer_interrupt(session, run_multi, "NEED_INPUT", "INPUT_GIVEN", "fp_n2")
+    assert st_rep == "REPLAY"
+    # 接着回答同波仍未回答的 ev1（不同指纹 fp_n1）-> 应返回 PENDING + ev1，绝不误判冲突
+    st_second, target_second = kernel.answer_interrupt(session, run_multi, "NEED_INPUT", "INPUT_GIVEN", "fp_n1")
+    assert st_second == "PENDING" and target_second.seq == ev1.seq
+
+    # 2) bus.py：payload 不能覆盖 seq/topic/timestamp；fire("*") 不双发；三级父子总线逐级冒泡；非字典 table 不崩
+    root_bus = kernel.Bus()
+    mid_bus = kernel.Bus(parent=root_bus)
+    leaf_bus = kernel.Bus(parent=mid_bus)
+    root_seen: list = []
+    root_bus.subscribe("*", lambda e: root_seen.append(e))
+    env = leaf_bus.fire("custom.evt", {"seq": 999, "topic": "fake", "timestamp": 0, "ok": True})
+    assert env["seq"] == 1 and env["topic"] == "custom.evt" and env["timestamp"] > 0 and env["ok"] is True
+    assert len(root_seen) == 1 and root_seen[0]["topic"] == "custom.evt"
+
+    star_calls = []
+    star_bus = kernel.Bus()
+    star_bus.subscribe("*", lambda e: star_calls.append(e))
+    star_bus.fire("*", {"x": 1})
+    assert len(star_calls) == 1
+    assert star_bus.adjudicate("tool_x", {}, {"table": "NOT_A_DICT", "fields": "NOT_A_LIST"}) is None
+
+    # 3) event_log.py：调用方事后修改 payload 不破坏哈希链；rollback 清空投影缓存；RUN_RESUMED 恢复 trace.status
+    run_ev = kernel.create_run(session, "ev-audit-spec", initial_node="start")
+    session.commit()
+    mutable = {"k": "original", "nums": (1, 2)}
+    kernel.append_event(session, run_ev, "STEP_OK", "s1", mutable)
+    mutable["k"] = "tampered_after_append"
+    session.commit()
+    assert kernel.verify_chain(session, run_ev) is True
+
+    # 回滚后投影缓存自动失效，不会读到已回滚的幽灵状态
+    proj_default = lambda s, r: kernel.project_with(s, r)
+    before_state = proj_default(session, run_ev)
+    kernel.append_event(session, run_ev, "RUN_FAILED", "s1", {"node": "s1", "result": {"error": "temp"}})
+    _ = proj_default(session, run_ev)  # 填充缓存为 FAILED
+    session.rollback()
+    after_rollback_state = proj_default(session, run_ev)
+    assert after_rollback_state.status == before_state.status
+
+    tr = kernel.build_trace(
+        [
+            {"seq": 1, "kind": "RUN_CREATED", "node": "start", "payload_json": {}},
+            {"seq": 2, "kind": "APPROVAL_REQUIRED", "node": "gate", "payload_json": {"interrupt_id": "abc"}},
+            {"seq": 3, "kind": "RUN_RESUMED", "node": "gate", "payload_json": {}},
+        ],
+        run_id="r-trace",
+    )
+    assert tr.status == "running"
+
+    # 4) run.py：BudgetGuard 重复 attach 幂等不双倍记账；detach 后不再记账
+    bg_bus = kernel.Bus()
+    guard = kernel.BudgetGuard(run_id="bg-idempotent").attach(bg_bus).attach(bg_bus)
+    bg_bus.fire("tool.after", {"tool": "t", "attempts": 1, "usage": {"total_tokens": 50}})
+    assert guard.snapshot()["llm_calls"] == 1
+    assert guard.snapshot()["total_tokens"] == 50
+    guard.detach()
+    bg_bus.fire("tool.after", {"tool": "t", "attempts": 1, "usage": {"total_tokens": 50}})
+    assert guard.snapshot()["llm_calls"] == 1
+    assert bg_bus.budget_guard is None
+
+    # 5) scheduler.py：max_steps < 1 报错；终态不被残留 goto 复活
+    def term_reducer(state: kernel.RunState, kind: str, payload: dict) -> kernel.RunState:
+        if kind == "RUN_CREATED":
+            return replace(state, status="RUNNING", current_node="start", when="always")
+        if kind == "DONE":
+            return replace(state, status="COMPLETED", current_node="finish", result_json=payload)
+        if kind == "GO_REDIRECT":
+            return replace(state, status="RUNNING", current_node=payload["target"], pending_target=payload["target"])
+        return state
+
+    proj_t = lambda s, r: kernel.project_with(s, r, reducer=term_reducer)
+    term_plan = kernel.WorkflowPlan(
+        name="terminal_guard",
+        nodes=(
+            kernel.PlanNode("start", "起点", "stage"),
+            kernel.PlanNode("work", "干活", "stage"),
+            kernel.PlanNode("finish", "终点", "terminal"),
+        ),
+        edges=(
+            kernel.PlanEdge("start", "work", "always"),
+            kernel.PlanEdge("work", "finish", "always"),
+        ),
+        entry="start",
+    )
+    run_t = kernel.create_run(session, "term-spec", initial_node="start")
+    ctx_t = kernel.RunContext(session=session, run=run_t, settings=object(), state=proj_t(session, run_t), projector=proj_t)
+    sch_t = kernel.Scheduler(
+        term_plan,
+        {"work": lambda _i, _c: kernel.Outcome(events=[("DONE", "finish", {"ok": True})], goto="work")},
+    )
+    with pytest.raises(ValueError, match="max_steps"):
+        sch_t.drive(ctx_t, max_steps=0)
+    steps_t = sch_t.drive(ctx_t)
+    assert len(steps_t) == 1
+    assert proj_t(session, run_t).status == "COMPLETED"
+
+
+
 
 
 
