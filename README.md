@@ -1,4 +1,4 @@
-# RegOps（`dq_agent`）— 监管报送规则装配与审计台
+# dq-agent（`dq_agent`）— 监管报送规则装配与审计台
 
 面向金融监管报送场景的**确定性工具 + 受控 AI 参数赋值**工作台：覆盖监管规范文档解析、表字段元数据与码表核对、Oracle/MySQL 建表与校验规则装配、人工确权、Oracle 沙箱黄金正例造数与靶向反例变异验证，到生产校验 SQL 部署 ZIP 包一键交付。
 
@@ -35,7 +35,7 @@ dq_agent/
 │   │   ├── main.py                   # 极简 FastAPI 启动入口（lifespan / CORS / register_routers）
 │   │   ├── infra/                    # 层 0：基础设施、20 张 ORM 表、BlobStore、受控 LLM 客户端
 │   │   ├── kernel/                   # 层 1：ProdAgent 六大核心微内核（零业务依赖）
-│   │   ├── policy/                   # 层 2：RegOps 策略装配（Plan / Bus 门禁 / Channels）
+│   │   ├── policy/                   # 层 2：监管业务策略装配（Plan / Bus 门禁 / Channels）
 │   │   ├── ingestion/                # 层 3：文档拆箱、纯离线解析器、AI 结构切块与进度广播
 │   │   ├── catalog/                  # 层 4：监管资产目录（tables / code_sets / 并发提取 / 版本 Diff）
 │   │   ├── generation/               # 层 5：纯离线规则内核（core）、MySQL/Oracle SQL 编译与前段 BSP
