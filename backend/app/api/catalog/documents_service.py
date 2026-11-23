@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.catalog.code_sets.service import (
@@ -223,8 +224,19 @@ def ingest_uploaded_file_with_flag(
                 block_count=0,
             )
             session.add(document)
-            session.commit()
-            document_id = document.id
+            try:
+                session.commit()
+                document_id = document.id
+            except IntegrityError:
+                session.rollback()
+                existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one()
+                if existing.status != "DELETED":
+                    return existing, False
+                reimport_deleted = True
+                existing.status = "OVERVIEW_REQUIRED"
+                existing.spec_version = "UNKNOWN"
+                session.commit()
+                document_id = existing.id
 
     if not prepare:
         with sf() as session:
@@ -286,9 +298,24 @@ def soft_delete_document(session: Session, document_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Document not found")
     if document_has_active_run(session, document):
         raise HTTPException(status_code=409, detail="文档正在解析或切块中，请先取消当前任务后再删除")
-    document.status = "DELETED"
+    if document.status == "DELETED":
+        return {"id": document.id, "status": document.status, "assets_preserved": True}
+    updated = (
+        session.query(SourceDocumentModel)
+        .filter(
+            SourceDocumentModel.id == document_id,
+            SourceDocumentModel.status.notin_(["PREPARING", "EXTRACTING"]),
+        )
+        .update({SourceDocumentModel.status: "DELETED"}, synchronize_session="fetch")
+    )
+    if updated != 1:
+        session.rollback()
+        latest = session.get(SourceDocumentModel, document_id)
+        if latest and latest.status == "DELETED":
+            return {"id": latest.id, "status": latest.status, "assets_preserved": True}
+        raise HTTPException(status_code=409, detail="文档正在解析或切块中，请先取消当前任务后再删除")
     session.commit()
-    return {"id": document.id, "status": document.status, "assets_preserved": True}
+    return {"id": document_id, "status": "DELETED", "assets_preserved": True}
 
 
 def get_document_detail(session: Session, document_id: str) -> Dict[str, Any]:
@@ -356,7 +383,17 @@ def prepare_parallel_extraction(
         raise HTTPException(status_code=409, detail="Superseded raw blocks cannot be extracted")
     needs_analysis = document.status == "UPLOADED"
     file_name = document.file_name
-    document.status = "EXTRACTING"
+    claimed = (
+        session.query(SourceDocumentModel)
+        .filter(
+            SourceDocumentModel.id == document_id,
+            SourceDocumentModel.status.notin_(["DELETED", "PREPARING", "EXTRACTING"]),
+        )
+        .update({SourceDocumentModel.status: "EXTRACTING"}, synchronize_session="fetch")
+    )
+    if claimed != 1:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="当前文档已有正在运行的解析或切块任务")
     session.commit()
     return file_name, unique_block_ids, needs_analysis
 

@@ -27,6 +27,7 @@ from app.infra.task_runner import TaskRunner, task_runner
 from .bus import Bus, global_bus
 from .event_log import (
     RunState,
+    acquire_run_lock,
     append_event,
     project_many_with,
     project_with,
@@ -359,6 +360,7 @@ class BudgetGuard:
             if isinstance(prior_tools, dict)
             else {}
         )
+        self._in_flight_calls = 0
         self._bus: Optional[Bus] = None
 
     def attach(self, bus: Bus) -> "BudgetGuard":
@@ -411,49 +413,83 @@ class BudgetGuard:
         with self._lock:
             self._steps += 1
 
+    def _snapshot_locked(self) -> Dict[str, Any]:
+        elapsed = round(self._elapsed_offset + (time.monotonic() - self._started_at), 2)
+        return {
+            "llm_calls": self._llm_calls,
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": self._completion_tokens,
+            "total_tokens": self._total_tokens,
+            "total_llm_seconds": round(self._total_llm_seconds, 2),
+            "elapsed_seconds": elapsed,
+            "steps": self._steps,
+            "tool_rejections": self._tool_rejections,
+            "by_tool": dict(self._by_tool),
+            "limits": self.limits.as_dict(),
+        }
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            elapsed = round(self._elapsed_offset + (time.monotonic() - self._started_at), 2)
-            return {
-                "llm_calls": self._llm_calls,
-                "prompt_tokens": self._prompt_tokens,
-                "completion_tokens": self._completion_tokens,
-                "total_tokens": self._total_tokens,
-                "total_llm_seconds": round(self._total_llm_seconds, 2),
-                "elapsed_seconds": elapsed,
-                "steps": self._steps,
-                "tool_rejections": self._tool_rejections,
-                "by_tool": dict(self._by_tool),
-                "limits": self.limits.as_dict(),
-            }
+            return self._snapshot_locked()
+
+    def _find_breach(self, snap: Dict[str, Any]) -> Optional[Tuple[str, Any, Any]]:
+        if self.limits.max_llm_calls is not None and snap["llm_calls"] >= self.limits.max_llm_calls:
+            return ("max_llm_calls", snap["llm_calls"], self.limits.max_llm_calls)
+        if self.limits.max_total_tokens is not None and snap["total_tokens"] >= self.limits.max_total_tokens:
+            return ("max_total_tokens", snap["total_tokens"], self.limits.max_total_tokens)
+        if self.limits.max_elapsed_seconds is not None and snap["elapsed_seconds"] >= self.limits.max_elapsed_seconds:
+            return ("max_elapsed_seconds", snap["elapsed_seconds"], self.limits.max_elapsed_seconds)
+        if self.limits.max_steps is not None and snap["steps"] >= self.limits.max_steps:
+            return ("max_steps", snap["steps"], self.limits.max_steps)
+        return None
+
+    def _raise_breach(
+        self,
+        breach: Tuple[str, Any, Any],
+        snap: Dict[str, Any],
+        bus: Optional[Bus],
+    ) -> None:
+        metric, used, limit = breach
+        active_bus = bus or self._bus
+        if active_bus is not None and hasattr(active_bus, "fire"):
+            active_bus.fire(
+                "budget.exceeded",
+                {
+                    "run_id": self.run_id,
+                    "metric": metric,
+                    "used": used,
+                    "limit": limit,
+                    "snapshot": snap,
+                },
+            )
+        raise BudgetExceededError(metric, used, limit, snap)
+
+    def begin_call(self, bus: Optional[Bus] = None) -> None:
+        """在锁内原子校验预算并预占一次在途 LLM 调用名额，防止并发突破上限。"""
+        breach = None
+        snap: Dict[str, Any] = {}
+        with self._lock:
+            snap = self._snapshot_locked()
+            projected_calls = self._llm_calls + self._in_flight_calls
+            projected_snap = {**snap, "llm_calls": max(snap["llm_calls"], projected_calls)}
+            breach = self._find_breach(projected_snap)
+            if breach is None:
+                self._in_flight_calls += 1
+                return
+            snap = projected_snap
+        self._raise_breach(breach, snap, bus)
+
+    def end_calls(self, count: int = 1) -> None:
+        """归还已完成或中止的在途 LLM 调用预占计数。"""
+        with self._lock:
+            self._in_flight_calls = max(0, self._in_flight_calls - max(0, int(count)))
 
     def check(self, bus: Optional[Bus] = None) -> None:
         """检查是否触达任一预算上限；超限时广播 budget.exceeded 并抛出 BudgetExceededError。"""
         snap = self.snapshot()
-        breach = None
-        if self.limits.max_llm_calls is not None and snap["llm_calls"] >= self.limits.max_llm_calls:
-            breach = ("max_llm_calls", snap["llm_calls"], self.limits.max_llm_calls)
-        elif self.limits.max_total_tokens is not None and snap["total_tokens"] >= self.limits.max_total_tokens:
-            breach = ("max_total_tokens", snap["total_tokens"], self.limits.max_total_tokens)
-        elif self.limits.max_elapsed_seconds is not None and snap["elapsed_seconds"] >= self.limits.max_elapsed_seconds:
-            breach = ("max_elapsed_seconds", snap["elapsed_seconds"], self.limits.max_elapsed_seconds)
-        elif self.limits.max_steps is not None and snap["steps"] >= self.limits.max_steps:
-            breach = ("max_steps", snap["steps"], self.limits.max_steps)
+        breach = self._find_breach(snap)
         if breach is not None:
-            metric, used, limit = breach
-            active_bus = bus or self._bus
-            if active_bus is not None and hasattr(active_bus, "fire"):
-                active_bus.fire(
-                    "budget.exceeded",
-                    {
-                        "run_id": self.run_id,
-                        "metric": metric,
-                        "used": used,
-                        "limit": limit,
-                        "snapshot": snap,
-                    },
-                )
-            raise BudgetExceededError(metric, used, limit, snap)
+            self._raise_breach(breach, snap, bus)
 
 
 # ── 3. 运行取消令牌与活跃实例注册表（Cancellation & Registry） ───────────────────
@@ -661,6 +697,12 @@ def cancel_run(
     commit: bool = True,
 ) -> Dict[str, Any]:
     """取消指定运行中 Run：若后台线程活跃则投递取消令牌，否则直接落账 RUN_CANCELLED。"""
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise ValueError("Run not found")
+    run = fresh_run
     project_fn = projector or project_with
     reg = registry if registry is not None else run_registry()
     state = project_fn(session, run)
@@ -809,6 +851,12 @@ def delete_run(
     commit: bool = True,
 ) -> Dict[str, Any]:
     """统一 Run 删除原语：运行态守卫 → 业务前置清理钩子 → 删事件与身份 → 提交 → 外部资源清理钩子。"""
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise ValueError("Run not found")
+    run = fresh_run
     project_fn = projector or project_with
     reg = registry if registry is not None else run_registry()
     if project_fn(session, run).status in set(active_statuses) or reg.is_active(run.id):
@@ -818,8 +866,14 @@ def delete_run(
     for hook in pre_delete_hooks or ():
         hook(session, run, context)
 
-    session.query(EventModel).filter(EventModel.run_id == run.id).delete(synchronize_session=False)
-    session.delete(run)
+    session.query(EventModel).filter(EventModel.run_id == run_id).delete(synchronize_session=False)
+    deleted = session.query(RunModel).filter(RunModel.id == run_id).delete(synchronize_session=False)
+    if fresh_run in session:
+        session.expunge(fresh_run)
+    if run in session:
+        session.expunge(run)
+    if deleted == 0:
+        raise ValueError("Run not found")
     session.flush()
     if commit:
         session.commit()

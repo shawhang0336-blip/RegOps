@@ -25,7 +25,7 @@ from app.infra.db_tables import (
     SpecificationModel,
     TableMetadataModel,
 )
-from app.kernel.event_log import append_event
+from app.kernel.event_log import acquire_run_lock, append_event
 from app.kernel.run import run_registry
 from app.policy.regops_bus import default_bus
 from app.policy.regops_plan import ACTIVE_RUN_STATUSES, project, project_many
@@ -332,6 +332,10 @@ def update_rule_params(
     editor: str,
     reason: str,
 ) -> Dict[str, Any]:
+    row = session.get(RuleModel, rule_row_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    acquire_run_lock(session, row.run_id)
     row = session.get(RuleModel, rule_row_id)
     if not row:
         raise HTTPException(status_code=404, detail="Rule not found")

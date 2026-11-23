@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.catalog.documents_service import ingest_uploaded_file
 from app.catalog.code_sets.readiness import evaluate_code_set, is_reference_placeholder
@@ -302,6 +303,38 @@ def publish_code_sets_batch(
     }
 
 
+def _claim_code_set_version_bump(
+    session: Session,
+    row: CodeSetModel,
+    expected_version: int,
+    *,
+    new_status: str = "DRAFT",
+    extra_updates: Optional[Dict[str, Any]] = None,
+) -> None:
+    """原子 CAS 递增码表版本，防止并发请求基于相同 expected_version 静默覆盖。"""
+    updates: Dict[Any, Any] = {
+        CodeSetModel.current_version: expected_version + 1,
+        CodeSetModel.status: new_status,
+    }
+    for col_name, col_val in (extra_updates or {}).items():
+        updates[getattr(CodeSetModel, col_name)] = col_val
+    matched = (
+        session.query(CodeSetModel)
+        .filter(
+            CodeSetModel.id == row.id,
+            CodeSetModel.current_version == expected_version,
+        )
+        .update(updates, synchronize_session=False)
+    )
+    if matched != 1:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+    set_committed_value(row, "current_version", expected_version + 1)
+    set_committed_value(row, "status", new_status)
+    for col_name, col_val in (extra_updates or {}).items():
+        set_committed_value(row, col_name, col_val)
+
+
 def edit_code_set_record(
     session: Session,
     code_set_id: str,
@@ -314,6 +347,7 @@ def edit_code_set_record(
         raise HTTPException(status_code=404, detail="Code set not found")
     if row.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+    extra_updates: Dict[str, Any] = {}
     for key in ["code", "name", "definition"]:
         if key in changes:
             val = changes[key]
@@ -321,21 +355,24 @@ def edit_code_set_record(
                 cleaned = str(val or "").strip().upper()
                 if not cleaned:
                     raise HTTPException(status_code=422, detail="码表代码不能为空")
-                setattr(row, key, cleaned)
+                extra_updates[key] = cleaned
             elif key == "name":
                 cleaned = str(val or "").strip()
                 if not cleaned:
                     raise HTTPException(status_code=422, detail="码表名称不能为空")
-                setattr(row, key, cleaned)
+                extra_updates[key] = cleaned
             else:
-                setattr(row, key, "" if val is None else str(val))
-    row.current_version += 1
-    row.status = "DRAFT"
+                extra_updates[key] = "" if val is None else str(val)
     try:
+        _claim_code_set_version_bump(
+            session, row, expected_version, new_status="DRAFT", extra_updates=extra_updates
+        )
         session.commit()
     except IntegrityError as exc:
         session.rollback()
-        raise HTTPException(status_code=409, detail=f"码表代码 {row.code} 与当前版本冲突") from exc
+        raise HTTPException(
+            status_code=409, detail=f"码表代码 {extra_updates.get('code', row.code)} 与当前版本冲突"
+        ) from exc
     return code_set_detail(session, row)
 
 
@@ -359,11 +396,13 @@ def add_code_value_record(
     clean_label_cn = label_cn.strip()
     if not code_val or not clean_label_cn:
         raise HTTPException(status_code=422, detail="码值和中文含义不能为空")
+    _claim_code_set_version_bump(session, row, expected_version, new_status="DRAFT")
     existing_ci = {
         (val or "").strip().upper()
         for (val,) in session.query(CodeValueModel.value).filter(CodeValueModel.code_set_id == row.id).all()
     }
     if code_val.upper() in existing_ci:
+        session.rollback()
         raise HTTPException(status_code=409, detail=f"码值 {code_val} 已存在（忽略大小写重复）")
     max_order = (
         session.query(func.max(CodeValueModel.sort_order))
@@ -384,8 +423,6 @@ def add_code_value_record(
             source_locator={"editor": editor},
         )
     )
-    row.current_version += 1
-    row.status = "DRAFT"
     refresh_reference_status(session, row.id)
     try:
         session.commit()
@@ -422,17 +459,18 @@ def edit_code_value_record(
         }
         if new_val.upper() in other_ci:
             raise HTTPException(status_code=409, detail=f"码值 {new_val} 已存在（忽略大小写重复）")
-        value.value = new_val
     if "label_cn" in changes:
         new_label = str(changes["label_cn"] or "").strip()
         if not new_label:
             raise HTTPException(status_code=422, detail="中文含义不能为空")
-        value.label_cn = new_label
+    _claim_code_set_version_bump(session, row, expected_version, new_status="DRAFT")
+    if "value" in changes:
+        value.value = str(changes["value"] or "").strip()
+    if "label_cn" in changes:
+        value.label_cn = str(changes["label_cn"] or "").strip()
     for key in ["label_en", "definition", "enabled", "sort_order"]:
         if key in changes:
             setattr(value, key, changes[key])
-    row.current_version += 1
-    row.status = "DRAFT"
     refresh_reference_status(session, row.id)
     try:
         session.commit()
@@ -460,8 +498,25 @@ def publish_code_set_record(
             status_code=409,
             detail={"code": blocker["code"], "message": blocker["message"]},
         )
-    row.status = "PUBLISHED"
-    row.published_version = row.current_version
+    matched = (
+        session.query(CodeSetModel)
+        .filter(
+            CodeSetModel.id == code_set_id,
+            CodeSetModel.current_version == expected_version,
+        )
+        .update(
+            {
+                CodeSetModel.status: "PUBLISHED",
+                CodeSetModel.published_version: expected_version,
+            },
+            synchronize_session=False,
+        )
+    )
+    if matched != 1:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+    set_committed_value(row, "status", "PUBLISHED")
+    set_committed_value(row, "published_version", expected_version)
     auto_link_all_references(session)
     session.commit()
     return code_set_detail(session, row)
@@ -552,8 +607,7 @@ def import_code_values_xlsx(
         existing_ci.add(code_ci)
         sort_order += 1
         imported += 1
-    row.current_version += 1
-    row.status = "DRAFT"
+    _claim_code_set_version_bump(session, row, expected_version, new_status="DRAFT")
     refresh_reference_status(session, row.id)
     try:
         session.commit()

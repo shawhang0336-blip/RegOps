@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.catalog.tables.domain import MetadataTableDraft, require_valid_metadata
 from app.catalog.tables.views import (
@@ -28,6 +29,35 @@ from app.infra.db_tables import (
     RawBlockModel,
     TableMetadataModel,
 )
+
+
+def claim_table_version_bump(
+    session: Session,
+    table: TableMetadataModel,
+    expected_version: int,
+    *,
+    new_status: str = "DRAFT",
+) -> None:
+    """原子 CAS 递增表版本，防止并发请求基于相同 expected_version 静默覆盖。"""
+    matched = (
+        session.query(TableMetadataModel)
+        .filter(
+            TableMetadataModel.id == table.id,
+            TableMetadataModel.current_version == expected_version,
+            TableMetadataModel.status != "MERGED",
+        )
+        .update(
+            {
+                TableMetadataModel.current_version: expected_version + 1,
+                TableMetadataModel.status: new_status,
+            },
+            synchronize_session=False,
+        )
+    )
+    if matched != 1:
+        raise ValueError("VERSION_CONFLICT")
+    set_committed_value(table, "current_version", expected_version + 1)
+    set_committed_value(table, "status", new_status)
 
 
 def update_field(
@@ -98,6 +128,7 @@ def update_field(
         raise ValueError("INVALID_DECIMAL_PLACES")
     if ({"data_type", "length", "decimal_places"} & set(normalized_changes)) and eff_type == "NUMBER" and eff_dec > eff_length:
         raise ValueError("INVALID_PRECISION")
+    claim_table_version_bump(session, table, expected_version, new_status="DRAFT")
     old = _field_view(field)
     for key, value in normalized_changes.items():
         setattr(field, key, value)
@@ -108,8 +139,6 @@ def update_field(
         from app.catalog.code_sets.linking import ensure_field_reference
 
         ensure_field_reference(session, field)
-    table.current_version += 1
-    table.status = "DRAFT"
     session.add(
         MetadataRevisionModel(
             id=str(uuid.uuid4()),

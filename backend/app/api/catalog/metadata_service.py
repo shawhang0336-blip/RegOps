@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.catalog.extraction import extract_parallel_for_blocks
 from app.catalog.tables.domain import MetadataFieldDraft
+from app.catalog.tables.mutations import claim_table_version_bump
 from app.catalog.tables.readiness import evaluate_table, latest_table_rows
 from app.catalog.tables.service import publish_table, table_detail, table_summary
 from app.infra.db_tables import (
@@ -251,9 +252,12 @@ def create_table_field(
         ai_value_json=draft.model_dump(),
         **draft.model_dump(),
     )
+    try:
+        claim_table_version_bump(session, table, expected_version, new_status="DRAFT")
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     session.add(field)
-    table.current_version += 1
-    table.status = "DRAFT"
     session.add(
         MetadataRevisionModel(
             id=str(uuid.uuid4()),
@@ -291,6 +295,11 @@ def delete_table_field(
         raise HTTPException(status_code=409, detail="MERGED table cannot be edited")
     if table.current_version != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+    try:
+        claim_table_version_bump(session, table, expected_version, new_status="DRAFT")
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     old = {"field_id": field.id, "field_en": field.field_en, "field_cn": field.field_cn}
     # MySQL 8 强外键顺序：先清子表引用与历史修订的 field_id 外键，再删字段本身，最后落一条 field_id=None 的删除审计记录
     session.query(FieldCodeReferenceModel).filter(
@@ -302,8 +311,6 @@ def delete_table_field(
     session.flush()
     session.delete(field)
     session.flush()
-    table.current_version += 1
-    table.status = "DRAFT"
     session.add(
         MetadataRevisionModel(
             id=str(uuid.uuid4()),

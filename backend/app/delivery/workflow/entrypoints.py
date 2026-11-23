@@ -38,7 +38,7 @@ from app.infra.errors import WorkflowError
 from app.infra.llm import RealDesignLlm
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.kernel.bus import global_bus
-from app.kernel.event_log import append_event
+from app.kernel.event_log import acquire_run_lock, append_event
 from app.kernel.interrupt import answer_interrupt, record_interrupt_answer
 from app.kernel.run import (
     CancellationToken,
@@ -228,6 +228,12 @@ def approve_generic_rules(
     llm=None,
     defer_continuation: bool = False,
 ) -> RunModel:
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise WorkflowError("Run not found")
+    run = fresh_run
     normalized_input = {rule_hash: decision for rule_hash, decision in decisions.items()}
     fingerprint = hashlib.sha256(canonical_json(normalized_input).encode()).hexdigest()
     try:
@@ -285,6 +291,12 @@ def approve_generic_rules(
 
 
 def confirm_generic_test_results(session: Session, run: RunModel, approver: str) -> RunModel:
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise WorkflowError("Run not found")
+    run = fresh_run
     fingerprint = hashlib.sha256(canonical_json({"approver": approver}).encode()).hexdigest()
     status, interrupt = answer_interrupt(
         session,
@@ -341,7 +353,17 @@ def retry_generic_run(
     1. 若存在失败的审计报告（AUDIT_REJECTED）：触发 GO_REDIRECT 回到 rule_binder，由 Scheduler 驱动靶向重绑与重验；
     2. 若在审计前因超时/网络/取消/进程重启中断（无审计报告）：写 RUN_RESUMED 事件，从 EventLog 最后一个已完成节点断点续跑。
     """
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise WorkflowError("Run not found")
+    run = fresh_run
     state = project(session, run)
+    if state.status in ACTIVE_RUN_STATUSES or run_registry().is_active(run.id):
+        raise WorkflowError("批次正在执行中，请勿重复发起重试")
+    if state.status != "FAILED":
+        raise WorkflowError(f"仅失败或中断批次可重试（当前状态：{state.status}）")
     report_uri = (state.result_json or {}).get("audit_report_blob")
     if not report_uri:
         redirect = (
@@ -433,6 +455,12 @@ def reaudit_generic_run(
     defer_continuation: bool = False,
 ) -> RunModel:
     """人工改参后的轻量重审：保留规则集合不动，仅重跑造数与 Oracle 沙箱验证。"""
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise WorkflowError("Run not found")
+    run = fresh_run
     if project(session, run).status in ACTIVE_RUN_STATUSES or run_registry().is_active(run.id):
         raise WorkflowError("批次正在执行中，请等当前验证结束后再发起重审")
     pending = _pending_rules(session, run.id)

@@ -8,10 +8,12 @@
 
 import hashlib
 import re
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.catalog.tables.domain import (
@@ -73,6 +75,28 @@ from app.ingestion.parsers.pdf_parser import (
 )
 
 METADATA_BATCH_SIZE = 3  # 疑难字段小批次：单次 AI 调用少字段，超时损失可控
+
+_BLOCK_LOCKS_GUARD = threading.Lock()
+_BLOCK_LOCKS: Dict[str, threading.RLock] = {}
+_MAX_BLOCK_LOCKS = 2048
+
+
+def _get_block_extract_lock(block_id: str) -> threading.RLock:
+    with _BLOCK_LOCKS_GUARD:
+        lock = _BLOCK_LOCKS.get(block_id)
+        if lock is not None:
+            return lock
+        if len(_BLOCK_LOCKS) >= _MAX_BLOCK_LOCKS:
+            for key in list(_BLOCK_LOCKS.keys()):
+                candidate = _BLOCK_LOCKS[key]
+                if candidate.acquire(blocking=False):
+                    candidate.release()
+                    _BLOCK_LOCKS.pop(key, None)
+                    if len(_BLOCK_LOCKS) < _MAX_BLOCK_LOCKS:
+                        break
+        lock = threading.RLock()
+        _BLOCK_LOCKS[block_id] = lock
+        return lock
 
 
 def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableDraft, trace: Dict[str, Any]) -> TableMetadataModel:
@@ -148,8 +172,20 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
                 else block.ordinal
             ),
         )
-        session.add(table)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(table)
+                session.flush()
+        except IntegrityError:
+            concurrent = (
+                session.query(TableMetadataModel)
+                .filter(TableMetadataModel.block_id == block.id)
+                .order_by(TableMetadataModel.current_version.desc())
+                .first()
+            )
+            if not concurrent:
+                raise
+            return concurrent
 
     for index, field in enumerate(draft.fields):
         values = field.model_dump()
@@ -417,6 +453,11 @@ def _apply_source_definitions(
 
 
 def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> str:
+    with _get_block_extract_lock(block_id):
+        return _extract_metadata_for_block_locked(block_id, settings, auto_link=auto_link)
+
+
+def _extract_metadata_for_block_locked(block_id: str, settings: Settings, auto_link: bool = True) -> str:
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
         if not block:

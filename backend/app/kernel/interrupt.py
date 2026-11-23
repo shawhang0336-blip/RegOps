@@ -145,12 +145,19 @@ def answer_interrupt(
     - `("PENDING", interrupt_event)`：存在待回答的中断（或旧数据无 interrupt_id 时的兼容路径），交由调用方落账；
     - 若同一中断已被不同内容回答且 `reject_conflict=True`，抛出 `ValueError`。
     """
-    latest = latest_interrupt(session, run, interrupt_kind)
+    from .event_log import acquire_run_lock
+
+    run_id = run.id
+    acquire_run_lock(session, run_id)
+    fresh_run = session.get(RunModel, run_id)
+    if fresh_run is None:
+        raise ValueError("Run not found")
+    latest = latest_interrupt(session, fresh_run, interrupt_kind)
     mapping = answer_kinds if answer_kinds is not None else {interrupt_kind: answer_kind}
-    pending = pending_interrupt_with(session, run, interrupt_kind, mapping)
+    pending = pending_interrupt_with(session, fresh_run, interrupt_kind, mapping)
     if latest and (latest.payload_json or {}).get("interrupt_id"):
         interrupt_id = latest.payload_json["interrupt_id"]
-        prior = matching_answer(session, run, answer_kind, interrupt_id, answer_fingerprint)
+        prior = matching_answer(session, fresh_run, answer_kind, interrupt_id, answer_fingerprint)
         if prior:
             return "REPLAY", prior
         # 若同波次还有其他未回答的同类型中断工单（pending is not None），优先交由调用方回答，不误判为冲突
@@ -158,7 +165,7 @@ def answer_interrupt(
             answered = [
                 event
                 for event in session.query(EventModel)
-                .filter(EventModel.run_id == run.id, EventModel.kind == answer_kind)
+                .filter(EventModel.run_id == fresh_run.id, EventModel.kind == answer_kind)
                 .all()
                 if (event.payload_json or {}).get("interrupt_id") == interrupt_id
             ]

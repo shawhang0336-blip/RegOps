@@ -161,6 +161,20 @@ class Bus:
         if guard is not None and hasattr(guard, "check"):
             guard.check(self)
 
+    def begin_llm_call(self) -> None:
+        """在并发派发 LLM 前原子校验预算并预占在途名额；兼容仅有 check() 的守卫。"""
+        guard = self.budget_guard
+        if guard is not None and hasattr(guard, "begin_call"):
+            guard.begin_call(self)
+        elif guard is not None and hasattr(guard, "check"):
+            guard.check(self)
+
+    def end_llm_calls(self, count: int = 1) -> None:
+        """归还已完成或异常退出的在途 LLM 调用名额。"""
+        guard = self.budget_guard
+        if guard is not None and hasattr(guard, "end_calls"):
+            guard.end_calls(count)
+
     def add_adjudicator(self, fn: Adjudicator) -> "Bus":
         with self._lock:
             if fn not in self._adjudicators:

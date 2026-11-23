@@ -8,8 +8,11 @@
 - 机制层不硬编码任何业务事件名（业务折叠规则位于 app/policy/regops_plan.py）。
 """
 
+import gc
 import hashlib
 import json
+import threading
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -89,10 +92,168 @@ def _state_cache(session: Session) -> Dict[str, Dict[int, RunState]]:
     return session.info.setdefault("_run_state_cache", {})
 
 
+class _SessionRLock:
+    """支持跨线程 GC/finalizer 安全解锁的事务级可重入锁。
+
+    标准 `threading.RLock` 仅允许持锁线程调用 `release()`，若调用方创建内存 `Session` 后
+    未显式 `commit()/close()` 即离开作用域，GC 在其他线程触发清理时无法放锁；本锁在同一线程内
+    保持可重入，同时允许 `weakref.finalize` 在任何线程回收失联 `Session` 时安全释放。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._owner: Optional[int] = None
+        self._count = 0
+
+    def acquire(self, blocking: bool = True) -> bool:
+        tid = threading.get_ident()
+        with self._cond:
+            if self._owner == tid:
+                self._count += 1
+                return True
+            if not blocking and self._count > 0:
+                return False
+            while self._count > 0:
+                self._cond.wait()
+            self._owner = tid
+            self._count = 1
+            return True
+
+    def acquire_if_idle(self) -> bool:
+        with self._cond:
+            if self._count > 0:
+                return False
+            self._owner = threading.get_ident()
+            self._count = 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            if self._count <= 0:
+                return
+            self._count -= 1
+            if self._count == 0:
+                self._owner = None
+                self._cond.notify()
+
+
+def _release_lock_box(box: List[Any]) -> None:
+    if not box:
+        return
+    lock = box.pop()
+    lock.release()
+
+
+def _acquire_with_gc(lock: _SessionRLock) -> None:
+    if not lock.acquire(blocking=False):
+        gc.collect()
+        lock.acquire()
+
+
+def bind_session_lock(
+    session: Session,
+    lock: _SessionRLock,
+    bucket_key: str,
+    entry_key: str = "_",
+) -> None:
+    """将进程级可重入锁绑定到当前 `Session` 事务生命周期，并在 GC 回收时兜底放锁。"""
+    held = session.info.get(bucket_key)
+    if held and entry_key in held:
+        return
+    _acquire_with_gc(lock)
+    try:
+        has_unflushed = bool(session.new or session.dirty or session.deleted)
+        if session.in_transaction() and not session.info.get("_tx_has_writes") and not has_unflushed:
+            saved = dict(session.info.pop(bucket_key, {}))
+            session.rollback()
+            box = [lock]
+            saved[entry_key] = box
+            session.info[bucket_key] = saved
+        else:
+            if not has_unflushed:
+                session.expire_all()
+            box = [lock]
+            session.info.setdefault(bucket_key, {})[entry_key] = box
+        weakref.finalize(session, _release_lock_box, box)
+    except Exception:
+        lock.release()
+        raise
+
+
+def release_session_locks(session: Session, bucket_key: str) -> None:
+    """释放某个 `Session` 在指定槽位上持有的全部锁。"""
+    held = session.info.pop(bucket_key, None)
+    if held:
+        for box in reversed(list(held.values())):
+            _release_lock_box(box)
+
+
+_MAX_RUN_LOCKS = 2048
+_RUN_LOCKS_GUARD = threading.Lock()
+_RUN_LOCKS: Dict[str, _SessionRLock] = {}
+
+
+def _get_run_lock(run_id: str) -> _SessionRLock:
+    with _RUN_LOCKS_GUARD:
+        lock = _RUN_LOCKS.get(run_id)
+        if lock is not None:
+            return lock
+        if len(_RUN_LOCKS) >= _MAX_RUN_LOCKS:
+            for key in list(_RUN_LOCKS.keys()):
+                candidate = _RUN_LOCKS[key]
+                if candidate.acquire_if_idle():
+                    try:
+                        _RUN_LOCKS.pop(key, None)
+                    finally:
+                        candidate.release()
+                    if len(_RUN_LOCKS) < _MAX_RUN_LOCKS:
+                        break
+        lock = _SessionRLock()
+        _RUN_LOCKS[run_id] = lock
+        return lock
+
+
+def _release_held_run_locks(session: Session) -> None:
+    release_session_locks(session, "_held_run_locks")
+    session.info.pop("_tx_has_writes", None)
+
+
+@sa_event.listens_for(Session, "after_flush")
+def _mark_session_writes(session: Session, _flush_context: Any) -> None:
+    session.info["_tx_has_writes"] = True
+
+
+@sa_event.listens_for(Session, "do_orm_execute")
+def _mark_orm_writes(orm_execute_state: Any) -> None:
+    if orm_execute_state.is_update or orm_execute_state.is_delete:
+        orm_execute_state.session.info["_tx_has_writes"] = True
+
+
 @sa_event.listens_for(Session, "after_soft_rollback")
 def _clear_state_cache_on_rollback(session: Session, _previous_transaction: Any) -> None:
     """事务回滚后立即清空 session 级状态投影缓存，杜绝读到已回滚的幽灵脏状态。"""
     session.info.pop("_run_state_cache", None)
+    if not session.in_transaction():
+        _release_held_run_locks(session)
+
+
+@sa_event.listens_for(Session, "after_transaction_end")
+def _release_locks_on_tx_end(session: Session, transaction: Any) -> None:
+    # 仅在最外层根事务真正结束时释放锁；begin_nested() 保存点结束也会触发 after_commit，绝不能在此前提前放锁。
+    if getattr(transaction, "parent", None) is None and not session.in_transaction():
+        _release_held_run_locks(session)
+
+
+def acquire_run_lock(session: Session, run_id: str) -> None:
+    """按 run_id 在当前事务生命周期内串行化状态检查与事件追加，杜绝并发写入导致哈希链分叉或重入。"""
+    if not run_id:
+        return
+    held = session.info.get("_held_run_locks")
+    if held and run_id in held:
+        return
+    lock = _get_run_lock(run_id)
+    _state_cache(session).pop(run_id, None)
+    bind_session_lock(session, lock, "_held_run_locks", run_id)
 
 
 def project_with(
@@ -175,18 +336,20 @@ def append_event(
     bus: Any = None,
 ) -> EventModel:
     """追加一条不可变事件，并通过 Bus 广播 event.appended 生命周期信号。"""
+    run_id = run.id
+    acquire_run_lock(session, run_id)
     # 快照化并按 canonical_event_json 归一化载荷：防止调用方事后修改原 dict 导致已计算的 SHA-256 哈希链断裂
     stored_payload = json.loads(canonical_event_json(payload if payload is not None else {}))
     previous = (
         session.query(EventModel)
-        .filter(EventModel.run_id == run.id)
+        .filter(EventModel.run_id == run_id)
         .order_by(EventModel.seq.desc())
         .first()
     )
     prev_hash = previous.event_hash if previous else GENESIS_HASH
-    event_hash = compute_event_hash(run.id, kind, node, stored_payload, prev_hash)
+    event_hash = compute_event_hash(run_id, kind, node, stored_payload, prev_hash)
     event = EventModel(
-        run_id=run.id,
+        run_id=run_id,
         kind=kind,
         node=node,
         payload_json=stored_payload,
@@ -194,16 +357,18 @@ def append_event(
         event_hash=event_hash,
     )
     session.add(event)
-    run.updated_at = datetime.utcnow()
+    session.query(RunModel).filter(RunModel.id == run_id).update(
+        {RunModel.updated_at: datetime.utcnow()}, synchronize_session=False
+    )
     session.flush()
-    _state_cache(session).pop(run.id, None)
+    _state_cache(session).pop(run_id, None)
 
     active_bus = bus if bus is not None else global_bus()
     if hasattr(active_bus, "fire"):
         active_bus.fire(
             "event.appended",
             {
-                "run_id": run.id,
+                "run_id": run_id,
                 "seq": event.seq,
                 "kind": kind,
                 "node": node,
@@ -211,9 +376,9 @@ def append_event(
             },
         )
         if kind == "RUN_CREATED":
-            active_bus.fire("run.created", {"run_id": run.id, "spec_id": run.spec_id, "node": node})
+            active_bus.fire("run.created", {"run_id": run_id, "spec_id": run.spec_id, "node": node})
         elif kind in {"RUN_RESUMED", "REAUDIT_REQUESTED"}:
-            active_bus.fire("run.resumed", {"run_id": run.id, "kind": kind, "node": node})
+            active_bus.fire("run.resumed", {"run_id": run_id, "kind": kind, "node": node})
     return event
 
 

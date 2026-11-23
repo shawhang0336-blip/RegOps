@@ -11,6 +11,8 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import event as sa_event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.catalog.code_sets.parser import (
@@ -27,6 +29,31 @@ from app.infra.db_tables import (
     RawBlockModel,
     TableMetadataModel,
 )
+from app.kernel.event_log import _SessionRLock, bind_session_lock, release_session_locks
+
+
+_LINK_LOCK = _SessionRLock()
+
+
+def _release_link_lock(session: Session) -> None:
+    release_session_locks(session, "_held_link_lock")
+
+
+@sa_event.listens_for(Session, "after_soft_rollback")
+def _release_link_lock_on_soft_rollback(session: Session, _previous_transaction: Any) -> None:
+    if not session.in_transaction():
+        _release_link_lock(session)
+
+
+@sa_event.listens_for(Session, "after_transaction_end")
+def _release_link_lock_on_tx_end(session: Session, transaction: Any) -> None:
+    # 仅在最外层根事务结束时释放链接锁，避免 ensure_field_reference 内 begin_nested() 触发 after_commit 提前放锁。
+    if getattr(transaction, "parent", None) is None and not session.in_transaction():
+        _release_link_lock(session)
+
+
+def _acquire_link_lock(session: Session) -> None:
+    bind_session_lock(session, _LINK_LOCK, "_held_link_lock")
 
 
 def _chunked(items: List[Any], size: int = 500):
@@ -350,6 +377,7 @@ def ensure_field_reference(
     existing_ref_by_field: Optional[Dict[str, FieldCodeReferenceModel]] = None,
     candidate_norms: Optional[List[Tuple[str, CodeSetModel]]] = None,
 ) -> None:
+    _acquire_link_lock(session)
     text = (field.code_reference_text or "").strip()
     if not text or text.upper() in {"无", "N/A", "NONE", "无引用"}:
         # 字段引用被人工清空时同步解绑旧引用，避免残留失效码表关联
@@ -415,7 +443,7 @@ def ensure_field_reference(
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_INLINE_ENUM".upper())[:96]
             code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
             if not code_set:
-                code_set = CodeSetModel(
+                candidate = CodeSetModel(
                     id=str(uuid.uuid4()),
                     code=code,
                     name=f"{field.field_cn or field.field_en}（内联枚举）"[:255],
@@ -424,35 +452,43 @@ def ensure_field_reference(
                     status="AI_SELF_VALIDATED",
                     current_version=1,
                 )
-                session.add(code_set)
-                session.flush()
-                _stamp_field_ordinal(session, code_set, field)
-                seen_vals_ci = set()
-                sort_idx = 0
-                for item in enum_values:
-                    val_clean = str(item["value"] or "").strip()[:128]
-                    if not val_clean or val_clean.upper() in seen_vals_ci:
-                        continue
-                    seen_vals_ci.add(val_clean.upper())
-                    session.add(
-                        CodeValueModel(
-                            id=str(uuid.uuid4()),
-                            code_set_id=code_set.id,
-                            value=val_clean,
-                            label_cn=str(item["label_cn"] or "").strip()[:255],
-                            label_en="",
-                            definition="",
-                            sort_order=sort_idx,
-                            enabled=True,
-                            source_locator={},
-                        )
-                    )
-                    sort_idx += 1
-                if by_code is not None:
-                    by_code[code] = code_set
-                if sets_with_values is not None:
-                    sets_with_values.add(code_set.id)
-            elif not _set_has_values(session, code_set, sets_with_values):
+                try:
+                    with session.begin_nested():
+                        session.add(candidate)
+                        session.flush()
+                        _stamp_field_ordinal(session, candidate, field)
+                        seen_vals_ci = set()
+                        sort_idx = 0
+                        for item in enum_values:
+                            val_clean = str(item["value"] or "").strip()[:128]
+                            if not val_clean or val_clean.upper() in seen_vals_ci:
+                                continue
+                            seen_vals_ci.add(val_clean.upper())
+                            session.add(
+                                CodeValueModel(
+                                    id=str(uuid.uuid4()),
+                                    code_set_id=candidate.id,
+                                    value=val_clean,
+                                    label_cn=str(item["label_cn"] or "").strip()[:255],
+                                    label_en="",
+                                    definition="",
+                                    sort_order=sort_idx,
+                                    enabled=True,
+                                    source_locator={},
+                                )
+                            )
+                            sort_idx += 1
+                        session.flush()
+                    code_set = candidate
+                    if by_code is not None:
+                        by_code[code] = code_set
+                    if sets_with_values is not None:
+                        sets_with_values.add(code_set.id)
+                except IntegrityError:
+                    code_set = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+                    if not code_set:
+                        raise
+            if code_set and not _set_has_values(session, code_set, sets_with_values):
                 # 之前建过同名的内联枚举表但没写进取值，这里补上
                 _fill_code_values(session, code_set, enum_values, text)
                 if sets_with_values is not None:
@@ -462,7 +498,7 @@ def ensure_field_reference(
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())[:96]
             code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
             if not code_set:
-                code_set = CodeSetModel(
+                candidate = CodeSetModel(
                     id=str(uuid.uuid4()),
                     code=code,
                     name=text[:255],
@@ -471,9 +507,16 @@ def ensure_field_reference(
                     status="DRAFT",
                     current_version=1,
                 )
-                session.add(code_set)
-                session.flush()
-                _stamp_field_ordinal(session, code_set, field)
+                try:
+                    with session.begin_nested():
+                        session.add(candidate)
+                        session.flush()
+                    code_set = candidate
+                    _stamp_field_ordinal(session, code_set, field)
+                except IntegrityError:
+                    code_set = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+                    if not code_set:
+                        raise
                 if by_name is not None:
                     by_name[text] = code_set
                 if by_code is not None:
@@ -520,6 +563,7 @@ def ensure_field_reference(
 
 
 def ensure_table_references(session: Session, table: TableMetadataModel) -> None:
+    _acquire_link_lock(session)
     fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).all()
     for field in fields:
         ensure_field_reference(session, field)
@@ -527,6 +571,7 @@ def ensure_table_references(session: Session, table: TableMetadataModel) -> None
 
 def auto_link_all_references(session: Session) -> int:
     """Fast O(F + C) batch alignment between all FieldMetadataModel and CodeSetModel rows."""
+    _acquire_link_lock(session)
     session.flush()
     all_sets = session.query(CodeSetModel).all()
     sets_with_values = {

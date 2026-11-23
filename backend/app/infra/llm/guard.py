@@ -193,112 +193,123 @@ def call_llm_validated(
     validate_fn = validator if validator is not None else (lambda args: args)
 
     max_total = max(1, transient_attempts) + max(1, validation_attempts)
-    for attempt in range(1, max_total + 1):
-        if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
-            cancellation.raise_if_cancelled()
-        if active_bus is not None and hasattr(active_bus, "check_budget"):
-            active_bus.check_budget()
-        attempt_timeout = timeout
-        if timeout and transient_used:
-            attempt_timeout = int(min(timeout * (1 + 0.5 * transient_used), timeout * 2))
-        try:
-            if attempt_timeout is None:
-                if feedback is None:
-                    arguments, trace = llm.assign(tool_name, instruction, payload)
+    reserved_calls = 0
+    try:
+        for attempt in range(1, max_total + 1):
+            if cancellation is not None and hasattr(cancellation, "raise_if_cancelled"):
+                cancellation.raise_if_cancelled()
+            if active_bus is not None and hasattr(active_bus, "begin_llm_call"):
+                active_bus.begin_llm_call()
+                reserved_calls += 1
+            elif active_bus is not None and hasattr(active_bus, "check_budget"):
+                active_bus.check_budget()
+            attempt_timeout = timeout
+            if timeout and transient_used:
+                attempt_timeout = int(min(timeout * (1 + 0.5 * transient_used), timeout * 2))
+            try:
+                if attempt_timeout is None:
+                    if feedback is None:
+                        arguments, trace = llm.assign(tool_name, instruction, payload)
+                    else:
+                        arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
                 else:
-                    arguments, trace = llm.assign(tool_name, instruction, payload, feedback)
-            else:
-                if feedback is None:
-                    arguments, trace = llm.assign(tool_name, instruction, payload, timeout=attempt_timeout)
-                else:
-                    arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
+                    if feedback is None:
+                        arguments, trace = llm.assign(tool_name, instruction, payload, timeout=attempt_timeout)
+                    else:
+                        arguments, trace = llm.assign(tool_name, instruction, payload, feedback, timeout=attempt_timeout)
 
-            if not isinstance(arguments, dict):
-                raise ValueError(f"工具 {tool_name} 必须返回 JSON 对象参数，实际收到 {type(arguments).__name__}")
+                if not isinstance(arguments, dict):
+                    raise ValueError(f"工具 {tool_name} 必须返回 JSON 对象参数，实际收到 {type(arguments).__name__}")
 
-            rejection_reason = (
-                active_bus.adjudicate(tool_name, arguments, payload)
-                if active_bus is not None and hasattr(active_bus, "adjudicate")
-                else None
-            )
-            if rejection_reason:
-                bus_rejections.append(
-                    {
-                        "attempt": attempt,
-                        "tool_name": tool_name,
-                        "reason": rejection_reason,
-                        "arguments": arguments,
-                    }
+                rejection_reason = (
+                    active_bus.adjudicate(tool_name, arguments, payload)
+                    if active_bus is not None and hasattr(active_bus, "adjudicate")
+                    else None
                 )
-                if isinstance(trace, dict):
-                    trace["bus_rejected"] = rejection_reason
-                raise ValueError(rejection_reason)
+                if rejection_reason:
+                    bus_rejections.append(
+                        {
+                            "attempt": attempt,
+                            "tool_name": tool_name,
+                            "reason": rejection_reason,
+                            "arguments": arguments,
+                        }
+                    )
+                    if isinstance(trace, dict):
+                        trace["bus_rejected"] = rejection_reason
+                    raise ValueError(rejection_reason)
 
-            result = validate_fn(arguments)
-            if isinstance(trace, dict):
-                if bus_rejections:
-                    trace["bus_rejected"] = bus_rejections[-1]["reason"]
-                    trace["bus_rejections"] = bus_rejections
-                if rejection:
-                    trace["previous_rejection"] = rejection
-                if retried_after_timeout:
-                    trace["retried_after_timeout"] = True
-                if attempt > 1:
-                    trace["attempts"] = attempt
-            if active_bus is not None and hasattr(active_bus, "fire"):
-                loc = locate_payload(payload)
-                after_payload: Dict[str, Any] = {
-                    "tool": tool_name,
-                    "attempts": attempt,
-                    "table_code": loc["table_code"],
-                }
+                result = validate_fn(arguments)
                 if isinstance(trace, dict):
-                    if trace.get("elapsed_seconds") is not None:
-                        after_payload["elapsed_seconds"] = trace.get("elapsed_seconds")
-                    if isinstance(trace.get("usage"), dict):
-                        after_payload["usage"] = trace["usage"]
-                active_bus.fire("tool.after", after_payload)
-            return result, trace
-        except LlmTimeoutError as exc:
-            transient_used += 1
-            retried_after_timeout = True
-            last_kind, last_error = "timeout", str(exc)
-            if transient_used >= transient_attempts:
-                break
-            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
-        except (httpx.HTTPError, TimeoutError, ConnectionError) as exc:
-            transient_used += 1
-            last_kind, last_error = "transport", f"{type(exc).__name__}: {exc}"
-            if transient_used >= transient_attempts:
-                break
-            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
-        except RuntimeError as exc:
-            kind = _classify_runtime_error(exc)
-            last_error = str(exc)
-            if kind == "fatal_model_error":
+                    if bus_rejections:
+                        trace["bus_rejected"] = bus_rejections[-1]["reason"]
+                        trace["bus_rejections"] = bus_rejections
+                    if rejection:
+                        trace["previous_rejection"] = rejection
+                    if retried_after_timeout:
+                        trace["retried_after_timeout"] = True
+                    if attempt > 1:
+                        trace["attempts"] = attempt
+                if active_bus is not None and hasattr(active_bus, "fire"):
+                    loc = locate_payload(payload)
+                    after_payload: Dict[str, Any] = {
+                        "tool": tool_name,
+                        "attempts": attempt,
+                        "table_code": loc["table_code"],
+                    }
+                    if isinstance(trace, dict):
+                        if trace.get("elapsed_seconds") is not None:
+                            after_payload["elapsed_seconds"] = trace.get("elapsed_seconds")
+                        if isinstance(trace.get("usage"), dict):
+                            after_payload["usage"] = trace["usage"]
+                    active_bus.fire("tool.after", after_payload)
+                if reserved_calls and active_bus is not None and hasattr(active_bus, "end_llm_calls"):
+                    active_bus.end_llm_calls(reserved_calls)
+                    reserved_calls = 0
+                return result, trace
+            except LlmTimeoutError as exc:
                 transient_used += 1
-                last_kind = "model_error"
-                break
-            if kind == "model_no_tool_call":
-                # 模型漏调工具属于输出契约违约，消耗校验配额并直接带硬提示重试，不虚耗网络退避时间
-                validation_used += 1
+                retried_after_timeout = True
+                last_kind, last_error = "timeout", str(exc)
+                if transient_used >= transient_attempts:
+                    break
+                backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            except (httpx.HTTPError, TimeoutError, ConnectionError) as exc:
+                transient_used += 1
+                last_kind, last_error = "transport", f"{type(exc).__name__}: {exc}"
+                if transient_used >= transient_attempts:
+                    break
+                backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            except RuntimeError as exc:
+                kind = _classify_runtime_error(exc)
+                last_error = str(exc)
+                if kind == "fatal_model_error":
+                    transient_used += 1
+                    last_kind = "model_error"
+                    break
+                if kind == "model_no_tool_call":
+                    # 模型漏调工具属于输出契约违约，消耗校验配额并直接带硬提示重试，不虚耗网络退避时间
+                    validation_used += 1
+                    last_kind = kind
+                    feedback = _NO_TOOL_CALL_HINT
+                    if validation_used >= validation_attempts:
+                        break
+                    continue
+                transient_used += 1
                 last_kind = kind
-                feedback = _NO_TOOL_CALL_HINT
+                if transient_used >= transient_attempts:
+                    break
+                backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            except (ValueError, KeyError) as exc:
+                validation_used += 1
+                rejection = f"缺少必填字段 {exc}" if isinstance(exc, KeyError) else str(exc)
+                feedback = rejection
+                last_kind, last_error = "validation", rejection
                 if validation_used >= validation_attempts:
                     break
-                continue
-            transient_used += 1
-            last_kind = kind
-            if transient_used >= transient_attempts:
-                break
-            backoff_wait(wait_steps, transient_used, cancellation=cancellation)
-        except (ValueError, KeyError) as exc:
-            validation_used += 1
-            rejection = f"缺少必填字段 {exc}" if isinstance(exc, KeyError) else str(exc)
-            feedback = rejection
-            last_kind, last_error = "validation", rejection
-            if validation_used >= validation_attempts:
-                break
+    finally:
+        if reserved_calls and active_bus is not None and hasattr(active_bus, "end_llm_calls"):
+            active_bus.end_llm_calls(reserved_calls)
 
     if last_kind == "timeout":
         message = f"{tool_name} model call timed out after retry ({transient_used} 次): {last_error}"
