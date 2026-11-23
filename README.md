@@ -79,6 +79,93 @@ dq_agent/
 
 ---
 
+## AI 如何介入本项目（确定性优先 + 受控参数赋值）
+
+本项目**不是**让大模型自由发挥写 SQL 的对话式脚本，而是遵循 **「程序做确定性骨架，AI 只做受控结构化参数赋值」** 的工程范式。
+
+### 1. 介入红线：AI 做什么 vs 绝不做什么
+
+| 维度 | AI 负责（受控 Tool-Call 赋值） | 确定性程序负责（0 Token，零幻觉） |
+| --- | --- | --- |
+| **输出形式** | 只能调用预定义 JSON Schema 工具返回结构化参数（严禁输出 SQL 或自由文本） | 校验、编译、落库、执行与打包全部由确定性代码完成 |
+| **SQL 与 DDL** | 绝不直接生成任何 SQL / DDL | `generation/sql/compiler.py` 与 `code_set_sql.py` 确定性编译 Oracle / MySQL 8 DDL、码表 `MERGE/UPSERT` 与 13 类算子校验 SQL |
+| **规划与基础规则** | 不参与预算规划、基础表结构与常规机械规则 | `derive_generation_plan`（预算规划）、`compile_schema`（表结构）、`rule_backfill.py`（必填 / 列宽上限 / 固定值 / 已发布码表白名单）全确定性执行 |
+| **验证与交付** | 仅负责复杂语义字段的造数参数与正则反例构造，失败时定向返修参数 | `OracleSandbox` 真实建表/灌数/真跑裁决；人工 `Interrupt` 审批门禁 + 防篡改哈希校验锁死生产包导出 |
+
+### 2. 全链路 AI 介入流程
+
+```mermaid
+flowchart TD
+    A["上传规范 PDF / DOCX / XLSX"] --> B["离线体检 survey + AI 文档结构导航（inspect_document_structure）"]
+    B --> C["程序按策略切块"]
+    C --> D{"是否存在跨页断裂/混装/告警？（adaptive 门控）"}
+    D -- "否（0 Token）" --> F["确定性字段与码表提取"]
+    D -- "是" --> E["AI 合并/拆分/定角色与块内细分（assign_document_structure / assign_block_segments）"]
+    E --> F
+    F --> G{"存在疑难字段或非结构化码表？"}
+    G -- "否（0 Token）" --> I["人工核对元数据与码表"]
+    G -- "是" --> H["AI 补全 + 原文证据独立复核（assign_metadata / review_metadata / assign_code_set / review_code_set）"]
+    H --> I
+    I --> J["确定性预算规划 + DDL 编译 + 机械规则回填（0 Token）"]
+    J --> K{"语义分流闸门：残余条件/比较/公式/格式信号？"}
+    K -- "否（0 Token）" --> M["跨表外键汇聚与去重（assign_rules cross_table）"]
+    K -- "是" --> L["AI 按表 BSP 扇出 + 单字段并发语义绑定（assign_rules）"]
+    L --> M
+    M --> N["Oracle 建表+灌码+空跑 → 人工审批门禁 WAITING_APPROVAL"]
+    N --> O["黄金正例造数：简单列程序求解 + 耦合列 AI 赋值（assign_generators + 黄金自洽门禁）"]
+    O --> P["反例变异：11 类非正则程序变异（0 Token）+ 正则/补漏 AI 变异（assign_audit_cases）"]
+    P --> Q["Oracle AB 沙箱真跑审计"]
+    Q -- "全部通过" --> R["人工测试确认门禁 WAITING_TEST_APPROVAL → 生产部署 ZIP 包"]
+    Q -- "黄金样本误报" --> O
+    Q -- "机械规则漏检" --> P
+    Q -- "语义规则偏差" --> S["AI 靶向单条返修参数，禁换算子（assign_rules rebind）"]
+    S --> Q
+```
+
+### 3. 全仓库受控 AI 工具介入明细
+
+全项目全部受控工具契约集中定义在 [`backend/app/infra/llm/schemas.py`](backend/app/infra/llm/schemas.py)，按四个业务阶段精确分工：
+
+| 阶段 | 工具名 | 触发条件（如何省 Token） | AI 职责与硬边界 | 对应源码 |
+| --- | --- | --- | --- | --- |
+| **规范接入** | `inspect_document_structure` | 每份新文档切块前 1 次 | 基于离线 `survey` 摘要，从该文件类型合法策略白名单内选择切块策略并标注章节角色（`TABLE_METADATA / CODE_SET / IGNORE`）；非法策略自动回退程序默认值 | [`structure_service.py`](backend/app/ingestion/structure_service.py) |
+| **规范接入** | `assign_document_structure` | 默认 `adaptive` 模式：**仅跨页断裂、混装或带告警的章节调用**；结构清晰块 0 Token 跳过 | 决定合并 `source_block_ids`、原文 `split_markers` 切分或纠正角色；禁止拆坏已解析的 `parsed_spec`，所有块 ID 受白名单校验 | [`structure_service.py`](backend/app/ingestion/structure_service.py) |
+| **规范接入** | `assign_block_segments` | 仅对需细分的混装大块触发 | 标出术语 / XML / 数据字典 / 码值 / 主键的逐字起止标记，由程序按偏移切出子块并保留父块证据链 | [`structure_service.py`](backend/app/ingestion/structure_service.py) |
+| **资产目录** | `assign_metadata` | **确定性先行**：要素齐全字段毫秒级落库；仅缺类型/英文名/有解析告警的疑难字段或纯文本块小批次调用 | 补齐字段中文名、英文名、类型、长度与校验原文；校验返回字段数完全匹配，异常自动退回确定性映射 | [`catalog/tables/service.py`](backend/app/catalog/tables/service.py) |
+| **资产目录** | `review_metadata` | 仅在本次提取实际使用过 AI 时触发 | 独立复核整表元数据；强制每条问题附逐字原文 `evidence`，**严禁用业务常识替代原文报 `ERROR`**（无依据强制降级 `WARNING`） | [`catalog/tables/service.py`](backend/app/catalog/tables/service.py) |
+| **资产目录** | `assign_code_set` / `review_code_set` | 结构化码表与内联枚举先走程序/正则；仅正则无果的非结构化码表走 AI 兜底；复核带防幻觉护栏 | 提取码值项或复核遗漏/错配；`enforce_code_set_review_evidence` 自动过滤无原文支撑的误报 | [`catalog/code_sets/service.py`](backend/app/catalog/code_sets/service.py) |
+| **规则装配** | `assign_rules`（单表语义） | 经 `needs_semantic_rule_binding` 语义分流：**剥离已覆盖短语后无残余约束信号的字段 0 Token 跳过** | 仅绑定当前 `target_field` 剩余语义规则（`COND_REQUIRED` / `COND_VALUE` / `ARITHMETIC_BALANCE` / `UNIQUE_KEY` / `REGEXP` / `NUM_RANGE` / `FIELD_COMPARE` / `NOT_IN` 等），禁止重复输出机械规则，区分 `DOC_EXPLICIT` 与 `AI_EXPANDED` | [`stage_rules.py`](backend/app/generation/workflow/stage_rules.py) |
+| **规则装配** | `assign_rules`（跨表外键） | 仅多表批量生成时触发 1 次 | 装配跨表 `FOREIGN_KEY` 及可选 `golden_overrides`；源表/目标表/字段均受跨表白名单硬拦截 | [`stage_rules.py`](backend/app/generation/workflow/stage_rules.py) |
+| **沙箱验证** | `assign_generators` | 简单列、数值区间、独立唯一键优先程序确定性求解；**仅剩余耦合列按跨字段约束连通分量打包调 AI** | 为黄金正例 A 分配 `FIXED / ENUM / SEQUENCE` 生成器；返回后必须立即通过**黄金自洽门禁**（`find_golden_rule_violations` 零违规）才能落库 | [`stage_data.py`](backend/app/delivery/testing/stage_data.py) |
+| **沙箱验证** | `assign_audit_cases` | **11 类非正则算子 100% 确定性变异（0 Token）**；仅正则规则或自愈补漏规则调 AI | 构造贴近业务的精准违规反例 B；若 AI 仍失败，自动触发正则确定性兜底变异（`build_regexp_fallback_mutation`） | [`stage_audit.py`](backend/app/delivery/testing/stage_audit.py) |
+| **三路自愈** | `assign_rules`（单条返修） / `assign_generators` / `assign_audit_cases` | 仅 Oracle 沙箱审计未全通过且未超最大尝试次数时定向触发 | 严格分流：①黄金误报只修造数不改规则；②机械规则漏检只重造变异用例；③语义规则偏差只修订该条规则 `params` 且**严禁擅自更换 `operator`** | [`nodes_back.py`](backend/app/delivery/testing/nodes_back.py) |
+
+> 注：`schemas.py` 中仍保留 `assign_generation_plan` 与 `assign_schema` 作为兼容契约定义，但主流程现已全部收敛为纯确定性实现（[`planning.py`](backend/app/generation/core/planning.py) 与 [`binding.py`](backend/app/generation/core/binding.py)），运行时不消耗任何 Token。
+
+### 4. 五重运行时护栏（把 AI 关进确定性笼子）
+
+所有业务阶段的 LLM 调用必须经过 [`call_llm_validated`](backend/app/infra/llm/guard.py)，严禁裸调模型接口：
+
+1. **作用域最小化契约（[`schemas.py`](backend/app/infra/llm/schemas.py)）**
+   按工具动态拼装最小前置约束（文档解析阶段不会混入规则算子说明书），算子枚举仅暴露 `LLM_OPERATORS`（禁用 `LENGTH` 等易误报算子，统一用 `LENGTH_MAX` 表示列宽上限、`REGEXP` 表示精确位数格式）。
+2. **五大确定性事前 Bus 门禁（[`regops_bus.py`](backend/app/policy/regops_bus.py)）**
+   在任何业务逻辑消费 AI 输出之前，单次 Run 的 Bus 自动执行五道白名单裁决：
+   - `field_whitelist_adjudicator`：拦截幻觉字段名（含 `if_field` / `right_field` / `terms[].field` / `key_fields[]` / 变异 `overrides`）；
+   - `cross_table_adjudicator`：拦截不在已确认表/字段白名单内的跨表引用与 `golden_overrides`；
+   - `operator_whitelist_adjudicator`：拦截非 `LLM_OPERATORS` 算子；
+   - `code_set_values_adjudicator`：拦截不在已发布码表值域内的 `ENUM` / `COND_VALUE` / 生成器取值；
+   - `structure_block_adjudicator`：拦截虚构的切块 `source_block_ids`。
+3. **分轨容错与拒绝原因自动回喂（[`guard.py`](backend/app/infra/llm/guard.py)）**
+   - **网络 / 超时 / 429 / 5xx 瞬时错**：消耗 `transient_attempts`（默认 4 次），带随机抖动退避等待并逐次放宽超时窗口；
+   - **漏调工具 / Bus 门禁拦截 / 业务 validator 拒收**：消耗 `validation_attempts`（默认 3 次），零等待立即把精确拒收原因作为 `feedback` 回喂模型自我修正，并将拦截明细记入 `bus_rejections`；
+   - **鉴权或配置致命错误**：快速失败，不空耗重试预算。
+4. **横切预算熔断与协作式取消（`llm_execution_scope` + `BudgetGuard`）**
+   通过 `contextvars` 穿透多线程并发 Worker，实时统计 `llm_calls`、`total_tokens` 与 `elapsed_seconds`（可在「系统设置」页配置上限）；触发预算上限立即熔断，操作员点击中止时可在退避等待中即时唤醒退出。
+5. **全量可回放审计与离线模式（`EventLog` + `scripted`）**
+   每次 AI 赋值入参/出参、门禁拦截记录、Token 消耗与耗时均追加写入带 SHA-256 哈希链的不可变事件账本，前端批次详情页可完整回放追踪；同时支持 `LLM_PROVIDER=scripted` 离线确定性模式零成本跑通回归测试。
+
+---
+
 ## 本地启动
 
 ### 1. 环境配置
