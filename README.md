@@ -30,7 +30,7 @@
 ## 目录结构
 
 ```text
-dq_agent/
+data-rule-studio/
 ├── backend/                          # FastAPI 后端（严格单向八层 DAG）
 │   ├── ARCHITECTURE.md               # 后端八层架构导览与 AST 红线说明
 │   ├── app/
