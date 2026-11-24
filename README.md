@@ -6,16 +6,17 @@
 
 ---
 
-## 核心特性与架构原则
+## 核心特性与工作台界面
 
-- **三步端到端工作台**
-  1. **规范解析与核对**：支持 PDF / DOCX / XLSX 规范文档接入、AI 结构体检与切块、表字段与公共/内联码表双轨并行提取、人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
-  2. **生成表结构、码表和规则**：确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
-  3. **测试与下载**：AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、测试确认门禁、生产 DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载，并支持跨版本制度文档 Diff 与跨批次 SQL Diff。
+- **顶部横向三步工作台与辅助治理入口**
+  1. **01 规范解析与核对（`/documents`）**：支持 PDF / DOCX / XLSX 规范文档接入、AI 结构体检与切块、表字段与公共/内联码表双轨并行提取、人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
+  2. **02 生成表结构、码表和规则（`/generation`）**：确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
+  3. **03 测试与下载（`/runs`）**：AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、测试确认门禁、生产 DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载。
+  - 辅助入口：**变更记录（`/versions`）** 支持跨版本制度文档 Diff 与跨批次 SQL Diff；**系统设置（`/settings`）** 配置数据源与模型/预算参数，右上角实时显示后端在线状态与浅色/深色外观切换。
 - **后端架构（ProdAgent「机制在内，策略在外」+ 严格单向八层 DAG）**
   - 六大微内核（`Plan` / `Bus` / `EventLog` / `Interrupt` / `Run` / `Scheduler` 真 BSP `Send` 波次引擎）与业务策略彻底隔离；
   - 全链路以只追加哈希链事件账本（`EventLog`）与内容寻址大对象存储（`BlobStore`）为唯一事实源，支持门禁拦截、一等人工中断挂起、横切成本熔断（`BudgetGuard`）、运行中取消、断点续跑与 SSE 实时事件推送；
-  - 统一收口全部 `/api/*` 接口（无历史 `/api/v2` 分叉），`api/` 按四大业务域采用**薄路由 + 服务分离**，严禁跨路由互调。
+  - 统一收口全部 `/api/*` 接口，`api/` 按四大业务域采用**薄路由 + 服务分离**，严禁跨路由互调。
 - **前端架构（与后端四大业务域 1:1 对称）**
   - React 19 + Vite 7，路由级 `React.lazy` 懒加载分包；
   - 全站 `/api/*` 请求集中收口在 `frontend/src/api/`，业务模块按 `platform / catalog / generation / delivery` 与后端一一对应，公共组件与纯工具严格单向依赖。
@@ -151,7 +152,7 @@ flowchart TD
 | **沙箱验证** | `assign_audit_cases` | **11 类非正则算子 100% 确定性变异（0 Token）**；仅正则规则或自愈补漏规则调 AI | 构造贴近业务的精准违规反例 B；若 AI 仍失败，自动触发正则确定性兜底变异（`build_regexp_fallback_mutation`） | [`stage_audit.py`](backend/app/delivery/testing/stage_audit.py) |
 | **三路自愈** | `assign_rules`（单条返修） / `assign_generators` / `assign_audit_cases` | 仅 Oracle 沙箱审计未全通过且未超最大尝试次数时定向触发 | 严格分流：①黄金误报只修造数不改规则；②机械规则漏检只重造变异用例；③语义规则偏差只修订该条规则 `params` 且**严禁擅自更换 `operator`** | [`nodes_back.py`](backend/app/delivery/testing/nodes_back.py) |
 
-> 注：`schemas.py` 中仍保留 `assign_generation_plan` 与 `assign_schema` 作为兼容契约定义，但主流程现已全部收敛为纯确定性实现（[`planning.py`](backend/app/generation/core/planning.py) 与 [`binding.py`](backend/app/generation/core/binding.py)），运行时不消耗任何 Token。
+> 注：预算规划（[`planning.py`](backend/app/generation/core/planning.py)）与表结构装配（[`binding.py`](backend/app/generation/core/binding.py)）由纯确定性程序完成，0 Token 消耗。
 
 ### 4. 五重运行时护栏（把 AI 关进确定性笼子）
 
@@ -220,10 +221,10 @@ npm run dev
 ## 测试与架构守卫
 
 ```bash
-# 后端全量测试（含八层 DAG、内核纯净度、API 零跨路由依赖等 AST 架构守卫）
+# 后端全量测试（334 项：含八层 DAG、内核纯净度、API 零跨路由依赖等 AST 架构守卫）
 cd backend && pytest -q
 
-# 前端单测与架构边界守卫（含目录结构、/api/* 统一收口与单向依赖校验）
+# 前端单测与架构边界守卫（10 项：目录结构、/api/* 统一收口与单向依赖校验）
 cd frontend && npm test
 
 # 前端生产构建验证
