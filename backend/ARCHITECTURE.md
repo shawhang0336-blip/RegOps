@@ -1,4 +1,4 @@
-# RegOps 后端架构导览（`backend/app/`）
+# Data Rule Studio 后端架构导览（`backend/app/`）
 
 后端严格遵循 **ProdAgent“机制在内，策略在外”** + **严格单向八层 DAG（3 层底座 + Step 0/1/2/3 四业务阶段 + 1 层接口）** 原则。  
 `backend/app/` 根目录只保留唯一 FastAPI 启动入口 [`main.py`](app/main.py) 与 **8 个职责正交的子包**，所有跨层引用均使用显式绝对导入（`from app.<层>.<模块> import ...`），且依赖方向严格单向无环：

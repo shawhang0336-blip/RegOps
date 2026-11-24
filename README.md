@@ -1,6 +1,8 @@
-# dq-agent（`dq_agent`）— 监管报送规则装配与审计台
+# Data Rule Studio（`data-rule-studio`）— 数据规则装配与验证台
 
-面向金融监管报送场景的**确定性工具 + 受控 AI 参数赋值**工作台：覆盖监管规范文档解析、表字段元数据与码表核对、Oracle/MySQL 建表与校验规则装配、人工确权、Oracle 沙箱黄金正例造数与靶向反例变异验证，到生产校验 SQL 部署 ZIP 包一键交付。
+> **统一 Data Agent 产品家族**：[`data-rule-studio`](https://github.com/shawhang0336-blip/data-rule-studio)（规则装配与验证） · [`data-biz-copilot`](https://github.com/shawhang0336-blip/data-biz-copilot)（业务资产与制度对账） · [`data-sql-guardian`](https://github.com/shawhang0336-blip/data-sql-guardian)（SQL 优化与发布门禁）
+
+面向金融监管报送与数据质量场景的**确定性工具 + 受控 AI 参数赋值**工作台：覆盖监管规范文档解析、表字段元数据与码表核对、Oracle/MySQL 建表与校验规则装配、人工确权、Oracle 沙箱黄金正例造数与靶向反例变异验证，到生产校验 SQL 部署 ZIP 包一键交付。
 
 ---
 

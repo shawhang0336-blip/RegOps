@@ -31,8 +31,8 @@ DEFAULT_BUDGET: Dict[str, int] = {
 
 
 class Settings(BaseSettings):
-    app_name: str = "监管规则装配与审计台"
-    database_url: str = "sqlite:///./var/dq_agent.db"
+    app_name: str = "Data Rule Studio — 数据规则装配与验证台"
+    database_url: str = "sqlite:///./var/data_rule_studio.db"
     business_database_url: Optional[str] = None
     oracle_sandbox_url: Optional[str] = None
     business_allowed_tables: str = ""

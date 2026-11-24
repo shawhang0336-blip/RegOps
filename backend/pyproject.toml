@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dq-regulatory-agent"
+name = "data-rule-studio"
 version = "0.1.0"
-description = "Deterministic regulatory rule binding and audit workbench"
+description = "Data Rule Studio: deterministic regulatory rule binding, sandbox validation, and audit workbench"
 requires-python = ">=3.9"
 dependencies = [
   "fastapi>=0.115,<1",

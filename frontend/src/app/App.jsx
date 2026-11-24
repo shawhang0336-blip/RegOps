@@ -65,9 +65,9 @@ function WorkbenchLayout() {
     <div className="app-shell horizontal-shell">
       <ScrollToTop />
       <header className="workbench-header">
-        <NavLink to="/documents" className="workbench-brand" aria-label="RegOps 监管报送规则生成工具">
+        <NavLink to="/documents" className="workbench-brand" aria-label="Data Rule Studio 数据规则装配与验证台">
           <span className="workbench-brand-mark"><BrandMark /></span>
-          <span className="workbench-brand-name"><span>Reg</span><span className="workbench-brand-accent">Ops</span></span>
+          <span className="workbench-brand-text">Data Rule<span className="workbench-brand-accent"> Studio</span></span>
         </NavLink>
 
         <nav className="workbench-steps" aria-label="使用流程">

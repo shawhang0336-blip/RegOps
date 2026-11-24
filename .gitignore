@@ -11,6 +11,8 @@ frontend/dist/
 # 根目录下的 sqlite 兜底库是误启动产物，真实配置走 .env 的 MySQL
 /dq_agent.db
 /dq_agent.db-*
+/data_rule_studio.db
+/data_rule_studio.db-*
 data/specs/
 *.log
 .workbuddy/

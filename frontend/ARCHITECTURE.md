@@ -1,4 +1,4 @@
-# RegOps 前端架构导览（`frontend/src/`）
+# Data Rule Studio 前端架构导览（`frontend/src/`）
 
 前端严格遵循 **按业务域分层 + 单向依赖 + 后端 1:1 对称** 原则。  
 `frontend/src/` 根目录只保留唯一挂载入口 [`main.jsx`](src/main.jsx) 与 **8 个职责正交的目录**，且 4 大业务域（`platform` / `catalog` / `generation` / `delivery`）与后端 [`backend/app/api/`](../backend/app/api/) 一一对应：
