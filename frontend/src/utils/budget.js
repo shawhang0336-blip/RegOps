@@ -27,6 +27,20 @@ export const BUDGET_META = {
     min: 1,
     max: 32,
   },
+  max_llm_rpm: {
+    label: '每分钟最大请求数',
+    desc: '客户端平滑限流上限，遇 429 限流时自动全局冷却（0 表示不限速）',
+    unit: '次 / 分钟',
+    min: 0,
+    max: 6000,
+  },
+  max_calls_per_table: {
+    label: '单表 AI 调用上限',
+    desc: '两级预算隔离上限：单张报表或内容块超出后仅隔离本表并归还父预算（0 表示不限制）',
+    unit: '次 / 表',
+    min: 0,
+    max: 500,
+  },
   max_llm_calls: {
     label: '单批次 AI 调用上限',
     desc: '内核 BudgetGuard 熔断保护；超过后自动停止并保留检查点（0 表示仅统计不熔断）',

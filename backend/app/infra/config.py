@@ -23,6 +23,8 @@ DEFAULT_BUDGET: Dict[str, int] = {
     "max_cases_per_table": 1000,
     "max_retries": 3,
     "max_llm_concurrency": 4,
+    "max_llm_rpm": 0,
+    "max_calls_per_table": 0,
     # ProdAgent BudgetGuard 成本熔断阈值（0 表示仅统计不熔断）
     "max_llm_calls": 120,
     "max_total_tokens": 1500000,

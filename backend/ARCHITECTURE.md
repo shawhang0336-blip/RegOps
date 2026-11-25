@@ -24,22 +24,22 @@ backend/app/
 │   ├── errors.py                #    统一领域异常 WorkflowError（携带结构化错误定位 context）
 │   ├── task_runner.py           #    带任务键去重的进程内有界后台线程池（TaskRunner）
 │   └── llm/                     #    受控大模型子包
-│       ├── client.py            #      OpenAI 兼容 HTTP 客户端（httpx 连接池复用、并发信号量、502/504 非 JSON 容错）
+│       ├── client.py            #      OpenAI 兼容 HTTP 客户端（连接池复用、并发信号量、RPM 令牌桶限速与 429 跨线程退避、401/402/403 鉴权/账单识别）
 │       ├── schemas.py           #      12 个受控工具 JSON Schema、spec_payload 与作用域 Prompt 契约
-│       └── guard.py             #      跨三阶段受控 LLM 调用守卫（分轨退避重试、上下文作用域透传、鸭子类型 Bus 门禁回喂）
+│       └── guard.py             #      跨三阶段受控 LLM 调用守卫（分轨退避重试、鉴权/账单硬错误零重试熔断、上下文透传、鸭子类型 Bus 门禁回喂）
 │
 ├── kernel/                      # 层 1：ProdAgent 六大核心微内核（仅依赖 infra，零业务依赖）
 │   ├── plan.py                  #    静态只读工作流蓝图（PlanNode / PlanEdge / RetryPolicy / timeout / WorkflowPlan）
 │   ├── bus.py                   #    全生命周期事件总线（check/adjudicate 门禁 + fire/subscribe 广播 + node.retry + 预算检查钩子）
 │   ├── event_log.py             #    只追加哈希链事件账本（唯一事实源）+ 按 reducer 隔离的投影缓存 + 零成本 Trace/Span 瀑布折叠
 │   ├── interrupt.py             #    一等人工中断协议（Interrupt / answer_interrupt / record_interrupt_answer）
-│   ├── run.py                   #    Run 控制面（RunContext / ChannelSpec / AmbiguousWriteError / BudgetGuard / CancellationToken / 生命周期原语）
-│   └── scheduler.py             #    真 BSP 波次调度引擎（Send 动态扇出 / Goto / Interrupt / 节点级 Retry+Timeout / 屏障冲突校验）
+│   ├── run.py                   #    Run 控制面（RunContext / MemoryRun + MemoryEvent 无库上下文 / ChannelSpec / BudgetGuard / CancellationToken / 生命周期原语）
+│   └── scheduler.py             #    真 BSP 波次调度引擎（execute_wave 自动透传 contextvars / Send 动态扇出 / Goto / Interrupt / 节点级 Retry+Timeout / 屏障校验）
 │
 ├── policy/                      # 层 2：RegOps 领域策略层（3 模块，严格一一对应 kernel 插槽，零 import 期全局副作用）
-│   ├── regops_plan.py           #    Step 2 18 节点拓扑 + 人工中断门协议 + Step 1 / Step 2 统一事件状态折叠（显式 reducer）
-│   ├── regops_bus.py            #    五大确定性事前门禁裁决器（字段/跨表字段/算子/批量码表/切块 ID 白名单）与 default_bus
-│   └── regops_channels.py       #    24 个命名数据通道（含单表增量检查点）与 EventLog + BlobStore 单次查询断点恢复
+│   ├── regops_plan.py           #    Step 0/1 准备/提取双图（INGESTION_*_PLAN）+ Step 2 18 节点拓扑 + 人工中断门协议 + 全阶段事件折叠（显式 reducer）
+│   ├── regops_bus.py            #    五大确定性事前门禁裁决器 + build_child_bus 两级子预算隔离与 default_bus
+│   └── regops_channels.py       #    Step 1 INGESTION_CHANNELS（BLOCK_EXTRACTED 检查点恢复）+ Step 2 24 个命名通道与单次查询断点恢复
 │
 ├── ingestion/                   # 层 3（Step 0：原始规范文件拆箱、体检与切块，前端归入「01 规范解析与核对」上半段）
 │   ├── parsers/                 #    纯离线文件拆箱、通用三级 PDF 切块与硬伤体检（零 DB、零 LLM）
@@ -64,8 +64,8 @@ backend/app/
 │   │   ├── service.py           #      码表抽取、AI 复核防幻觉护栏与摘要/删除服务
 │   │   ├── readiness.py         #      码表就绪度评估与自动发布
 │   │   └── bindings.py          #      数据库无关的已发布码表加载、值域绑定与规则/造数用量校验
-│   ├── extraction.py            #    跨子域协同：表元数据 + 码表双轨并发抽取与自动对齐
-│   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 kernel.run + BudgetGuard）
+│   ├── extraction.py            #    跨子域协同：execute_wave Worker 纯计算（零 DB 访问）与主协调线程单写落库 + 自动对齐
+│   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 Scheduler + INGESTION_CHANNELS 块级断点续跑）
 │   └── version_diff.py          #    跨版本监管制度文档差异对比与影响面分级（返回增量受影响表清单）
 │
 ├── generation/                  # 层 5（Step 2，对应前端 02「生成表结构、码表和规则」）：DDL、码表 SQL、规则装配与 Oracle 空跑

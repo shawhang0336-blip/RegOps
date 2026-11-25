@@ -14,6 +14,8 @@
 
 from contextlib import contextmanager
 import contextvars
+from datetime import datetime
+import json
 import threading
 import time
 import uuid
@@ -26,9 +28,14 @@ from app.infra.db_tables import EventModel, RunModel
 from app.infra.task_runner import TaskRunner, task_runner
 from .bus import Bus, global_bus
 from .event_log import (
+    GENESIS_HASH,
     RunState,
+    StateReducer,
     acquire_run_lock,
     append_event,
+    canonical_event_json,
+    compute_event_hash,
+    fold_with,
     project_many_with,
     project_with,
     verify_chain,
@@ -147,6 +154,32 @@ def invocation_scope(invocation: InvocationContext) -> Iterator[InvocationContex
 
 
 @dataclass
+class MemoryEvent:
+    """无库内存 Run 的轻量事件记录（兼容 `fold_with` 与 `build_trace`）。"""
+
+    id: str
+    run_id: str
+    seq: int
+    kind: str
+    node: str
+    payload_json: Dict[str, Any]
+    prev_hash: str
+    event_hash: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class MemoryRun:
+    """无库内存 Run 身份（供纯内存内层 Scheduler 使用，零数据库访问）。"""
+
+    id: str
+    spec_id: str = "memory"
+    status: str = "RUNNING"
+    current_node: str = "created"
+    attempt: int = 1
+
+
+@dataclass
 class RunContext:
     """单次 Run 调度的运行时容器：承载只读 state 投影、shared 通道、Identity、Bus、取消令牌与预算守卫。"""
 
@@ -168,6 +201,8 @@ class RunContext:
     cancellation: Any = None
     budget_guard: Any = None
     resume_values: Dict[str, Any] = field(default_factory=dict)
+    reducer: Optional[StateReducer] = None
+    memory_events: List[MemoryEvent] = field(default_factory=list)
 
     def check_cancelled(self) -> None:
         """在节点/波次边界检查取消令牌；若已取消则抛出 RunCancelledError。"""
@@ -258,10 +293,72 @@ class RunContext:
     def get(self, key: str, default: Any = None) -> Any:
         return self.shared.get(key, default)
 
+    @property
+    def is_in_memory(self) -> bool:
+        """当前调度上下文是否运行在无库纯内存模式（session is None）。"""
+        return self.session is None
+
+    def record_event(self, kind: str, node: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        """统一事件写入：DB 模式落 EventModel 哈希链，内存模式落 `MemoryEvent` 链并广播生命周期事件。"""
+        body = payload if payload is not None else {}
+        if self.session is not None:
+            return append_event(self.session, self.run, kind, node, body, bus=self.bus)
+
+        run_id = str(getattr(self.run, "id", "") or "memory")
+        stored_payload = json.loads(canonical_event_json(body))
+        prev_hash = self.memory_events[-1].event_hash if self.memory_events else GENESIS_HASH
+        event_hash = compute_event_hash(run_id, kind, node, stored_payload, prev_hash)
+        seq = len(self.memory_events) + 1
+        ev = MemoryEvent(
+            id=f"{run_id}-ev-{seq}",
+            run_id=run_id,
+            seq=seq,
+            kind=kind,
+            node=node,
+            payload_json=stored_payload,
+            prev_hash=prev_hash,
+            event_hash=event_hash,
+        )
+        self.memory_events.append(ev)
+        if hasattr(self.bus, "fire"):
+            self.bus.fire(
+                "event.appended",
+                {
+                    "run_id": run_id,
+                    "seq": ev.seq,
+                    "kind": kind,
+                    "node": node,
+                    "event_hash": ev.event_hash,
+                },
+            )
+            if kind == "RUN_CREATED":
+                self.bus.fire(
+                    "run.created",
+                    {"run_id": run_id, "spec_id": getattr(self.run, "spec_id", "memory"), "node": node},
+                )
+            elif kind in {"RUN_RESUMED", "REAUDIT_REQUESTED"}:
+                self.bus.fire("run.resumed", {"run_id": run_id, "kind": kind, "node": node})
+        return ev
+
+    def flush(self) -> None:
+        """有库模式下刷写事务缓冲；纯内存模式下为空操作。"""
+        if self.session is not None:
+            self.session.flush()
+
+    def commit(self) -> None:
+        """有库模式下提交事务；纯内存模式下为空操作。"""
+        if self.session is not None:
+            self.session.commit()
+
     def refresh_state(self) -> RunState:
-        """从事件账本重新折叠状态（append_event 之后调用）。"""
+        """从事件账本（或纯内存事件链）重新折叠状态。"""
+        if self.session is None:
+            self.state = fold_with(self.memory_events, reducer=self.reducer)
+            return self.state
         if self.projector is not None:
             self.state = self.projector(self.session, self.run)
+        elif self.reducer is not None:
+            self.state = project_with(self.session, self.run, reducer=self.reducer)
         else:
             self.state = project_with(self.session, self.run)
         return self.state
@@ -432,9 +529,12 @@ class BudgetGuard:
         with self._lock:
             return self._snapshot_locked()
 
-    def _find_breach(self, snap: Dict[str, Any]) -> Optional[Tuple[str, Any, Any]]:
-        if self.limits.max_llm_calls is not None and snap["llm_calls"] >= self.limits.max_llm_calls:
-            return ("max_llm_calls", snap["llm_calls"], self.limits.max_llm_calls)
+    def _find_breach(self, snap: Dict[str, Any], *, pre_call: bool = False) -> Optional[Tuple[str, Any, Any]]:
+        if self.limits.max_llm_calls is not None:
+            if pre_call and snap["llm_calls"] >= self.limits.max_llm_calls:
+                return ("max_llm_calls", snap["llm_calls"], self.limits.max_llm_calls)
+            if not pre_call and snap["llm_calls"] > self.limits.max_llm_calls:
+                return ("max_llm_calls", snap["llm_calls"], self.limits.max_llm_calls)
         if self.limits.max_total_tokens is not None and snap["total_tokens"] >= self.limits.max_total_tokens:
             return ("max_total_tokens", snap["total_tokens"], self.limits.max_total_tokens)
         if self.limits.max_elapsed_seconds is not None and snap["elapsed_seconds"] >= self.limits.max_elapsed_seconds:
@@ -472,7 +572,7 @@ class BudgetGuard:
             snap = self._snapshot_locked()
             projected_calls = self._llm_calls + self._in_flight_calls
             projected_snap = {**snap, "llm_calls": max(snap["llm_calls"], projected_calls)}
-            breach = self._find_breach(projected_snap)
+            breach = self._find_breach(projected_snap, pre_call=True)
             if breach is None:
                 self._in_flight_calls += 1
                 return
@@ -485,9 +585,9 @@ class BudgetGuard:
             self._in_flight_calls = max(0, self._in_flight_calls - max(0, int(count)))
 
     def check(self, bus: Optional[Bus] = None) -> None:
-        """检查是否触达任一预算上限；超限时广播 budget.exceeded 并抛出 BudgetExceededError。"""
+        """检查是否触达任一预算上限；波次边界不误杀已恰好用满名额的 0-Token 收尾节点。"""
         snap = self.snapshot()
-        breach = self._find_breach(snap)
+        breach = self._find_breach(snap, pre_call=False)
         if breach is not None:
             self._raise_breach(breach, snap, bus)
 
@@ -881,6 +981,57 @@ def delete_run(
     for hook in post_commit_hooks or ():
         hook(session, context)
     return context
+
+
+def create_memory_context(
+    workflow_name: str,
+    *,
+    run_id: Optional[str] = None,
+    initial_node: str = "created",
+    settings: Any = None,
+    shared: Optional[Dict[str, Any]] = None,
+    channels: Optional[Dict[str, ChannelSpec]] = None,
+    bus: Optional[Bus] = None,
+    llm: Any = None,
+    concurrency: int = 4,
+    cancellation: Any = None,
+    budget_guard: Any = None,
+    reducer: Optional[StateReducer] = None,
+    identity: Optional[Identity] = None,
+) -> RunContext:
+    """创建完全不触碰 SQLAlchemy Session 的纯内存 `RunContext`，供内层纯计算调度复用。"""
+    rid = run_id or f"mem-{workflow_name}-{uuid.uuid4().hex[:12]}"
+    run_obj = MemoryRun(id=rid, spec_id=workflow_name, current_node=initial_node)
+    active_bus = bus if bus is not None else Bus()
+    active_reducer: StateReducer = reducer or (
+        lambda st, kind, p: replace(
+            st,
+            status="RUNNING",
+            current_node=str((p or {}).get("initial_node") or initial_node),
+            resume_from_node=str((p or {}).get("initial_node") or initial_node),
+        )
+        if kind == "RUN_CREATED"
+        else st
+    )
+    ctx = RunContext(
+        session=None,
+        run=run_obj,
+        settings=settings,
+        state=RunState(),
+        identity=identity or Identity(),
+        shared=dict(shared or {}),
+        channels=dict(channels or {}),
+        bus=active_bus,
+        llm=llm,
+        concurrency=max(1, int(concurrency or 1)),
+        current_node=initial_node,
+        cancellation=cancellation,
+        budget_guard=budget_guard,
+        reducer=active_reducer,
+    )
+    ctx.record_event("RUN_CREATED", initial_node, {"spec_id": workflow_name, "initial_node": initial_node})
+    ctx.refresh_state()
+    return ctx
 
 
 def replay_run(

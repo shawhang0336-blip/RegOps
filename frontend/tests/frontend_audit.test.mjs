@@ -120,12 +120,16 @@ test('validateBudgetInput blocks empty string, float, bool, and out-of-bounds va
     max_retries: '3',
     max_llm_concurrency: '4',
     max_llm_calls: '120',
+    max_llm_rpm: '180',
+    max_calls_per_table: '20',
     max_total_tokens: '1500000',
     max_elapsed_seconds: '900',
   })
   assert.equal(ok.ok, true)
   assert.equal(ok.value.max_llm_concurrency, 4)
-  assert.equal(Object.keys(BUDGET_META).length, 7)
+  assert.equal(ok.value.max_llm_rpm, 180)
+  assert.equal(ok.value.max_calls_per_table, 20)
+  assert.equal(Object.keys(BUDGET_META).length, 9)
 })
 
 test('fileSha256 safely returns null on non-HTTPS intranet where crypto.subtle is missing', async () => {

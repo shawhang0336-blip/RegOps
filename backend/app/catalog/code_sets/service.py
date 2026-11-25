@@ -53,6 +53,7 @@ from app.catalog.code_sets.parser import (
     parse_inline_enum,
     validate_code_set_draft,
 )
+from app.infra.errors import ProviderAuthOrBillingError
 from app.infra.llm import RealDesignLlm
 from app.kernel.run import BudgetExceededError, RunCancelledError
 from app.infra.llm.guard import call_llm_validated
@@ -421,123 +422,365 @@ def _record_code_set_validation(
     row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) or _has_error_issues(issues) else "AI_SELF_VALIDATED"
 
 
+def preload_existing_code_sets_state(session: Session) -> Dict[str, Dict[str, Any]]:
+    """预加载已有码表的校验状态与码值集合，供无 DB Worker 判断是否可跳过重复 AI 复核。"""
+    rows = session.query(CodeSetModel).all()
+    if not rows:
+        return {}
+    reviewed_ids = {
+        cs_id
+        for (cs_id,) in session.query(CodeSetValidationModel.code_set_id)
+        .filter(CodeSetValidationModel.validator_kind == "AI_REVIEW")
+        .all()
+    }
+    vals_by_cs: Dict[str, set] = {}
+    for cs_id, val in session.query(CodeValueModel.code_set_id, CodeValueModel.value).all():
+        vals_by_cs.setdefault(cs_id, set()).add((val or "").strip().upper())
+
+    state: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        state[r.code.upper()] = {
+            "id": r.id,
+            "name": r.name,
+            "definition": r.definition or "",
+            "source_type": r.source_type,
+            "has_ai_review": r.id in reviewed_ids,
+            "values": vals_by_cs.get(r.id, set()),
+        }
+    return state
+
+
+def _compute_single_code_set_review(
+    draft: CodeSetDraft,
+    raw_content: str,
+    source_locator: Dict[str, Any],
+    settings: Settings,
+    *,
+    review_with_ai: Any = "adaptive",
+    extra_program_issues: Optional[List[Dict[str, Any]]] = None,
+    existing_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    llm: Any = None,
+    bus: Any = None,
+) -> Dict[str, Any]:
+    program_issues = validate_code_set_draft(draft) + list(extra_program_issues or [])
+    if review_with_ai in {False, "never"}:
+        return {
+            "program_issues": program_issues,
+            "review_kind": "NONE",
+            "ai_issues": [],
+            "ai_trace": None,
+        }
+    if review_with_ai == "adaptive":
+        needs_ai_review = (draft.source_type == "AI_EXTRACTED" or bool(program_issues)) and len(draft.values) <= 120
+        if not needs_ai_review:
+            return {
+                "program_issues": program_issues,
+                "review_kind": "DETERMINISTIC",
+                "ai_issues": [],
+                "ai_trace": {"strategy": "DETERMINISTIC_CROSS_CHECK", "value_count": len(draft.values)},
+            }
+
+    active_llm = llm
+    if active_llm is None:
+        try:
+            active_llm = RealDesignLlm(settings)
+        except Exception:
+            active_llm = None
+    if active_llm is None:
+        return {
+            "program_issues": program_issues,
+            "review_kind": "NO_LLM",
+            "ai_issues": [],
+            "ai_trace": None,
+        }
+
+    safe_code = draft.code.upper()[:96]
+    prev = (existing_state or {}).get(safe_code)
+    if prev and prev.get("has_ai_review"):
+        incoming_keys = {(item.value or "").strip().upper() for item in draft.values if item.value.strip()}
+        if incoming_keys <= prev.get("values", set()) and not (
+            draft.definition and (not prev.get("definition") or prev.get("source_type") == "DOCUMENT_REFERENCE") and prev.get("definition") != draft.definition
+        ):
+            return {
+                "program_issues": program_issues,
+                "review_kind": "SKIPPED_UNCHANGED",
+                "ai_issues": [],
+                "ai_trace": None,
+            }
+
+    try:
+        args, trace = call_llm_validated(
+            active_llm,
+            "review_code_set",
+            "独立复核码值表。仅输出码值遗漏、重复、含义错配、无证据码值或定义不一致的问题；无问题返回空数组。",
+            {
+                "source_locator": source_locator,
+                "code_set": draft.model_dump(),
+                "raw_context": raw_content[:6000],
+            },
+            timeout=35,
+            backoff=(1.0,),
+            bus=bus,
+            transient_attempts=2,
+            validation_attempts=2,
+        )
+        issues = args.get("issues", [])
+    except (BudgetExceededError, RunCancelledError, ProviderAuthOrBillingError):
+        raise
+    except Exception as exc:
+        trace = {"error": f"{type(exc).__name__}: {exc}"}
+        issues = [{
+            "severity": "WARNING",
+            "code": "AI_REVIEW_UNAVAILABLE",
+            "value": "",
+            "message": f"AI 复核不可用：{trace['error']}",
+        }]
+    issues = enforce_code_set_review_evidence(issues, draft, raw_content)
+    return {
+        "program_issues": program_issues,
+        "review_kind": "AI",
+        "ai_issues": issues,
+        "ai_trace": trace,
+    }
+
+
+def compute_code_sets_for_block_snapshot(
+    block_snap: Dict[str, Any],
+    settings: Settings,
+    *,
+    review_with_ai: Any = "adaptive",
+    existing_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    llm: Any = None,
+    bus: Any = None,
+) -> List[Dict[str, Any]]:
+    """纯计算/HTTP 码表提取 Worker：零 SQLAlchemy 访问，返回待单写落库的码表草案清单。"""
+    block_id = str(block_snap["id"])
+    ordinal = int(block_snap.get("ordinal") or 0)
+    block_type = str(block_snap.get("block_type") or "")
+    raw_content = str(block_snap.get("raw_content") or "")
+    source_locator = dict(block_snap.get("source_locator") or {})
+    content = dict(block_snap.get("content_json") or {})
+
+    results: List[Dict[str, Any]] = []
+
+    cs_spec = content.get("code_set_spec")
+    if cs_spec and cs_spec.get("values"):
+        valid_vals = _clean_value_drafts(cs_spec["values"])
+        if valid_vals:
+            draft = CodeSetDraft(
+                code=cs_spec["code"],
+                name=cs_spec["name"],
+                definition=cs_spec.get("definition", ""),
+                source_type=cs_spec.get("source_type", "DOCUMENT_TABLE"),
+                values=valid_vals,
+            )
+            locator = {**source_locator, "block_id": block_id}
+            review = _compute_single_code_set_review(
+                draft,
+                raw_content,
+                source_locator,
+                settings,
+                review_with_ai=review_with_ai,
+                existing_state=existing_state,
+                llm=llm,
+                bus=bus,
+            )
+            results.append({"draft": draft, "locator": locator, **review})
+
+    inline_list = content.get("inline_code_sets") or []
+    for inline_cs in inline_list:
+        valid_vals = _clean_value_drafts(inline_cs.get("values") or [])
+        if not valid_vals:
+            continue
+        draft = CodeSetDraft(
+            code=inline_cs["code"],
+            name=inline_cs["name"],
+            definition=inline_cs.get("definition", ""),
+            source_type="INLINE_ENUM",
+            values=valid_vals,
+        )
+        locator = {
+            **source_locator,
+            "block_id": block_id,
+            "field_en": inline_cs.get("field_en", ""),
+            "page": inline_cs.get("page", ""),
+        }
+        review = _compute_single_code_set_review(
+            draft,
+            raw_content,
+            source_locator,
+            settings,
+            review_with_ai=review_with_ai,
+            existing_state=existing_state,
+            llm=llm,
+            bus=bus,
+        )
+        results.append({"draft": draft, "locator": locator, **review})
+
+    if not results and (block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} or content.get("candidate_role") == "CODE_SET"):
+        title = content.get("table_name") or source_locator.get("title") or source_locator.get("section") or f"码值表_{ordinal + 1}"
+        code_id = content.get("table_code") or re.sub(r"[^A-Z0-9_]", "_", f"CS_{block_id[:8]}".upper())
+        pairs = extract_code_pairs_from_section(raw_content, str(source_locator.get("section", "")), title)
+        valid_vals = _clean_value_drafts(pairs)
+        extra_warnings: List[Dict[str, Any]] = []
+        if not valid_vals:
+            if len(raw_content) > 6000:
+                extra_warnings.append(
+                    {
+                        "severity": "WARNING",
+                        "code": "RAW_CONTENT_TRUNCATED",
+                        "value": "",
+                        "message": f"原文长 {len(raw_content)} 字，AI 兜底抽取仅读取前 6000 字，请核对尾部码值是否完整",
+                    }
+                )
+            try:
+                active_llm = llm if llm is not None else RealDesignLlm(settings)
+                args, _ = call_llm_validated(
+                    active_llm,
+                    "assign_code_set",
+                    "从输入块中提取码值表代码、中文名、定义及全部码值项（value、label_cn、label_en、definition），不得虚构。",
+                    {"source_locator": source_locator, "raw_content": raw_content[:6000]},
+                    timeout=35,
+                    backoff=(1.0,),
+                    bus=bus,
+                    transient_attempts=2,
+                    validation_attempts=2,
+                )
+                valid_vals = _clean_value_drafts(args.get("values", []))
+                draft = CodeSetDraft(
+                    code=args.get("code") or code_id,
+                    name=args.get("name") or title,
+                    definition=args.get("definition", ""),
+                    source_type="AI_EXTRACTED",
+                    values=valid_vals,
+                )
+            except (BudgetExceededError, RunCancelledError, ProviderAuthOrBillingError):
+                raise
+            except Exception:
+                draft = CodeSetDraft(code=code_id, name=title, definition="待补充码值项", source_type="DOCUMENT_TABLE", values=[])
+        else:
+            draft = CodeSetDraft(
+                code=code_id,
+                name=title,
+                definition=f"从文档块 {title} 提取",
+                source_type="DOCUMENT_TABLE",
+                values=valid_vals,
+            )
+        if draft.values:
+            locator = {**source_locator, "block_id": block_id}
+            review = _compute_single_code_set_review(
+                draft,
+                raw_content,
+                source_locator,
+                settings,
+                review_with_ai=review_with_ai,
+                extra_program_issues=extra_warnings,
+                existing_state=existing_state,
+                llm=llm,
+                bus=bus,
+            )
+            results.append({"draft": draft, "locator": locator, **review})
+
+    return results
+
+
+def persist_computed_code_sets(
+    session: Session,
+    computed_items: List[Dict[str, Any]],
+    *,
+    auto_link: bool = False,
+) -> List[str]:
+    """在主协调线程单写落库已计算的码表草案及校验记录。"""
+    created_ids: List[str] = []
+    for item in computed_items:
+        draft: CodeSetDraft = item["draft"]
+        locator = item["locator"]
+        program_issues = item["program_issues"]
+        review_kind = item["review_kind"]
+        row, changed = _upsert_code_set_draft(session, draft, locator)
+        session.add(
+            CodeSetValidationModel(
+                id=str(uuid.uuid4()),
+                code_set_id=row.id,
+                validator_kind="PROGRAM",
+                status="NEEDS_REVIEW" if _has_error_issues(program_issues) else ("WARNING" if program_issues else "PASSED"),
+                issues_json=program_issues,
+                trace_json={"value_count": len(draft.values)},
+            )
+        )
+        if row.status != "PUBLISHED":
+            if review_kind == "NONE":
+                row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "PROGRAM_VALIDATED"
+            elif review_kind == "DETERMINISTIC":
+                session.add(
+                    CodeSetValidationModel(
+                        id=str(uuid.uuid4()),
+                        code_set_id=row.id,
+                        validator_kind="AI_REVIEW",
+                        status="PASSED",
+                        issues_json=[],
+                        trace_json=item["ai_trace"],
+                    )
+                )
+                row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "AI_SELF_VALIDATED"
+            elif review_kind == "NO_LLM":
+                row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "PROGRAM_VALIDATED"
+            elif review_kind == "SKIPPED_UNCHANGED":
+                existing_review = session.query(CodeSetValidationModel).filter(
+                    CodeSetValidationModel.code_set_id == row.id,
+                    CodeSetValidationModel.validator_kind == "AI_REVIEW",
+                ).first()
+                if changed or not existing_review:
+                    row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) else "AI_SELF_VALIDATED"
+            elif review_kind == "AI":
+                ai_issues = item["ai_issues"]
+                existing_review = session.query(CodeSetValidationModel).filter(
+                    CodeSetValidationModel.code_set_id == row.id,
+                    CodeSetValidationModel.validator_kind == "AI_REVIEW",
+                ).first()
+                if changed or not existing_review:
+                    session.add(
+                        CodeSetValidationModel(
+                            id=str(uuid.uuid4()),
+                            code_set_id=row.id,
+                            validator_kind="AI_REVIEW",
+                            status="NEEDS_REVIEW" if _has_error_issues(ai_issues) else "PASSED",
+                            issues_json=ai_issues,
+                            trace_json=item["ai_trace"],
+                        )
+                    )
+                    row.status = "NEEDS_REVIEW" if _has_error_issues(program_issues) or _has_error_issues(ai_issues) else "AI_SELF_VALIDATED"
+        created_ids.append(row.id)
+    if auto_link:
+        auto_link_all_references(session)
+    session.flush()
+    return created_ids
+
+
 def extract_code_sets_for_block(block_id: str, settings: Settings, auto_link: bool = True, review_with_ai: Any = "adaptive") -> List[str]:
     """Extract standalone CodeSets or inline field enum CodeSets from a RawBlockModel (Track B)."""
     with SessionLocal() as session:
         block = session.get(RawBlockModel, block_id)
         if not block:
             raise ValueError("Raw block not found")
-
-        created_ids: List[str] = []
-        content = block.content_json or {}
-
-        # Case 1: Block has pre-extracted standalone code_set_spec (from PDF Chapter 9 / Appendix / DOCX / XLSX)
-        cs_spec = content.get("code_set_spec")
-        if cs_spec and cs_spec.get("values"):
-            valid_vals = _clean_value_drafts(cs_spec["values"])
-            if valid_vals:
-                draft = CodeSetDraft(
-                    code=cs_spec["code"],
-                    name=cs_spec["name"],
-                    definition=cs_spec.get("definition", ""),
-                    source_type=cs_spec.get("source_type", "DOCUMENT_TABLE"),
-                    values=valid_vals,
-                )
-                row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
-                _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
-                created_ids.append(row.id)
-
-        # Case 2: Block has inline_code_sets (from table fields in Chapter 6 or Statistical System Section 四)
-        inline_list = content.get("inline_code_sets") or []
-        for inline_cs in inline_list:
-            valid_vals = _clean_value_drafts(inline_cs.get("values") or [])
-            if not valid_vals:
-                continue
-            draft = CodeSetDraft(
-                code=inline_cs["code"],
-                name=inline_cs["name"],
-                definition=inline_cs.get("definition", ""),
-                source_type="INLINE_ENUM",
-                values=valid_vals,
-            )
-            row, changed = _upsert_code_set_draft(
-                session,
-                draft,
-                {
-                    **block.source_locator,
-                    "block_id": block.id,
-                    "field_en": inline_cs.get("field_en", ""),
-                    "page": inline_cs.get("page", ""),
-                },
-            )
-            _record_code_set_validation(session, row, draft, block, settings, changed, review_with_ai=review_with_ai)
-            created_ids.append(row.id)
-
-        # Case 3: Unstructured block routed as CODE_SET without pre-extracted values -> regex + AI fallback
-        if not created_ids and (block.block_type in {"CODE_SET", "CODE_SET_CANDIDATE"} or content.get("candidate_role") == "CODE_SET"):
-            title = content.get("table_name") or block.source_locator.get("title") or block.source_locator.get("section") or f"码值表_{block.ordinal + 1}"
-            code_id = content.get("table_code") or re.sub(r"[^A-Z0-9_]", "_", f"CS_{block.id[:8]}".upper())
-            pairs = extract_code_pairs_from_section(block.raw_content, str(block.source_locator.get("section", "")), title)
-            valid_vals = _clean_value_drafts(pairs)
-            extra_warnings: List[Dict[str, Any]] = []
-            if not valid_vals:
-                if len(block.raw_content or "") > 6000:
-                    extra_warnings.append(
-                        {
-                            "severity": "WARNING",
-                            "code": "RAW_CONTENT_TRUNCATED",
-                            "value": "",
-                            "message": f"原文长 {len(block.raw_content)} 字，AI 兜底抽取仅读取前 6000 字，请核对尾部码值是否完整",
-                        }
-                    )
-                try:
-                    llm = RealDesignLlm(settings)
-                    args, _ = call_llm_validated(
-                        llm,
-                        "assign_code_set",
-                        "从输入块中提取码值表代码、中文名、定义及全部码值项（value、label_cn、label_en、definition），不得虚构。",
-                        {"source_locator": block.source_locator, "raw_content": block.raw_content[:6000]},
-                        timeout=35,
-                        backoff=(1.0,),
-                        transient_attempts=2,
-                        validation_attempts=2,
-                    )
-                    valid_vals = _clean_value_drafts(args.get("values", []))
-                    draft = CodeSetDraft(
-                        code=args.get("code") or code_id,
-                        name=args.get("name") or title,
-                        definition=args.get("definition", ""),
-                        source_type="AI_EXTRACTED",
-                        values=valid_vals,
-                    )
-                except (BudgetExceededError, RunCancelledError):
-                    raise
-                except Exception:
-                    draft = CodeSetDraft(code=code_id, name=title, definition="待补充码值项", source_type="DOCUMENT_TABLE", values=[])
-            else:
-                draft = CodeSetDraft(
-                    code=code_id,
-                    name=title,
-                    definition=f"从文档块 {title} 提取",
-                    source_type="DOCUMENT_TABLE",
-                    values=valid_vals,
-                )
-            if draft.values:
-                row, changed = _upsert_code_set_draft(session, draft, {**block.source_locator, "block_id": block.id})
-                _record_code_set_validation(
-                    session,
-                    row,
-                    draft,
-                    block,
-                    settings,
-                    changed,
-                    review_with_ai=review_with_ai,
-                    extra_program_issues=extra_warnings,
-                )
-                created_ids.append(row.id)
-
-        if auto_link:
-            auto_link_all_references(session)
+        existing_state = preload_existing_code_sets_state(session)
+        snap = {
+            "id": block.id,
+            "document_id": block.document_id,
+            "ordinal": int(block.ordinal or 0),
+            "block_type": block.block_type,
+            "raw_content": block.raw_content or "",
+            "raw_hash": block.raw_hash or "",
+            "source_locator": dict(block.source_locator or {}),
+            "content_json": dict(block.content_json or {}),
+        }
+        computed_items = compute_code_sets_for_block_snapshot(
+            snap,
+            settings,
+            review_with_ai=review_with_ai,
+            existing_state=existing_state,
+        )
+        created_ids = persist_computed_code_sets(session, computed_items, auto_link=auto_link)
         session.commit()
         return created_ids
 

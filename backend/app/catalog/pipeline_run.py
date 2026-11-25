@@ -1,33 +1,34 @@
-"""Step 1 文档导入与解析的统一 Run 控制面（Layer 5: engine）。
+"""Step 0 + Step 1 文档导入与解析的统一 Run 控制面（Layer 4: catalog/pipeline_run）。
 
-将原本散落在 `api/documents.py` 的后台线程与纯内存进度表统一收编至 ProdAgent 微内核 `kernel.run`：
-1. 每次 `prepare`（结构体检 + 初步切块）与 `extract`（多块并行元数据 + 码表提取）均创建独立 `RunModel(spec_id=document_id)`，
-   通过 `RUN_CREATED(run_kind="INGESTION")` 写入 `EventLog` 不可变哈希链；
-2. 后台执行经由 `kernel.run.submit_run` 挂载 `CancellationToken` 注册到全局 `run_registry()`，
-   同时通过 `llm_execution_scope` 将 Run 级 `Bus` + `BudgetGuard` + `CancellationToken` 自动透传至所有深层 LLM 调用；
-3. 实时进度同步写入内存 `import_progress`（低延迟 + `document.progress` SSE）与 `EventLog`（`INGESTION_STAGE` / `INGESTION_COMPLETED` / `RUN_CANCELLED` / `RUN_FAILED`），
-   服务重启后可从 `EventLog` 完整还原阶段、日志与 `budget_usage`，并由 `recover_interrupted_ingestion_runs()` 自动回收僵尸任务。
+将文档体检/切块（prepare）与双轨并行解析（extract）统一纳入 ProdAgent `Scheduler + WorkflowPlan + Channel`：
+1. `INGESTION_PREPARE_PLAN` 驱动 `prepare -> document_overview -> initial_chunking -> prepare_completed`；
+2. `INGESTION_EXTRACT_PLAN` 驱动 `extract -> document_structure? -> extract_dispatch -> Send("block_extract_worker") -> parallel_extraction`；
+3. `block_extract_worker` 纯内存计算/调用大模型（零 DB 访问），屏障主线程统一落库并写 `BLOCK_EXTRACTED` 检查点，
+   中途取消/预算超限/402 熔断后再次运行可跳过已落库块实现零重复续跑。
 """
 
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.infra.config import Settings, get_budget, get_settings
+from app.infra.db import SessionLocal
 from app.infra.db_tables import (
+    CodeSetModel,
     DocumentArchitectureModel,
+    EventModel,
     FieldCodeReferenceModel,
     FieldMetadataModel,
     RawBlockModel,
+    RunModel,
     SourceDocumentModel,
     TableMetadataModel,
 )
-from app.infra.config import Settings, get_settings
-from app.infra.db import SessionLocal
-from app.infra.errors import WorkflowError
-from app.infra.db_tables import EventModel, RunModel
-from app.infra.config import get_budget
+from app.infra.errors import ProviderAuthOrBillingError, WorkflowError
+from app.infra.llm import configure_llm_concurrency, configure_llm_rate_limit
+from app.infra.llm.guard import llm_execution_scope
 from app.ingestion.import_progress import STAGE_LABELS
 from app.ingestion.import_progress import ensure as progress_ensure
 from app.ingestion.import_progress import finish as progress_finish
@@ -37,8 +38,6 @@ from app.ingestion.import_progress import update as progress_update
 from app.kernel.event_log import append_event, verify_chain
 from app.kernel.run import (
     BudgetExceededError,
-    BudgetGuard,
-    BudgetLimits,
     CancellationToken,
     RunCancelledError,
     cancel_run as kernel_cancel_run,
@@ -48,10 +47,13 @@ from app.kernel.run import (
     run_registry,
     submit_run as kernel_submit_run,
 )
-from app.infra.llm.guard import llm_execution_scope
-from app.policy.regops_bus import default_bus
+from app.kernel.scheduler import Outcome, Scheduler, Send, WaveExecutionError
+from app.policy.regops_bus import build_child_bus
+from app.policy.regops_channels import build_ingestion_context, recover_ingestion_checkpoint
 from app.policy.regops_plan import (
     ACTIVE_INGESTION_STATUSES,
+    INGESTION_EXTRACT_PLAN,
+    INGESTION_PREPARE_PLAN,
     project_ingestion,
     project_ingestion_many,
 )
@@ -62,6 +64,17 @@ def _stages_catalog() -> List[Dict[str, Any]]:
         {"index": index, "label": label, "description": description}
         for index, (label, description) in STAGE_LABELS.items()
     ]
+
+
+def _unwrap_wave_error(exc: BaseException) -> BaseException:
+    if not isinstance(exc, WaveExecutionError):
+        return exc
+    errs = list(getattr(exc, "errors", []) or [])
+    for priority_type in (RunCancelledError, ProviderAuthOrBillingError, BudgetExceededError):
+        for _label, err in errs:
+            if isinstance(err, priority_type):
+                return err
+    return getattr(exc, "first_error", exc)
 
 
 def _is_ingestion_run(session: Session, run: RunModel) -> bool:
@@ -135,10 +148,39 @@ def list_document_runs(session: Session, document_id: str, limit: int = 20) -> L
     return items
 
 
-def _record_stage(
+def _create_ingestion_run(
     session: Session,
-    run: RunModel,
-    bus: Any,
+    *,
+    document_id: str,
+    file_name: str,
+    phase: str,
+    stage: int,
+    detail: str,
+    counters: Optional[Dict[str, Any]] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> RunModel:
+    init_payload: Dict[str, Any] = {
+        "run_kind": "INGESTION",
+        "document_id": document_id,
+        "file_name": file_name,
+        "phase": phase,
+        "stage": stage,
+        "detail": detail,
+        "counters": dict(counters or {}),
+    }
+    if extra_payload:
+        init_payload.update(extra_payload)
+    run = kernel_create_run(
+        session,
+        document_id,
+        initial_node=phase,
+        initial_payload=init_payload,
+    )
+    session.commit()
+    return run
+
+
+def _stage_payload(
     *,
     stage: Optional[int] = None,
     node: str = "ingestion",
@@ -146,7 +188,7 @@ def _record_stage(
     counters: Optional[Dict[str, Any]] = None,
     log: Optional[str] = None,
     budget_usage: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"node": node, "at": time.time()}
     if stage is not None:
         payload["stage"] = stage
@@ -158,36 +200,31 @@ def _record_stage(
         payload["log"] = log
     if budget_usage is not None:
         payload["budget_usage"] = budget_usage
-    append_event(session, run, "INGESTION_STAGE", node, payload, bus=bus)
-    session.commit()
+    return payload
 
 
-def _create_ingestion_run(
-    session: Session,
-    *,
-    document_id: str,
-    file_name: str,
-    phase: str,
-    stage: int,
-    detail: str,
-    counters: Optional[Dict[str, Any]] = None,
-) -> RunModel:
-    run = kernel_create_run(
-        session,
-        document_id,
-        initial_node=phase,
-        initial_payload={
-            "run_kind": "INGESTION",
-            "document_id": document_id,
-            "file_name": file_name,
-            "phase": phase,
-            "stage": stage,
-            "detail": detail,
-            "counters": dict(counters or {}),
-        },
-    )
-    session.commit()
-    return run
+def _ingestion_error_details(exc: BaseException, current_node: str) -> Dict[str, Any]:
+    if isinstance(exc, BudgetExceededError):
+        return {
+            "stage": current_node,
+            "error_type": type(exc).__name__,
+            "error_kind": "budget",
+            "metric": exc.metric,
+            "used": exc.used,
+            "limit": exc.limit,
+            "budget_snapshot": exc.snapshot,
+        }
+    if isinstance(exc, ProviderAuthOrBillingError):
+        return {
+            "stage": current_node,
+            "error_type": type(exc).__name__,
+            "error_kind": "billing_or_auth",
+        }
+    return {
+        "stage": current_node,
+        "error_type": type(exc).__name__,
+        "error_kind": "ingestion",
+    }
 
 
 def start_document_prepare_run(
@@ -204,7 +241,7 @@ def start_document_prepare_run(
     reextract_blocks_fn: Optional[Callable[..., Any]] = None,
     store_blocks_fn: Optional[Callable[..., Any]] = None,
 ) -> str:
-    """创建并提交 Step 1 文档结构检查与切块（prepare）Run。"""
+    """创建并提交 Step 0/1 文档结构检查与切块（prepare）Run（由 INGESTION_PREPARE_PLAN 驱动）。"""
     sf = session_factory if session_factory is not None else SessionLocal
     from app.ingestion.structure_service import inspect_document_overview, reextract_document_blocks
 
@@ -303,136 +340,168 @@ def start_document_prepare_run(
             budget_cfg = get_budget(own_session)
 
     def _drive_prepare(db: Session, run: RunModel, token: CancellationToken) -> None:
-        run_bus = default_bus()
-        guard = BudgetGuard(BudgetLimits.from_dict(budget_cfg), run_id=run.id).attach(run_bus)
+        concurrency = max(1, int(budget_cfg.get("max_llm_concurrency", 4)))
+        configure_llm_concurrency(concurrency)
+        configure_llm_rate_limit(int(budget_cfg.get("max_llm_rpm") or 0))
+        ctx = build_ingestion_context(
+            db,
+            run,
+            settings,
+            budget=budget_cfg,
+            concurrency=concurrency,
+            cancellation=token,
+            shared={"document_id": document_id, "phase": "prepare"},
+        )
+        guard = ctx.budget_guard
         current_node = "document_overview"
 
-        try:
-            with llm_execution_scope(bus=run_bus, cancellation=token):
-                token.raise_if_cancelled()
-                progress_update(
-                    document_id,
-                    stage=2,
-                    status="WORKING",
-                    detail="AI 正在判断文档结构与切块方式",
-                    log="开始检查整份文件结构",
-                )
-                _record_stage(
-                    db,
-                    run,
-                    run_bus,
-                    stage=2,
-                    node="document_overview",
-                    detail="AI 正在判断文档结构与切块方式",
-                    log="开始检查整份文件结构",
-                )
+        def _node_document_overview(_inp: Any, local_ctx: Any) -> Outcome:
+            nonlocal current_node
+            current_node = "document_overview"
+            progress_update(
+                document_id,
+                stage=2,
+                status="WORKING",
+                detail="AI 正在判断文档结构与切块方式",
+                log="开始检查整份文件结构",
+            )
+            with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
                 overview_fn(document_id, settings, force=reimport_deleted)
-                token.raise_if_cancelled()
-
-                db.expire_all()
-                run = db.get(RunModel, run_id) or run
-                doc = db.get(SourceDocumentModel, document_id)
-                doc_status = doc.status if doc else ""
-                if doc_status == "OVERVIEW_FAILED":
-                    progress_update(
-                        document_id,
-                        detail="结构体检未完成，继续按文件类型切块",
-                        log="结构体检失败，跳过诊断信息，直接进入切块",
-                    )
-
-                current_node = "initial_chunking"
+            db.expire_all()
+            doc = db.get(SourceDocumentModel, document_id)
+            if doc and doc.status == "OVERVIEW_FAILED":
                 progress_update(
                     document_id,
-                    stage=3,
-                    detail="正在按文件类型切分内容块",
-                    log="结构检查完成，开始初步切块",
+                    detail="结构体检未完成，继续按文件类型切块",
+                    log="结构体检失败，跳过诊断信息，直接进入切块",
                 )
-                _record_stage(
-                    db,
-                    run,
-                    run_bus,
-                    stage=3,
-                    node="initial_chunking",
-                    detail="正在按文件类型切分内容块",
-                    log="结构检查完成，开始初步切块",
-                    budget_usage=guard.snapshot(),
-                )
+            return Outcome(
+                when="always",
+                events=[
+                    (
+                        "INGESTION_STAGE",
+                        "document_overview",
+                        _stage_payload(
+                            stage=2,
+                            node="document_overview",
+                            detail="AI 正在判断文档结构与切块方式",
+                            log="开始检查整份文件结构",
+                            budget_usage=guard.snapshot() if guard else None,
+                        ),
+                    )
+                ],
+            )
+
+        def _node_initial_chunking(_inp: Any, local_ctx: Any) -> Outcome:
+            nonlocal current_node
+            current_node = "initial_chunking"
+            progress_update(
+                document_id,
+                stage=3,
+                detail="正在按文件类型切分内容块",
+                log="结构检查完成，开始初步切块",
+            )
+            with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
                 if reimport_deleted:
                     reextract_fn(document_id, settings)
                 else:
                     store_blocks_fn(document_id)
-                token.raise_if_cancelled()
+            db.expire_all()
+            doc = db.get(SourceDocumentModel, document_id)
+            count = doc.block_count if doc else 0
+            final_doc_status = doc.status if doc else "UPLOADED"
+            budget_snap = guard.snapshot() if guard else None
+            progress_update(
+                document_id,
+                counters={"blocks": count},
+                detail=f"已生成 {count} 个内容块",
+                log=f"初步切块完成：{count} 个内容块",
+            )
+            progress_finish(document_id, status="READY", detail="结构检查与切块完成，可以开始解析字段")
+            return Outcome(
+                when="always",
+                output={"blocks": count, "document_status": final_doc_status},
+                events=[
+                    (
+                        "INGESTION_STAGE",
+                        "initial_chunking",
+                        _stage_payload(
+                            stage=3,
+                            node="initial_chunking",
+                            detail="正在按文件类型切分内容块",
+                            log="结构检查完成，开始初步切块",
+                            budget_usage=budget_snap,
+                        ),
+                    ),
+                    (
+                        "INGESTION_COMPLETED",
+                        "prepare_completed",
+                        {
+                            "stage": 3,
+                            "progress_status": "READY",
+                            "detail": "结构检查与切块完成，可以开始解析字段",
+                            "counters": {"blocks": count},
+                            "document_status": final_doc_status,
+                            "budget_usage": budget_snap,
+                        },
+                    ),
+                ],
+            )
 
-                db.expire_all()
-                run = db.get(RunModel, run_id) or run
-                doc = db.get(SourceDocumentModel, document_id)
-                count = doc.block_count if doc else 0
-                final_doc_status = doc.status if doc else "UPLOADED"
-
-                budget_snap = guard.snapshot()
-                progress_update(
-                    document_id,
-                    counters={"blocks": count},
-                    detail=f"已生成 {count} 个内容块",
-                    log=f"初步切块完成：{count} 个内容块",
-                )
-                progress_finish(document_id, status="READY", detail="结构检查与切块完成，可以开始解析字段")
-                append_event(
-                    db,
-                    run,
-                    "INGESTION_COMPLETED",
-                    "initial_chunking",
-                    {
-                        "stage": 3,
-                        "progress_status": "READY",
-                        "detail": "结构检查与切块完成，可以开始解析字段",
-                        "counters": {"blocks": count},
-                        "document_status": final_doc_status,
-                        "budget_usage": budget_snap,
-                    },
-                    bus=run_bus,
-                )
-                run_bus.fire("run.completed", {"run_id": run.id, "node": "initial_chunking", "status": "COMPLETED"})
-                db.commit()
+        sched = Scheduler(
+            INGESTION_PREPARE_PLAN,
+            {
+                "document_overview": _node_document_overview,
+                "initial_chunking": _node_initial_chunking,
+            },
+        )
+        try:
+            sched.drive(ctx, max_workers=1)
         except RunCancelledError as exc:
-            budget_snap = guard.snapshot()
+            budget_snap = guard.snapshot() if guard else None
             progress_finish(document_id, status="FAILED", detail=f"已人工中止：{exc.reason}")
-            run = db.get(RunModel, run_id) or run
+            fresh_run = db.get(RunModel, run_id) or run
             kernel_record_run_cancelled(
                 db,
-                run,
+                fresh_run,
                 node=current_node,
                 reason=exc.reason,
                 extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "prepare"},
-                bus=run_bus,
+                bus=ctx.bus,
                 commit=True,
             )
-        except Exception as exc:  # noqa: BLE001
-            budget_snap = guard.snapshot()
-            label = "预算熔断" if isinstance(exc, BudgetExceededError) else f"处理失败（{type(exc).__name__}）"
-            progress_finish(document_id, status="FAILED", detail=f"{label}：{exc}")
-            err_details = (
-                {
-                    "stage": current_node,
-                    "error_type": type(exc).__name__,
-                    "error_kind": "budget",
-                    "metric": exc.metric,
-                    "used": exc.used,
-                    "limit": exc.limit,
-                    "budget_snapshot": exc.snapshot,
-                }
-                if isinstance(exc, BudgetExceededError)
-                else {"stage": current_node, "error_type": type(exc).__name__, "error_kind": "ingestion"}
+        except BaseException as exc:
+            root = _unwrap_wave_error(exc)
+            if isinstance(root, RunCancelledError):
+                budget_snap = guard.snapshot() if guard else None
+                progress_finish(document_id, status="FAILED", detail=f"已人工中止：{root.reason}")
+                fresh_run = db.get(RunModel, run_id) or run
+                kernel_record_run_cancelled(
+                    db,
+                    fresh_run,
+                    node=current_node,
+                    reason=root.reason,
+                    extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "prepare"},
+                    bus=ctx.bus,
+                    commit=True,
+                )
+                return
+            budget_snap = guard.snapshot() if guard else None
+            label = (
+                "预算熔断"
+                if isinstance(root, BudgetExceededError)
+                else ("账单/鉴权受限" if isinstance(root, ProviderAuthOrBillingError) else f"处理失败（{type(root).__name__}）")
             )
-            run = db.get(RunModel, run_id) or run
+            progress_finish(document_id, status="FAILED", detail=f"{label}：{root}")
+            fresh_run = db.get(RunModel, run_id) or run
             kernel_fail_run(
                 db,
-                run,
+                fresh_run,
                 node=current_node,
-                error=f"{type(exc).__name__}: {exc}",
-                error_details=err_details,
+                error=f"{type(root).__name__}: {root}",
+                error_details=_ingestion_error_details(root, current_node),
                 extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "prepare"},
-                bus=run_bus,
+                bus=ctx.bus,
                 commit=True,
             )
 
@@ -461,9 +530,14 @@ def start_document_extract_run(
     analyze_structure_fn: Optional[Callable[..., Any]] = None,
     extract_parallel_fn: Optional[Callable[..., Any]] = None,
 ) -> str:
-    """创建并提交 Step 1 文档多块并发解析（extract）Run。"""
+    """创建并提交 Step 1 文档多块并行解析（extract）Run（由 INGESTION_EXTRACT_PLAN 驱动，支持块级断点续跑）。"""
     sf = session_factory if session_factory is not None else SessionLocal
-    from app.catalog.extraction import extract_parallel_for_blocks
+    from app.catalog.extraction import (
+        execute_block_task,
+        extract_parallel_for_blocks,
+        persist_block_extraction_outputs,
+        prepare_block_extraction_tasks,
+    )
     from app.ingestion.structure_service import analyze_document_structure
 
     analyze_fn = analyze_structure_fn or analyze_document_structure
@@ -489,6 +563,7 @@ def start_document_extract_run(
             stage=4,
             detail=f"准备解析 {total} 个内容块",
             counters={"blocks_total": total, "blocks_done": 0},
+            extra_payload={"needs_analysis": bool(needs_analysis)},
         )
         run_id = run.id
         budget_cfg = get_budget(session)
@@ -502,14 +577,63 @@ def start_document_extract_run(
                 stage=4,
                 detail=f"准备解析 {total} 个内容块",
                 counters={"blocks_total": total, "blocks_done": 0},
+                extra_payload={"needs_analysis": bool(needs_analysis)},
             )
             run_id = run.id
             budget_cfg = get_budget(own_session)
 
     def _drive_extract(db: Session, run: RunModel, token: CancellationToken) -> None:
-        run_bus = default_bus()
-        guard = BudgetGuard(BudgetLimits.from_dict(budget_cfg), run_id=run.id).attach(run_bus)
-        current_node = "document_structure" if needs_analysis else "parallel_extraction"
+        concurrency = max(1, int(budget_cfg.get("max_llm_concurrency", 4)))
+        configure_llm_concurrency(concurrency)
+        configure_llm_rate_limit(int(budget_cfg.get("max_llm_rpm") or 0))
+        per_block_calls = int(budget_cfg.get("max_calls_per_table") or 0)
+
+        ctx = build_ingestion_context(
+            db,
+            run,
+            settings,
+            budget=budget_cfg,
+            concurrency=concurrency,
+            cancellation=token,
+            shared={"document_id": document_id, "phase": "extract"},
+        )
+        guard = ctx.budget_guard
+        current_node = "document_structure" if needs_analysis else "extract_dispatch"
+        dispatch_state: Dict[str, Any] = {
+            "custom_hook": False,
+            "prep": None,
+            "reused_table_ids": [],
+            "reused_cs_ids": [],
+            "skipped_checkpoint_events": [],
+        }
+
+        def _on_block(done: int, count: int, tables: int) -> None:
+            detail_msg = f"正在逐块提取字段与码表（{done}/{count}）"
+            log_msg = f"已完成 {done}/{count} 个内容块，产出 {tables} 张报表"
+            progress_update(
+                document_id,
+                detail=detail_msg,
+                counters={"blocks_total": count, "blocks_done": done, "tables": tables},
+                log=log_msg,
+            )
+            cur_run = db.get(RunModel, run_id)
+            if cur_run is not None:
+                append_event(
+                    db,
+                    cur_run,
+                    "INGESTION_STAGE",
+                    "parallel_extraction",
+                    _stage_payload(
+                        stage=4,
+                        node="parallel_extraction",
+                        detail=detail_msg,
+                        counters={"blocks_total": count, "blocks_done": done, "tables": tables},
+                        log=log_msg,
+                        budget_usage=guard.snapshot() if guard else None,
+                    ),
+                    bus=ctx.bus,
+                )
+                db.commit()
 
         progress_update(
             document_id,
@@ -519,76 +643,321 @@ def start_document_extract_run(
             counters={"blocks_total": total, "blocks_done": 0},
             log=f"开始解析 {total} 个内容块",
         )
-        _record_stage(
-            db,
-            run,
-            run_bus,
-            stage=4,
-            node=current_node,
-            detail=f"正在逐块提取字段与码表（0/{total}）",
-            counters={"blocks_total": total, "blocks_done": 0},
-            log=f"开始解析 {total} 个内容块",
-        )
 
-        try:
-            with llm_execution_scope(bus=run_bus, cancellation=token):
-                token.raise_if_cancelled()
-                if needs_analysis:
-                    analyze_fn(document_id, settings)
-                token.raise_if_cancelled()
-
-                current_node = "parallel_extraction"
-
-                def _on_block(done: int, count: int, tables: int) -> None:
-                    detail_msg = f"正在逐块提取字段与码表（{done}/{count}）"
-                    log_msg = f"已完成 {done}/{count} 个内容块，产出 {tables} 张报表"
-                    progress_update(
-                        document_id,
-                        detail=detail_msg,
-                        counters={"blocks_total": count, "blocks_done": done, "tables": tables},
-                        log=log_msg,
-                    )
-                    cur_run = db.get(RunModel, run_id)
-                    if cur_run is not None:
-                        _record_stage(
-                            db,
-                            cur_run,
-                            run_bus,
+        def _node_document_structure(_inp: Any, local_ctx: Any) -> Outcome:
+            nonlocal current_node
+            current_node = "document_structure"
+            with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
+                analyze_fn(document_id, settings)
+            return Outcome(
+                when="always",
+                events=[
+                    (
+                        "INGESTION_STAGE",
+                        "document_structure",
+                        _stage_payload(
                             stage=4,
-                            node="parallel_extraction",
-                            detail=detail_msg,
-                            counters={"blocks_total": count, "blocks_done": done, "tables": tables},
-                            log=log_msg,
-                            budget_usage=guard.snapshot(),
+                            node="document_structure",
+                            detail="文档结构重整完成，准备双轨提取",
+                            budget_usage=guard.snapshot() if guard else None,
+                        ),
+                    )
+                ],
+            )
+
+        def _node_extract_dispatch(_inp: Any, local_ctx: Any) -> Outcome:
+            nonlocal current_node
+            current_node = "extract_dispatch"
+            if parallel_fn is not extract_parallel_for_blocks:
+                dispatch_state["custom_hook"] = True
+                return Outcome(when="direct", output={"custom_hook": True})
+
+            checkpoints = recover_ingestion_checkpoint(db, document_id, exclude_run_id=run_id)
+            valid_skips: Set[Tuple[str, str]] = set()
+            reused_events: List[tuple] = []
+            reused_table_ids: List[str] = []
+            reused_cs_ids: List[str] = []
+
+            if checkpoints:
+                raw_rows = db.query(RawBlockModel).filter(RawBlockModel.id.in_(block_ids)).all()
+                hash_by_id = {r.id: (r.raw_hash or "") for r in raw_rows}
+                tbl_by_block = {
+                    r.block_id: r.id
+                    for r in db.query(TableMetadataModel.id, TableMetadataModel.block_id)
+                    .filter(TableMetadataModel.block_id.in_(block_ids))
+                    .all()
+                }
+                cs_rows = (
+                    db.query(CodeSetModel.id, CodeSetModel.definition)
+                    .filter(CodeSetModel.id.isnot(None))
+                    .all()
+                )
+                has_any_cs = bool(cs_rows)
+                for ck_key, ck_hash in checkpoints.items():
+                    if ":" not in ck_key:
+                        continue
+                    track, bid = ck_key.split(":", 1)
+                    if bid not in hash_by_id or hash_by_id[bid] != ck_hash:
+                        continue
+                    if track == "metadata" and bid in tbl_by_block:
+                        valid_skips.add(("metadata", bid))
+                        reused_table_ids.append(tbl_by_block[bid])
+                        reused_events.append(
+                            ("BLOCK_EXTRACTED", "extract_dispatch", {"block_id": bid, "track": "metadata", "raw_hash": ck_hash, "reused": True})
+                        )
+                    elif track == "code_sets" and has_any_cs:
+                        valid_skips.add(("code_sets", bid))
+                        reused_events.append(
+                            ("BLOCK_EXTRACTED", "extract_dispatch", {"block_id": bid, "track": "code_sets", "raw_hash": ck_hash, "reused": True})
                         )
 
-                result = parallel_fn(block_ids, settings, targets, on_progress=_on_block)
-                token.raise_if_cancelled()
-                final_status = "EXTRACTION_PARTIAL" if result.get("errors") else "EXTRACTED"
-                if result.get("errors") and not result.get("table_ids") and not result.get("code_set_ids"):
-                    final_status = "EXTRACTION_FAILED"
-        except RunCancelledError as exc:
-            budget_snap = guard.snapshot()
-            db.expire_all()
+            with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
+                prep = prepare_block_extraction_tasks(
+                    db,
+                    block_ids,
+                    settings,
+                    targets=targets,
+                    skip_keys=valid_skips,
+                    cancellation=token,
+                )
+            dispatch_state["prep"] = prep
+            dispatch_state["reused_table_ids"] = reused_table_ids
+            dispatch_state["reused_cs_ids"] = reused_cs_ids
+
+            tasks: List[Dict[str, Any]] = prep["tasks"]
+            existing_cs_state = prep["existing_cs_state"]
+            if not tasks:
+                return Outcome(
+                    when="direct",
+                    output={"all_cached": True},
+                    events=[
+                        *reused_events,
+                        (
+                            "INGESTION_STAGE",
+                            "extract_dispatch",
+                            _stage_payload(
+                                stage=4,
+                                node="extract_dispatch",
+                                detail=f"命中检查点跳过 {len(valid_skips)} 个已提取块，准备自动对齐",
+                                budget_usage=guard.snapshot() if guard else None,
+                            ),
+                        ),
+                    ],
+                )
+
+            sends = [
+                Send(
+                    "block_extract_worker",
+                    {"task": t, "existing_cs_state": existing_cs_state},
+                    label=f"{t['track']}:{t['block_id'][:8]}",
+                )
+                for t in tasks
+            ]
+            return Outcome(
+                when="fanout",
+                sends=sends,
+                events=[
+                    *reused_events,
+                    (
+                        "INGESTION_STAGE",
+                        "extract_dispatch",
+                        _stage_payload(
+                            stage=4,
+                            node="extract_dispatch",
+                            detail=f"已派发 {len(tasks)} 个提取任务（跳过 {len(valid_skips)} 个已检查点块）",
+                            budget_usage=guard.snapshot() if guard else None,
+                        ),
+                    ),
+                ],
+            )
+
+        def _node_block_extract_worker(item: Dict[str, Any], local_ctx: Any) -> Outcome:
+            task = item["task"]
+            bid = task["block_id"]
+            track = task["track"]
+            raw_hash = task.get("raw_hash") or ""
+            worker_bus = (
+                build_child_bus(local_ctx.bus, max_llm_calls=per_block_calls, run_id=run_id)
+                if per_block_calls > 0
+                else local_ctx.bus
+            )
+            with llm_execution_scope(bus=worker_bus, cancellation=token):
+                try:
+                    out = execute_block_task(
+                        task,
+                        settings,
+                        bus=worker_bus,
+                        existing_cs_state=item["existing_cs_state"],
+                        cancellation=token,
+                    )
+                except BudgetExceededError as exc:
+                    if per_block_calls > 0 and guard is not None:
+                        parent_snap = guard.snapshot()
+                        parent_limits = guard.limits
+                        parent_breached = bool(
+                            (parent_limits.max_llm_calls is not None and parent_snap["llm_calls"] >= parent_limits.max_llm_calls)
+                            or (parent_limits.max_total_tokens is not None and parent_snap["total_tokens"] >= parent_limits.max_total_tokens)
+                            or (parent_limits.max_elapsed_seconds is not None and parent_snap["elapsed_seconds"] >= parent_limits.max_elapsed_seconds)
+                        )
+                        if not parent_breached:
+                            out = {
+                                "track": track,
+                                "block_id": bid,
+                                "raw_hash": raw_hash,
+                                "error": f"BudgetExceededError: {exc}",
+                            }
+                        else:
+                            raise
+                    else:
+                        raise
+
+            channel_key = "block_codeset_outputs" if track == "code_sets" else "block_meta_outputs"
+            shared_delta: Dict[str, Any] = {channel_key: {bid: out}}
+            ev_list: List[tuple] = []
+            if "error" in out:
+                shared_delta["block_errors"] = {"block_id": bid, "track": track, "error": out["error"]}
+            else:
+                shared_delta["blocks_completed"] = {f"{track}:{bid}": raw_hash}
+                ev_list.append(
+                    (
+                        "BLOCK_EXTRACTED",
+                        "block_extract_worker",
+                        {"block_id": bid, "track": track, "raw_hash": raw_hash, "label": f"{track}:{bid[:8]}"},
+                    )
+                )
+            return Outcome(shared=shared_delta, output={"track": track, "block_id": bid}, events=ev_list)
+
+        def _node_parallel_extraction(_payload: Any, local_ctx: Any) -> Outcome:
+            nonlocal current_node
+            current_node = "parallel_extraction"
+            if dispatch_state["custom_hook"]:
+                with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
+                    result = parallel_fn(block_ids, settings, targets, on_progress=_on_block)
+            else:
+                prep = dispatch_state["prep"] or {
+                    "ordered_meta_ids": [],
+                    "ordered_cs_ids": [],
+                    "pre_errors": [],
+                }
+                result = persist_block_extraction_outputs(
+                    db,
+                    local_ctx.get("block_meta_outputs") or {},
+                    local_ctx.get("block_codeset_outputs") or {},
+                    ordered_meta_ids=prep["ordered_meta_ids"],
+                    ordered_cs_ids=prep["ordered_cs_ids"],
+                    pre_errors=prep["pre_errors"],
+                    initial_table_ids=dispatch_state["reused_table_ids"],
+                    initial_code_set_ids=dispatch_state["reused_cs_ids"],
+                    on_progress=_on_block,
+                    auto_link=True,
+                )
+
+            token.raise_if_cancelled()
+            final_status = "EXTRACTION_PARTIAL" if result.get("errors") else "EXTRACTED"
+            if result.get("errors") and not result.get("table_ids") and not result.get("code_set_ids"):
+                final_status = "EXTRACTION_FAILED"
+
+            budget_snap = guard.snapshot() if guard else None
+            db.flush()
             doc = db.get(SourceDocumentModel, document_id)
             if doc:
-                doc.status = "EXTRACTION_FAILED"
-            progress_finish(document_id, status="FAILED", detail=f"已人工中止：{exc.reason}")
-            run = db.get(RunModel, run_id) or run
-            kernel_record_run_cancelled(
-                db,
-                run,
-                node=current_node,
-                reason=exc.reason,
-                extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "extract"},
-                bus=run_bus,
-                commit=True,
+                doc.status = final_status
+            db.add(
+                DocumentArchitectureModel(
+                    id=str(uuid.uuid4()),
+                    document_id=document_id,
+                    status=final_status,
+                    plan_json={"stage": "EXTRACTION", "result": result},
+                    warnings_json=[item.get("error", "解析未完成") for item in result.get("errors", [])],
+                    trace_json={
+                        "table_count": len(result.get("table_ids", [])),
+                        "code_set_count": len(result.get("code_set_ids", [])),
+                        "budget_usage": budget_snap,
+                    },
+                )
             )
-            return
-        except Exception as exc:  # noqa: BLE001
-            budget_snap = guard.snapshot()
-            err_msg = f"{type(exc).__name__}: {exc}"
-            db.expire_all()
+            tables = len(result.get("table_ids", []))
+            code_sets = len(result.get("code_set_ids", []))
+            if final_status == "EXTRACTION_FAILED":
+                err_detail = result["errors"][0]["error"] if result.get("errors") else "解析失败"
+                raise WorkflowError(
+                    err_detail,
+                    context={"stage": "parallel_extraction", "error_kind": "ingestion", "extract_result": result},
+                )
+
+            summary_text = f"解析完成：{tables} 张报表、{code_sets} 张码表"
+            final_counters = {"tables": tables, "code_sets": code_sets, "blocks_done": total, "blocks_total": total}
+            progress_update(document_id, counters=final_counters, log=summary_text)
+            progress_finish(document_id, status="DONE", detail=summary_text)
+            return Outcome(
+                shared={"extract_result": result},
+                output=result,
+                events=[
+                    (
+                        "INGESTION_COMPLETED",
+                        "parallel_extraction",
+                        {
+                            "stage": 4,
+                            "progress_status": "DONE",
+                            "detail": summary_text,
+                            "counters": final_counters,
+                            "document_status": final_status,
+                            "budget_usage": budget_snap,
+                            "result": result,
+                        },
+                    )
+                ],
+            )
+
+        sched = Scheduler(
+            INGESTION_EXTRACT_PLAN,
+            {
+                "document_structure": _node_document_structure,
+                "extract_dispatch": _node_extract_dispatch,
+                "block_extract_worker": _node_block_extract_worker,
+                "parallel_extraction": _node_parallel_extraction,
+            },
+        )
+        try:
+            sched.drive(ctx, max_workers=concurrency)
+        except BaseException as exc:
+            root = _unwrap_wave_error(exc)
+            # 波次中途触发取消/预算/欠费时，将 Scheduler 屏障已收集的部分已完成块落库保存，确保续跑 0 重复
+            partial_meta = ctx.get("block_meta_outputs") or {}
+            partial_cs = ctx.get("block_codeset_outputs") or {}
+            if (partial_meta or partial_cs) and not dispatch_state["custom_hook"]:
+                try:
+                    persist_block_extraction_outputs(
+                        db,
+                        partial_meta,
+                        partial_cs,
+                        auto_link=False,
+                    )
+                    db.flush()
+                except Exception:
+                    pass
+
+            budget_snap = guard.snapshot() if guard else None
+            if isinstance(root, RunCancelledError):
+                doc = db.get(SourceDocumentModel, document_id)
+                if doc:
+                    doc.status = "EXTRACTION_FAILED"
+                progress_finish(document_id, status="FAILED", detail=f"已人工中止：{root.reason}")
+                fresh_run = db.get(RunModel, run_id) or run
+                kernel_record_run_cancelled(
+                    db,
+                    fresh_run,
+                    node=current_node,
+                    reason=root.reason,
+                    extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "extract"},
+                    bus=ctx.bus,
+                    commit=True,
+                )
+                return
+
+            err_msg = f"{type(root).__name__}: {root}"
+            err_ctx = getattr(root, "context", None) or {}
+            custom_extract_result = err_ctx.get("extract_result")
             doc = db.get(SourceDocumentModel, document_id)
             if doc:
                 doc.status = "EXTRACTION_FAILED"
@@ -597,96 +966,28 @@ def start_document_extract_run(
                         id=str(uuid.uuid4()),
                         document_id=document_id,
                         status="EXTRACTION_FAILED",
-                        plan_json={"stage": "EXTRACTION", "result": {"table_ids": [], "code_set_ids": [], "errors": [{"error": err_msg}]}},
+                        plan_json={"stage": "EXTRACTION", "result": custom_extract_result or {"table_ids": [], "code_set_ids": [], "errors": [{"error": err_msg}]}},
                         warnings_json=[err_msg],
                         trace_json={"table_count": 0, "code_set_count": 0, "budget_usage": budget_snap},
                     )
                 )
             progress_finish(document_id, status="FAILED", detail=err_msg)
-            err_details = (
-                {
-                    "stage": current_node,
-                    "error_type": type(exc).__name__,
-                    "error_kind": "budget",
-                    "metric": exc.metric,
-                    "used": exc.used,
-                    "limit": exc.limit,
-                    "budget_snapshot": exc.snapshot,
-                }
-                if isinstance(exc, BudgetExceededError)
-                else {"stage": current_node, "error_type": type(exc).__name__, "error_kind": "ingestion"}
-            )
-            run = db.get(RunModel, run_id) or run
+            fresh_run = db.get(RunModel, run_id) or run
             kernel_fail_run(
                 db,
-                run,
+                fresh_run,
                 node=current_node,
-                error=err_msg,
-                error_details=err_details,
-                extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "extract"},
-                bus=run_bus,
+                error=str(root) if custom_extract_result else err_msg,
+                error_details=_ingestion_error_details(root, current_node),
+                extra_result={
+                    "budget_usage": budget_snap,
+                    "document_id": document_id,
+                    "phase": "extract",
+                    **({"result": custom_extract_result} if custom_extract_result else {}),
+                },
+                bus=ctx.bus,
                 commit=True,
             )
-            return
-
-        budget_snap = guard.snapshot()
-        db.expire_all()
-        run = db.get(RunModel, run_id) or run
-        doc = db.get(SourceDocumentModel, document_id)
-        if doc:
-            doc.status = final_status
-        db.add(
-            DocumentArchitectureModel(
-                id=str(uuid.uuid4()),
-                document_id=document_id,
-                status=final_status,
-                plan_json={"stage": "EXTRACTION", "result": result},
-                warnings_json=[item.get("error", "解析未完成") for item in result.get("errors", [])],
-                trace_json={
-                    "table_count": len(result.get("table_ids", [])),
-                    "code_set_count": len(result.get("code_set_ids", [])),
-                    "budget_usage": budget_snap,
-                },
-            )
-        )
-
-        tables = len(result.get("table_ids", []))
-        code_sets = len(result.get("code_set_ids", []))
-        if final_status == "EXTRACTION_FAILED":
-            err_detail = result["errors"][0]["error"] if result.get("errors") else "解析失败"
-            progress_finish(document_id, status="FAILED", detail=err_detail)
-            kernel_fail_run(
-                db,
-                run,
-                node="parallel_extraction",
-                error=err_detail,
-                extra_result={"budget_usage": budget_snap, "document_id": document_id, "phase": "extract", "result": result},
-                bus=run_bus,
-                commit=True,
-            )
-        else:
-            summary_text = f"解析完成：{tables} 张报表、{code_sets} 张码表"
-            final_counters = {"tables": tables, "code_sets": code_sets, "blocks_done": total, "blocks_total": total}
-            progress_update(document_id, counters=final_counters, log=summary_text)
-            progress_finish(document_id, status="DONE", detail=summary_text)
-            append_event(
-                db,
-                run,
-                "INGESTION_COMPLETED",
-                "parallel_extraction",
-                {
-                    "stage": 4,
-                    "progress_status": "DONE",
-                    "detail": summary_text,
-                    "counters": final_counters,
-                    "document_status": final_status,
-                    "budget_usage": budget_snap,
-                    "result": result,
-                },
-                bus=run_bus,
-            )
-            run_bus.fire("run.completed", {"run_id": run.id, "node": "parallel_extraction", "status": "COMPLETED"})
-            db.commit()
 
     kernel_submit_run(
         run_id,
@@ -815,7 +1116,10 @@ def document_progress_view(session: Session, document_id: str) -> Dict[str, Any]
             if key in {"blocks", "tables", "fields", "code_sets"}:
                 continue
             counters[key] = value
-        prog_status = str(run_result.get("progress_status") or ("WORKING" if run_state.status in ACTIVE_INGESTION_STATUSES else "DONE" if run_state.status == "COMPLETED" else "FAILED"))
+        prog_status = str(
+            run_result.get("progress_status")
+            or ("WORKING" if run_state.status in ACTIVE_INGESTION_STATUSES else "DONE" if run_state.status == "COMPLETED" else "FAILED")
+        )
         return {
             "document_id": document_id,
             "run_id": run.id,

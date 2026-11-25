@@ -18,8 +18,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
-from app.infra.errors import WorkflowError
-from app.infra.llm.client import LlmTimeoutError
+from app.infra.errors import ProviderAuthOrBillingError, WorkflowError
+from app.infra.llm.client import LlmTimeoutError, notify_llm_rate_limited, set_cancellation_provider
 
 _ACTIVE_BUS: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_bus", default=None)
 _ACTIVE_CANCEL: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("regops_active_llm_cancel", default=None)
@@ -33,6 +33,9 @@ def current_llm_bus() -> Optional[Any]:
 def current_cancellation() -> Optional[Any]:
     """返回当前上下文作用域挂载的 CancellationToken（供并发 worker 协作式检查取消）。"""
     return _ACTIVE_CANCEL.get()
+
+
+set_cancellation_provider(current_cancellation)
 
 
 @contextmanager
@@ -76,6 +79,7 @@ ERROR_SUGGESTIONS = {
     "model_no_tool_call": "模型多次未返回结构化工具调用。检查模型是否支持 function calling 或调整 LLM_TOOL_CHOICE。",
     "transport": "模型接口网络抖动或连接中断。检查网络代理与接口端点可用性。",
     "validation": "AI 返回的参数连续多次未通过确定性校验或 Bus 门禁。检查工具契约与输入 payload。",
+    "billing_or_auth": "上游模型账户余额不足或 API Key 鉴权失效，已快速熔断暂停，请核对账单或密钥后断点续跑。",
     "internal": "非模型错误。查看 message 与后端日志定位。",
 }
 
@@ -86,6 +90,15 @@ DEFAULT_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
 _NO_TOOL_CALL_HINT = (
     "上一次没有返回工具调用。必须通过工具返回结构化参数，禁止输出自然语言或 SQL；"
     "字段名、规则参数必须严格取自输入。"
+)
+
+_FATAL_BILLING_MARKERS = (
+    "LLM HTTP 401",
+    "LLM HTTP 402",
+    "LLM HTTP 403",
+    "Insufficient Balance",
+    "invalid_api_key",
+    "Arrearage",
 )
 
 _TRANSIENT_HTTP_MARKERS = ("LLM HTTP 429", "LLM HTTP 500", "LLM HTTP 502", "LLM HTTP 503", "LLM HTTP 504")
@@ -280,7 +293,15 @@ def call_llm_validated(
                 if transient_used >= transient_attempts:
                     break
                 backoff_wait(wait_steps, transient_used, cancellation=cancellation)
+            except ProviderAuthOrBillingError as exc:
+                exc.context = {**fail_context(tool_name, payload, "billing_or_auth"), **(exc.context or {})}
+                raise
             except RuntimeError as exc:
+                if any(marker in str(exc) for marker in _FATAL_BILLING_MARKERS):
+                    raise ProviderAuthOrBillingError(
+                        str(exc),
+                        context=fail_context(tool_name, payload, "billing_or_auth"),
+                    ) from exc
                 kind = _classify_runtime_error(exc)
                 last_error = str(exc)
                 if kind == "fatal_model_error":
@@ -295,6 +316,8 @@ def call_llm_validated(
                     if validation_used >= validation_attempts:
                         break
                     continue
+                if "LLM HTTP 429" in last_error:
+                    notify_llm_rate_limited()
                 transient_used += 1
                 last_kind = kind
                 if transient_used >= transient_attempts:

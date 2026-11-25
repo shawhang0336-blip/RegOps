@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from app.infra.contracts import LLM_OPERATORS
 from app.kernel.bus import Bus, global_bus
+from app.kernel.run import BudgetGuard, BudgetLimits
 
 # 单表字段名参数：模型在这些槽位上填错/编造会导致规则、生成器或表结构绑定到不存在的列。
 # 注意：references_field 属于目标表字段，严禁在此用当前表白名单校验（由 cross_table_adjudicator 按目标表白名单裁决）。
@@ -281,3 +282,16 @@ def default_bus(parent: Optional[Bus] = None) -> Bus:
     """单次 Run 的默认总线：搭载五大确定性门禁，并将生命周期广播冒泡至 global_bus。"""
     effective_parent = global_bus() if parent is None else parent
     return _attach_regops_adjudicators(Bus(parent=effective_parent))
+
+
+def build_child_bus(
+    parent_bus: Bus,
+    *,
+    max_llm_calls: int = 0,
+    run_id: Optional[str] = None,
+) -> Bus:
+    """构造挂载单表/单块子预算守卫的子 Bus：继承全部五大门禁并级联父总线预占与回滚。"""
+    child = default_bus(parent=parent_bus)
+    if max_llm_calls > 0:
+        BudgetGuard(BudgetLimits(max_llm_calls=int(max_llm_calls)), run_id=run_id).attach(child)
+    return child

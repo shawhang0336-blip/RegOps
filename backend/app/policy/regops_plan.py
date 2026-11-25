@@ -103,6 +103,61 @@ DEFAULT_PLAN = WorkflowPlan(
     entry="created",
 )
 
+# =============================================================================
+# Step 0 / Step 1：文档导入、切块与双轨并行解析拓扑
+# =============================================================================
+
+INGESTION_PREPARE_PLAN = WorkflowPlan(
+    name="regops_ingestion_prepare",
+    entry="prepare",
+    nodes=(
+        PlanNode("prepare", "准备文档导入", "stage"),
+        PlanNode("document_overview", "AI 结构体检", "stage"),
+        PlanNode("initial_chunking", "文档初步切块", "stage"),
+        PlanNode("prepare_completed", "切块准备完成", "terminal"),
+    ),
+    edges=(
+        PlanEdge("prepare", "document_overview", "always"),
+        PlanEdge("document_overview", "initial_chunking", "always"),
+        PlanEdge("initial_chunking", "prepare_completed", "always"),
+    ),
+)
+
+INGESTION_EXTRACT_PLAN = WorkflowPlan(
+    name="regops_ingestion_extract",
+    entry="extract",
+    nodes=(
+        PlanNode("extract", "准备并行解析", "stage"),
+        PlanNode("document_structure", "AI 文档结构重整", "stage"),
+        PlanNode("extract_dispatch", "双轨提取任务派发", "stage"),
+        PlanNode("block_extract_worker", "单块字段与码表提取", "stage"),
+        PlanNode("parallel_extraction", "双轨落库与自动对齐", "terminal"),
+    ),
+    edges=(
+        PlanEdge("extract", "document_structure", "needs_analysis"),
+        PlanEdge("extract", "extract_dispatch", "always"),
+        PlanEdge("document_structure", "extract_dispatch", "always"),
+        PlanEdge("extract_dispatch", "block_extract_worker", "fanout"),
+        PlanEdge("extract_dispatch", "parallel_extraction", "direct"),
+        PlanEdge("block_extract_worker", "parallel_extraction", "always"),
+    ),
+)
+
+
+def resolve_run_plan(session: Session, run: RunModel) -> WorkflowPlan:
+    """按 Run 首条事件语义识别归属工作流图（Step 0/1 文档解析 vs Step 2/3 生成验证）。"""
+    first = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id)
+        .order_by(EventModel.seq.asc())
+        .first()
+    )
+    if first and isinstance(first.payload_json, dict) and first.payload_json.get("run_kind") == "INGESTION":
+        if first.payload_json.get("phase") == "prepare":
+            return INGESTION_PREPARE_PLAN
+        return INGESTION_EXTRACT_PLAN
+    return DEFAULT_PLAN
+
 # 中断类型 → 恢复节点（与 Plan 节点名严格一致）
 INTERRUPT_RESUME_NODES: Dict[str, str] = {
     "APPROVAL_REQUIRED": "human_gate",
@@ -445,12 +500,28 @@ def fold_ingestion_event(state: RunState, kind: str, payload: Dict[str, Any]) ->
             "detail": payload.get("detail") or "任务已创建，准备执行",
             "counters": dict(payload.get("counters") or {}),
             "logs": [],
+            "completed_blocks": {},
         }
         return replace(
             state,
             status="RUNNING",
             current_node=payload.get("phase") or "created",
             result_json=base,
+            when="needs_analysis" if payload.get("needs_analysis") else "always",
+        )
+    if kind == "BLOCK_EXTRACTED":
+        cur_result = dict(state.result_json) if isinstance(state.result_json, dict) else {}
+        completed = dict(cur_result.get("completed_blocks") or {})
+        track = payload.get("track")
+        bid = payload.get("block_id")
+        if track and bid:
+            completed[f"{track}:{bid}"] = str(payload.get("raw_hash") or "")
+        cur_result["completed_blocks"] = completed
+        return replace(
+            state,
+            status="RUNNING",
+            current_node=payload.get("node") or "block_extract_worker",
+            result_json=cur_result,
             when="always",
         )
     if kind == "INGESTION_STAGE":

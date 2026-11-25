@@ -22,6 +22,8 @@ BUDGET_BOUNDS: Dict[str, Tuple[int, int]] = {
     "max_cases_per_table": (1, 20000),
     "max_retries": (0, 20),
     "max_llm_concurrency": (1, 32),
+    "max_llm_rpm": (0, 6000),
+    "max_calls_per_table": (0, 500),
     "max_llm_calls": (0, 10000),
     "max_total_tokens": (0, 100_000_000),
     "max_elapsed_seconds": (0, 86400),

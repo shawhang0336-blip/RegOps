@@ -23,9 +23,11 @@ from app.infra.blob_store import LocalBlobStore
 from app.infra.contracts import RuleDefinition
 from app.infra.db_tables import RuleModel
 from app.infra.errors import WorkflowError
+from app.infra.llm.guard import llm_execution_scope
 from app.kernel.interrupt import Interrupt
 from app.kernel.run import RunContext
 from app.kernel.scheduler import Outcome, Send
+from app.policy.regops_bus import build_child_bus
 
 
 def _front_bodies(specs, llm, budget, concurrency, settings):
@@ -157,16 +159,23 @@ def _front_bodies(specs, llm, budget, concurrency, settings):
         """纯单表规则绑定并发 Worker（零 DB 写操作；结果由 Scheduler 屏障落账并增量归约）。"""
         spec = spec_by_code[table_code]
         wave_ctx = ctx.get("rule_wave_ctx") or {}
-        rules, trace = bind_table_rules_worker(
-            spec,
-            llm=ctx.llm,
-            plans=ctx.get("plans"),
-            field_code_sets=wave_ctx.get("field_code_sets") or {},
-            det_index=wave_ctx.get("det_index") or prepare_deterministic_rule_index([]),
-            concurrency=ctx.concurrency,
-            outer_workers=int(wave_ctx.get("outer_workers") or 1),
-            bus=ctx.bus,
+        per_table_calls = int((ctx.budget or {}).get("max_calls_per_table") or 0)
+        worker_bus = (
+            build_child_bus(ctx.bus, max_llm_calls=per_table_calls, run_id=ctx.run.id)
+            if per_table_calls > 0
+            else ctx.bus
         )
+        with llm_execution_scope(bus=worker_bus, cancellation=ctx.cancellation):
+            rules, trace = bind_table_rules_worker(
+                spec,
+                llm=ctx.llm,
+                plans=ctx.get("plans"),
+                field_code_sets=wave_ctx.get("field_code_sets") or {},
+                det_index=wave_ctx.get("det_index") or prepare_deterministic_rule_index([]),
+                concurrency=ctx.concurrency,
+                outer_workers=int(wave_ctx.get("outer_workers") or 1),
+                bus=worker_bus,
+            )
         serialized_rules = [rule.model_dump() for rule in rules]
         gaps = trace.get("gaps") or []
         return Outcome(

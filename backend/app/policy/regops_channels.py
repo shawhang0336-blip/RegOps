@@ -15,17 +15,19 @@ from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
 from app.infra.contracts import AuditCaseBinding, RuleDefinition
 from app.infra.db_tables import EventModel, RuleModel, RunModel
+from app.kernel.event_log import fold_with
 from app.kernel.run import (
     BudgetGuard,
     BudgetLimits,
     ChannelSpec,
     Identity,
     RunContext,
+    append_list,
     last_value,
     merge_dict,
 )
 from .regops_bus import default_bus
-from .regops_plan import fold, project
+from .regops_plan import fold, fold_ingestion_event, project, project_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,103 @@ def build_context(
         attempt_base=attempt_base,
         current_node=state.current_node,
         projector=project,
+        cancellation=cancellation,
+        budget_guard=budget_guard,
+    )
+
+
+INGESTION_CHANNELS: Dict[str, ChannelSpec] = {
+    "document_id": ChannelSpec("document_id", last_value),
+    "phase": ChannelSpec("phase", last_value),
+    "blocks_completed": ChannelSpec("blocks_completed", merge_dict),
+    "block_meta_outputs": ChannelSpec("block_meta_outputs", merge_dict),
+    "block_codeset_outputs": ChannelSpec("block_codeset_outputs", merge_dict),
+    "block_errors": ChannelSpec("block_errors", append_list),
+    "extract_result": ChannelSpec("extract_result", last_value),
+}
+
+
+def recover_ingestion_checkpoint(
+    session: Session,
+    document_id: str,
+    *,
+    exclude_run_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """从最近一次失败/中断的 Step 1 提取 Run 恢复已落库的内容块检查点（若上次已完成则全新重跑）。"""
+    rows = (
+        session.query(RunModel)
+        .filter(RunModel.spec_id == document_id)
+        .order_by(RunModel.created_at.desc())
+        .all()
+    )
+    completed: Dict[str, str] = {}
+    found_extract = False
+    for prev_run in rows:
+        if exclude_run_id and prev_run.id == exclude_run_id:
+            continue
+        first = (
+            session.query(EventModel)
+            .filter(EventModel.run_id == prev_run.id)
+            .order_by(EventModel.seq.asc())
+            .first()
+        )
+        if not first or not isinstance(first.payload_json, dict):
+            continue
+        if first.payload_json.get("run_kind") != "INGESTION" or first.payload_json.get("phase") != "extract":
+            continue
+        found_extract = True
+        state = project_ingestion(session, prev_run)
+        if state.status == "COMPLETED":
+            break
+        if state.status == "FAILED":
+            prev_completed = (state.result_json or {}).get("completed_blocks") or {}
+            if isinstance(prev_completed, dict):
+                for key, val in prev_completed.items():
+                    completed.setdefault(str(key), str(val or ""))
+            continue
+        break
+    return completed if found_extract else {}
+
+
+def build_ingestion_context(
+    session: Session,
+    run: RunModel,
+    settings: Settings,
+    *,
+    budget: Optional[Dict[str, Any]] = None,
+    concurrency: int = 4,
+    cancellation: Any = None,
+    shared: Optional[Dict[str, Any]] = None,
+    bus: Optional[Any] = None,
+) -> RunContext:
+    """组装 Step 0/1 文档导入/解析专用 `RunContext`，挂载 `INGESTION_CHANNELS` 与双级预算守卫。"""
+    events = (
+        session.query(EventModel)
+        .filter(EventModel.run_id == run.id)
+        .order_by(EventModel.seq)
+        .all()
+    )
+    state = fold_with(events, reducer=fold_ingestion_event)
+    active_bus = bus if bus is not None else default_bus()
+    prior_usage = (state.result_json or {}).get("budget_usage") if isinstance(state.result_json, dict) else None
+    budget_guard = BudgetGuard(
+        BudgetLimits.from_dict(budget),
+        run_id=run.id,
+        seed=prior_usage if isinstance(prior_usage, dict) else None,
+    ).attach(active_bus)
+    return RunContext(
+        session=session,
+        run=run,
+        settings=settings,
+        state=state,
+        shared=dict(shared or {}),
+        channels=dict(INGESTION_CHANNELS),
+        bus=active_bus,
+        budget=budget,
+        concurrency=max(1, int(concurrency or 1)),
+        current_node=state.current_node,
+        projector=project_ingestion,
+        reducer=fold_ingestion_event,
         cancellation=cancellation,
         budget_guard=budget_guard,
     )

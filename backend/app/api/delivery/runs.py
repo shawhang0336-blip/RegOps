@@ -37,7 +37,7 @@ from app.infra.db_tables import RunModel
 from app.infra.errors import WorkflowError
 from app.kernel.bus import global_bus
 from app.kernel.event_log import project_trace
-from app.policy.regops_plan import DEFAULT_PLAN, project
+from app.policy.regops_plan import project, resolve_run_plan
 
 router = APIRouter(tags=["runs"])
 
@@ -239,7 +239,8 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
 
 @router.get("/api/runs/{run_id}/trace")
 def trace_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
-    return project_trace(session, _require_run(session, run_id), plan=DEFAULT_PLAN).as_dict()
+    run = _require_run(session, run_id)
+    return project_trace(session, run, plan=resolve_run_plan(session, run)).as_dict()
 
 
 @router.get("/api/runs/{run_id}/bus-events")

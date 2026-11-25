@@ -221,7 +221,7 @@ npm run dev
 ## 测试与架构守卫
 
 ```bash
-# 后端全量测试（334 项：含八层 DAG、内核纯净度、API 零跨路由依赖等 AST 架构守卫）
+# 后端全量测试（337 项：含八层 DAG、内核纯净度、Step 0/1 Scheduler 断点续跑、RPM 限流等 AST 与行为守卫）
 cd backend && pytest -q
 
 # 前端单测与架构边界守卫（10 项：目录结构、/api/* 统一收口与单向依赖校验）

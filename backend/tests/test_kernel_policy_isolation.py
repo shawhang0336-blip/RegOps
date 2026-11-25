@@ -163,6 +163,8 @@ def test_app_root_directory_stays_clean_and_layered():
     actual = {p.name for p in app_dir.iterdir() if p.name != "__pycache__"}
     assert actual == ALLOWED_ROOT_ENTRIES
     assert policy.DEFAULT_PLAN.validate() == []
+    assert policy.INGESTION_PREPARE_PLAN.validate() == []
+    assert policy.INGESTION_EXTRACT_PLAN.validate() == []
 
 
 def test_all_backend_layers_form_strict_dag():

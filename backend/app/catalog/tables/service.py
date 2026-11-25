@@ -54,6 +54,7 @@ from app.catalog.tables.views import (
     table_summary,
     type_basis_for,
 )
+from app.infra.errors import ProviderAuthOrBillingError
 from app.infra.llm import RealDesignLlm
 from app.infra.llm.guard import call_llm_validated, submit_with_context
 from app.kernel.run import BudgetExceededError, RunCancelledError
@@ -452,6 +453,324 @@ def _apply_source_definitions(
         field.field_definition = definition[:500]
 
 
+def snapshot_raw_block(block: RawBlockModel) -> Dict[str, Any]:
+    """将 RawBlockModel 脱库序列化为纯字典快照，供无 DB 并发 Worker 安全消费。"""
+    return {
+        "id": block.id,
+        "document_id": block.document_id,
+        "ordinal": int(block.ordinal or 0),
+        "block_type": block.block_type,
+        "raw_content": block.raw_content or "",
+        "raw_hash": block.raw_hash or "",
+        "source_locator": dict(block.source_locator or {}),
+        "content_json": dict(block.content_json or {}),
+    }
+
+
+def compute_metadata_for_block_snapshot(
+    block_snap: Dict[str, Any],
+    settings: Settings,
+    *,
+    llm: Any = None,
+    bus: Any = None,
+) -> Dict[str, Any]:
+    """纯计算/HTTP 元数据提取 Worker：零 SQLAlchemy 访问，返回待单写线程落库的元数据草案与复核结果。"""
+    block_id = str(block_snap["id"])
+    ordinal = int(block_snap.get("ordinal") or 0)
+    raw_content = str(block_snap.get("raw_content") or "")
+    source_locator = dict(block_snap.get("source_locator") or {})
+    content_json = dict(block_snap.get("content_json") or {})
+
+    source_spec = content_json.get("spec") or content_json.get("parent_spec") or {}
+    terms_text = source_spec.get("terms_text", "")
+    raw_fields = source_spec.get("fields")
+    if raw_fields is None:
+        rows = content_json.get("rows", [])
+        raw_fields = [{"row": row, "headers": content_json.get("headers", [])} for row in rows[1:] if any(row)]
+    if not raw_fields:
+        raw_fields = [{"raw_text": raw_content}]
+    fallback_code = source_spec.get("table_code") or content_json.get("table_code") or f"TABLE_{block_id.replace('-', '')[:12].upper()}"
+    fallback_name = source_spec.get("table_name") or content_json.get("table_name") or source_locator.get("sheet") or f"原始表格 {ordinal + 1}"
+
+    active_llm = llm
+    if active_llm is None:
+        try:
+            active_llm = RealDesignLlm(settings)
+        except Exception:
+            active_llm = None
+
+    indexed_fields = list(enumerate(raw_fields))
+    clean_items = [item for item in indexed_fields if not _field_needs_ai(item[1])]
+    suspect_items = [item for item in indexed_fields if _field_needs_ai(item[1])]
+    clean_drafts = {
+        index: _deterministic_field_draft(raw_field, terms_text, source_locator)
+        for index, raw_field in clean_items
+    }
+    chunks = [suspect_items[i : i + METADATA_BATCH_SIZE] for i in range(0, len(suspect_items), METADATA_BATCH_SIZE)]
+
+    def bind_chunk(chunk_items):
+        chunk = [raw_field for _, raw_field in chunk_items]
+        is_unstructured = len(chunk) == 1 and "raw_text" in chunk[0]
+        if active_llm is not None:
+            payload = {
+                "source_locator": source_locator,
+                "table": {"table_code": fallback_code, "table_name": fallback_name},
+                "raw_fields": chunk,
+                "raw_context": (
+                    raw_content[:CONTEXT_MAX_CHARS]
+                    if is_unstructured
+                    else _excerpt_for_fields(
+                        raw_content,
+                        [item.get("name") or item.get("field_en") or "" for item in chunk],
+                    )
+                ),
+            }
+
+            def _validate_meta_batch(args):
+                candidate = {
+                    "table_code": fallback_code,
+                    "table_name": fallback_name,
+                    "table_definition": args.get("table_definition", ""),
+                    "fields": args.get("fields", []),
+                }
+                draft = MetadataTableDraft.model_validate(candidate)
+                if is_unstructured:
+                    if not draft.fields:
+                        raise ValueError("Unstructured block LLM response returned zero fields")
+                elif len(draft.fields) != len(chunk):
+                    raise ValueError(
+                        f"Field count mismatch in batch LLM response: expected {len(chunk)}, got {len(draft.fields)}"
+                    )
+                require_valid_metadata(draft)
+                return draft
+
+            instruction = (
+                "从输入非结构化原文块中提取该表的全部业务字段定义（字段英文名、中文名、类型、长度、小数位、是否必填、校验原文、码值引用等）。"
+                "不得遗漏原文中的字段，也不得虚构原文未出现的字段；定义与长度仅在有明确依据时填写。"
+                if is_unstructured
+                else f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。"
+            )
+
+            try:
+                draft, trace = call_llm_validated(
+                    active_llm,
+                    "assign_metadata",
+                    instruction,
+                    payload,
+                    _validate_meta_batch,
+                    timeout=120,
+                    backoff=(1.0,),
+                    bus=bus,
+                    transient_attempts=2,
+                    validation_attempts=2,
+                )
+                _apply_source_definitions(draft.fields, chunk, terms_text)
+                return draft.fields, draft.table_definition, trace
+            except (BudgetExceededError, RunCancelledError, ProviderAuthOrBillingError):
+                raise
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {exc}"
+        else:
+            err_msg = ""
+
+        mapped_fields = [
+            _deterministic_field_draft(rf, terms_text, source_locator, fallback_reason=err_msg)
+            for rf in chunk
+        ]
+        table_def = f"{fallback_name}（共 {len(raw_fields)} 个字段，结构化提取）"
+        return mapped_fields, table_def, {
+            "strategy": "DETERMINISTIC_BATCH_MAPPING",
+            "field_count": len(mapped_fields),
+            **({"fallback_from": err_msg} if err_msg else {}),
+        }
+
+    if chunks:
+        with ThreadPoolExecutor(max_workers=max(1, min(2, len(chunks)))) as executor:
+            futures = [submit_with_context(executor, bind_chunk, chunk_items) for chunk_items in chunks]
+            chunk_results = []
+            for future in futures:
+                try:
+                    chunk_results.append(future.result())
+                except (BudgetExceededError, RunCancelledError, ProviderAuthOrBillingError):
+                    for f in futures:
+                        f.cancel()
+                    raise
+    else:
+        chunk_results = []
+
+    fields_by_index: Dict[int, List[MetadataFieldDraft]] = {
+        index: [draft_field] for index, draft_field in clean_drafts.items()
+    }
+    table_definition = ""
+    batch_traces = []
+    if clean_drafts:
+        batch_traces.append({"strategy": "DETERMINISTIC_FIRST", "field_count": len(clean_drafts)})
+    for chunk_items, (fields_part, t_def, tr) in zip(chunks, chunk_results):
+        if len(chunk_items) == 1 and "raw_text" in chunk_items[0][1]:
+            fields_by_index[chunk_items[0][0]] = list(fields_part)
+        else:
+            for (index, _), draft_field in zip(chunk_items, fields_part):
+                fields_by_index[index] = [draft_field]
+        if t_def and not table_definition:
+            table_definition = t_def
+        batch_traces.append(tr)
+    all_fields: List[MetadataFieldDraft] = [
+        draft_field
+        for index in range(len(raw_fields))
+        for draft_field in fields_by_index.get(index, [])
+    ]
+
+    ai_assignment_used = any(not str(trace.get("strategy", "")).startswith("DETERMINISTIC") for trace in batch_traces)
+    assignment_fallback = bool(suspect_items) and not ai_assignment_used
+    draft = MetadataTableDraft(
+        table_code=fallback_code,
+        table_name=fallback_name,
+        table_definition=table_definition or f"{fallback_name} 结构化元数据表",
+        fields=all_fields,
+    )
+    require_valid_metadata(draft)
+    trace = {
+        "provider": settings.llm_provider if active_llm else "DETERMINISTIC",
+        "model": settings.llm_model if active_llm else "rule-engine",
+        "batch_count": len(chunk_results),
+        "batches": batch_traces,
+        "arguments": draft.model_dump(),
+    }
+
+    program_issues = validate_metadata_draft(draft)
+    if content_json.get("human_required"):
+        program_issues.append(
+            {
+                "severity": "WARNING",
+                "code": "SOURCE_PARSE_REVIEW_REQUIRED",
+                "field_en": "",
+                "message": "；".join(content_json.get("parse_warnings") or ["来源块需要人工确认"]),
+            }
+        )
+
+    issues: List[Dict[str, Any]] = []
+    if active_llm is not None and ai_assignment_used:
+        try:
+            args, review_trace = call_llm_validated(
+                active_llm,
+                "review_metadata",
+                (
+                    "独立复核整表字段元数据，只依据 raw_context 判断，仅输出存在遗漏、类型长度错配、"
+                    "无依据必填或虚构码值的问题。硬性要求："
+                    "①每条问题必须给出 evidence，逐字摘录 raw_context 中支持该判断的原文；"
+                    "②raw_context 没有声明数据类型/长度时，不得判定类型或长度错配为 ERROR，"
+                    "只能报 WARNING 并把 evidence 填 NO_SOURCE；"
+                    "③不要用业务常识（如\"金额项应为数值型\"）替代原文声明，此类推断不得报 ERROR；"
+                    "④原文用①②③列举取值时，按序号 1..N 编码是允许的，不要判为编造码值；"
+                    "⑤本条只审字段元数据本身，不要评价校验规则/条件算子是否已装配（那是后续阶段）；"
+                    "⑥没有问题就返回空数组。"
+                ),
+                {
+                    "source_locator": source_locator,
+                    "table": {"table_code": draft.table_code, "table_name": draft.table_name},
+                    "fields": [f.model_dump() for f in draft.fields],
+                    "raw_context": _excerpt_for_fields(
+                        raw_content, [f.field_en for f in draft.fields]
+                    ),
+                },
+                timeout=60,
+                backoff=(1.0,),
+                bus=bus,
+                transient_attempts=2,
+                validation_attempts=2,
+            )
+            issues = args.get("issues", [])
+        except (BudgetExceededError, RunCancelledError, ProviderAuthOrBillingError):
+            raise
+        except Exception as exc:
+            review_trace = {"error": f"{type(exc).__name__}: {exc}"}
+            issues = [
+                {
+                    "severity": "WARNING",
+                    "code": "AI_REVIEW_FALLBACK",
+                    "field_en": "",
+                    "message": f"在线 AI 复核跳过，已使用确定性规则交叉核验：{review_trace['error']}",
+                }
+            ]
+    elif assignment_fallback:
+        review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "skipped_reason": "AI_ASSIGNMENT_UNAVAILABLE"}
+        issues = [{
+            "severity": "WARNING",
+            "code": "AI_REVIEW_UNAVAILABLE",
+            "field_en": "",
+            "message": "AI 字段赋值不可用，已使用程序提取并交叉检查；无需再等待一次 AI 复核。",
+        }]
+    else:
+        review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "checked_fields": len(draft.fields)}
+
+    issues = enforce_issue_evidence(issues, raw_content)
+    table_status = "NEEDS_REVIEW" if table_needs_review(program_issues + issues) else "AI_SELF_VALIDATED"
+    return {
+        "block_id": block_id,
+        "draft": draft,
+        "trace": trace,
+        "program_issues": program_issues,
+        "issues": issues,
+        "review_trace": review_trace,
+        "table_status": table_status,
+    }
+
+
+def persist_computed_metadata(
+    session: Session,
+    block: RawBlockModel,
+    computed: Dict[str, Any],
+    *,
+    auto_link: bool = False,
+) -> TableMetadataModel:
+    """在主协调线程中单写落库已计算完成的表字段元数据与审计复核记录。"""
+    draft: MetadataTableDraft = computed["draft"]
+    table = _persist_draft(session, block, draft, computed["trace"])
+    program_issues = computed["program_issues"]
+    issues = computed["issues"]
+    review_trace = computed["review_trace"]
+
+    session.add(
+        MetadataValidationModel(
+            id=str(uuid.uuid4()),
+            table_id=table.id,
+            validator_kind="PROGRAM",
+            round=1,
+            status="FAILED" if any(item["severity"] == "ERROR" for item in program_issues) else "PASSED",
+            issues_json=program_issues,
+        )
+    )
+    session.add(
+        MetadataValidationModel(
+            id=str(uuid.uuid4()),
+            table_id=table.id,
+            validator_kind="AI_REVIEW",
+            round=1,
+            status="FAILED" if any(item.get("severity") == "ERROR" for item in issues) else "PASSED",
+            issues_json=issues,
+        )
+    )
+    session.add(
+        MetadataRevisionModel(
+            id=str(uuid.uuid4()),
+            table_id=table.id,
+            field_id=None,
+            revision_kind="AI_REVIEW",
+            old_value_json=None,
+            new_value_json={"issues": issues, "trace": review_trace},
+            editor="AI_REVIEWER",
+            reason="Independent batch metadata review",
+        )
+    )
+    table.status = computed["table_status"]
+    if auto_link:
+        from app.catalog.code_sets.linking import ensure_table_references
+
+        ensure_table_references(session, table)
+    session.flush()
+    return table
+
+
 def extract_metadata_for_block(block_id: str, settings: Settings, auto_link: bool = True) -> str:
     with _get_block_extract_lock(block_id):
         return _extract_metadata_for_block_locked(block_id, settings, auto_link=auto_link)
@@ -462,273 +781,7 @@ def _extract_metadata_for_block_locked(block_id: str, settings: Settings, auto_l
         block = session.get(RawBlockModel, block_id)
         if not block:
             raise ValueError("Raw block not found")
-        source_spec = block.content_json.get("spec") or block.content_json.get("parent_spec") or {}
-        terms_text = source_spec.get("terms_text", "")
-        raw_fields = source_spec.get("fields")
-        if raw_fields is None:
-            rows = block.content_json.get("rows", [])
-            raw_fields = [{"row": row, "headers": block.content_json.get("headers", [])} for row in rows[1:] if any(row)]
-        if not raw_fields:
-            raw_fields = [{"raw_text": block.raw_content}]
-        fallback_code = source_spec.get("table_code") or block.content_json.get("table_code") or f"TABLE_{block.id.replace('-', '')[:12].upper()}"
-        fallback_name = source_spec.get("table_name") or block.content_json.get("table_name") or block.source_locator.get("sheet") or f"原始表格 {block.ordinal + 1}"
-
-        try:
-            llm = RealDesignLlm(settings)
-        except Exception:
-            llm = None
-
-        # 确定性提取先行：spec_parser 已结构化、字段要素齐全的字段毫秒级落库，
-        # 只有缺类型/缺英文名/有解析告警的疑难字段才小批次调 AI，避免整批 120s 白等超时。
-        indexed_fields = list(enumerate(raw_fields))
-        clean_items = [item for item in indexed_fields if not _field_needs_ai(item[1])]
-        suspect_items = [item for item in indexed_fields if _field_needs_ai(item[1])]
-        clean_drafts = {
-            index: _deterministic_field_draft(raw_field, terms_text, block.source_locator)
-            for index, raw_field in clean_items
-        }
-
-        # 疑难字段小批次调 AI，失败的批次退回确定性提取
-        chunks = [suspect_items[i : i + METADATA_BATCH_SIZE] for i in range(0, len(suspect_items), METADATA_BATCH_SIZE)]
-
-        def bind_chunk(chunk_items):
-            chunk = [raw_field for _, raw_field in chunk_items]
-            is_unstructured = len(chunk) == 1 and "raw_text" in chunk[0]
-            if llm is not None:
-                payload = {
-                    "source_locator": block.source_locator,
-                    "table": {"table_code": fallback_code, "table_name": fallback_name},
-                    "raw_fields": chunk,
-                    "raw_context": (
-                        (block.raw_content or "")[:CONTEXT_MAX_CHARS]
-                        if is_unstructured
-                        else _excerpt_for_fields(
-                            block.raw_content,
-                            [item.get("name") or item.get("field_en") or "" for item in chunk],
-                        )
-                    ),
-                }
-                def _validate_meta_batch(args):
-                    candidate = {
-                        "table_code": fallback_code,
-                        "table_name": fallback_name,
-                        "table_definition": args.get("table_definition", ""),
-                        "fields": args.get("fields", []),
-                    }
-                    draft = MetadataTableDraft.model_validate(candidate)
-                    if is_unstructured:
-                        if not draft.fields:
-                            raise ValueError("Unstructured block LLM response returned zero fields")
-                    elif len(draft.fields) != len(chunk):
-                        raise ValueError(
-                            f"Field count mismatch in batch LLM response: expected {len(chunk)}, got {len(draft.fields)}"
-                        )
-                    require_valid_metadata(draft)
-                    return draft
-
-                instruction = (
-                    "从输入非结构化原文块中提取该表的全部业务字段定义（字段英文名、中文名、类型、长度、小数位、是否必填、校验原文、码值引用等）。"
-                    "不得遗漏原文中的字段，也不得虚构原文未出现的字段；定义与长度仅在有明确依据时填写。"
-                    if is_unstructured
-                    else f"批量装配输入的 {len(chunk)} 个字段。字段英文名、中文名、类型和校验原文为最低必备信息；定义、长度、码值引用等仅在有明确依据时填写，其他项可省略，不得虚构。"
-                )
-
-                try:
-                    draft, trace = call_llm_validated(
-                        llm,
-                        "assign_metadata",
-                        instruction,
-                        payload,
-                        _validate_meta_batch,
-                        timeout=120,
-                        backoff=(1.0,),
-                        transient_attempts=2,
-                        validation_attempts=2,
-                    )
-                    _apply_source_definitions(draft.fields, chunk, terms_text)
-                    return draft.fields, draft.table_definition, trace
-                except (BudgetExceededError, RunCancelledError):
-                    raise
-                except Exception as exc:
-                    err_msg = f"{type(exc).__name__}: {exc}"
-            else:
-                err_msg = ""
-
-            # Deterministic fast-path / fallback mapping
-            mapped_fields = [
-                _deterministic_field_draft(rf, terms_text, block.source_locator, fallback_reason=err_msg)
-                for rf in chunk
-            ]
-            table_def = f"{fallback_name}（共 {len(raw_fields)} 个字段，结构化提取）"
-            return mapped_fields, table_def, {
-                "strategy": "DETERMINISTIC_BATCH_MAPPING",
-                "field_count": len(mapped_fields),
-                **({"fallback_from": err_msg} if err_msg else {}),
-            }
-
-        if chunks:
-            with ThreadPoolExecutor(max_workers=max(1, min(2, len(chunks)))) as executor:
-                futures = [submit_with_context(executor, bind_chunk, chunk_items) for chunk_items in chunks]
-                chunk_results = []
-                for future in futures:
-                    try:
-                        chunk_results.append(future.result())
-                    except (BudgetExceededError, RunCancelledError):
-                        for f in futures:
-                            f.cancel()
-                        raise
-        else:
-            chunk_results = []
-
-        # 按原始字段顺序合并：确定性结果 + AI/兜底结果（支持非结构化 raw_text 展开为多字段）
-        fields_by_index: Dict[int, List[MetadataFieldDraft]] = {
-            index: [draft_field] for index, draft_field in clean_drafts.items()
-        }
-        table_definition = ""
-        batch_traces = []
-        if clean_drafts:
-            batch_traces.append({"strategy": "DETERMINISTIC_FIRST", "field_count": len(clean_drafts)})
-        for chunk_items, (fields_part, t_def, tr) in zip(chunks, chunk_results):
-            if len(chunk_items) == 1 and "raw_text" in chunk_items[0][1]:
-                fields_by_index[chunk_items[0][0]] = list(fields_part)
-            else:
-                for (index, _), draft_field in zip(chunk_items, fields_part):
-                    fields_by_index[index] = [draft_field]
-            if t_def and not table_definition:
-                table_definition = t_def
-            batch_traces.append(tr)
-        all_fields: List[MetadataFieldDraft] = [
-            draft_field
-            for index in range(len(raw_fields))
-            for draft_field in fields_by_index.get(index, [])
-        ]
-
-        # 只有真调过 AI 赋值的批次才值得再做一次 AI 复核；全确定性提取走交叉核验即可
-        ai_assignment_used = any(not str(trace.get("strategy", "")).startswith("DETERMINISTIC") for trace in batch_traces)
-        assignment_fallback = bool(suspect_items) and not ai_assignment_used
-        draft = MetadataTableDraft(
-            table_code=fallback_code,
-            table_name=fallback_name,
-            table_definition=table_definition or f"{fallback_name} 结构化元数据表",
-            fields=all_fields,
-        )
-        require_valid_metadata(draft)
-        trace = {
-            "provider": settings.llm_provider if llm else "DETERMINISTIC",
-            "model": settings.llm_model if llm else "rule-engine",
-            "batch_count": len(chunk_results),
-            "batches": batch_traces,
-            "arguments": draft.model_dump(),
-        }
-        table = _persist_draft(session, block, draft, trace)
-        program_issues = validate_metadata_draft(draft)
-        if block.content_json.get("human_required"):
-            program_issues.append(
-                {
-                    "severity": "WARNING",
-                    "code": "SOURCE_PARSE_REVIEW_REQUIRED",
-                    "field_en": "",
-                    "message": "；".join(block.content_json.get("parse_warnings") or ["来源块需要人工确认"]),
-                }
-            )
-        session.add(
-            MetadataValidationModel(
-                id=str(uuid.uuid4()),
-                table_id=table.id,
-                validator_kind="PROGRAM",
-                round=1,
-                status="FAILED" if any(item["severity"] == "ERROR" for item in program_issues) else "PASSED",
-                issues_json=program_issues,
-            )
-        )
-
-        # Differential Review Stage (using review_metadata tool or deterministic cross-check)
-        issues: List[Dict[str, Any]] = []
-        if llm is not None and ai_assignment_used:
-            try:
-                args, review_trace = call_llm_validated(
-                    llm,
-                    "review_metadata",
-                    (
-                        "独立复核整表字段元数据，只依据 raw_context 判断，仅输出存在遗漏、类型长度错配、"
-                        "无依据必填或虚构码值的问题。硬性要求："
-                        "①每条问题必须给出 evidence，逐字摘录 raw_context 中支持该判断的原文；"
-                        "②raw_context 没有声明数据类型/长度时，不得判定类型或长度错配为 ERROR，"
-                        "只能报 WARNING 并把 evidence 填 NO_SOURCE；"
-                        "③不要用业务常识（如\"金额项应为数值型\"）替代原文声明，此类推断不得报 ERROR；"
-                        "④原文用①②③列举取值时，按序号 1..N 编码是允许的，不要判为编造码值；"
-                        "⑤本条只审字段元数据本身，不要评价校验规则/条件算子是否已装配（那是后续阶段）；"
-                        "⑥没有问题就返回空数组。"
-                    ),
-                    {
-                        "source_locator": block.source_locator,
-                        "table": {"table_code": draft.table_code, "table_name": draft.table_name},
-                        "fields": [f.model_dump() for f in draft.fields],
-                        "raw_context": _excerpt_for_fields(
-                            block.raw_content, [f.field_en for f in draft.fields]
-                        ),
-                    },
-                    timeout=60,
-                    backoff=(1.0,),
-                    transient_attempts=2,
-                    validation_attempts=2,
-                )
-                issues = args.get("issues", [])
-            except (BudgetExceededError, RunCancelledError):
-                raise
-            except Exception as exc:
-                review_trace = {"error": f"{type(exc).__name__}: {exc}"}
-                issues = [
-                    {
-                        "severity": "WARNING",
-                        "code": "AI_REVIEW_FALLBACK",
-                        "field_en": "",
-                        "message": f"在线 AI 复核跳过，已使用确定性规则交叉核验：{review_trace['error']}",
-                    }
-                ]
-        elif assignment_fallback:
-            review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "skipped_reason": "AI_ASSIGNMENT_UNAVAILABLE"}
-            issues = [{
-                "severity": "WARNING",
-                "code": "AI_REVIEW_UNAVAILABLE",
-                "field_en": "",
-                "message": "AI 字段赋值不可用，已使用程序提取并交叉检查；无需再等待一次 AI 复核。",
-            }]
-        else:
-            review_trace = {"strategy": "DETERMINISTIC_CROSS_CHECK", "checked_fields": len(draft.fields)}
-
-        issues = enforce_issue_evidence(issues, block.raw_content)
-        session.add(
-            MetadataValidationModel(
-                id=str(uuid.uuid4()),
-                table_id=table.id,
-                validator_kind="AI_REVIEW",
-                round=1,
-                status="FAILED" if any(item.get("severity") == "ERROR" for item in issues) else "PASSED",
-                issues_json=issues,
-            )
-        )
-        session.add(
-            MetadataRevisionModel(
-                id=str(uuid.uuid4()),
-                table_id=table.id,
-                field_id=None,
-                revision_kind="AI_REVIEW",
-                old_value_json=None,
-                new_value_json={"issues": issues, "trace": review_trace},
-                editor="AI_REVIEWER",
-                reason="Independent batch metadata review",
-            )
-        )
-        # 只有确实违反原文的 ERROR 才让整表进待复核；提示类问题保留在详情里，不再整表标红
-        table.status = (
-            "NEEDS_REVIEW"
-            if table_needs_review(program_issues + issues)
-            else "AI_SELF_VALIDATED"
-        )
-        if auto_link:
-            from app.catalog.code_sets.linking import ensure_table_references
-
-            ensure_table_references(session, table)
+        computed = compute_metadata_for_block_snapshot(snapshot_raw_block(block), settings)
+        table = persist_computed_metadata(session, block, computed, auto_link=auto_link)
         session.commit()
         return table.id

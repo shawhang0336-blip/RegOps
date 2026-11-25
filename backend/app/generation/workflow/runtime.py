@@ -14,8 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from sqlalchemy.orm import Session
 
 from app.infra.contracts import RuleDefinition, SpecDocument
-from app.infra.errors import WorkflowError
-from app.infra.llm import configure_llm_concurrency
+from app.infra.errors import ProviderAuthOrBillingError, WorkflowError
+from app.infra.llm import configure_llm_concurrency, configure_llm_rate_limit
 from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
 from app.infra.config import get_budget
 from app.kernel.bus import global_bus
@@ -103,6 +103,17 @@ def _error_details(exc: BaseException, fallback_stage: str) -> Dict[str, Any]:
             "budget_snapshot": exc.snapshot,
             "suggestion": "执行已触达内核预算上限（BudgetGuard 熔断）。可在系统设置放宽预算或缩小单批表数量后重试。",
         }
+    if isinstance(exc, ProviderAuthOrBillingError):
+        context = getattr(exc, "context", None) or {}
+        return {
+            "stage": context.get("stage") or fallback_stage,
+            "error_type": type(exc).__name__,
+            "error_kind": "billing_or_auth",
+            "tool_name": context.get("tool_name"),
+            "table_code": context.get("table_code"),
+            "field": context.get("field"),
+            "suggestion": ERROR_SUGGESTIONS.get("billing_or_auth", ERROR_SUGGESTIONS["internal"]),
+        }
     context = getattr(exc, "context", None) or {}
     kind = context.get("error_kind") or "internal"
     return {
@@ -150,11 +161,12 @@ def _call_validated(llm, tool_name, instruction, payload, validator, timeout=Non
 
 
 def _resolve_budget(session: Session, generation_budget=None):
-    """预算只读一次并贯通到底：max_retries 决定自愈轮数，max_llm_concurrency 决定并发宽度。"""
+    """预算只读一次并贯通到底：max_retries 决定自愈轮数，max_llm_concurrency / max_llm_rpm 决定并发与限速。"""
     if generation_budget is None:
         generation_budget = get_budget(session)
     concurrency = max(1, int(generation_budget.get("max_llm_concurrency", 4)))
     configure_llm_concurrency(concurrency)
+    configure_llm_rate_limit(int(generation_budget.get("max_llm_rpm") or 0))
     return generation_budget, concurrency
 
 
