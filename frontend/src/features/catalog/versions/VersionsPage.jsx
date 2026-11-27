@@ -1,626 +1,296 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import {
-  diffPackages,
-  getMetadataTable,
-  listMetadataTables,
-} from '../../../api/catalog.js'
-import { diffRuns, listRuns } from '../../../api/delivery.js'
-import { createGenerationRun } from '../../../api/generation.js'
+import { listMetadataRevisions, listMetadataTables } from '../../../api/catalog.js'
+import { listRuns } from '../../../api/delivery.js'
 import PageHeader from '../../../components/PageHeader.jsx'
-import { RevisionDiffView } from '../../../components/RevisionDiffView.jsx'
-import { DetailSkeleton, ListSkeleton } from '../../../components/Skeleton.jsx'
 import { StatusBadge } from '../../../components/StatusBadge.jsx'
 import StatusMessage from '../../../components/StatusMessage.jsx'
 import { useWorkspace } from '../../../context/WorkspaceContext.jsx'
-import { regulatorMeta } from '../../../utils/activeDocument.js'
-import { formatTime } from '../../../utils/dateTime.js'
-
-const IMPACT_META = {
-  BREAKING: { label: '破坏性变更', tone: 'red' },
-  RULE_IMPACT: { label: '规则受影响', tone: 'amber' },
-  METADATA_ONLY: { label: '仅描述变更', tone: 'blue' },
-  NONE: { label: '无变化', tone: 'neutral' },
-}
-
-const CHANGE_KIND_META = {
-  ADDED: { label: '新增报表', tone: 'green' },
-  REMOVED: { label: '下线报表', tone: 'red' },
-  MODIFIED: { label: '结构/校验变更', tone: 'amber' },
-  UNCHANGED: { label: '无变化', tone: 'neutral' },
-}
-
-const ATTR_LABELS = {
-  data_type: '数据类型',
-  length: '列宽',
-  decimal_places: '小数位',
-  required: '必填',
-  check_text_raw: '校验原文',
-  code_reference_text: '码表引用',
-  field_cn: '中文名',
-}
+import { agencyMeta, normalizeReportCode, regulatorMeta } from '../../../utils/activeDocument.js'
+import ChangeFeedTab from './ChangeFeedTab.jsx'
+import PackageDiffTab from './PackageDiffTab.jsx'
+import RunSqlDiffTab from './RunSqlDiffTab.jsx'
 
 export default function VersionsPage() {
   const navigate = useNavigate()
-  const { packages, activePackageId, activePackage, packagesInActiveRegulator, activeRegulator } = useWorkspace()
-  const [activeTab, setActiveTab] = useState('doc-diff')
+  const { packages, activeAgency, activeRegulator, activePackageId, activePackage } = useWorkspace()
 
-  // Tab 1: 规范包跨版本 Diff
-  const [basePkgId, setBasePkgId] = useState('')
-  const [targetPkgId, setTargetPkgId] = useState('')
-  const [docDiff, setDocDiff] = useState(null)
-  const [docDiffFilter, setDocDiffFilter] = useState('CHANGED')
-  const [diffBusy, setDiffBusy] = useState(false)
-  const [genBusy, setGenBusy] = useState(false)
+  const activeScopeRegulator =
+    activeRegulator !== 'ALL' ? activeRegulator : (activeAgency !== 'ALL' ? activeAgency : '')
+  const hasWorkspaceFilter = Boolean(activePackageId || activeScopeRegulator)
 
-  const selectablePackages = packagesInActiveRegulator.length >= 2 ? packagesInActiveRegulator : packages
+  const [scopeByProject, setScopeByProject] = useState(false)
+  const [activeTab, setActiveTab] = useState('feed')
 
-  useEffect(() => {
-    if (!packages.length) return
-    const pool = selectablePackages
-    const targetDefault = (activePackageId && pool.some((p) => p.id === activePackageId)) ? activePackageId : (pool[0]?.id || '')
-    const baseDefault = activePackage?.parent_package_id || pool.find((p) => p.id !== targetDefault)?.id || targetDefault
-    if (!targetPkgId || !pool.some((p) => p.id === targetPkgId)) setTargetPkgId(targetDefault)
-    if (!basePkgId || !pool.some((p) => p.id === basePkgId)) setBasePkgId(baseDefault)
-  }, [packages, activePackageId, activePackage, activeRegulator])
+  // Tab 1 变更流状态（默认聚焦人工修改与发布，去噪隐藏大批量 AI 初始提取）
+  const [humanOnly, setHumanOnly] = useState(true)
+  const [kindFilter, setKindFilter] = useState('ALL')
+  const [revisions, setRevisions] = useState([])
+  const [revisionSummary, setRevisionSummary] = useState({
+    total: 0,
+    human_edits: 0,
+    publishes: 0,
+    drafts: 0,
+    ai_events: 0,
+    tables_touched: 0,
+  })
+  const [revisionsLoading, setRevisionsLoading] = useState(true)
 
-  // Tab 2: 跨验证批次规则与 SQL Diff
-  const [runs, setRuns] = useState([])
-  const [baseRunId, setBaseRunId] = useState('')
-  const [targetRunId, setTargetRunId] = useState('')
-  const [runDiff, setRunDiff] = useState(null)
-  const [runDiffBusy, setRunDiffBusy] = useState(false)
-
-  // Tab 3: 单表修订记录（原有功能完整保留）
+  // 共享资产状态（报表列表 + 验证批次列表）
   const [tables, setTables] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
-  const [detail, setDetail] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [detailLoading, setDetailLoading] = useState(false)
-  const [tableSearch, setTableSearch] = useState('')
-  const [filterKind, setFilterKind] = useState('ALL')
+  const [runs, setRuns] = useState([])
+  const [assetsLoading, setAssetsLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const requestRef = useRef(0)
 
-  async function selectTable(id) {
-    const reqId = ++requestRef.current
-    setSelectedId(id)
-    setDetailLoading(true)
-    try {
-      const data = await getMetadataTable(id)
-      if (reqId === requestRef.current) setDetail(data)
-    } catch (err) {
-      if (reqId === requestRef.current) setError(err.message)
-    } finally {
-      if (reqId === requestRef.current) setDetailLoading(false)
+  const queryScope = useMemo(() => {
+    if (!scopeByProject || !hasWorkspaceFilter) return {}
+    return {
+      packageId: activePackageId || undefined,
+      regulator: activeScopeRegulator || undefined,
     }
-  }
+  }, [scopeByProject, hasWorkspaceFilter, activePackageId, activeScopeRegulator])
+
+  const loadRevisions = useCallback(async () => {
+    setRevisionsLoading(true)
+    try {
+      const data = await listMetadataRevisions({
+        ...queryScope,
+        humanOnly,
+        revisionKind: kindFilter,
+        limit: 120,
+      })
+      setRevisions(data?.revisions || [])
+      if (data?.summary) setRevisionSummary(data.summary)
+    } catch (err) {
+      setError(err.message || '加载变更动态失败')
+    } finally {
+      setRevisionsLoading(false)
+    }
+  }, [queryScope, humanOnly, kindFilter])
+
+  const loadAssets = useCallback(async () => {
+    setAssetsLoading(true)
+    try {
+      const [tableList, runList] = await Promise.all([
+        listMetadataTables(queryScope).catch(() => []),
+        listRuns(queryScope).catch(() => []),
+      ])
+      setTables(tableList)
+      setRuns(runList)
+    } catch (err) {
+      setError(err.message || '加载资产版本信息失败')
+    } finally {
+      setAssetsLoading(false)
+    }
+  }, [queryScope])
 
   useEffect(() => {
-    let cancelled = false
-    setLoading(true)
-    Promise.all([
-      listMetadataTables(activePackageId ? { packageId: activePackageId } : {}).catch(() => []),
-      listRuns(activePackageId ? { packageId: activePackageId } : {}).catch(() => []),
-    ])
-      .then(async ([tableList, runList]) => {
-        if (cancelled) return
-        setTables(tableList)
-        setRuns(runList)
-        if (runList.length >= 2) {
-          setBaseRunId(runList[1].id)
-          setTargetRunId(runList[0].id)
-        } else if (runList.length === 1) {
-          setBaseRunId(runList[0].id)
-          setTargetRunId(runList[0].id)
-        }
-        if (tableList[0]?.id && !cancelled) {
-          await selectTable(tableList[0].id)
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err.message)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activePackageId])
+    loadRevisions()
+  }, [loadRevisions])
 
-  async function compareDocuments() {
-    if (!basePkgId || !targetPkgId) return
-    setDiffBusy(true)
-    setError('')
-    try {
-      const data = await diffPackages(basePkgId, targetPkgId)
-      setDocDiff(data)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setDiffBusy(false)
-    }
+  useEffect(() => {
+    loadAssets()
+  }, [loadAssets])
+
+  function handleOpenTable(tableId, documentId) {
+    const qs = new URLSearchParams({ view: 'fields', table: tableId })
+    if (documentId) qs.set('document_id', documentId)
+    navigate(`/documents?${qs.toString()}`)
   }
 
-  async function runIncrementalGeneration() {
-    const affectedIds = docDiff?.affected_table_ids || []
-    if (!affectedIds.length) return
-    setGenBusy(true)
-    setError('')
-    try {
-      const created = await createGenerationRun({ tableIds: affectedIds, acceptWarnings: true })
-      setNotice(`已对 ${affectedIds.length} 张受影响报表发起增量规则生成与验证。`)
-      navigate(`/runs?run=${created.id}`)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setGenBusy(false)
+  // 统计同一监管报表下存在多版本的体系数 & 同表有多次运行的报表数
+  const upgradeablePackageStats = useMemo(() => {
+    const byReg = new Map()
+    for (const pkg of packages) {
+      const code = normalizeReportCode(pkg.regulator)
+      byReg.set(code, (byReg.get(code) || 0) + 1)
     }
-  }
+    const multiRegCount = [...byReg.values()].filter((c) => c >= 2).length
+    const inheritedCount = packages.filter((p) => Boolean(p.parent_package_id)).length
+    return { total: packages.length, multiRegCount, inheritedCount }
+  }, [packages])
 
-  async function compareRuns() {
-    if (!baseRunId || !targetRunId) return
-    setRunDiffBusy(true)
-    setError('')
-    try {
-      const data = await diffRuns(baseRunId, targetRunId)
-      setRunDiff(data)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setRunDiffBusy(false)
+  const comparableTableRuns = useMemo(() => {
+    const counts = new Map()
+    for (const r of runs) {
+      for (const t of r.tables || []) {
+        if (t.table_code) counts.set(t.table_code, (counts.get(t.table_code) || 0) + 1)
+      }
     }
-  }
+    return [...counts.values()].filter((c) => c >= 2).length
+  }, [runs])
 
-  const visibleDocTables = (docDiff?.tables || []).filter((item) => {
-    if (docDiffFilter === 'CHANGED') return item.change_kind !== 'UNCHANGED'
-    if (docDiffFilter === 'BREAKING') return item.impact === 'BREAKING'
-    return true
-  })
+  const scopeLabel = useMemo(() => {
+    if (activePackage) {
+      const rm = regulatorMeta(activePackage.regulator)
+      return `${rm.agencyShortLabel} · ${activePackage.name}`
+    }
+    if (activeRegulator !== 'ALL') {
+      const rm = regulatorMeta(activeRegulator)
+      return `${rm.agencyShortLabel} · ${rm.label}`
+    }
+    if (activeAgency !== 'ALL') return agencyMeta(activeAgency).label
+    return '全部监管机构'
+  }, [activeAgency, activePackage, activeRegulator])
 
-  const visibleTables = tables.filter((table) => {
-    const q = tableSearch.trim().toLowerCase()
-    if (!q) return true
-    return (
-      (table.table_name || '').toLowerCase().includes(q) ||
-      (table.table_code || '').toLowerCase().includes(q)
-    )
-  })
-
-  const revisions = (detail?.revisions || []).filter(
-    (item) => filterKind === 'ALL' || item.revision_kind === filterKind,
+  const publishedTableCount = useMemo(
+    () => tables.filter((t) => t.status === 'PUBLISHED').length,
+    [tables],
   )
 
   return (
-    <>
+    <div className="versions-center-page">
       <PageHeader
-        eyebrow="监管版本运营台"
-        title="制度差异与变更追踪"
-        description="对比新旧监管制度文档的报表与字段差异、定位受影响规则并一键增量重跑，或对比两次验证批次的规则与 Oracle SQL 变化。"
+        eyebrow="资产治理 · 版本迭代与影响面"
+        title="版本演进与变更中心"
+        description="追踪监管报表字段的人工修改与发布动态，评估新旧制度升级对报表/码表/规则的影响面，对比历史验证批次的 Oracle SQL 差异。"
         actions={
-          activeTab === 'revisions' && detail ? (
+          <>
+            {hasWorkspaceFilter && (
+              <div className="project-scope-toggle">
+                <button
+                  type="button"
+                  className={`button sm ${!scopeByProject ? 'primary' : 'secondary'}`}
+                  onClick={() => setScopeByProject(false)}
+                >
+                  全行全量视角
+                </button>
+                <button
+                  type="button"
+                  className={`button sm ${scopeByProject ? 'primary' : 'secondary'}`}
+                  title={`仅查看当前范围：${scopeLabel}`}
+                  onClick={() => setScopeByProject(true)}
+                >
+                  仅当前范围
+                </button>
+              </div>
+            )}
             <button
               type="button"
-              className="button secondary"
-              onClick={() => {
-                const qs = new URLSearchParams({ view: 'fields', table: detail.id })
-                if (detail.document_id) qs.set('document_id', detail.document_id)
-                navigate(`/documents?${qs.toString()}`)
-              }}
+              className="button secondary sm"
+              onClick={() => navigate('/audit')}
             >
-              打开此表 →
+              前往审计中心 (哈希链) →
             </button>
-          ) : null
+          </>
         }
       />
 
       <StatusMessage error={error} notice={notice} onClose={() => { setError(''); setNotice('') }} />
 
-      <nav className="validation-tab-bar" style={{ marginBottom: 16 }}>
-        <button type="button" className={activeTab === 'doc-diff' ? 'active' : ''} onClick={() => setActiveTab('doc-diff')}>
-          制度文档版本对比 & 影响面
+      {/* 顶部 4 张资产演进 KPI 卡 */}
+      <section className="audit-kpi-grid" aria-label="版本演进概览指标">
+        <article className="audit-kpi-card">
+          <div className="audit-kpi-head">
+            <span>人工修订与版本发布</span>
+            <StatusBadge tone="green">{revisionSummary.publishes} 次发布</StatusBadge>
+          </div>
+          <strong className="audit-kpi-value">{revisionSummary.human_edits} 次人工改字段</strong>
+          <small className="audit-kpi-sub">
+            累计 {revisionSummary.total} 条记录（含 {revisionSummary.ai_events} 条 AI 自动识别/复核）
+          </small>
+        </article>
+
+        <article className="audit-kpi-card">
+          <div className="audit-kpi-head">
+            <span>监管规范包版本基线</span>
+            <StatusBadge tone={upgradeablePackageStats.multiRegCount > 0 ? 'blue' : 'neutral'}>
+              {upgradeablePackageStats.multiRegCount > 0
+                ? `${upgradeablePackageStats.multiRegCount} 体系可升级对比`
+                : '均为单版基线'}
+            </StatusBadge>
+          </div>
+          <strong className="audit-kpi-value">{upgradeablePackageStats.total} 套规范包</strong>
+          <small className="audit-kpi-sub">
+            {upgradeablePackageStats.inheritedCount > 0
+              ? `其中 ${upgradeablePackageStats.inheritedCount} 套设置了前置基线继承关系`
+              : '新建下年度规范包并继承旧版后，可自动生成升级影响面报告'}
+          </small>
+        </article>
+
+        <article className="audit-kpi-card">
+          <div className="audit-kpi-head">
+            <span>当前范围报表资产</span>
+            <StatusBadge tone="blue">{publishedTableCount} 已发布</StatusBadge>
+          </div>
+          <strong className="audit-kpi-value">{tables.length} 张报表</strong>
+          <small className="audit-kpi-sub">
+            {scopeByProject && hasWorkspaceFilter ? `当前范围：${scopeLabel}` : '全行所有有效规范包纳管报表'}
+          </small>
+        </article>
+
+        <article className="audit-kpi-card">
+          <div className="audit-kpi-head">
+            <span>可对比验证批次</span>
+            <StatusBadge tone="violet">Oracle SQL</StatusBadge>
+          </div>
+          <strong className="audit-kpi-value">{runs.length} 个批次</strong>
+          <small className="audit-kpi-sub">
+            {comparableTableRuns > 0
+              ? `${comparableTableRuns} 张报表拥有多批次历史，支持同表 SQL Diff`
+              : '同一张表运行 2 次以上即可自动配对对比生产 SQL 变化'}
+          </small>
+        </article>
+      </section>
+
+      <nav className="validation-tab-bar" aria-label="版本变更视图切换">
+        <button
+          type="button"
+          className={activeTab === 'feed' ? 'active' : ''}
+          onClick={() => setActiveTab('feed')}
+        >
+          1. 变更动态与修订时间线 ({revisionSummary.human_edits + revisionSummary.publishes})
         </button>
-        <button type="button" className={activeTab === 'run-diff' ? 'active' : ''} onClick={() => setActiveTab('run-diff')}>
-          验证批次规则与 SQL 对比
+        <button
+          type="button"
+          className={activeTab === 'pkg-diff' ? 'active' : ''}
+          onClick={() => setActiveTab('pkg-diff')}
+        >
+          2. 制度升级对比 & 影响面
         </button>
-        <button type="button" className={activeTab === 'revisions' ? 'active' : ''} onClick={() => setActiveTab('revisions')}>
-          单表修订记录 ({tables.length})
+        <button
+          type="button"
+          className={activeTab === 'run-diff' ? 'active' : ''}
+          onClick={() => setActiveTab('run-diff')}
+        >
+          3. 规则与 SQL 版本对比 ({runs.length})
         </button>
       </nav>
 
-      {activeTab === 'doc-diff' && (
-        <section className="panel">
-          <div className="panel-heading">
-            <div>
-              <h2>跨版本规范包对比</h2>
-              <p>选择同一监管项目的新旧版本规范包，自动比对每张融合报表的增删改、字段类型/长度/必填/校验变更及补充核查规则差异。</p>
-            </div>
-            <div className="actions">
-              <button
-                type="button"
-                className="button primary"
-                disabled={diffBusy || !basePkgId || !targetPkgId}
-                onClick={compareDocuments}
-              >
-                {diffBusy ? '正在比对...' : '执行版本对比'}
-              </button>
-            </div>
-          </div>
+      {activeTab === 'feed' && (
+        <ChangeFeedTab
+          revisions={revisions}
+          revisionSummary={revisionSummary}
+          revisionsLoading={revisionsLoading}
+          humanOnly={humanOnly}
+          onToggleHumanOnly={setHumanOnly}
+          kindFilter={kindFilter}
+          onChangeKindFilter={setKindFilter}
+          tables={tables}
+          tablesLoading={assetsLoading}
+          onOpenTable={handleOpenTable}
+          onError={setError}
+        />
+      )}
 
-          <div className="list-filter-bar" style={{ marginBottom: 14 }}>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">基线规范包（旧版）</small>
-              <select value={basePkgId} onChange={(e) => setBasePkgId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择基线规范包</option>
-                {selectablePackages.map((pkg) => {
-                  const pm = regulatorMeta(pkg.regulator)
-                  return (
-                    <option key={pkg.id} value={pkg.id}>
-                      [{pm.agencyShortLabel} · {pm.shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
-                    </option>
-                  )
-                })}
-              </select>
-            </label>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">目标规范包（新版）</small>
-              <select value={targetPkgId} onChange={(e) => setTargetPkgId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择新版规范包</option>
-                {selectablePackages.map((pkg) => {
-                  const pm = regulatorMeta(pkg.regulator)
-                  return (
-                    <option key={pkg.id} value={pkg.id}>
-                      [{pm.agencyShortLabel} · {pm.shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
-                    </option>
-                  )
-                })}
-              </select>
-            </label>
-          </div>
-
-          {docDiff ? (
-            <>
-              <div className="audit-metrics" style={{ marginBottom: 14 }}>
-                <div><span>新增 / 下线报表</span><strong>+{docDiff.summary.added_tables} / -{docDiff.summary.removed_tables}</strong></div>
-                <div><span>变更报表</span><strong>{docDiff.summary.modified_tables} 张</strong><small>无变化 {docDiff.summary.unchanged_tables} 张</small></div>
-                <div><span>破坏性变更</span><strong>{docDiff.summary.breaking_tables} 张</strong><small>规则受影响 {docDiff.summary.rule_impact_tables} 张</small></div>
-                <div>
-                  <span>建议增量重跑</span>
-                  <strong>{docDiff.summary.affected_table_count} 张</strong>
-                  {docDiff.summary.rule_evidences && (
-                    <small>
-                      补充规则 {docDiff.summary.rule_evidences.base} → {docDiff.summary.rule_evidences.target}（+{docDiff.summary.rule_evidences.added} / -{docDiff.summary.rule_evidences.removed}）
-                    </small>
-                  )}
-                </div>
-              </div>
-
-              {docDiff.affected_table_ids?.length > 0 && (
-                <div className="action-callout" style={{ marginBottom: 14 }}>
-                  <div>
-                    <strong>识别到 {docDiff.affected_table_ids.length} 张受影响报表需要重新装配规则</strong>
-                    <p>仅对新增与受影响的报表发起 Step 2 增量规则生成，未变更报表保持历史产物不动。</p>
-                  </div>
-                  <button
-                    type="button"
-                    className="button primary"
-                    disabled={genBusy}
-                    onClick={runIncrementalGeneration}
-                  >
-                    {genBusy ? '正在发起...' : `一键增量生成 (${docDiff.affected_table_ids.length} 张)`}
-                  </button>
-                </div>
-              )}
-
-              <div className="list-filter-bar" style={{ marginBottom: 10 }}>
-                <select value={docDiffFilter} onChange={(e) => setDocDiffFilter(e.target.value)}>
-                  <option value="CHANGED">仅看有变化报表</option>
-                  <option value="BREAKING">仅看破坏性变更</option>
-                  <option value="ALL">全部报表 ({docDiff.tables.length})</option>
-                </select>
-              </div>
-
-              {visibleDocTables.length > 0 ? (
-                <div className="list-stack">
-                  {visibleDocTables.map((tbl) => {
-                    const cMeta = CHANGE_KIND_META[tbl.change_kind] || { label: tbl.change_kind, tone: 'neutral' }
-                    const iMeta = IMPACT_META[tbl.impact] || { label: tbl.impact, tone: 'neutral' }
-                    return (
-                      <details className="run-section" key={`${tbl.change_kind}-${tbl.table_code}`} open={tbl.impact === 'BREAKING'}>
-                        <summary style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                          <span>
-                            <strong>{tbl.table_name || tbl.table_code}</strong> <code>{tbl.table_code}</code>
-                            {' · '}字段 {tbl.field_counts.base} → {tbl.field_counts.target}
-                          </span>
-                          <span className="actions">
-                            <StatusBadge tone={cMeta.tone}>{cMeta.label}</StatusBadge>
-                            <StatusBadge tone={iMeta.tone}>{iMeta.label}</StatusBadge>
-                          </span>
-                        </summary>
-                        <div style={{ marginTop: 10 }}>
-                          {tbl.added_fields.length > 0 && (
-                            <p className="muted-text">
-                              <strong>新增字段 ({tbl.added_fields.length})：</strong>
-                              {tbl.added_fields.map((f) => `${f.field_en}(${f.data_type}(${f.length})${f.required ? ',必填' : ''})`).join('、')}
-                            </p>
-                          )}
-                          {tbl.removed_fields.length > 0 && (
-                            <p className="danger-text">
-                              <strong>删除字段 ({tbl.removed_fields.length})：</strong>
-                              {tbl.removed_fields.map((f) => f.field_en).join('、')}
-                            </p>
-                          )}
-                          {tbl.modified_fields.length > 0 && (
-                            <div className="table-wrap" style={{ marginTop: 8 }}>
-                              <table>
-                                <thead>
-                                  <tr><th>字段</th><th>影响等级</th><th>具体变化（旧 → 新）</th></tr>
-                                </thead>
-                                <tbody>
-                                  {tbl.modified_fields.map((mf) => {
-                                    const fm = IMPACT_META[mf.impact] || { label: mf.impact, tone: 'neutral' }
-                                    return (
-                                      <tr key={mf.field_en}>
-                                        <td><code>{mf.field_en}</code><small>{mf.field_cn}</small></td>
-                                        <td><StatusBadge tone={fm.tone}>{fm.label}</StatusBadge></td>
-                                        <td>
-                                          {mf.changes.map((c, idx) => (
-                                            <div key={idx}>
-                                              <strong>{ATTR_LABELS[c.attr] || c.attr}：</strong>
-                                              <code>{String(c.old)}</code> → <code>{String(c.new)}</code>
-                                            </div>
-                                          ))}
-                                        </td>
-                                      </tr>
-                                    )
-                                  })}
-                                </tbody>
-                              </table>
-                            </div>
-                          )}
-                          {tbl.change_kind === 'UNCHANGED' && <p className="muted-text">该表字段结构与校验原文完全一致。</p>}
-                        </div>
-                      </details>
-                    )
-                  })}
-                </div>
-              ) : (
-                <div className="empty">当前筛选条件下没有差异报表。</div>
-              )}
-            </>
-          ) : (
-            <div className="empty">选择两份已导入的监管规范文档，点击「执行版本对比」即可查看字段级 Diff 与影响面分析。</div>
-          )}
-        </section>
+      {activeTab === 'pkg-diff' && (
+        <PackageDiffTab
+          packages={packages}
+          activePackageId={activePackageId}
+          activePackage={activePackage}
+          activeRegulator={activeRegulator}
+          onNotice={setNotice}
+          onError={setError}
+        />
       )}
 
       {activeTab === 'run-diff' && (
-        <section className="panel">
-          <div className="panel-heading">
-            <div>
-              <h2>验证批次规则与 Oracle SQL 对比</h2>
-              <p>选择两个历史验证批次，逐条对比新增、删除和参数/SQL 发生变化的规则。</p>
-            </div>
-            <button
-              type="button"
-              className="button primary"
-              disabled={runDiffBusy || !baseRunId || !targetRunId}
-              onClick={compareRuns}
-            >
-              {runDiffBusy ? '正在比对...' : '对比规则差异'}
-            </button>
-          </div>
-
-          <div className="list-filter-bar" style={{ marginBottom: 14 }}>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">基线批次</small>
-              <select value={baseRunId} onChange={(e) => setBaseRunId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择基线批次</option>
-                {runs.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.id.slice(0, 8)} · {(r.tables || []).map((t) => t.table_code).join(', ')} · {formatTime(r.created_at)} ({r.status})
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">目标批次</small>
-              <select value={targetRunId} onChange={(e) => setTargetRunId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择目标批次</option>
-                {runs.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.id.slice(0, 8)} · {(r.tables || []).map((t) => t.table_code).join(', ')} · {formatTime(r.created_at)} ({r.status})
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          {runDiff ? (
-            <>
-              <div className="audit-metrics" style={{ marginBottom: 14 }}>
-                <div><span>新增规则</span><strong>+{runDiff.summary.added}</strong></div>
-                <div><span>移除规则</span><strong>-{runDiff.summary.removed}</strong></div>
-                <div><span>参数 / SQL 变更</span><strong>{runDiff.summary.modified}</strong></div>
-                <div><span>保持不变</span><strong>{runDiff.summary.unchanged}</strong></div>
-              </div>
-
-              {runDiff.modified.length > 0 && (
-                <div className="table-wrap" style={{ marginBottom: 14 }}>
-                  <h3 style={{ marginBottom: 8 }}>变更规则 ({runDiff.modified.length})</h3>
-                  <table>
-                    <thead><tr><th>表 / 字段</th><th>规则 / 算子</th><th>差异详情（旧 → 新）</th></tr></thead>
-                    <tbody>
-                      {runDiff.modified.map((item) => (
-                        <tr key={`${item.table_code}-${item.rule_key}`}>
-                          <td><strong>{item.table_code}</strong><small>{item.field}</small></td>
-                          <td><code>{item.operator}</code><small>{item.rule_key}</small></td>
-                          <td>
-                            {item.changes.map((c, idx) => (
-                              <div key={idx} style={{ marginBottom: 4 }}>
-                                <strong>{c.attr}：</strong>
-                                <code>{typeof c.old === 'object' ? JSON.stringify(c.old) : String(c.old)}</code>
-                                {' → '}
-                                <code>{typeof c.new === 'object' ? JSON.stringify(c.new) : String(c.new)}</code>
-                              </div>
-                            ))}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {runDiff.added.length > 0 && (
-                <div className="table-wrap" style={{ marginBottom: 14 }}>
-                  <h3 style={{ marginBottom: 8 }}>新增规则 ({runDiff.added.length})</h3>
-                  <table>
-                    <thead><tr><th>表 / 字段</th><th>规则 / 算子</th><th>编译后 Oracle WHERE</th></tr></thead>
-                    <tbody>
-                      {runDiff.added.map((r) => (
-                        <tr key={r.rule_hash}>
-                          <td><strong>{r.table_code}</strong><small>{r.field}</small></td>
-                          <td><code>{r.operator}</code><small>{r.rule_key}</small></td>
-                          <td><code>{r.sql || JSON.stringify(r.params)}</code></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {runDiff.removed.length > 0 && (
-                <div className="table-wrap">
-                  <h3 style={{ marginBottom: 8 }}>移除规则 ({runDiff.removed.length})</h3>
-                  <table>
-                    <thead><tr><th>表 / 字段</th><th>规则 / 算子</th><th>原 Oracle WHERE</th></tr></thead>
-                    <tbody>
-                      {runDiff.removed.map((r) => (
-                        <tr key={r.rule_hash}>
-                          <td><strong>{r.table_code}</strong><small>{r.field}</small></td>
-                          <td><code>{r.operator}</code><small>{r.rule_key}</small></td>
-                          <td><code>{r.sql || JSON.stringify(r.params)}</code></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {runDiff.added.length === 0 && runDiff.removed.length === 0 && runDiff.modified.length === 0 && (
-                <div className="empty">两个批次的有效规则集合与编译 SQL 完全一致。</div>
-              )}
-            </>
-          ) : (
-            <div className="empty">选择两个历史验证批次，点击「对比规则差异」查看新增/移除/改参规则与 SQL 变化。</div>
-          )}
-        </section>
+        <RunSqlDiffTab
+          runs={runs}
+          onError={setError}
+        />
       )}
-
-      {activeTab === 'revisions' && (
-        <section className="workspace-grid versions-layout">
-          <div className="panel list-panel">
-            <div className="panel-heading">
-              <div>
-                <h2>选择报表</h2>
-                <p>共 {tables.length} 张表</p>
-              </div>
-              <StatusBadge tone="neutral">{tables.length}</StatusBadge>
-            </div>
-
-            <div className="list-filters" style={{ marginBottom: 10 }}>
-              <input
-                type="search"
-                placeholder="搜索报表名称或代码..."
-                value={tableSearch}
-                onChange={(e) => setTableSearch(e.target.value)}
-              />
-            </div>
-
-            {loading ? (
-              <ListSkeleton rows={6} />
-            ) : visibleTables.length > 0 ? (
-              <div className="list-stack">
-                {visibleTables.map((table) => (
-                  <button
-                    type="button"
-                    className={`list-row ${(selectedId || detail?.id) === table.id ? 'selected' : ''}`}
-                    key={table.id}
-                    onClick={() => selectTable(table.id)}
-                  >
-                    <div className="list-row-top">
-                      <strong>{table.table_name}</strong>
-                      <StatusBadge status={table.status} />
-                    </div>
-                    <span>
-                      <code>{table.table_code}</code> · 当前 v{table.current_version}
-                    </span>
-                    <em>{table.published_version ? `已发布 v${table.published_version}` : '未发布'}</em>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="empty">
-                {tableSearch ? '没有匹配的报表。' : '暂无元数据表版本记录。'}
-              </div>
-            )}
-          </div>
-
-          <div className={`panel ${detailLoading && detail ? 'panel-transitioning' : ''}`}>
-            {detailLoading && !detail ? (
-              <DetailSkeleton blocks={4} />
-            ) : detail ? (
-              <>
-                <div className="panel-heading">
-                  <div>
-                    <div className="actions">
-                      <h2>{detail.table_name}</h2>
-                      <code>{detail.table_code}</code>
-                      <StatusBadge status={detail.status} />
-                    </div>
-                    <p>
-                      当前版本 v{detail.current_version} · 发布基线{' '}
-                      {detail.published_version ? `v${detail.published_version}` : '未发布'} · 共{' '}
-                      {detail.revisions.length} 条变更记录
-                    </p>
-                  </div>
-                  <div className="actions">
-                    <select
-                      value={filterKind}
-                      onChange={(e) => setFilterKind(e.target.value)}
-                      aria-label="筛选变更类型"
-                    >
-                      <option value="ALL">全部变更类型 ({detail.revisions.length})</option>
-                      <option value="HUMAN_EDIT">人工修改</option>
-                      <option value="HUMAN_ADD">新增字段</option>
-                      <option value="HUMAN_DELETE">删除字段</option>
-                      <option value="DRAFT_CREATED">创建修改版本</option>
-                      <option value="PUBLISHED">发布记录</option>
-                      <option value="AI_EXTRACTION">自动识别</option>
-                      <option value="AI_REVIEW">AI 复核</option>
-                    </select>
-                  </div>
-                </div>
-
-                {revisions.length > 0 ? (
-                  <div className="revision-list">
-                    {revisions.map((item, index) => (
-                      <RevisionDiffView key={index} revision={item} />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="empty">当前筛选条件下没有变更记录。</div>
-                )}
-              </>
-            ) : (
-              <div className="empty">请从左侧选择一张表查看版本演进与字段级差异。</div>
-            )}
-          </div>
-        </section>
-      )}
-    </>
+    </div>
   )
 }

@@ -9,7 +9,7 @@ function formatDiffValue(key, val) {
   return String(val)
 }
 
-export function RevisionDiffView({ revision }) {
+export function RevisionDiffView({ revision, tableContext = null, onOpenTable = null }) {
   const [showRaw, setShowRaw] = useState(false)
   const kind = revision.revision_kind
   const oldVal = revision.old_value || {}
@@ -124,21 +124,44 @@ export function RevisionDiffView({ revision }) {
 
   return (
     <div className="revision-card">
+      {tableContext && (
+        <div className="revision-table-context">
+          <div className="revision-table-context-main">
+            {tableContext.regulatorLabel && (
+              <span className="audit-reg-chip">{tableContext.regulatorLabel}</span>
+            )}
+            <strong>{tableContext.table_name || tableContext.table_code}</strong>
+            {tableContext.table_code && <code>{tableContext.table_code}</code>}
+            {tableContext.package_name && (
+              <span className="muted-text">{tableContext.package_name}</span>
+            )}
+          </div>
+          {onOpenTable && (
+            <button type="button" className="button ghost sm" onClick={onOpenTable}>
+              打开此表核对 →
+            </button>
+          )}
+        </div>
+      )}
       <div className="revision-card-header">
         <div className="revision-meta">
           <StatusBadge
             tone={
               kind === 'PUBLISHED'
                 ? 'green'
-                : kind === 'AI_EXTRACTION' || kind === 'AI_REVIEW'
-                  ? 'violet'
-                  : 'blue'
+                : kind === 'HUMAN_DELETE'
+                  ? 'red'
+                  : kind === 'HUMAN_ADD' || kind === 'HUMAN_EDIT'
+                    ? 'amber'
+                    : kind === 'AI_EXTRACTION' || kind === 'AI_REVIEW'
+                      ? 'violet'
+                      : 'blue'
             }
           >
             {REVISION_LABELS[kind] || kind}
           </StatusBadge>
           <strong>{revision.reason || '变更记录'}</strong>
-          <span className="muted-text">{revision.editor || '系统'}</span>
+          <span className="muted-text">操作人：{revision.editor || '系统'}</span>
         </div>
         <div className="revision-actions">
           <span className="revision-time">{formatTime(revision.created_at)}</span>

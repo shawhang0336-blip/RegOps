@@ -74,9 +74,37 @@ def list_tables(
     status: Optional[str] = None,
     document_id: Optional[str] = None,
     package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
-    return svc.list_tables_with_stats(session, status=status, document_id=document_id, package_id=package_id)
+    return svc.list_tables_with_stats(
+        session,
+        status=status,
+        document_id=document_id,
+        package_id=package_id,
+        regulator=regulator,
+    )
+
+
+@router.get("/revisions")
+def list_revisions(
+    package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
+    table_id: Optional[str] = None,
+    revision_kind: Optional[str] = None,
+    human_only: bool = False,
+    limit: int = 120,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return svc.list_metadata_revisions(
+        session,
+        package_id=package_id,
+        regulator=regulator,
+        table_id=table_id,
+        revision_kind=revision_kind,
+        human_only=human_only,
+        limit=max(1, min(limit, 500)),
+    )
 
 
 @router.get("/tables/{table_id}")

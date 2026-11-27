@@ -769,6 +769,17 @@ export default function RunsPage() {
                   {replay && ` · ${replay.chain_valid ? '哈希链完整' : '哈希链异常'}`}
                 </summary>
 
+                <div className="audit-shortcut-bar">
+                  <span>需逐条核查 SHA-256 哈希链、节点耗时瀑布或导出银行合规审计证据？</span>
+                  <button
+                    type="button"
+                    className="button secondary sm"
+                    onClick={() => navigate(`/audit?run=${encodeURIComponent(active.id)}`)}
+                  >
+                    在审计中心查看完整哈希链 →
+                  </button>
+                </div>
+
                 <div className="audit-metrics" style={{ marginTop: 12, marginBottom: 12 }}>
                   <div>
                     <span>当前 Plan 节点</span>

@@ -25,6 +25,20 @@ export function getRunReplay(runId) {
   return api(`/api/runs/${runId}/replay`)
 }
 
+export function getAuditOverview({ packageId, regulator, runKind, limit } = {}) {
+  const params = new URLSearchParams()
+  if (packageId) params.set('package_id', packageId)
+  if (regulator && regulator !== 'ALL') params.set('regulator', regulator)
+  if (runKind && runKind !== 'ALL') params.set('run_kind', runKind)
+  if (limit) params.set('limit', String(limit))
+  const qs = params.toString()
+  return api(`/api/runs/audit-overview${qs ? `?${qs}` : ''}`)
+}
+
+export function getAuditRunDetail(runId) {
+  return api(`/api/runs/${runId}/audit-detail`)
+}
+
 export function diffRuns(baseRunId, targetRunId) {
   const qs = new URLSearchParams({ base_run_id: baseRunId, target_run_id: targetRunId }).toString()
   return api(`/api/runs/diff?${qs}`)

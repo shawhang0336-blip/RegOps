@@ -13,7 +13,7 @@
   1. **01 规范解析与核对（`/documents`）**：支持基于规范包的多文件与压缩包异构接入（PDF / DOCX / XLSX / ZIP 以及旧版 `.doc`（LibreOffice / macOS `textutil`）与 `.xls`（`xlrd`）自动转码），自动识别文档角色（`MAIN_SPEC` / `SCHEMA_APPENDIX` / `CODE_SET_APPENDIX` / `RULE_SUPPLEMENT` / `REVISION_NOTE`）、Word 合并单元格与章节树、Excel 多表拆分、1104/地方银行业二维矩阵表样（`MATRIX_REPORT`）隔离、EAST OCR 检核规则 PDF 行级解析、国标层级码表（如 GB/T 4754-2017）零 LLM 结构化抽取、三轨并行提取与跨文件同表融合/冲突标红、单文件原地替换更新（`PUT`），以及人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
   2. **02 生成表结构、码表和规则（`/generation`）**：按当前规范包自动筛选报表清单，将包内独立核查规则（`TableRuleEvidence`）桥接注入 Step 2，完成确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
   3. **03 测试与下载（`/runs`）**：支持按监管机构 / 监管报表 / 版本包过滤历史批次，执行 AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、断点续跑（`RUN_RESUMED`）、测试确认门禁、生产 Oracle + MySQL DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载。
-  - 辅助入口：**变更记录（`/versions`）** 支持跨版本规范包字段与补充规则 Diff（`diffPackages`）、影响面分级及跨批次 SQL Diff；**系统设置（`/settings`）** 配置数据源与模型/预算参数，右上角实时显示后端在线状态与浅色/深色外观切换。
+  - 右上角三大治理入口：**审计中心（`/audit`）** 独立承接全链路 EventLog 合规审计（实时重算 Step 0/1 文档解析与 Step 2/3 规则验证全量 SHA-256 哈希链、节点耗时瀑布、Bus 物理门禁拦截、人工确权签批指纹、端到端加密指纹及 JSON 证据包导出）；**变更记录（`/versions`）** 重构为「版本演进与变更中心」（默认去噪的跨表变更动态流 + 按单表演进、同监管体系智能配对的报表/码表码值/补充规则三层升级影响面评估与 Markdown 报告导出、同表智能配对的 Oracle SQL 红绿块级 Diff）；**系统设置（`/settings`）** 配置数据源与模型/预算参数，并实时显示后端在线状态与浅色/深色外观切换。
 - **后端架构（ProdAgent「机制在内，策略在外」+ 严格单向八层 DAG）**
   - 六大微内核（`Plan` / `Bus` / `EventLog` / `Interrupt` / `Run` / `Scheduler` 真 BSP `Send` 波次引擎）与业务策略彻底隔离；
   - 全链路以只追加哈希链事件账本（`EventLog`）与内容寻址大对象存储（`BlobStore`）为唯一事实源，支持门禁拦截、一等人工中断挂起、横切成本熔断（`BudgetGuard`）、运行中取消、断点续跑与 SSE 实时事件推送；
@@ -75,9 +75,9 @@ data-rule-studio/
 
 | 业务域 | 前端页面（`frontend/src/features/`） | 前端接口（`frontend/src/api/`） | 后端接口（`backend/app/api/`） | 职责范围 |
 | --- | --- | --- | --- | --- |
-| `catalog` | `catalog/`（工作台、多文件规范包、文档、元数据、码表、变更记录） | `catalog.js` | `catalog/`（`packages` / `documents` / `metadata` / `code_sets`） | 规范包多文件接入、三轨提取、跨文件融合、码表对齐与版本 Diff |
+| `catalog` | `catalog/`（工作台、多文件规范包、文档、元数据、码表、版本演进与变更中心） | `catalog.js` | `catalog/`（`packages` / `documents` / `metadata` / `code_sets`） | 规范包多文件接入、三轨提取、跨文件融合、码表对齐、全局修订流与跨版本影响面 Diff |
 | `generation` | `generation/`（规则工作台与规则编辑抽屉） | `generation.js` | `generation/`（`generation` / `artifacts`） | 规则/表结构/码表产物聚合、规则改参、发起生成与打包下载 |
-| `delivery` | `delivery/`（测试与下载、追踪瀑布、历史清理） | `delivery.js` | `delivery/`（`runs`） | 运行批次控制、规则审批、测试确认、沙箱预览与批次 Diff |
+| `delivery` | `delivery/`（测试与下载、全链路审计中心、追踪瀑布、历史清理） | `delivery.js` | `delivery/`（`runs`） | 运行批次控制、全链路 SHA-256 哈希链审计、规则审批、测试确认、沙箱预览与批次 SQL Diff |
 | `platform` | `platform/`（系统设置） | `platform.js` | `platform/`（`system` / `settings`） | 健康探测、SSE 事件流、Blob 读取、连接探活与执行预算 |
 
 ---
@@ -221,7 +221,7 @@ npm run dev
 ## 测试与架构守卫
 
 ```bash
-# 后端全量测试（340 passed, 1 skipped：含八层 DAG、内核纯净度、多文件异构规范解析与跨文件融合、旧版 .doc/.xls 与 EAST OCR 规则回归、Step 0/1 断点续跑与 RPM 限流等守卫）
+# 后端全量测试（345 passed, 1 skipped：含八层 DAG、内核纯净度、SHA-256 哈希链防篡改审计中心、修订流与码表/规则升级 Diff、多文件异构规范解析与跨文件融合、旧版 .doc/.xls 与 EAST OCR 规则回归、Step 0/1 断点续跑与 RPM 限流等守卫）
 cd backend && pytest -q
 
 # 前端单测与架构边界守卫（10 项：目录结构、银行监管机构/报表字典、/api/* 统一收口与单向依赖校验）

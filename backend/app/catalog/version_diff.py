@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.infra.db_tables import (
+    CodeSetModel,
+    CodeValueModel,
     FieldMetadataModel,
     SourceDocumentModel,
     SpecPackageModel,
@@ -283,8 +285,237 @@ def diff_documents(session: Session, base_doc_id: str, target_doc_id: str) -> Di
     }
 
 
+def _load_latest_code_sets(
+    session: Session,
+    package_id: str,
+) -> Tuple[List[CodeSetModel], Dict[str, List[CodeValueModel]]]:
+    rows = (
+        session.query(CodeSetModel)
+        .filter(
+            CodeSetModel.package_id == package_id,
+            CodeSetModel.status != "PLACEHOLDER",
+        )
+        .order_by(CodeSetModel.code.asc(), CodeSetModel.current_version.desc())
+        .all()
+    )
+    latest: Dict[str, CodeSetModel] = {}
+    for row in rows:
+        key = (row.code or "").strip().upper()
+        if key and key not in latest:
+            latest[key] = row
+    sets = list(latest.values())
+    set_ids = [cs.id for cs in sets]
+    values_by_set: Dict[str, List[CodeValueModel]] = {sid: [] for sid in set_ids}
+    for idx in range(0, len(set_ids), 500):
+        chunk = set_ids[idx : idx + 500]
+        for val in (
+            session.query(CodeValueModel)
+            .filter(CodeValueModel.code_set_id.in_(chunk))
+            .order_by(CodeValueModel.sort_order.asc(), CodeValueModel.value.asc())
+            .all()
+        ):
+            values_by_set.setdefault(val.code_set_id, []).append(val)
+    return sets, values_by_set
+
+
+def _compare_code_sets(
+    session: Session,
+    base_package_id: str,
+    target_package_id: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    base_sets, base_vals = _load_latest_code_sets(session, base_package_id)
+    target_sets, target_vals = _load_latest_code_sets(session, target_package_id)
+
+    base_by_code = {cs.code.upper(): cs for cs in base_sets}
+    base_by_name = {_norm_name(cs.name): cs for cs in base_sets if _norm_name(cs.name)}
+    matched_base_ids = set()
+    diffs: List[Dict[str, Any]] = []
+    total_added_vals = 0
+    total_removed_vals = 0
+
+    for tgt in target_sets:
+        base = base_by_code.get(tgt.code.upper())
+        if base is None:
+            cand = base_by_name.get(_norm_name(tgt.name))
+            if cand is not None and cand.id not in matched_base_ids:
+                base = cand
+        t_list = target_vals.get(tgt.id, [])
+        if base is None:
+            total_added_vals += len(t_list)
+            diffs.append(
+                {
+                    "change_kind": "ADDED",
+                    "impact": "RULE_IMPACT",
+                    "code": tgt.code,
+                    "name": tgt.name,
+                    "value_counts": {"base": 0, "target": len(t_list)},
+                    "added_values": [{"value": v.value, "label_cn": v.label_cn} for v in t_list[:80]],
+                    "removed_values": [],
+                    "modified_values": [],
+                }
+            )
+            continue
+
+        matched_base_ids.add(base.id)
+        b_list = base_vals.get(base.id, [])
+        b_map = {v.value: v for v in b_list}
+        t_map = {v.value: v for v in t_list}
+
+        added_v = [{"value": v.value, "label_cn": v.label_cn} for k, v in t_map.items() if k not in b_map]
+        removed_v = [{"value": v.value, "label_cn": v.label_cn} for k, v in b_map.items() if k not in t_map]
+        modified_v = []
+        for k in sorted(set(b_map) & set(t_map)):
+            bv, tv = b_map[k], t_map[k]
+            if (bv.label_cn or "").strip() != (tv.label_cn or "").strip() or bool(bv.enabled) != bool(tv.enabled):
+                modified_v.append(
+                    {
+                        "value": k,
+                        "old_label_cn": bv.label_cn,
+                        "new_label_cn": tv.label_cn,
+                        "old_enabled": bool(bv.enabled),
+                        "new_enabled": bool(tv.enabled),
+                    }
+                )
+        total_added_vals += len(added_v)
+        total_removed_vals += len(removed_v)
+
+        if removed_v or any(m["old_enabled"] and not m["new_enabled"] for m in modified_v):
+            impact = "BREAKING"
+            change_kind = "MODIFIED"
+        elif added_v or modified_v:
+            impact = "RULE_IMPACT"
+            change_kind = "MODIFIED"
+        else:
+            impact = "NONE"
+            change_kind = "UNCHANGED"
+
+        diffs.append(
+            {
+                "change_kind": change_kind,
+                "impact": impact,
+                "code": tgt.code,
+                "name": tgt.name,
+                "value_counts": {"base": len(b_list), "target": len(t_list)},
+                "added_values": added_v[:80],
+                "removed_values": removed_v[:80],
+                "modified_values": modified_v[:80],
+            }
+        )
+
+    for base in base_sets:
+        if base.id in matched_base_ids:
+            continue
+        b_list = base_vals.get(base.id, [])
+        total_removed_vals += len(b_list)
+        diffs.append(
+            {
+                "change_kind": "REMOVED",
+                "impact": "BREAKING",
+                "code": base.code,
+                "name": base.name,
+                "value_counts": {"base": len(b_list), "target": 0},
+                "added_values": [],
+                "removed_values": [{"value": v.value, "label_cn": v.label_cn} for v in b_list[:80]],
+                "modified_values": [],
+            }
+        )
+
+    diffs.sort(key=lambda x: (-_IMPACT_RANK.get(x["impact"], 0), x["change_kind"] == "UNCHANGED", x["code"]))
+    summary = {
+        "base": len(base_sets),
+        "target": len(target_sets),
+        "added": sum(1 for d in diffs if d["change_kind"] == "ADDED"),
+        "removed": sum(1 for d in diffs if d["change_kind"] == "REMOVED"),
+        "modified": sum(1 for d in diffs if d["change_kind"] == "MODIFIED"),
+        "unchanged": sum(1 for d in diffs if d["change_kind"] == "UNCHANGED"),
+        "added_values": total_added_vals,
+        "removed_values": total_removed_vals,
+    }
+    return summary, diffs
+
+
+def _rule_evidence_view(row: TableRuleEvidenceModel) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "table_code": row.table_code,
+        "table_name": row.table_name,
+        "rule_code": row.rule_code,
+        "rule_name": row.rule_name,
+        "severity": row.severity,
+        "scope": row.scope,
+        "target_fields": list(row.target_fields_json or []),
+        "rule_text": row.rule_text,
+        "reference_sql": row.reference_sql or "",
+        "rule_hash": row.rule_hash,
+    }
+
+
+def _compare_rule_evidences(
+    session: Session,
+    base_package_id: str,
+    target_package_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+    base_rows = (
+        session.query(TableRuleEvidenceModel)
+        .filter(TableRuleEvidenceModel.package_id == base_package_id)
+        .order_by(TableRuleEvidenceModel.table_code.asc(), TableRuleEvidenceModel.rule_code.asc())
+        .all()
+    )
+    target_rows = (
+        session.query(TableRuleEvidenceModel)
+        .filter(TableRuleEvidenceModel.package_id == target_package_id)
+        .order_by(TableRuleEvidenceModel.table_code.asc(), TableRuleEvidenceModel.rule_code.asc())
+        .all()
+    )
+
+    base_by_hash = {r.rule_hash: r for r in base_rows}
+    target_by_hash = {r.rule_hash: r for r in target_rows}
+    unchanged_hashes = set(base_by_hash) & set(target_by_hash)
+
+    rem_base = [r for h, r in base_by_hash.items() if h not in unchanged_hashes]
+    rem_target = [r for h, r in target_by_hash.items() if h not in unchanged_hashes]
+
+    base_by_code_key: Dict[Tuple[str, str], TableRuleEvidenceModel] = {}
+    for r in rem_base:
+        if r.rule_code:
+            base_by_code_key[(r.table_code.upper(), r.rule_code.upper())] = r
+
+    matched_base_hashes = set()
+    added: List[Dict[str, Any]] = []
+    modified: List[Dict[str, Any]] = []
+    for tr in rem_target:
+        key = (tr.table_code.upper(), tr.rule_code.upper()) if tr.rule_code else None
+        br = base_by_code_key.get(key) if key else None
+        if br is not None and br.rule_hash not in matched_base_hashes:
+            matched_base_hashes.add(br.rule_hash)
+            modified.append(
+                {
+                    "table_code": tr.table_code,
+                    "table_name": tr.table_name or br.table_name,
+                    "rule_code": tr.rule_code,
+                    "rule_name": tr.rule_name or br.rule_name,
+                    "old": _rule_evidence_view(br),
+                    "new": _rule_evidence_view(tr),
+                }
+            )
+        else:
+            added.append(_rule_evidence_view(tr))
+
+    removed = [_rule_evidence_view(br) for br in rem_base if br.rule_hash not in matched_base_hashes]
+
+    summary = {
+        "base": len(base_by_hash),
+        "target": len(target_by_hash),
+        "added": len(added),
+        "removed": len(removed),
+        "modified": len(modified),
+        "unchanged": len(unchanged_hashes),
+    }
+    return summary, {"added": added[:200], "removed": removed[:200], "modified": modified[:200]}
+
+
 def diff_packages(session: Session, base_package_id: str, target_package_id: str) -> Dict[str, Any]:
-    """对比两套多文件监管规范包的表结构、字段校验与补充核查规则差异。"""
+    """对比两套多文件监管规范包的表结构、字段校验、码表码值与补充核查规则差异。"""
     base_pkg = session.get(SpecPackageModel, base_package_id)
     target_pkg = session.get(SpecPackageModel, target_package_id)
     if not base_pkg:
@@ -298,19 +529,10 @@ def diff_packages(session: Session, base_package_id: str, target_package_id: str
         base_tables, base_fields, target_tables, target_fields
     )
 
-    base_rules = {
-        r.rule_hash for r in session.query(TableRuleEvidenceModel).filter(TableRuleEvidenceModel.package_id == base_package_id).all()
-    }
-    target_rules = {
-        r.rule_hash for r in session.query(TableRuleEvidenceModel).filter(TableRuleEvidenceModel.package_id == target_package_id).all()
-    }
-    summary["rule_evidences"] = {
-        "base": len(base_rules),
-        "target": len(target_rules),
-        "added": len(target_rules - base_rules),
-        "removed": len(base_rules - target_rules),
-        "unchanged": len(base_rules & target_rules),
-    }
+    code_set_summary, code_set_diffs = _compare_code_sets(session, base_package_id, target_package_id)
+    rule_summary, rule_details = _compare_rule_evidences(session, base_package_id, target_package_id)
+    summary["code_sets"] = code_set_summary
+    summary["rule_evidences"] = rule_summary
 
     return {
         "base_package": {
@@ -330,4 +552,6 @@ def diff_packages(session: Session, base_package_id: str, target_package_id: str
         "summary": summary,
         "affected_table_ids": affected_table_ids,
         "tables": table_diffs,
+        "code_sets": code_set_diffs,
+        "rule_evidences": rule_details,
     }

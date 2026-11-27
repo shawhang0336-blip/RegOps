@@ -169,8 +169,31 @@ export function diffPackages(baseId, targetId) {
 
 // ── 报表与字段元数据 (/api/metadata/*) ───────────────────────────────────────
 
-export function listMetadataTables({ documentId, packageId, status } = {}) {
-  return api(`/api/metadata/tables${querySuffix({ document_id: documentId, package_id: packageId, status })}`)
+export function listMetadataTables({ documentId, packageId, regulator, status } = {}) {
+  return api(`/api/metadata/tables${querySuffix({
+    document_id: documentId,
+    package_id: packageId,
+    regulator: regulator && regulator !== 'ALL' ? regulator : undefined,
+    status,
+  })}`)
+}
+
+export function listMetadataRevisions({
+  packageId,
+  regulator,
+  tableId,
+  revisionKind,
+  humanOnly,
+  limit,
+} = {}) {
+  return api(`/api/metadata/revisions${querySuffix({
+    package_id: packageId,
+    regulator: regulator && regulator !== 'ALL' ? regulator : undefined,
+    table_id: tableId,
+    revision_kind: revisionKind && revisionKind !== 'ALL' ? revisionKind : undefined,
+    human_only: humanOnly ? 'true' : undefined,
+    limit,
+  })}`)
 }
 
 export function getMetadataTable(tableId) {

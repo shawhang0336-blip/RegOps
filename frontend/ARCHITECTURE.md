@@ -23,9 +23,9 @@ frontend/src/
 ├── api/                             # 统一后端 API 客户端层（全站唯一允许出现 /api/* 路径的目录）
 │   ├── client.js                    #   底层 HTTP 封装（api / ApiError / downloadFile / 422 格式化）
 │   ├── platform.js                  #   /api/health、/api/blobs/*、/api/settings/*、SSE URL 构造
-│   ├── catalog.js                   #   /api/packages/*（含 PUT 单文件替换/DELETE 移除/extract/diff）、/api/documents/*、/api/metadata/*、/api/code-sets/*
+│   ├── catalog.js                   #   /api/packages/*（含 PUT 单文件替换/DELETE 移除/extract/diff）、/api/documents/*、/api/metadata/*（含 /revisions 修订动态流）、/api/code-sets/*
 │   ├── generation.js                #   /api/generation/*、/api/artifacts/*（支持 package_id 过滤）
-│   └── delivery.js                  #   /api/runs/*（支持 package_id & 机构级 regulator 过滤、审批、重审、清理、diff、预览）
+│   └── delivery.js                  #   /api/runs/*（含 /audit-overview 与 /{id}/audit-detail 全链路审计、package_id & 机构级 regulator 过滤、审批、重审、清理、diff、预览）
 │
 ├── components/                      # 全站通用 UI 组件（零业务路由状态，严禁依赖 features/）
 │   ├── SelectDropdown.jsx           #   自研键盘无障碍现代下拉组件（徽章、版本标签、统计副标题与明暗主题浮层）
@@ -63,15 +63,16 @@ frontend/src/
     │   ├── documents/               #     DocumentsPage / CurrentFilePicker / ImportProgressPanel / documentHelpers
     │   ├── metadata/                #     MetadataPage / FieldEditorDrawer / MetadataPanels / metadataHelpers
     │   ├── codeSets/                #     CodeSetsPage（支持 packageId 隔离查询）
-    │   └── versions/                #     VersionsPage（跨版本规范包 Diff / 批次 SQL Diff / 单表修订历史）
+    │   └── versions/                #     VersionsPage + ChangeFeedTab / PackageDiffTab / RunSqlDiffTab（变更动态时间线、报表/码表/规则升级影响面与评估报告导出、同表 Oracle SQL Diff）
     ├── generation/                  #   域 2：规则与产物装配
     │   ├── ArtifactsPage.jsx        #     规则工作台主页面（按当前规范包自动限定报表与规则范围）
     │   ├── ArtifactDetail.jsx       #     表结构 / 码表 / 产物明细
     │   ├── RulesViews.jsx           #     单表与跨表规则审批视图
     │   ├── RuleDrawer.jsx           #     规则参数抽屉与手工改参
     │   └── artifactHelpers.js
-    ├── delivery/                    #   域 3：运行批次控制与测试下载
-    │   ├── RunsPage.jsx             #     按监管机构/报表/版本包筛选批次、验证明细、沙箱预览与生产 ZIP 下载
+    ├── delivery/                    #   域 3：运行批次控制、全链路审计与测试下载
+    │   ├── RunsPage.jsx             #     按监管机构/报表/版本包筛选批次、验证明细、沙箱预览、生产 ZIP 下载与直达审计中心入口
+    │   ├── AuditCenterPage.jsx      #     独立全链路合规审计中心（/audit）：实时 SHA-256 哈希链逐条验签、节点耗时瀑布、AI 门禁/人工确权、端到端加密指纹与 JSON 证据包导出
     │   ├── HistoryCleanupModal.jsx  #     历史冗余批次清理弹窗
     │   └── RunTraceTimeline.jsx     #     EventLog / Bus 耗时瀑布与链路回放
     └── platform/                    #   域 4：系统设置

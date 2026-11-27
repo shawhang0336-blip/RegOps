@@ -13,6 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api.common import matches_regulator_filter
 from app.catalog.extraction import extract_parallel_for_blocks
 from app.catalog.tables.domain import MetadataFieldDraft
 from app.catalog.tables.mutations import claim_table_version_bump
@@ -25,6 +26,7 @@ from app.infra.db_tables import (
     MetadataValidationModel,
     RawBlockModel,
     SourceDocumentModel,
+    SpecPackageModel,
     TableMetadataModel,
 )
 from app.ingestion.structure_service import analyze_document_structure
@@ -67,8 +69,17 @@ def list_tables_with_stats(
     status: Optional[str] = None,
     document_id: Optional[str] = None,
     package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     rows = latest_table_rows(session, document_id=document_id, status=status, package_id=package_id)
+    if regulator and regulator.strip().upper() != "ALL":
+        pkg_regs = {
+            p.id: p.regulator
+            for p in session.query(SpecPackageModel.id, SpecPackageModel.regulator)
+            .filter(SpecPackageModel.status != "DELETED")
+            .all()
+        }
+        rows = [row for row in rows if matches_regulator_filter(pkg_regs.get(row.package_id), regulator)]
     table_ids = [row.id for row in rows]
     stats: Dict[str, Dict[str, Any]] = {}
     latest_by_kind: Dict[tuple, Any] = {}
@@ -122,11 +133,35 @@ def list_tables_with_stats(
             entry["inferred"] += 1
         elif basis == "MANUAL":
             entry["manual"] += 1
+
+    rev_stats: Dict[str, Dict[str, Any]] = {}
+    if table_ids:
+        rev_rows = (
+            session.query(
+                MetadataRevisionModel.table_id,
+                MetadataRevisionModel.revision_kind,
+                MetadataRevisionModel.created_at,
+            )
+            .filter(MetadataRevisionModel.table_id.in_(table_ids))
+            .all()
+        )
+        for t_id, r_kind, created_at in rev_rows:
+            bucket = rev_stats.setdefault(
+                t_id,
+                {"total": 0, "human": 0, "last_at": None},
+            )
+            bucket["total"] += 1
+            if r_kind in {"HUMAN_EDIT", "HUMAN_ADD", "HUMAN_DELETE"}:
+                bucket["human"] += 1
+            if created_at and (bucket["last_at"] is None or created_at > bucket["last_at"]):
+                bucket["last_at"] = created_at
+
     result = []
     for row in rows:
         field_count = field_counts.get(row.id, 0)
         basis = basis_stats.get(row.id, {"source": 0, "inferred": 0, "manual": 0})
         entry = stats.get(row.id) or {}
+        rev_info = rev_stats.get(row.id) or {"total": 0, "human": 0, "last_at": None}
         top_codes = sorted(
             (entry.get("codes") or {}).items(),
             key=lambda item: item[1],
@@ -145,9 +180,109 @@ def list_tables_with_stats(
                 "type_inferred_count": basis["inferred"],
                 "type_manual_count": basis["manual"],
                 "type_all_inferred": field_count > 0 and basis["source"] == 0 and basis["manual"] == 0,
+                "revision_count": rev_info["total"],
+                "human_revision_count": rev_info["human"],
+                "last_revised_at": rev_info["last_at"].isoformat() if rev_info["last_at"] else None,
             }
         )
     return result
+
+
+_HUMAN_GOVERNANCE_KINDS = frozenset({"HUMAN_EDIT", "HUMAN_ADD", "HUMAN_DELETE", "PUBLISHED", "DRAFT_CREATED"})
+_HUMAN_EDIT_KINDS = frozenset({"HUMAN_EDIT", "HUMAN_ADD", "HUMAN_DELETE"})
+
+
+def list_metadata_revisions(
+    session: Session,
+    *,
+    package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
+    table_id: Optional[str] = None,
+    revision_kind: Optional[str] = None,
+    human_only: bool = False,
+    limit: int = 120,
+) -> Dict[str, Any]:
+    """跨表/跨规范包全局变更动态时间线：集中呈现字段修改、发布与 AI 复核记录。"""
+    pkgs_by_id = {
+        p.id: p
+        for p in session.query(SpecPackageModel).filter(SpecPackageModel.status != "DELETED").all()
+    }
+    query = (
+        session.query(MetadataRevisionModel, TableMetadataModel)
+        .join(TableMetadataModel, MetadataRevisionModel.table_id == TableMetadataModel.id)
+        .filter(TableMetadataModel.status != "MERGED")
+    )
+    if package_id:
+        query = query.filter(TableMetadataModel.package_id == package_id)
+    if table_id:
+        query = query.filter(MetadataRevisionModel.table_id == table_id)
+
+    rows = query.order_by(MetadataRevisionModel.created_at.desc()).limit(max(limit * 4, 600)).all()
+
+    target_reg = (regulator or "").strip()
+    target_kind = (revision_kind or "").strip().upper()
+
+    summary = {
+        "total": 0,
+        "human_edits": 0,
+        "publishes": 0,
+        "drafts": 0,
+        "ai_events": 0,
+        "tables_touched": 0,
+    }
+    touched_table_ids = set()
+    items: List[Dict[str, Any]] = []
+
+    for rev, tbl in rows:
+        if tbl.package_id and tbl.package_id not in pkgs_by_id:
+            continue
+        pkg = pkgs_by_id.get(tbl.package_id) if tbl.package_id else None
+        pkg_reg = pkg.regulator if pkg else None
+        if target_reg and not matches_regulator_filter(pkg_reg, target_reg):
+            continue
+
+        # 汇总基于范围（package_id + regulator + table_id）的完整统计
+        summary["total"] += 1
+        touched_table_ids.add(tbl.id)
+        if rev.revision_kind in _HUMAN_EDIT_KINDS:
+            summary["human_edits"] += 1
+        elif rev.revision_kind == "PUBLISHED":
+            summary["publishes"] += 1
+        elif rev.revision_kind == "DRAFT_CREATED":
+            summary["drafts"] += 1
+        else:
+            summary["ai_events"] += 1
+
+        if human_only and rev.revision_kind not in _HUMAN_GOVERNANCE_KINDS:
+            continue
+        if target_kind and target_kind != "ALL" and rev.revision_kind != target_kind:
+            continue
+
+        if len(items) < limit:
+            items.append(
+                {
+                    "id": rev.id,
+                    "table_id": tbl.id,
+                    "table_code": tbl.table_code,
+                    "table_name": tbl.table_name,
+                    "table_status": tbl.status,
+                    "table_version": tbl.current_version,
+                    "document_id": tbl.document_id,
+                    "package_id": tbl.package_id,
+                    "package_name": pkg.name if pkg else None,
+                    "regulator": pkg_reg,
+                    "field_id": rev.field_id,
+                    "revision_kind": rev.revision_kind,
+                    "editor": rev.editor,
+                    "reason": rev.reason,
+                    "old_value": rev.old_value_json,
+                    "new_value": rev.new_value_json,
+                    "created_at": rev.created_at.isoformat() if rev.created_at else None,
+                }
+            )
+
+    summary["tables_touched"] = len(touched_table_ids)
+    return {"summary": summary, "revisions": items}
 
 
 def build_type_template_csv(

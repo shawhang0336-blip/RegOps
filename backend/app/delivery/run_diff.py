@@ -76,6 +76,22 @@ def _semantic_key(entry: Dict[str, Any]) -> Tuple[str, str, str]:
     return (entry["table_code"], entry["field"], entry["operator"])
 
 
+def _run_spec_meta(session: Session, run: RunModel) -> Dict[str, Any]:
+    spec = session.get(SpecificationModel, run.spec_id)
+    content = (spec.content_json or {}) if spec else {}
+    raw_tables = content.get("tables") or ([content] if content.get("table_code") else [])
+    tables = [
+        {"table_code": item.get("table_code"), "table_name": item.get("table_name") or item.get("table_code")}
+        for item in raw_tables
+        if item.get("table_code")
+    ]
+    return {
+        "tables": tables,
+        "package_name": content.get("package_name"),
+        "regulator": content.get("regulator"),
+    }
+
+
 def diff_runs(session: Session, base_run_id: str, target_run_id: str) -> Dict[str, Any]:
     """对比两次验证批次的有效规则集合与编译后 Oracle SQL 差异。"""
     base_run = session.get(RunModel, base_run_id)
@@ -166,19 +182,28 @@ def diff_runs(session: Session, base_run_id: str, target_run_id: str) -> Dict[st
 
     base_state = project(session, base_run)
     target_state = project(session, target_run)
+    base_meta = _run_spec_meta(session, base_run)
+    target_meta = _run_spec_meta(session, target_run)
+    base_codes = {t["table_code"] for t in base_meta["tables"]}
+    target_codes = {t["table_code"] for t in target_meta["tables"]}
+    shared_tables = sorted(base_codes & target_codes)
+
     return {
         "base_run": {
             "id": base_run.id,
             "status": base_state.status,
             "created_at": base_run.created_at.isoformat() if base_run.created_at else None,
             "rule_count": len(base_entries),
+            **base_meta,
         },
         "target_run": {
             "id": target_run.id,
             "status": target_state.status,
             "created_at": target_run.created_at.isoformat() if target_run.created_at else None,
             "rule_count": len(target_entries),
+            **target_meta,
         },
+        "shared_tables": shared_tables,
         "summary": {
             "added": len(added),
             "removed": len(removed),

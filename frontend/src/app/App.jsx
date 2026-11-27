@@ -12,6 +12,7 @@ const PreparationWorkspace = lazy(() => import('../features/catalog/PreparationW
 const VersionsPage = lazy(() => import('../features/catalog/versions/VersionsPage.jsx'))
 const ArtifactsPage = lazy(() => import('../features/generation/ArtifactsPage.jsx'))
 const RunsPage = lazy(() => import('../features/delivery/RunsPage.jsx'))
+const AuditCenterPage = lazy(() => import('../features/delivery/AuditCenterPage.jsx'))
 const SettingsPage = lazy(() => import('../features/platform/SettingsPage.jsx'))
 
 const pipelineNavigation = [
@@ -21,6 +22,7 @@ const pipelineNavigation = [
 ]
 
 const governanceNavigation = [
+  ['/audit', '审计中心', '审'],
   ['/versions', '变更记录', '历'],
   ['/settings', '系统设置', '设'],
 ]
@@ -125,6 +127,7 @@ function WorkbenchLayout() {
                 <Route path="/code-sets" element={<PreparationRedirect view="codes" />} />
                 <Route path="/generation" element={<ArtifactsPage />} />
                 <Route path="/runs" element={<RunsPage />} />
+                <Route path="/audit" element={<AuditCenterPage />} />
                 <Route path="/versions" element={<VersionsPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
                 <Route path="*" element={<Navigate to="/documents" replace />} />

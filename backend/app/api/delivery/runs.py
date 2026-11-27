@@ -13,6 +13,8 @@ from app.api.common import (
     spawn_run_driver,
 )
 from app.api.delivery.runs_service import (
+    build_audit_overview,
+    build_audit_run_detail,
     build_validation_detail,
     delete_run_rows as _delete_run_rows,
     list_generation_runs,
@@ -140,6 +142,23 @@ def compare_runs(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/api/runs/audit-overview")
+def audit_overview(
+    package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
+    run_kind: Optional[str] = Query(default="ALL"),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(db_session),
+) -> Dict:
+    return build_audit_overview(
+        session,
+        package_id=package_id,
+        regulator=regulator,
+        run_kind=run_kind,
+        limit=limit,
+    )
+
+
 @router.get("/api/runs/{run_id}")
 def get_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     return run_view(session, _require_run(session, run_id))
@@ -245,6 +264,11 @@ def replay_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
 def trace_run(run_id: str, session: Session = Depends(db_session)) -> Dict:
     run = _require_run(session, run_id)
     return project_trace(session, run, plan=resolve_run_plan(session, run)).as_dict()
+
+
+@router.get("/api/runs/{run_id}/audit-detail")
+def audit_detail(run_id: str, session: Session = Depends(db_session)) -> Dict:
+    return build_audit_run_detail(session, _require_run(session, run_id))
 
 
 @router.get("/api/runs/{run_id}/bus-events")

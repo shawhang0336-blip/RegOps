@@ -66,7 +66,7 @@ backend/app/
 │   │   └── bindings.py          #      数据库无关的已发布码表加载、值域绑定与规则/造数用量校验
 │   ├── extraction.py            #    跨子域协同：三轨（metadata/code_sets/rule_evidence，含 EAST OCR 行级与 SAFE 核查规则提取）execute_wave Worker 纯计算、主协调单写落库及 reconcile_package_assets 跨文件融合与冲突检测
 │   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 Scheduler + INGESTION_CHANNELS 三轨块级断点续跑）
-│   └── version_diff.py          #    跨版本监管制度文档（diff_documents）与规范包（diff_packages）差异对比与影响面分级（返回增量受影响表清单）
+│   └── version_diff.py          #    跨版本监管制度文档（diff_documents）与规范包（diff_packages）差异对比与影响面分级（覆盖报表字段、码表码值与补充核查规则明细，返回增量受影响表清单）
 │
 ├── generation/                  # 层 5（Step 2，对应前端 02「生成表结构、码表和规则」）：DDL、码表 SQL、规则装配与 Oracle 空跑
 │   ├── core/                    #    ① 纯离线领域内核（AST 锁死：零 DB/LLM/Catalog/SQL/Workflow/Delivery 依赖）
@@ -110,8 +110,8 @@ backend/app/
     │   ├── packages_service.py  #      规范包生命周期、ZIP 安全拆包、历史文档自动收编、REVISION_NOTE 规则隔离、MySQL REPEATABLE READ 快照刷新与整包重提取协调服务
     │   ├── documents.py         #      /api/documents/* 薄路由（上传、切块、提取、进度、版本对比）
     │   ├── documents_service.py #      文档接入、原子落盘、初始切块与状态校验服务
-    │   ├── metadata.py          #      /api/metadata/* 薄路由（报表字段、就绪度、类型修正与发布）
-    │   ├── metadata_service.py  #      表字段统计聚合、CSV/XLSX 导入、强外键删除、草稿克隆与批量发布服务
+    │   ├── metadata.py          #      /api/metadata/* 薄路由（报表字段、跨表修订动态流 /revisions、就绪度、类型修正与发布）
+    │   ├── metadata_service.py  #      表字段与修订计数聚合、全局修订动态流、CSV/XLSX 导入、强外键删除、草稿克隆与批量发布服务
     │   ├── code_sets.py         #      /api/code-sets/* 薄路由（码表、码值、引用对齐与导入）
     │   └── code_sets_service.py #      码表明细、直传文档抽取、引用对齐与大小写去重导入服务
     ├── generation/              #    域 3：规则与产物装配
@@ -120,8 +120,8 @@ backend/app/
     │   ├── artifacts.py         #      /api/artifacts/* 薄路由（产物状态、规则总览与手工改参）
     │   └── artifacts_service.py #      产物批量聚合（防 N+1）、规则改参校验与 EventLog 留痕服务
     └── delivery/                #    域 4：运行批次控制与审计交付
-        ├── runs.py              #      /api/runs/* 薄路由（支持按 package_id 与监管机构/报表 regulator 过滤，覆盖审批、测试确认、断点重试、回放、trace、bus-events）
-        └── runs_service.py      #      批次列表批量折叠（机构级过滤）、多轮 Oracle 沙箱表清理与校验明细拼装服务
+        ├── runs.py              #      /api/runs/* 薄路由（支持按 package_id 与机构/报表 regulator 过滤，覆盖全链路审计总览 /audit-overview 与单批次档案 /audit-detail、审批、测试确认、断点重试、回放、trace、bus-events、run diff）
+        └── runs_service.py      #      批次列表批量折叠、全链路 EventLog 实时 SHA-256 验链与合规档案拼装（覆盖 INGESTION + GENERATION）、多轮 Oracle 沙箱表清理与校验明细服务
 ```
 
 ---

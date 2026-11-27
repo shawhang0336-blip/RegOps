@@ -47,7 +47,7 @@ export default function ProjectContextBar() {
   const [err, setErr] = useState('')
 
   function syncUrlPackage(nextPkgId) {
-    if (!['/documents', '/generation', '/runs', '/versions', '/'].includes(location.pathname)) return
+    if (!['/documents', '/generation', '/runs', '/versions', '/audit', '/'].includes(location.pathname)) return
     const next = new URLSearchParams(params)
     if (nextPkgId) {
       next.set('package_id', nextPkgId)
@@ -57,6 +57,9 @@ export default function ProjectContextBar() {
     }
     next.delete('table')
     next.delete('set')
+    if (location.pathname === '/audit') {
+      next.delete('run')
+    }
     setParams(next, { replace: true })
   }
 
