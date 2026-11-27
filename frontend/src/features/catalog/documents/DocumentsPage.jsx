@@ -571,7 +571,7 @@ export default function DocumentsPage({
               <span>支持 PDF、Word、Excel；完成后直接在下方核对报表字段和码表</span>
             </div>
             <span className="button primary">{busy ? '正在自动解析...' : '选择文件并解析'}</span>
-            <input className="file-input" type="file" accept=".pdf,.docx,.xlsx" disabled={busy} onChange={onFileInputChange} />
+            <input className="file-input" type="file" accept=".pdf,.docx,.xlsx,.zip,.doc,.xls" disabled={busy} onChange={onFileInputChange} />
           </label>
         )}
         {detail && (
@@ -639,7 +639,7 @@ export default function DocumentsPage({
         <input
           className="file-input"
           type="file"
-          accept=".pdf,.docx,.xlsx"
+          accept=".pdf,.docx,.xlsx,.zip,.doc,.xls"
           disabled={busy}
           onChange={onFileInputChange}
         />

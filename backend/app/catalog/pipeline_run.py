@@ -710,6 +710,11 @@ def start_document_extract_run(
                         reused_events.append(
                             ("BLOCK_EXTRACTED", "extract_dispatch", {"block_id": bid, "track": "code_sets", "raw_hash": ck_hash, "reused": True})
                         )
+                    elif track == "rule_evidence":
+                        valid_skips.add(("rule_evidence", bid))
+                        reused_events.append(
+                            ("BLOCK_EXTRACTED", "extract_dispatch", {"block_id": bid, "track": "rule_evidence", "raw_hash": ck_hash, "reused": True})
+                        )
 
             with llm_execution_scope(bus=local_ctx.bus, cancellation=token):
                 prep = prepare_block_extraction_tasks(
@@ -811,7 +816,12 @@ def start_document_extract_run(
                     else:
                         raise
 
-            channel_key = "block_codeset_outputs" if track == "code_sets" else "block_meta_outputs"
+            if track == "code_sets":
+                channel_key = "block_codeset_outputs"
+            elif track == "rule_evidence":
+                channel_key = "block_rule_outputs"
+            else:
+                channel_key = "block_meta_outputs"
             shared_delta: Dict[str, Any] = {channel_key: {bid: out}}
             ev_list: List[tuple] = []
             if "error" in out:
@@ -837,14 +847,17 @@ def start_document_extract_run(
                 prep = dispatch_state["prep"] or {
                     "ordered_meta_ids": [],
                     "ordered_cs_ids": [],
+                    "ordered_rule_ids": [],
                     "pre_errors": [],
                 }
                 result = persist_block_extraction_outputs(
                     db,
                     local_ctx.get("block_meta_outputs") or {},
                     local_ctx.get("block_codeset_outputs") or {},
+                    rule_outputs=local_ctx.get("block_rule_outputs") or {},
                     ordered_meta_ids=prep["ordered_meta_ids"],
                     ordered_cs_ids=prep["ordered_cs_ids"],
+                    ordered_rule_ids=prep.get("ordered_rule_ids"),
                     pre_errors=prep["pre_errors"],
                     initial_table_ids=dispatch_state["reused_table_ids"],
                     initial_code_set_ids=dispatch_state["reused_cs_ids"],
@@ -925,12 +938,14 @@ def start_document_extract_run(
             # 波次中途触发取消/预算/欠费时，将 Scheduler 屏障已收集的部分已完成块落库保存，确保续跑 0 重复
             partial_meta = ctx.get("block_meta_outputs") or {}
             partial_cs = ctx.get("block_codeset_outputs") or {}
-            if (partial_meta or partial_cs) and not dispatch_state["custom_hook"]:
+            partial_rules = ctx.get("block_rule_outputs") or {}
+            if (partial_meta or partial_cs or partial_rules) and not dispatch_state["custom_hook"]:
                 try:
                     persist_block_extraction_outputs(
                         db,
                         partial_meta,
                         partial_cs,
+                        rule_outputs=partial_rules,
                         auto_link=False,
                     )
                     db.flush()

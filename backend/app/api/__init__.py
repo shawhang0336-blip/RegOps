@@ -13,7 +13,7 @@
 
 from fastapi import FastAPI
 
-from app.api.catalog import code_sets, documents, metadata
+from app.api.catalog import code_sets, documents, metadata, packages
 from app.api.delivery import runs
 from app.api.generation import artifacts, generation
 from app.api.platform import settings as settings_api, system
@@ -24,7 +24,8 @@ def register_routers(app: FastAPI) -> None:
     # 1. 平台底座与系统设置
     app.include_router(system.router)
     app.include_router(settings_api.router, prefix="/api")
-    # 2. 监管资产目录（文档 / 表字段元数据 / 码表）
+    # 2. 监管资产目录（规范包 / 文档 / 表字段元数据 / 码表）
+    app.include_router(packages.router, prefix="/api")
     app.include_router(documents.router, prefix="/api")
     app.include_router(metadata.router, prefix="/api")
     app.include_router(code_sets.router, prefix="/api")

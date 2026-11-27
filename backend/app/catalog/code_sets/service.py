@@ -64,6 +64,7 @@ from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     RawBlockModel,
+    SourceDocumentModel,
     TableMetadataModel,
 )
 from app.infra.config import Settings
@@ -167,18 +168,34 @@ def _upsert_code_set_draft(
     session: Session,
     draft: CodeSetDraft,
     locator: Dict[str, Any],
+    *,
+    package_id: Optional[str] = None,
 ) -> Tuple[CodeSetModel, bool]:
     """幂等写入或补充码表草稿：使用数据库原生 SAVEPOINT 兜底并发唯一键竞争，彻底避免进程内锁与 DB 写锁形成 AB-BA 死锁。"""
     safe_code = draft.code.upper()[:96]
     safe_name = draft.name[:255]
+    resolved_pkg = package_id
+    if resolved_pkg is None and locator.get("block_id"):
+        blk = session.get(RawBlockModel, locator["block_id"])
+        if blk is not None:
+            resolved_pkg = (
+                session.query(SourceDocumentModel.package_id)
+                .filter(SourceDocumentModel.id == blk.document_id)
+                .scalar()
+            )
+    pkg_filter = (
+        (CodeSetModel.package_id == resolved_pkg)
+        if resolved_pkg is not None
+        else CodeSetModel.package_id.is_(None)
+    )
     existing = (
         session.query(CodeSetModel)
-        .filter(CodeSetModel.code == safe_code)
+        .filter(pkg_filter, CodeSetModel.code == safe_code)
         .order_by(CodeSetModel.current_version.desc())
         .first()
     )
     if not existing:
-        existing = session.query(CodeSetModel).filter(CodeSetModel.name == safe_name).first()
+        existing = session.query(CodeSetModel).filter(pkg_filter, CodeSetModel.name == safe_name).first()
     changed = False
     if existing:
         row = existing
@@ -192,6 +209,7 @@ def _upsert_code_set_draft(
         has_errors = any(issue["severity"] == "ERROR" for issue in validate_code_set_draft(draft))
         row = CodeSetModel(
             id=str(uuid.uuid4()),
+            package_id=resolved_pkg,
             code=safe_code,
             name=safe_name,
             definition=draft.definition,
@@ -206,7 +224,7 @@ def _upsert_code_set_draft(
         except IntegrityError:
             existing = (
                 session.query(CodeSetModel)
-                .filter(CodeSetModel.code == safe_code)
+                .filter(pkg_filter, CodeSetModel.code == safe_code)
                 .order_by(CodeSetModel.current_version.desc())
                 .first()
             )

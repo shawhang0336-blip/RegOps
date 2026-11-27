@@ -353,6 +353,7 @@ def latest_table_rows(
     document_id: Optional[str] = None,
     status: Optional[str] = None,
     *,
+    package_id: Optional[str] = None,
     include_deleted_docs: bool = False,
 ) -> List[TableMetadataModel]:
     """每张表只留最新版本行，且默认排除已软删（DELETED）文档及已失效（superseded）块的孤儿表。
@@ -377,6 +378,8 @@ def latest_table_rows(
         query = query.filter(TableMetadataModel.status != "MERGED")
     if document_id:
         query = query.filter(TableMetadataModel.document_id == document_id)
+    if package_id:
+        query = query.filter(TableMetadataModel.package_id == package_id)
     rows = query.order_by(
         TableMetadataModel.source_ordinal.asc(), TableMetadataModel.table_code.asc()
     ).all()
@@ -407,8 +410,13 @@ def _chunked(items: List[Any], size: int = 500):
         yield items[idx : idx + size]
 
 
-def evaluate_document(session: Session, document_id: Optional[str] = None) -> Dict[str, Any]:
-    tables = latest_table_rows(session, document_id=document_id)
+def evaluate_document(
+    session: Session,
+    document_id: Optional[str] = None,
+    *,
+    package_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     if not tables:
         return {"summary": summarize([]), "tables": []}
     table_ids = [table.id for table in tables]

@@ -41,6 +41,7 @@ class CodeValueRequest(BaseModel):
 
 class PublishBatchRequest(BaseModel):
     document_id: Optional[str] = None
+    package_id: Optional[str] = None
     code_set_ids: Optional[List[str]] = None
     referenced_only: bool = True
     dry_run: bool = False
@@ -49,10 +50,16 @@ class PublishBatchRequest(BaseModel):
 @router.get("")
 def list_code_sets(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     include_placeholders: bool = False,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
-    return svc.list_code_sets_view(session, document_id=document_id, include_placeholders=include_placeholders)
+    return svc.list_code_sets_view(
+        session,
+        document_id=document_id,
+        package_id=package_id,
+        include_placeholders=include_placeholders,
+    )
 
 
 @router.post("", status_code=201)
@@ -85,10 +92,11 @@ async def upload_code_set_document(
 @router.get("/references/unresolved")
 def unresolved_references(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
     """返回尚未解析到码表的字段引用（附带所属报表与字段信息）。"""
-    return svc.list_unresolved_code_references(session, document_id=document_id)
+    return svc.list_unresolved_code_references(session, document_id=document_id, package_id=package_id)
 
 
 @router.post("/references/relink")
@@ -100,11 +108,12 @@ def relink_references(session: Session = Depends(db_session)) -> Dict[str, Any]:
 @router.get("/readiness")
 def code_set_readiness(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     referenced_only: bool = False,
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
     """码表发布前的检查：空表、缺中文含义、码值超过字段长度。"""
-    return evaluate_code_sets(session, document_id=document_id, referenced_only=referenced_only)
+    return evaluate_code_sets(session, document_id=document_id, package_id=package_id, referenced_only=referenced_only)
 
 
 @router.post("/publish-batch")
@@ -116,6 +125,7 @@ def publish_code_sets_batch(
     return svc.publish_code_sets_batch(
         session,
         document_id=request.document_id,
+        package_id=request.package_id,
         code_set_ids=request.code_set_ids,
         referenced_only=request.referenced_only,
         dry_run=request.dry_run,

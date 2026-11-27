@@ -152,6 +152,21 @@ def bind_table_rules_worker(
                 "reason": gate_reason,
                 "arguments": {"rules": []},
             }
+        supp_all = getattr(spec, "supplementary_rules", None) or []
+        matching_supp = []
+        fname_up = field.name.upper()
+        for sr in supp_all:
+            if not isinstance(sr, dict):
+                continue
+            tfields = {str(x).upper() for x in (sr.get("target_fields") or [])}
+            rtext = str(sr.get("rule_text") or "")
+            if (
+                fname_up in tfields
+                or (field.name and field.name in rtext)
+                or (field.content and len(field.content) >= 2 and field.content in rtext)
+                or (not tfields and sr.get("scope") == "CROSS_TABLE")
+            ):
+                matching_supp.append(sr)
         payload = {
             **spec_payload(spec),
             "target_field": field.name,
@@ -160,6 +175,7 @@ def bind_table_rules_worker(
             "generation_plan": (plans or {}).get(spec.table_code) or {"mutations_per_rule": 1},
             "deterministic_rules": [_summarize_deterministic_rule(r) for r in field_det],
             "existing_rule_keys": [],
+            **({"supplementary_rules": matching_supp[:15]} if matching_supp else {}),
             **_code_set_context(field_code_sets, spec.table_code, field.name),
         }
         rules, trace = _call_validated(
@@ -167,6 +183,7 @@ def bind_table_rules_worker(
             "assign_rules",
             f"【严格范围】本次仅处理目标字段 `{field.name}`（即 target_field），返回的每条规则的 field 必须等于 `{field.name}`，严禁为 field_names 中的其他字段生成规则（field_names 仅用于填写 if_field / right_field）。"
             "deterministic_rules 中的必填、列宽上限、固定值和已发布码表白名单规则已由系统确定性派生并生效，严禁重复输出。"
+            "若输入包含 supplementary_rules（来自同项目独立核查规则或 Excel 检核公式表），且其命中当前目标字段，请将其一并转化为可执行规则。"
             "请一次返回该目标字段剩余所有需要语义理解的规则（如 COND_REQUIRED 条件必填、COND_VALUE 条件必空/条件值域约束、"
             "ARITHMETIC_BALANCE 行内算术平衡勾稽、UNIQUE_KEY 单列/联合唯一键查重、REGEXP 精确格式/定长编码、"
             "NUM_RANGE 数值上下限、FIELD_COMPARE 跨字段比较、NOT_IN 禁用取值或额外业务子集 ENUM）；同一语义只给一条最准确规则，不要输出多个变体；没有则返回空数组。"

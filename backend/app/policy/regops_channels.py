@@ -304,6 +304,7 @@ INGESTION_CHANNELS: Dict[str, ChannelSpec] = {
     "blocks_completed": ChannelSpec("blocks_completed", merge_dict),
     "block_meta_outputs": ChannelSpec("block_meta_outputs", merge_dict),
     "block_codeset_outputs": ChannelSpec("block_codeset_outputs", merge_dict),
+    "block_rule_outputs": ChannelSpec("block_rule_outputs", merge_dict),
     "block_errors": ChannelSpec("block_errors", append_list),
     "extract_result": ChannelSpec("extract_result", last_value),
 }

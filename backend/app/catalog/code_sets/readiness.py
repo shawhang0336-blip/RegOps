@@ -173,9 +173,20 @@ def evaluate_code_sets(
     session: Session,
     *,
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     referenced_only: bool = False,
 ) -> Dict[str, Any]:
-    if document_id:
+    if package_id:
+        from app.catalog.code_sets.linking import package_code_set_ids
+
+        ids = list(package_code_set_ids(session, package_id))
+        if not ids:
+            return {"summary": summarize_code_sets([]), "code_sets": []}
+        rows = []
+        for chunk in _chunked(ids):
+            rows.extend(session.query(CodeSetModel).filter(CodeSetModel.id.in_(chunk)).all())
+        rows.sort(key=lambda r: (r.source_ordinal is None, r.source_ordinal or 0, r.code or ""))
+    elif document_id:
         from app.catalog.code_sets.linking import document_code_set_ids
 
         ids = list(document_code_set_ids(session, document_id))

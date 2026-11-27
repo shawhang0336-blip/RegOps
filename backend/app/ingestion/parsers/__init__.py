@@ -10,11 +10,14 @@
 
 from .extractors import (
     ALLOWED_STRATEGIES_BY_FILE_TYPE,
+    convert_legacy_office_bytes,
     extract_document,
     extract_docx,
     extract_pdf,
     extract_xlsx,
+    infer_document_role,
     survey_document,
+    unpack_zip_archive,
 )
 from .pdf_catalog import extract_code_pairs_from_section, parse_document_catalog, parse_document_code_sets
 from .pdf_generic import (
@@ -39,6 +42,7 @@ from .quality import inspect_block, inspect_spec, summarize
 __all__ = [
     "ALLOWED_STRATEGIES_BY_FILE_TYPE",
     "SpecParseError",
+    "convert_legacy_office_bytes",
     "default_pdf_strategy",
     "detect_pdf_profiles",
     "extract_code_pairs_from_section",
@@ -51,6 +55,7 @@ __all__ = [
     "extract_pdf_headings",
     "extract_pdf_page_windows",
     "extract_xlsx",
+    "infer_document_role",
     "inspect_block",
     "inspect_spec",
     "lookup_term_definition",
@@ -62,4 +67,5 @@ __all__ = [
     "reflow_spec_terms",
     "summarize",
     "survey_document",
+    "unpack_zip_archive",
 ]

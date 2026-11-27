@@ -93,17 +93,36 @@ class SystemSettingModel(Base):
 
 
 # =============================================================================
-# 2. Step 1：文档导入、元数据与码表资产
+# 2. Step 1：规范包、多文件文档导入、元数据、码表与核查规则证据资产
 # =============================================================================
+
+
+class SpecPackageModel(Base):
+    """多文件监管规范项目包（支持 SAFE / 一表通 2.0 / EAST 5.0 / 1104 / 人行混装文档与包级隔离）。"""
+
+    __tablename__ = "spec_packages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    regulator: Mapped[str] = mapped_column(String(32), default="SAFE", index=True)
+    spec_version: Mapped[str] = mapped_column(String(64), default="UNKNOWN")
+    parent_package_id: Mapped[Optional[str]] = mapped_column(ForeignKey("spec_packages.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="ACTIVE", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class SourceDocumentModel(Base):
     __tablename__ = "source_documents"
+    __table_args__ = (UniqueConstraint("package_id", "sha256", name="uq_doc_package_sha256"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    package_id: Mapped[Optional[str]] = mapped_column(ForeignKey("spec_packages.id"), nullable=True, index=True)
+    doc_role: Mapped[str] = mapped_column(String(32), default="AUTO", server_default="AUTO")
     file_name: Mapped[str] = mapped_column(String(255))
     file_type: Mapped[str] = mapped_column(String(16))
-    sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
     blob_uri: Mapped[str] = mapped_column(String(255))
     spec_version: Mapped[str] = mapped_column(String(64), default="UNKNOWN")
     status: Mapped[str] = mapped_column(String(32), index=True)
@@ -143,6 +162,7 @@ class TableMetadataModel(Base):
     __table_args__ = (UniqueConstraint("block_id", "current_version", name="uq_table_block_version"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    package_id: Mapped[Optional[str]] = mapped_column(ForeignKey("spec_packages.id"), nullable=True, index=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
     block_id: Mapped[str] = mapped_column(ForeignKey("raw_blocks.id"), index=True)
     table_code: Mapped[str] = mapped_column(String(96), index=True)
@@ -209,9 +229,10 @@ class MetadataValidationModel(Base):
 
 class CodeSetModel(Base):
     __tablename__ = "code_sets"
-    __table_args__ = (UniqueConstraint("code", "current_version", name="uq_code_set_version"),)
+    __table_args__ = (UniqueConstraint("package_id", "code", "current_version", name="uq_code_set_pkg_version"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    package_id: Mapped[Optional[str]] = mapped_column(ForeignKey("spec_packages.id"), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(96), index=True)
     name: Mapped[str] = mapped_column(String(255))
     definition: Mapped[str] = mapped_column(_LONG_TEXT, default="")
@@ -263,6 +284,30 @@ class FieldCodeReferenceModel(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     condition_json: Mapped[Dict[str, Any]] = mapped_column(JSON)
     confidence: Mapped[float] = mapped_column(Float, default=0)
+
+
+class TableRuleEvidenceModel(Base):
+    """独立核查规则 / 检核规则文档 / Excel 校验公式的结构化证据表，按包回挂到表并喂入 Step 2。"""
+
+    __tablename__ = "table_rule_evidences"
+    __table_args__ = (UniqueConstraint("document_id", "block_id", "rule_hash", name="uq_rule_evidence_block_hash"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    package_id: Mapped[Optional[str]] = mapped_column(ForeignKey("spec_packages.id"), nullable=True, index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
+    block_id: Mapped[str] = mapped_column(ForeignKey("raw_blocks.id"), index=True)
+    table_code: Mapped[str] = mapped_column(String(96), index=True)
+    table_name: Mapped[str] = mapped_column(String(255), default="")
+    rule_code: Mapped[str] = mapped_column(String(96), default="")
+    rule_name: Mapped[str] = mapped_column(String(255), default="")
+    severity: Mapped[str] = mapped_column(String(16), default="HARD")
+    scope: Mapped[str] = mapped_column(String(24), default="SINGLE_TABLE")
+    target_fields_json: Mapped[list] = mapped_column(JSON, default=list)
+    rule_text: Mapped[str] = mapped_column(_LONG_TEXT)
+    reference_sql: Mapped[str] = mapped_column(_LONG_TEXT, default="")
+    source_locator: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    rule_hash: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # =============================================================================

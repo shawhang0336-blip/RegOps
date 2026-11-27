@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,7 +15,9 @@ from app.catalog.code_sets.service import (
     auto_link_all_references,
     extract_code_sets_for_block,
 )
+from app.catalog.extraction import extract_rule_evidences_from_block_snapshot, persist_rule_evidences
 from app.catalog.pipeline_run import latest_document_run
+from app.catalog.tables.service import snapshot_raw_block
 from app.infra.config import get_settings
 from app.infra.db import SessionLocal
 from app.infra.db_tables import (
@@ -23,7 +26,11 @@ from app.infra.db_tables import (
     SourceDocumentModel,
 )
 from app.ingestion.import_progress import update as progress_update
-from app.ingestion.parsers.extractors import extract_document
+from app.ingestion.parsers.extractors import (
+    convert_legacy_office_bytes,
+    extract_document,
+    infer_document_role,
+)
 from app.ingestion.parsers.quality import inspect_block
 from app.ingestion.structure_service import (
     inspect_document_overview,
@@ -35,6 +42,18 @@ from app.kernel.run import run_registry
 from app.policy.regops_plan import ACTIVE_INGESTION_STATUSES, project_ingestion
 
 FILE_TYPES = {"pdf": "pdf", "docx": "docx", "xlsx": "xlsx"}
+_UPLOAD_LOCKS_GUARD = threading.Lock()
+_UPLOAD_LOCKS: Dict[Tuple[str, str], threading.Lock] = {}
+
+
+def _upload_mutex(package_id: Optional[str], digest: str) -> threading.Lock:
+    key = (package_id or "__standalone__", digest)
+    with _UPLOAD_LOCKS_GUARD:
+        lock = _UPLOAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _UPLOAD_LOCKS[key] = lock
+        return lock
 ALLOWED_BLOCK_TYPES = frozenset(
     {
         "TABLE_SPEC",
@@ -46,6 +65,10 @@ ALLOWED_BLOCK_TYPES = frozenset(
         "DOCX_TABLE",
         "XLSX_SHEET",
         "PDF_SECTION",
+        "RULE_EVIDENCE",
+        "REVISION_DIFF",
+        "CATALOG_INDEX",
+        "MATRIX_REPORT",
         "NARRATIVE",
         "PROSE",
         "TEXT",
@@ -59,6 +82,8 @@ ALLOWED_BLOCK_TYPES = frozenset(
 def document_summary(row: SourceDocumentModel) -> Dict[str, Any]:
     return {
         "id": row.id,
+        "package_id": row.package_id,
+        "doc_role": getattr(row, "doc_role", "AUTO") or "AUTO",
         "file_name": row.file_name,
         "file_type": row.file_type,
         "sha256": row.sha256,
@@ -101,6 +126,36 @@ def auto_extract_code_sets(
     return created
 
 
+def auto_extract_rule_evidences(
+    document_id: str,
+    *,
+    session_factory: Optional[Callable[[], Any]] = None,
+) -> int:
+    """切块后确定性抽取 RULE_EVIDENCE 块与 Excel 检核规则清单入库（0 LLM 调用）。"""
+    sf = session_factory or SessionLocal
+    created = 0
+    with sf() as session:
+        doc = session.get(SourceDocumentModel, document_id)
+        pkg_id = doc.package_id if doc is not None else None
+        blocks = (
+            session.query(RawBlockModel)
+            .filter(RawBlockModel.document_id == document_id)
+            .order_by(RawBlockModel.ordinal)
+            .all()
+        )
+        for blk in blocks:
+            cj = blk.content_json or {}
+            if cj.get("superseded"):
+                continue
+            if not (blk.block_type == "RULE_EVIDENCE" or cj.get("candidate_role") == "RULE_EVIDENCE" or cj.get("rule_rows")):
+                continue
+            items = extract_rule_evidences_from_block_snapshot(snapshot_raw_block(blk))
+            created += len(persist_rule_evidences(session, blk, items, package_id=pkg_id))
+        if created:
+            session.commit()
+    return created
+
+
 def store_initial_blocks(
     document_id: str,
     *,
@@ -118,6 +173,7 @@ def store_initial_blocks(
         existing_blocks = session.query(RawBlockModel).filter(RawBlockModel.document_id == document.id).count()
         if existing_blocks:
             auto_extract_code_sets(document_id, gs(), session_factory=sf)
+            auto_extract_rule_evidences(document_id, session_factory=sf)
             return document
         settings = gs()
         source_path = Path(settings.blob_dir) / "uploads" / f"{document.sha256}.{document.file_type}"
@@ -133,6 +189,8 @@ def store_initial_blocks(
         document.spec_version = version
         document.status = "UPLOADED"
         document.block_count = len(blocks)
+        if getattr(document, "doc_role", "AUTO") in {"", "AUTO", None}:
+            document.doc_role = infer_document_role(document.file_name, blocks)
         flagged = 0
         for block in blocks:
             issues = inspect_block(block)
@@ -150,6 +208,7 @@ def store_initial_blocks(
             )
         session.commit()
         auto_extract_code_sets(document_id, gs(), session_factory=sf)
+        auto_extract_rule_evidences(document_id, session_factory=sf)
         return document
 
 
@@ -169,6 +228,8 @@ def ingest_uploaded_file_with_flag(
     content: bytes,
     *,
     prepare: bool = True,
+    package_id: Optional[str] = None,
+    doc_role: str = "AUTO",
     session_factory: Optional[Callable[[], Any]] = None,
     get_settings_fn: Optional[Callable[[], Any]] = None,
     extract_document_fn: Optional[Callable[..., Any]] = None,
@@ -178,6 +239,14 @@ def ingest_uploaded_file_with_flag(
     ef = extract_document_fn or extract_document
 
     clean_name = (filename or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="File name is required")
+    raw_suffix = Path(clean_name).suffix.lower().lstrip(".")
+    if raw_suffix in {"doc", "xls"}:
+        try:
+            clean_name, content = convert_legacy_office_bytes(clean_name, content)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     suffix = Path(clean_name).suffix.lower().lstrip(".")
     if suffix not in FILE_TYPES:
         raise HTTPException(status_code=422, detail="Only PDF, DOCX and XLSX are supported")
@@ -202,19 +271,34 @@ def ingest_uploaded_file_with_flag(
         raise
 
     reimport_deleted = False
-    with sf() as session:
-        existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one_or_none()
+    clean_role = (doc_role or "AUTO").strip().upper() or "AUTO"
+    pkg_filter = (
+        (SourceDocumentModel.package_id == package_id)
+        if package_id is not None
+        else SourceDocumentModel.package_id.is_(None)
+    )
+    with _upload_mutex(package_id, digest), sf() as session:
+        existing = (
+            session.query(SourceDocumentModel)
+            .filter(pkg_filter, SourceDocumentModel.sha256 == digest)
+            .order_by(SourceDocumentModel.created_at, SourceDocumentModel.id)
+            .first()
+        )
         if existing:
             if existing.status != "DELETED":
                 return existing, False
             reimport_deleted = True
             existing.status = "OVERVIEW_REQUIRED"
             existing.spec_version = "UNKNOWN"
+            if clean_role != "AUTO":
+                existing.doc_role = clean_role
             session.commit()
             document_id = existing.id
         else:
             document = SourceDocumentModel(
                 id=str(uuid.uuid4()),
+                package_id=package_id,
+                doc_role=clean_role,
                 file_name=Path(clean_name).name,
                 file_type=suffix,
                 sha256=digest,
@@ -229,7 +313,14 @@ def ingest_uploaded_file_with_flag(
                 document_id = document.id
             except IntegrityError:
                 session.rollback()
-                existing = session.query(SourceDocumentModel).filter(SourceDocumentModel.sha256 == digest).one()
+                existing = (
+                    session.query(SourceDocumentModel)
+                    .filter(pkg_filter, SourceDocumentModel.sha256 == digest)
+                    .order_by(SourceDocumentModel.created_at, SourceDocumentModel.id)
+                    .first()
+                )
+                if existing is None:
+                    raise
                 if existing.status != "DELETED":
                     return existing, False
                 reimport_deleted = True
@@ -267,6 +358,8 @@ def ingest_uploaded_file(
     content: bytes,
     *,
     prepare: bool = True,
+    package_id: Optional[str] = None,
+    doc_role: str = "AUTO",
     session_factory: Optional[Callable[[], Any]] = None,
     get_settings_fn: Optional[Callable[[], Any]] = None,
     extract_document_fn: Optional[Callable[..., Any]] = None,
@@ -275,6 +368,8 @@ def ingest_uploaded_file(
         filename,
         content,
         prepare=prepare,
+        package_id=package_id,
+        doc_role=doc_role,
         session_factory=session_factory,
         get_settings_fn=get_settings_fn,
         extract_document_fn=extract_document_fn,

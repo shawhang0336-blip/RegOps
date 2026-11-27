@@ -100,6 +100,17 @@ def needs_semantic_rule_binding(spec: Any, field: Any, field_det_rules: Optional
         hit = _CONSTRAINT.search(term_residual)
         if hit:
             return True, f"术语说明含约束信号「{hit.group(0)}」"
+    for sr in getattr(spec, "supplementary_rules", None) or ():
+        if not isinstance(sr, dict):
+            continue
+        tfields = {str(x).upper() for x in (sr.get("target_fields") or [])}
+        rtext = str(sr.get("rule_text") or "")
+        if (
+            (name and name.upper() in tfields)
+            or (name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", rtext))
+            or (content and len(content) >= 2 and content in rtext)
+        ):
+            return True, "存在独立核查规则补充证据，交 AI 结合生成规则"
     covered = "、".join(sorted(k for k in kinds if k)) or "无"
     return False, f"校验原文无残余语义约束（已确定性覆盖：{covered}）"
 

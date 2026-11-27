@@ -20,6 +20,7 @@ from app.infra.db_tables import (
     RawBlockModel,
     SourceDocumentModel,
     TableMetadataModel,
+    TableRuleEvidenceModel,
 )
 
 
@@ -259,9 +260,54 @@ def _field_view(field: FieldMetadataModel) -> Dict[str, Any]:
     }
 
 
+def _matching_rule_evidences(session: Session, table: TableMetadataModel) -> List[Dict[str, Any]]:
+    """查询挂载到该表的补充核查规则 / Excel 检核规则证据（按包或文档严格隔离）。"""
+    pkg_id = table.package_id
+    if pkg_id is None and table.document_id:
+        doc = session.get(SourceDocumentModel, table.document_id)
+        pkg_id = doc.package_id if doc is not None else None
+    query = session.query(TableRuleEvidenceModel)
+    if pkg_id:
+        query = query.filter(TableRuleEvidenceModel.package_id == pkg_id)
+    else:
+        query = query.filter(TableRuleEvidenceModel.document_id == table.document_id)
+    rows = query.order_by(TableRuleEvidenceModel.rule_code.asc(), TableRuleEvidenceModel.created_at.asc()).all()
+    if not rows:
+        return []
+    tcode_up = (table.table_code or "").strip().upper()
+    norm_tname = re.sub(r"[\s_\-：:（）()]+", "", table.table_name or "").lower()
+    matched: List[Dict[str, Any]] = []
+    for row in rows:
+        rcode_up = (row.table_code or "").strip().upper()
+        rname_norm = re.sub(r"[\s_\-：:（）()]+", "", row.table_name or "").lower()
+        rtext_up = (row.rule_text or "").upper()
+        hit = (
+            (tcode_up and rcode_up == tcode_up)
+            or (norm_tname and rname_norm and (norm_tname == rname_norm or norm_tname in rname_norm or rname_norm in norm_tname))
+            or (row.scope == "CROSS_TABLE" and tcode_up and tcode_up in rtext_up)
+        )
+        if not hit:
+            continue
+        matched.append(
+            {
+                "id": row.id,
+                "rule_code": row.rule_code,
+                "rule_name": row.rule_name,
+                "severity": row.severity,
+                "scope": row.scope,
+                "target_fields": list(row.target_fields_json or []),
+                "rule_text": row.rule_text,
+                "reference_sql": row.reference_sql or "",
+                "source_locator": dict(row.source_locator or {}),
+            }
+        )
+    return matched
+
+
 def table_summary(row: TableMetadataModel) -> Dict[str, Any]:
     return {
         "id": row.id,
+        "package_id": row.package_id,
         "document_id": row.document_id,
         "block_id": row.block_id,
         "table_code": row.table_code,
@@ -304,9 +350,12 @@ def table_detail(session: Session, table: TableMetadataModel) -> Dict[str, Any]:
             .all()
         ):
             refs[ref.field_id] = ref.code_set_id
+    rule_evidences = _matching_rule_evidences(session, table)
     return {
         **table_summary(table),
         "fields": [{**_field_view(field), "code_set_id": refs.get(field.id)} for field in fields],
+        "rule_evidence_count": len(rule_evidences),
+        "rule_evidences": rule_evidences,
         "validations": [
             {
                 "validator_kind": item.validator_kind,
@@ -342,6 +391,7 @@ def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocumen
     if not block:
         raise ValueError("RAW_BLOCK_NOT_FOUND")
     fields = session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == table.id).order_by(FieldMetadataModel.sort_order).all()
+    supp_rules = _matching_rule_evidences(session, table)
     return SpecDocument(
         version=document.spec_version,
         table_code=table.table_code,
@@ -364,4 +414,5 @@ def metadata_to_spec(session: Session, table: TableMetadataModel) -> SpecDocumen
         ],
         terms_text=block.raw_content,
         dictionary_text=block.raw_content,
+        supplementary_rules=supp_rules,
     )

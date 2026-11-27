@@ -13,7 +13,15 @@ frontend/dist/
 /dq_agent.db-*
 /data_rule_studio.db
 /data_rule_studio.db-*
-data/specs/
+# 监管资料库二进制原件仅留本地，保留 data/ 下 README、清单、正文 .md、_manifest_*.json 与 .csv 索引入库
+data/**/*.pdf
+data/**/*.doc
+data/**/*.docx
+data/**/*.xls
+data/**/*.xlsx
+data/**/*.zip
+data/**/*.rar
+data/**/*.7z
 *.log
 .workbuddy/
 var/

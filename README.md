@@ -9,7 +9,7 @@
 ## 核心特性与工作台界面
 
 - **顶部横向三步工作台与辅助治理入口**
-  1. **01 规范解析与核对（`/documents`）**：支持 PDF / DOCX / XLSX 规范文档接入、AI 结构体检与切块、表字段与公共/内联码表双轨并行提取、人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
+  1. **01 规范解析与核对（`/documents`）**：支持基于规范包（`SpecPackage`）的多文件与压缩包异构接入（PDF / DOCX / XLSX / ZIP，自动识别文档角色 `doc_role`、Word 合并单元格与章节树、Excel 多表拆分与 1104 二维表样隔离、三轨并行提取表字段/码表/检核规则补充证据、跨文件同表融合与冲突标红），以及人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
   2. **02 生成表结构、码表和规则（`/generation`）**：确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
   3. **03 测试与下载（`/runs`）**：AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、测试确认门禁、生产 DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载。
   - 辅助入口：**变更记录（`/versions`）** 支持跨版本制度文档 Diff 与跨批次 SQL Diff；**系统设置（`/settings`）** 配置数据源与模型/预算参数，右上角实时显示后端在线状态与浅色/深色外观切换。
@@ -24,7 +24,7 @@
 详细架构说明与阅读路线：
 - 后端架构导览：[backend/ARCHITECTURE.md](backend/ARCHITECTURE.md)
 - 前端架构导览：[frontend/ARCHITECTURE.md](frontend/ARCHITECTURE.md)
-- 监管规范背景资料：[docs/SAFE_1.4_修订说明与来源索引.md](docs/SAFE_1.4_修订说明与来源索引.md)
+- 监管规范资料总览：[data/README.md](data/README.md) · SAFE 1.4 修订索引：[data/03_国家外汇局_SAFE/SAFE_1.4_修订说明与来源索引.md](data/03_国家外汇局_SAFE/SAFE_1.4_修订说明与来源索引.md)
 
 ---
 
@@ -36,7 +36,7 @@ data-rule-studio/
 │   ├── ARCHITECTURE.md               # 后端八层架构导览与 AST 红线说明
 │   ├── app/
 │   │   ├── main.py                   # 极简 FastAPI 启动入口（lifespan / CORS / register_routers）
-│   │   ├── infra/                    # 层 0：基础设施、20 张 ORM 表、BlobStore、受控 LLM 客户端
+│   │   ├── infra/                    # 层 0：基础设施、24 张 ORM 表、BlobStore、受控 LLM 客户端
 │   │   ├── kernel/                   # 层 1：ProdAgent 六大核心微内核（零业务依赖）
 │   │   ├── policy/                   # 层 2：监管业务策略装配（Plan / Bus 门禁 / Channels）
 │   │   ├── ingestion/                # 层 3：文档拆箱、纯离线解析器、AI 结构切块与进度广播
@@ -47,7 +47,7 @@ data-rule-studio/
 │   │       ├── __init__.py           #   唯一路由装配入口 register_routers(app)
 │   │       ├── common.py             #   跨域公共依赖（db_session / spawn_run_driver / run_view）
 │   │       ├── platform/             #   /api/health、/api/events/stream、/api/blobs/*、/api/settings/*
-│   │       ├── catalog/              #   /api/documents/*、/api/metadata/*、/api/code-sets/*
+│   │       ├── catalog/              #   /api/packages/*、/api/documents/*、/api/metadata/*、/api/code-sets/*
 │   │       ├── generation/           #   /api/generation/*、/api/artifacts/*
 │   │       └── delivery/             #   /api/runs/*
 │   ├── migrations/                   # Alembic 数据库迁移脚本
@@ -65,8 +65,7 @@ data-rule-studio/
 │   │   ├── styles/                   # 全局样式收口（index.css 固定层叠顺序）
 │   │   └── features/                 # 按 4 大业务域组织的页面模块（catalog / generation / delivery / platform）
 │   └── tests/                        # 前端单测与架构边界自动化守卫（node --test）
-├── docs/                             # 监管规范背景资料与修订索引
-├── data/specs/                       # 本地监管 PDF 原件目录（.gitignore 忽略，不入库）
+├── data/                             # 统一监管规范资料库与测试样本（二进制原件 .gitignore 忽略，目录说明与清单索引入库）
 ├── .env.example                      # 环境变量模板
 └── README.md
 ```
@@ -75,7 +74,7 @@ data-rule-studio/
 
 | 业务域 | 前端页面（`frontend/src/features/`） | 前端接口（`frontend/src/api/`） | 后端接口（`backend/app/api/`） | 职责范围 |
 | --- | --- | --- | --- | --- |
-| `catalog` | `catalog/`（工作台、文档、元数据、码表、变更记录） | `catalog.js` | `catalog/`（`documents` / `metadata` / `code_sets`） | 规范接入、切块提取、表字段/码表核对与文档 Diff |
+| `catalog` | `catalog/`（工作台、多文件规范包、文档、元数据、码表、变更记录） | `catalog.js` | `catalog/`（`packages` / `documents` / `metadata` / `code_sets`） | 规范包多文件接入、三轨提取、跨文件融合、码表对齐与版本 Diff |
 | `generation` | `generation/`（规则工作台与规则编辑抽屉） | `generation.js` | `generation/`（`generation` / `artifacts`） | 规则/表结构/码表产物聚合、规则改参、发起生成与打包下载 |
 | `delivery` | `delivery/`（测试与下载、追踪瀑布、历史清理） | `delivery.js` | `delivery/`（`runs`） | 运行批次控制、规则审批、测试确认、沙箱预览与批次 Diff |
 | `platform` | `platform/`（系统设置） | `platform.js` | `platform/`（`system` / `settings`） | 健康探测、SSE 事件流、Blob 读取、连接探活与执行预算 |
@@ -192,7 +191,7 @@ cp .env.example .env
 - `DATABASE_URL`：应用管理库连接串（本地默认 SQLite，生产/联调推荐 MySQL 8+ `mysql+pymysql://...`）
 - `ORACLE_SANDBOX_URL`：Oracle 验证沙箱连接串（用于真跑建表、造数与规则验证）
 - `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`：OpenAI 兼容大模型配置（`scripted` 为离线脚本模式）
-- `SAFE_13_SPEC_PATH`：可选，如需运行外管 1.3 规范全量解析测试，可将 `金融机构外汇业务数据采集规范_1.3版_全文.pdf` 放入 `data/specs/`
+- `SAFE_13_SPEC_PATH`：可选，如需覆盖默认外管 1.3 规范全量解析路径，默认读取 `data/03_国家外汇局_SAFE/02_金融机构外汇业务数据采集规范/金融机构外汇业务数据采集规范_1.3版_全文.pdf`
 
 ### 2. 启动后端
 
@@ -221,7 +220,7 @@ npm run dev
 ## 测试与架构守卫
 
 ```bash
-# 后端全量测试（337 项：含八层 DAG、内核纯净度、Step 0/1 Scheduler 断点续跑、RPM 限流等 AST 与行为守卫）
+# 后端全量测试（340 passed, 1 skipped：含八层 DAG、内核纯净度、多文件异构规范解析与跨文件融合、Step 0/1 断点续跑与 RPM 限流等守卫）
 cd backend && pytest -q
 
 # 前端单测与架构边界守卫（10 项：目录结构、/api/* 统一收口与单向依赖校验）

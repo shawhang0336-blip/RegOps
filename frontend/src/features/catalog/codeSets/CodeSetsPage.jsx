@@ -9,7 +9,14 @@ import StatusMessage from '../../../components/StatusMessage.jsx'
 import { useFeedback } from '../../../context/FeedbackContext.jsx'
 import { ISSUE_LABELS, friendlyError, issueSeverity } from '../../../utils/labels.js'
 
-export default function CodeSetsPage({ embedded = false, onDocumentChange, onSummaryChange, statusFilter, onStatusFilterChange }) {
+export default function CodeSetsPage({
+  embedded = false,
+  packageId = '',
+  onDocumentChange,
+  onSummaryChange,
+  statusFilter,
+  onStatusFilterChange,
+}) {
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const { confirm } = useFeedback()
@@ -40,8 +47,10 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
 
   async function load(preferredId) {
     const loadId = ++loadRequestRef.current
-    const documentId = params.get('document_id')
-    if (embedded && !documentId) {
+    const activePkgId = packageId || params.get('package_id') || ''
+    const documentId = activePkgId ? null : params.get('document_id')
+    const effectivePkgId = activePkgId || null
+    if (embedded && !documentId && !effectivePkgId) {
       setSets([])
       setDetail(null)
       onSummaryChange?.(null)
@@ -50,9 +59,9 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     // 不带 referenced_only：汇总数要和下面的列表张数对得上，
     // 也要拿到每张码表自己的 blockers 才能显示「齐备 / 需补」
     const [setList, unresolvedList, readinessPayload] = await Promise.all([
-      catalogApi.listCodeSets({ documentId }),
-      catalogApi.listUnresolvedCodeReferences({ documentId }).catch(() => []),
-      catalogApi.getCodeSetReadiness({ documentId }).catch(() => null),
+      catalogApi.listCodeSets({ documentId, packageId: effectivePkgId }),
+      catalogApi.listUnresolvedCodeReferences({ documentId, packageId: effectivePkgId }).catch(() => []),
+      catalogApi.getCodeSetReadiness({ documentId, packageId: effectivePkgId }).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setSets(setList)
@@ -77,6 +86,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
   }
 
   const documentIdParam = params.get('document_id')
+  const packageIdParam = packageId || params.get('package_id') || ''
   const setParam = params.get('set')
   const nameParam = params.get('name')
 
@@ -88,7 +98,7 @@ export default function CodeSetsPage({ embedded = false, onDocumentChange, onSum
     load()
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [documentIdParam])
+  }, [documentIdParam, packageIdParam])
 
   useEffect(() => {
     if (!sets.length) return

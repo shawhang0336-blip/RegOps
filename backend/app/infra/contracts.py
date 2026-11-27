@@ -33,6 +33,7 @@ class SpecDocument(BaseModel):
     fields: List[FieldSpec]
     terms_text: str
     dictionary_text: str
+    supplementary_rules: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class Evidence(BaseModel):

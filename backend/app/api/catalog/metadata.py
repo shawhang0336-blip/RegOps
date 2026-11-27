@@ -56,6 +56,7 @@ class DeleteRequest(BaseModel):
 
 class PublishBatchRequest(BaseModel):
     document_id: Optional[str] = None
+    package_id: Optional[str] = None
     table_ids: Optional[List[str]] = None
     # all_ready = 三项都就绪才发；ddl_only = 只要 DDL 能落地就发（规则/码值问题写进快照）
     scope: str = "all_ready"
@@ -72,9 +73,10 @@ def extract_metadata(request: ExtractRequest, session: Session = Depends(db_sess
 def list_tables(
     status: Optional[str] = None,
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> List[Dict[str, Any]]:
-    return svc.list_tables_with_stats(session, status=status, document_id=document_id)
+    return svc.list_tables_with_stats(session, status=status, document_id=document_id, package_id=package_id)
 
 
 @router.get("/tables/{table_id}")
@@ -108,10 +110,11 @@ def edit_field(
 @router.get("/types/template")
 def download_type_template(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> Response:
     """导出类型修正模板（CSV）：仅导出当前有效最新版本表（排除 MERGED），严格 RFC 4180 转义。"""
-    body = svc.build_type_template_csv(session, document_id=document_id)
+    body = svc.build_type_template_csv(session, document_id=document_id, package_id=package_id)
     return Response(
         content=body,
         media_type="text/csv; charset=utf-8",
@@ -231,10 +234,11 @@ def publish(
 @router.get("/readiness")
 def metadata_readiness(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
     """每张表能出哪些产物：DDL / 规则 / 码值，以及卡在哪一项。"""
-    return evaluate_document(session, document_id)
+    return evaluate_document(session, document_id, package_id=package_id)
 
 
 @router.post("/tables/publish-batch")
@@ -243,6 +247,7 @@ def publish_batch(request: PublishBatchRequest, session: Session = Depends(db_se
     return svc.publish_tables_batch(
         session,
         document_id=request.document_id,
+        package_id=request.package_id,
         table_ids=request.table_ids,
         scope=request.scope,
         dry_run=request.dry_run,

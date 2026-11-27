@@ -66,8 +66,9 @@ def list_tables_with_stats(
     *,
     status: Optional[str] = None,
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    rows = latest_table_rows(session, document_id=document_id, status=status)
+    rows = latest_table_rows(session, document_id=document_id, status=status, package_id=package_id)
     table_ids = [row.id for row in rows]
     stats: Dict[str, Dict[str, Any]] = {}
     latest_by_kind: Dict[tuple, Any] = {}
@@ -149,9 +150,14 @@ def list_tables_with_stats(
     return result
 
 
-def build_type_template_csv(session: Session, *, document_id: Optional[str] = None) -> str:
+def build_type_template_csv(
+    session: Session,
+    *,
+    document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+) -> str:
     """导出类型修正模板（CSV）：仅导出当前有效最新版本表（排除 MERGED），严格 RFC 4180 转义。"""
-    tables = latest_table_rows(session, document_id=document_id)
+    tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     table_ids = [table.id for table in tables]
     fields_by_table: Dict[str, List[FieldMetadataModel]] = {}
     if table_ids:
@@ -343,6 +349,7 @@ def clone_table_draft(
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
     target = TableMetadataModel(
         id=str(uuid.uuid4()),
+        package_id=source.package_id,
         document_id=source.document_id,
         block_id=source.block_id,
         table_code=source.table_code,
@@ -432,6 +439,7 @@ def publish_tables_batch(
     session: Session,
     *,
     document_id: Optional[str],
+    package_id: Optional[str] = None,
     table_ids: Optional[List[str]],
     scope: str,
     dry_run: bool,
@@ -449,7 +457,7 @@ def publish_tables_batch(
             .all()
         )
     else:
-        tables = latest_table_rows(session, document_id=document_id)
+        tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     for table in tables:
         if table.status == "MERGED":
             skipped.append({"table_code": table.table_code, "reason": "MERGED_TABLE"})

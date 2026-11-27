@@ -27,6 +27,7 @@ from app.infra.db_tables import (
     FieldCodeReferenceModel,
     FieldMetadataModel,
     RawBlockModel,
+    SourceDocumentModel,
     TableMetadataModel,
 )
 from app.kernel.event_log import _SessionRLock, bind_session_lock, release_session_locks
@@ -84,6 +85,46 @@ def document_code_set_ids(session: Session, document_id: str) -> set:
         if (source_locator or {}).get("block_id") in block_ids
     }
     return referenced_ids | sourced_ids
+
+
+def package_code_set_ids(session: Session, package_id: str) -> set:
+    """返回指定规范包名下所有码表（含包直接归属、包内表引用以及包内文档来源块产出的码表）。"""
+    direct_ids = {
+        row.id
+        for row in session.query(CodeSetModel.id).filter(CodeSetModel.package_id == package_id).all()
+    }
+    referenced_ids = {
+        row.code_set_id
+        for row in session.query(FieldCodeReferenceModel)
+        .join(FieldMetadataModel, FieldCodeReferenceModel.field_id == FieldMetadataModel.id)
+        .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+        .filter(TableMetadataModel.package_id == package_id)
+        .all()
+    }
+    doc_ids = [
+        row.id
+        for row in session.query(SourceDocumentModel.id)
+        .filter(SourceDocumentModel.package_id == package_id, SourceDocumentModel.status != "DELETED")
+        .all()
+    ]
+    if not doc_ids:
+        return direct_ids | referenced_ids
+    block_ids = {
+        row.id for row in session.query(RawBlockModel.id).filter(RawBlockModel.document_id.in_(doc_ids)).all()
+    }
+    sourced_ids = (
+        {
+            code_set_id
+            for code_set_id, source_locator in session.query(
+                CodeValueModel.code_set_id,
+                CodeValueModel.source_locator,
+            ).all()
+            if (source_locator or {}).get("block_id") in block_ids
+        }
+        if block_ids
+        else set()
+    )
+    return direct_ids | referenced_ids | sourced_ids
 
 
 def document_code_set_ordinals(session: Session, document_id: str, code_set_ids: set) -> Dict[str, int]:
@@ -238,10 +279,21 @@ def _find_matching_code_set(
             collect(2, by_norm.get(norm_name))
 
     if not scored:
-        # 非批量场景（未预置索引）：直接查库
+        # 非批量场景（未预置索引）：仅在同包（或未归包全局库）内查找，绝不跨包串味
+        pkg_filter = None
+        if candidate_norms is not None:
+            # 当传入空 candidate_norms 时也避免全库串包
+            pkg_ids = {cs.package_id for _, cs in candidate_norms}
+            if pkg_ids:
+                pkg_filter = CodeSetModel.package_id.in_(pkg_ids)
         for name in names:
-            collect(0, session.query(CodeSetModel).filter(CodeSetModel.name == name).first())
-            collect(1, session.query(CodeSetModel).filter(CodeSetModel.code == name.upper()).first())
+            q_name = session.query(CodeSetModel).filter(CodeSetModel.name == name)
+            q_code = session.query(CodeSetModel).filter(CodeSetModel.code == name.upper())
+            if pkg_filter is not None:
+                q_name = q_name.filter(pkg_filter)
+                q_code = q_code.filter(pkg_filter)
+            collect(0, q_name.first())
+            collect(1, q_code.first())
 
     norms = candidate_norms
     if norms is None:
@@ -367,6 +419,16 @@ def _values_overlap(session: Session, code_set: CodeSetModel, enum_values: List[
     return any(label and label in labels for (label,) in query.all())
 
 
+def _resolve_field_package_id(session: Session, field: FieldMetadataModel) -> Optional[str]:
+    table = session.get(TableMetadataModel, field.table_id) if field.table_id else None
+    if table is None:
+        return None
+    if table.package_id:
+        return table.package_id
+    doc = session.get(SourceDocumentModel, table.document_id) if table.document_id else None
+    return doc.package_id if doc is not None else None
+
+
 def ensure_field_reference(
     session: Session,
     field: FieldMetadataModel,
@@ -376,6 +438,7 @@ def ensure_field_reference(
     sets_with_values: Optional[set] = None,
     existing_ref_by_field: Optional[Dict[str, FieldCodeReferenceModel]] = None,
     candidate_norms: Optional[List[Tuple[str, CodeSetModel]]] = None,
+    package_id: Optional[str] = None,
 ) -> None:
     _acquire_link_lock(session)
     text = (field.code_reference_text or "").strip()
@@ -412,6 +475,23 @@ def ensure_field_reference(
             session.delete(existing_rule)
             session.flush()
         return
+    resolved_pkg = package_id if package_id is not None else _resolve_field_package_id(session, field)
+    if by_name is None and resolved_pkg is not None:
+        # 严格限制只在当前包（外加 package_id IS NULL 全局码表）查找，禁止跨包串库
+        scoped_sets = (
+            session.query(CodeSetModel)
+            .filter(
+                (CodeSetModel.package_id == resolved_pkg) | (CodeSetModel.package_id.is_(None))
+            )
+            .all()
+        )
+        # 同名优先同包
+        scoped_sets.sort(key=lambda cs: (0 if cs.package_id is None else 1))
+        by_name = {cs.name: cs for cs in scoped_sets}
+        by_code = {cs.code.upper(): cs for cs in scoped_sets}
+        by_norm = {normalize_code_set_name(cs.name): cs for cs in scoped_sets if normalize_code_set_name(cs.name)}
+        candidate_norms = [(normalize_code_set_name(cs.name), cs) for cs in scoped_sets]
+
     code_set = _find_matching_code_set(
         session,
         text,
@@ -439,12 +519,18 @@ def ensure_field_reference(
         # 退回改用字段自己的内联枚举表，不关联。
         code_set = None
     if not code_set:
+        pkg_filter = (
+            (CodeSetModel.package_id == resolved_pkg)
+            if resolved_pkg is not None
+            else CodeSetModel.package_id.is_(None)
+        )
         if enum_values:
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_INLINE_ENUM".upper())[:96]
-            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(pkg_filter, CodeSetModel.code == code).first()
             if not code_set:
                 candidate = CodeSetModel(
                     id=str(uuid.uuid4()),
+                    package_id=resolved_pkg,
                     code=code,
                     name=f"{field.field_cn or field.field_en}（内联枚举）"[:255],
                     definition=f"字段 {field.field_en} 的内联枚举：{text}"[:1000],
@@ -485,7 +571,7 @@ def ensure_field_reference(
                     if sets_with_values is not None:
                         sets_with_values.add(code_set.id)
                 except IntegrityError:
-                    code_set = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+                    code_set = session.query(CodeSetModel).filter(pkg_filter, CodeSetModel.code == code).first()
                     if not code_set:
                         raise
             if code_set and not _set_has_values(session, code_set, sets_with_values):
@@ -496,10 +582,11 @@ def ensure_field_reference(
                 session.flush()
         else:
             code = re.sub(r"[^A-Z0-9_]", "_", f"{field.field_en}_CODESET".upper())[:96]
-            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+            code_set = by_code.get(code) if by_code is not None else session.query(CodeSetModel).filter(pkg_filter, CodeSetModel.code == code).first()
             if not code_set:
                 candidate = CodeSetModel(
                     id=str(uuid.uuid4()),
+                    package_id=resolved_pkg,
                     code=code,
                     name=text[:255],
                     definition=f"由字段 {field.field_en} 的校验引用自动建立",
@@ -514,7 +601,7 @@ def ensure_field_reference(
                     code_set = candidate
                     _stamp_field_ordinal(session, code_set, field)
                 except IntegrityError:
-                    code_set = session.query(CodeSetModel).filter(CodeSetModel.code == code).first()
+                    code_set = session.query(CodeSetModel).filter(pkg_filter, CodeSetModel.code == code).first()
                     if not code_set:
                         raise
                 if by_name is not None:
@@ -569,8 +656,8 @@ def ensure_table_references(session: Session, table: TableMetadataModel) -> None
         ensure_field_reference(session, field)
 
 
-def auto_link_all_references(session: Session) -> int:
-    """Fast O(F + C) batch alignment between all FieldMetadataModel and CodeSetModel rows."""
+def auto_link_all_references(session: Session, *, package_id: Optional[str] = None) -> int:
+    """Fast O(F + C) batch alignment scoped cleanly by package_id (with global NULL-package fallback)."""
     _acquire_link_lock(session)
     session.flush()
     all_sets = session.query(CodeSetModel).all()
@@ -578,33 +665,65 @@ def auto_link_all_references(session: Session) -> int:
         v.code_set_id
         for v in session.query(CodeValueModel).filter(CodeValueModel.enabled.is_(True)).all()
     }
-    by_name: Dict[str, CodeSetModel] = {}
-    by_code: Dict[str, CodeSetModel] = {}
-    by_norm: Dict[str, Optional[CodeSetModel]] = {}
 
-    for cs in all_sets:
-        by_name[cs.name] = cs
-        by_code[cs.code.upper()] = cs
-        nk = normalize_code_set_name(cs.name)
-        if not nk:
-            continue
-        existing = by_norm.get(nk)
-        if existing is None or existing.id == cs.id:
-            by_norm[nk] = cs
-        elif (cs.id in sets_with_values) and (existing.id not in sets_with_values):
-            by_norm[nk] = cs  # 归一化名冲突时优先保留有值码表，避免占位表遮蔽
+    # 按 package_id 建立独立码表池索引，彻底隔绝多项目间同名码表串味（包内优先，其次 package_id=None 全局码表）
+    table_rows = session.query(TableMetadataModel.id, TableMetadataModel.package_id).all()
+    pkg_by_table_id = {tid: pid for tid, pid in table_rows}
+    if package_id is not None:
+        all_fields = (
+            session.query(FieldMetadataModel)
+            .join(TableMetadataModel, FieldMetadataModel.table_id == TableMetadataModel.id)
+            .filter(TableMetadataModel.package_id == package_id)
+            .all()
+        )
+    else:
+        all_fields = session.query(FieldMetadataModel).all()
+
+    pools: Dict[Optional[str], Tuple[Dict[str, CodeSetModel], Dict[str, CodeSetModel], Dict[str, Optional[CodeSetModel]], List[Tuple[str, CodeSetModel]]]] = {}
+
+    def _build_pool(target_pkg: Optional[str]):
+        if target_pkg in pools:
+            return pools[target_pkg]
+        scoped_sets = [
+            cs
+            for cs in all_sets
+            if (target_pkg is None and cs.package_id is None)
+            or (target_pkg is not None and cs.package_id in {target_pkg, None})
+        ]
+        # 全局码表排在前面、包内码表排在后面，确保同名时同包覆盖全局
+        scoped_sets.sort(key=lambda cs: (0 if cs.package_id is None else 1))
+        by_name: Dict[str, CodeSetModel] = {}
+        by_code: Dict[str, CodeSetModel] = {}
+        by_norm: Dict[str, Optional[CodeSetModel]] = {}
+        for cs in scoped_sets:
+            by_name[cs.name] = cs
+            by_code[cs.code.upper()] = cs
+            nk = normalize_code_set_name(cs.name)
+            if not nk:
+                continue
+            existing = by_norm.get(nk)
+            if existing is None or existing.id == cs.id:
+                by_norm[nk] = cs
+            elif cs.package_id == target_pkg and existing.package_id is None:
+                by_norm[nk] = cs
+            elif (cs.id in sets_with_values) and (existing.id not in sets_with_values):
+                by_norm[nk] = cs
+        candidate_norms = [(normalize_code_set_name(cs.name), cs) for cs in scoped_sets]
+        pools[target_pkg] = (by_name, by_code, by_norm, candidate_norms)
+        return pools[target_pkg]
 
     existing_ref_by_field = {
         r.field_id: r for r in session.query(FieldCodeReferenceModel).all()
     }
-    # 已有引用若已指向"有值码表"，按原引用原文锚定，保证重跑幂等（表名被压缩后仍能命中同一张表）
     by_id = {cs.id: cs for cs in all_sets}
-    for ref in existing_ref_by_field.values():
-        anchor = by_id.get(ref.code_set_id)
-        if anchor is not None and ref.reference_text and anchor.id in sets_with_values:
-            by_name.setdefault(ref.reference_text, anchor)
-    candidate_norms = [(normalize_code_set_name(cs.name), cs) for cs in all_sets]
-    for field in session.query(FieldMetadataModel).all():
+    for field in all_fields:
+        f_pkg = package_id if package_id is not None else pkg_by_table_id.get(field.table_id)
+        by_name, by_code, by_norm, candidate_norms = _build_pool(f_pkg)
+        existing_ref = existing_ref_by_field.get(field.id)
+        if existing_ref and existing_ref.reference_text:
+            anchor = by_id.get(existing_ref.code_set_id)
+            if anchor is not None and anchor.id in sets_with_values and anchor.package_id in {f_pkg, None}:
+                by_name.setdefault(existing_ref.reference_text, anchor)
         text = (field.code_reference_text or "").strip()
         if (not text or text.upper() in {"无", "N/A", "NONE", "无引用"}) and field.id not in existing_ref_by_field:
             continue
@@ -617,6 +736,7 @@ def auto_link_all_references(session: Session) -> int:
             sets_with_values=sets_with_values,
             existing_ref_by_field=existing_ref_by_field,
             candidate_norms=candidate_norms,
+            package_id=f_pkg,
         )
 
     for ref in session.query(FieldCodeReferenceModel).all():

@@ -298,7 +298,7 @@ TOOL_SCHEMAS = {
 
 
 def spec_payload(spec: SpecDocument) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "table_code": spec.table_code,
         "table_name": spec.table_name,
         "section": spec.section,
@@ -306,6 +306,10 @@ def spec_payload(spec: SpecDocument) -> Dict[str, Any]:
         "field_names": [field.name for field in spec.fields],
         "terms_text": spec.terms_text[:6000],
     }
+    supp = getattr(spec, "supplementary_rules", None) or []
+    if supp:
+        payload["supplementary_rules"] = list(supp)[:40]
+    return payload
 
 
 _BASE_PROMPT = "你是监管报送装配器，只能调用指定工具进行结构化参数赋值，禁止输出 SQL 或自由文本。"

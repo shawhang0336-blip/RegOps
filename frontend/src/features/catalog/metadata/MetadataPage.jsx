@@ -12,7 +12,14 @@ import FieldEditorDrawer from './FieldEditorDrawer.jsx'
 import { AddFieldForm, TypeImportPanel, ValidationTabView } from './MetadataPanels.jsx'
 import { emptyField, tableGate, typeBasisMeta } from './metadataHelpers.js'
 
-export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadinessChange, reportFilter, onReportFilterChange }) {
+export default function MetadataPage({
+  embedded = false,
+  packageId = '',
+  onOpenCodeSets,
+  onReadinessChange,
+  reportFilter,
+  onReportFilterChange,
+}) {
   const navigate = useNavigate()
   const [params] = useSearchParams()
   const { confirm } = useFeedback()
@@ -50,18 +57,20 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
 
   async function load(preferredId) {
     const loadId = ++loadRequestRef.current
-    const documentId = params.get('document_id')
-    if (embedded && !documentId) {
+    const activePkgId = packageId || params.get('package_id') || ''
+    const documentId = activePkgId ? null : params.get('document_id')
+    const effectivePkgId = activePkgId || null
+    if (embedded && !documentId && !effectivePkgId) {
       setTables([])
       setDetail(null)
       onReadinessChange?.(null)
       return
     }
     const [tableList, unresolvedList, codeSetList, readinessPayload] = await Promise.all([
-      catalogApi.listMetadataTables({ documentId }),
-      catalogApi.listUnresolvedCodeReferences({ documentId }).catch(() => []),
-      catalogApi.listCodeSets({ documentId }).catch(() => []),
-      catalogApi.getMetadataReadiness({ documentId }).catch(() => null),
+      catalogApi.listMetadataTables({ documentId, packageId: effectivePkgId }),
+      catalogApi.listUnresolvedCodeReferences({ documentId, packageId: effectivePkgId }).catch(() => []),
+      catalogApi.listCodeSets({ documentId, packageId: effectivePkgId }).catch(() => []),
+      catalogApi.getMetadataReadiness({ documentId, packageId: effectivePkgId }).catch(() => null),
     ])
     if (loadId !== loadRequestRef.current) return
     setTables(tableList)
@@ -82,6 +91,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
   }
 
   const documentIdParam = params.get('document_id')
+  const packageIdParam = packageId || params.get('package_id') || ''
   const tableParam = params.get('table')
   const fieldParam = params.get('field')
 
@@ -92,7 +102,7 @@ export default function MetadataPage({ embedded = false, onOpenCodeSets, onReadi
     load()
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [documentIdParam])
+  }, [documentIdParam, packageIdParam])
 
   useEffect(() => {
     if (!tableParam || !tables.length) return

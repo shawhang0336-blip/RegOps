@@ -90,18 +90,78 @@ export function diffDocuments(baseId, targetId) {
   return api(`/api/documents/diff${querySuffix({ base_id: baseId, target_id: targetId })}`)
 }
 
+// ── 多文件规范包 (/api/packages/*) ────────────────────────────────────────────
+
+export function listPackages() {
+  return api('/api/packages')
+}
+
+export function createPackage(payload) {
+  return api('/api/packages', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getPackage(packageId) {
+  return api(`/api/packages/${packageId}`)
+}
+
+export function deletePackage(packageId) {
+  return api(`/api/packages/${packageId}`, { method: 'DELETE' })
+}
+
+export function uploadPackageFiles(packageId, files, { docRole = 'AUTO', prepare = true } = {}) {
+  const form = new FormData()
+  for (const file of files) {
+    form.append('files', file)
+  }
+  form.append('doc_role', docRole)
+  form.append('prepare', prepare ? 'true' : 'false')
+  return api(`/api/packages/${packageId}/files`, { method: 'POST', body: form })
+}
+
+export function updatePackageFileRole(packageId, documentId, docRole) {
+  return api(`/api/packages/${packageId}/files/${documentId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ doc_role: docRole }),
+  })
+}
+
+export function extractPackage(packageId, payload = {}) {
+  return api(`/api/packages/${packageId}/extract`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function reconcilePackage(packageId) {
+  return api(`/api/packages/${packageId}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export function listPackageRuleEvidences(packageId, { tableCode } = {}) {
+  return api(`/api/packages/${packageId}/rule-evidences${querySuffix({ table_code: tableCode })}`)
+}
+
+export function diffPackages(baseId, targetId) {
+  return api(`/api/packages/diff${querySuffix({ base_id: baseId, target_id: targetId })}`)
+}
+
 // ── 报表与字段元数据 (/api/metadata/*) ───────────────────────────────────────
 
-export function listMetadataTables({ documentId, status } = {}) {
-  return api(`/api/metadata/tables${querySuffix({ document_id: documentId, status })}`)
+export function listMetadataTables({ documentId, packageId, status } = {}) {
+  return api(`/api/metadata/tables${querySuffix({ document_id: documentId, package_id: packageId, status })}`)
 }
 
 export function getMetadataTable(tableId) {
   return api(`/api/metadata/tables/${tableId}`)
 }
 
-export function getMetadataReadiness({ documentId } = {}) {
-  return api(`/api/metadata/readiness${querySuffix({ document_id: documentId })}`)
+export function getMetadataReadiness({ documentId, packageId } = {}) {
+  return api(`/api/metadata/readiness${querySuffix({ document_id: documentId, package_id: packageId })}`)
 }
 
 export function deleteMetadataTable(tableId, payload) {
@@ -132,9 +192,9 @@ export function addMetadataField(tableId, payload) {
   })
 }
 
-export function downloadFieldTypeTemplate({ documentId } = {}) {
+export function downloadFieldTypeTemplate({ documentId, packageId } = {}) {
   return downloadFile(
-    `/api/metadata/types/template${querySuffix({ document_id: documentId })}`,
+    `/api/metadata/types/template${querySuffix({ document_id: documentId, package_id: packageId })}`,
     '字段类型修正模板.csv',
   )
 }
@@ -145,9 +205,10 @@ export function importFieldTypes(formData) {
 
 // ── 公共与内联码表 (/api/code-sets/*) ────────────────────────────────────────
 
-export function listCodeSets({ documentId, includePlaceholders } = {}) {
+export function listCodeSets({ documentId, packageId, includePlaceholders } = {}) {
   return api(`/api/code-sets${querySuffix({
     document_id: documentId,
+    package_id: packageId,
     include_placeholders: includePlaceholders ? 'true' : undefined,
   })}`)
 }
@@ -171,8 +232,8 @@ export function uploadCodeSetDocument(formData) {
   return api('/api/code-sets/upload-file', { method: 'POST', body: formData })
 }
 
-export function listUnresolvedCodeReferences({ documentId } = {}) {
-  return api(`/api/code-sets/references/unresolved${querySuffix({ document_id: documentId })}`)
+export function listUnresolvedCodeReferences({ documentId, packageId } = {}) {
+  return api(`/api/code-sets/references/unresolved${querySuffix({ document_id: documentId, package_id: packageId })}`)
 }
 
 export function relinkCodeReferences() {
@@ -182,9 +243,10 @@ export function relinkCodeReferences() {
   })
 }
 
-export function getCodeSetReadiness({ documentId, referencedOnly } = {}) {
+export function getCodeSetReadiness({ documentId, packageId, referencedOnly } = {}) {
   return api(`/api/code-sets/readiness${querySuffix({
     document_id: documentId,
+    package_id: packageId,
     referenced_only: referencedOnly ? 'true' : undefined,
   })}`)
 }

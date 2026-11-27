@@ -11,7 +11,8 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_SPEC_PATH = (
     ROOT_DIR
     / "data"
-    / "specs"
+    / "03_国家外汇局_SAFE"
+    / "02_金融机构外汇业务数据采集规范"
     / "金融机构外汇业务数据采集规范_1.3版_全文.pdf"
 )
 

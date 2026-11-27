@@ -20,7 +20,7 @@ backend/app/
 │   ├── config.py                #    环境配置 Settings、运行预算（DEFAULT_BUDGET / get_budget）与操作人占位常量
 │   ├── contracts.py             #    跨层共享 Pydantic 数据契约（FieldSpec / SpecDocument / RuleDefinition / Binding / LLM_OPERATORS）
 │   ├── db.py                    #    MySQL/Oracle 生产连接池、Base / SessionLocal / Alembic 初始化与 SQL 安全转义（quote_identifier）
-│   ├── db_tables.py             #    全部 20 张数据库 ORM 表统一定义（运行时账本 / 文档与资产元数据 / 生成规划与产物）
+│   ├── db_tables.py             #    全部 24 张数据库 ORM 表统一定义（运行时账本 / SpecPackage 规范包与规则证据 / 资产元数据 / 生成规划与产物）
 │   ├── errors.py                #    统一领域异常 WorkflowError（携带结构化错误定位 context）
 │   ├── task_runner.py           #    带任务键去重的进程内有界后台线程池（TaskRunner）
 │   └── llm/                     #    受控大模型子包
@@ -43,7 +43,7 @@ backend/app/
 │
 ├── ingestion/                   # 层 3（Step 0：原始规范文件拆箱、体检与切块，前端归入「01 规范解析与核对」上半段）
 │   ├── parsers/                 #    纯离线文件拆箱、通用三级 PDF 切块与硬伤体检（零 DB、零 LLM）
-│   │   ├── extractors.py        #      PDF / Word / Excel 统一抽块入口（消费 AI ① 切块蓝图）与全文摘要 survey
+│   │   ├── extractors.py        #      PDF / Word（标题树与 XML 合并单元格展开）/ Excel（双模式公式读值、单 Sheet 多表拆分、1104 MATRIX_REPORT）/ ZIP 拆包统一抽块入口、doc_role 识别与全文摘要 survey
 │   │   ├── pdf_catalog.py       #      外管局已知规范高精插件（目录与附录公共码表扫描）
 │   │   ├── pdf_generic.py       #      通用监管 PDF 二级章节切块（HEADING_SECTIONS）与三级分页兜底（PAGE_WINDOWS）
 │   │   ├── pdf_parser.py        #      PDF pdftotext 提取、表格折行重排与字段精拆
@@ -64,9 +64,9 @@ backend/app/
 │   │   ├── service.py           #      码表抽取、AI 复核防幻觉护栏与摘要/删除服务
 │   │   ├── readiness.py         #      码表就绪度评估与自动发布
 │   │   └── bindings.py          #      数据库无关的已发布码表加载、值域绑定与规则/造数用量校验
-│   ├── extraction.py            #    跨子域协同：execute_wave Worker 纯计算（零 DB 访问）与主协调线程单写落库 + 自动对齐
-│   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 Scheduler + INGESTION_CHANNELS 块级断点续跑）
-│   └── version_diff.py          #    跨版本监管制度文档差异对比与影响面分级（返回增量受影响表清单）
+│   ├── extraction.py            #    跨子域协同：三轨（metadata/code_sets/rule_evidence）execute_wave Worker 纯计算、主协调单写落库及 reconcile_package_assets 跨文件融合与冲突检测
+│   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 Scheduler + INGESTION_CHANNELS 三轨块级断点续跑）
+│   └── version_diff.py          #    跨版本监管制度文档（diff_documents）与规范包（diff_packages）差异对比与影响面分级（返回增量受影响表清单）
 │
 ├── generation/                  # 层 5（Step 2，对应前端 02「生成表结构、码表和规则」）：DDL、码表 SQL、规则装配与 Oracle 空跑
 │   ├── core/                    #    ① 纯离线领域内核（AST 锁死：零 DB/LLM/Catalog/SQL/Workflow/Delivery 依赖）
@@ -105,7 +105,9 @@ backend/app/
     ├── platform/                #    域 1：平台底座与配置
     │   ├── system.py            #      /api/health、/api/events/stream（SSE）、/api/blobs/*、/api/business/preview
     │   └── settings.py          #      /api/settings/*（连接探活与执行预算校验/持久化）
-    ├── catalog/                 #    域 2：监管资产目录（文档 / 表字段元数据 / 码表）
+    ├── catalog/                 #    域 2：监管资产目录（多文件规范包 / 文档 / 表字段元数据 / 码表）
+    │   ├── packages.py          #      /api/packages/* 薄路由（多文件/ZIP 批量上传、doc_role 修正、整包三轨提取与跨文件融合、包级对比）
+    │   ├── packages_service.py  #      规范包生命周期、ZIP 安全拆包、角色推断与整包重提取协调服务
     │   ├── documents.py         #      /api/documents/* 薄路由（上传、切块、提取、进度、版本对比）
     │   ├── documents_service.py #      文档接入、原子落盘、初始切块与状态校验服务
     │   ├── metadata.py          #      /api/metadata/* 薄路由（报表字段、就绪度、类型修正与发布）

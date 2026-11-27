@@ -15,7 +15,9 @@ from sqlalchemy.orm import Session
 from app.infra.db_tables import (
     FieldMetadataModel,
     SourceDocumentModel,
+    SpecPackageModel,
     TableMetadataModel,
+    TableRuleEvidenceModel,
 )
 
 _IMPACT_RANK = {"NONE": 0, "METADATA_ONLY": 1, "RULE_IMPACT": 2, "BREAKING": 3}
@@ -113,13 +115,16 @@ def _diff_table_fields(
     return added, removed, modified, table_impact
 
 
-def _load_doc_tables(
-    session: Session, document_id: str
+def _load_tables_and_fields(
+    session: Session,
+    *,
+    document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
 ) -> Tuple[List[TableMetadataModel], Dict[str, List[FieldMetadataModel]]]:
     """只加载每张表的最新版本有效行（过滤 MERGED 子表与历史旧版本），并按 500 项分片防 Oracle ORA-01795。"""
     from app.catalog.tables.readiness import latest_table_rows
 
-    tables = latest_table_rows(session, document_id=document_id)
+    tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     table_ids = [t.id for t in tables]
     fields_by_table: Dict[str, List[FieldMetadataModel]] = {tid: [] for tid in table_ids}
     for idx in range(0, len(table_ids), 500):
@@ -134,18 +139,12 @@ def _load_doc_tables(
     return tables, fields_by_table
 
 
-def diff_documents(session: Session, base_doc_id: str, target_doc_id: str) -> Dict[str, Any]:
-    """对比两份监管制度文档的表结构与字段校验差异，计算影响面并生成增量重跑表清单。"""
-    base_doc = session.get(SourceDocumentModel, base_doc_id)
-    target_doc = session.get(SourceDocumentModel, target_doc_id)
-    if not base_doc:
-        raise ValueError(f"Base document not found: {base_doc_id}")
-    if not target_doc:
-        raise ValueError(f"Target document not found: {target_doc_id}")
-
-    base_tables, base_fields = _load_doc_tables(session, base_doc_id)
-    target_tables, target_fields = _load_doc_tables(session, target_doc_id)
-
+def _compare_table_collections(
+    base_tables: List[TableMetadataModel],
+    base_fields: Dict[str, List[FieldMetadataModel]],
+    target_tables: List[TableMetadataModel],
+    target_fields: Dict[str, List[FieldMetadataModel]],
+) -> Tuple[Dict[str, Any], List[str], List[Dict[str, Any]]]:
     base_by_code = {t.table_code.upper(): t for t in base_tables}
     base_by_name = {_norm_name(t.table_name): t for t in base_tables if _norm_name(t.table_name)}
 
@@ -248,6 +247,23 @@ def diff_documents(session: Session, base_doc_id: str, target_doc_id: str) -> Di
         "rule_impact_tables": sum(1 for item in table_diffs if item["impact"] == "RULE_IMPACT"),
         "affected_table_count": len(affected_table_ids),
     }
+    return summary, affected_table_ids, table_diffs
+
+
+def diff_documents(session: Session, base_doc_id: str, target_doc_id: str) -> Dict[str, Any]:
+    """对比两份监管制度文档的表结构与字段校验差异，计算影响面并生成增量重跑表清单。"""
+    base_doc = session.get(SourceDocumentModel, base_doc_id)
+    target_doc = session.get(SourceDocumentModel, target_doc_id)
+    if not base_doc:
+        raise ValueError(f"Base document not found: {base_doc_id}")
+    if not target_doc:
+        raise ValueError(f"Target document not found: {target_doc_id}")
+
+    base_tables, base_fields = _load_tables_and_fields(session, document_id=base_doc_id)
+    target_tables, target_fields = _load_tables_and_fields(session, document_id=target_doc_id)
+    summary, affected_table_ids, table_diffs = _compare_table_collections(
+        base_tables, base_fields, target_tables, target_fields
+    )
     return {
         "base_document": {
             "id": base_doc.id,
@@ -260,6 +276,56 @@ def diff_documents(session: Session, base_doc_id: str, target_doc_id: str) -> Di
             "file_name": target_doc.file_name,
             "spec_version": target_doc.spec_version,
             "created_at": target_doc.created_at.isoformat() if target_doc.created_at else None,
+        },
+        "summary": summary,
+        "affected_table_ids": affected_table_ids,
+        "tables": table_diffs,
+    }
+
+
+def diff_packages(session: Session, base_package_id: str, target_package_id: str) -> Dict[str, Any]:
+    """对比两套多文件监管规范包的表结构、字段校验与补充核查规则差异。"""
+    base_pkg = session.get(SpecPackageModel, base_package_id)
+    target_pkg = session.get(SpecPackageModel, target_package_id)
+    if not base_pkg:
+        raise ValueError(f"Base package not found: {base_package_id}")
+    if not target_pkg:
+        raise ValueError(f"Target package not found: {target_package_id}")
+
+    base_tables, base_fields = _load_tables_and_fields(session, package_id=base_package_id)
+    target_tables, target_fields = _load_tables_and_fields(session, package_id=target_package_id)
+    summary, affected_table_ids, table_diffs = _compare_table_collections(
+        base_tables, base_fields, target_tables, target_fields
+    )
+
+    base_rules = {
+        r.rule_hash for r in session.query(TableRuleEvidenceModel).filter(TableRuleEvidenceModel.package_id == base_package_id).all()
+    }
+    target_rules = {
+        r.rule_hash for r in session.query(TableRuleEvidenceModel).filter(TableRuleEvidenceModel.package_id == target_package_id).all()
+    }
+    summary["rule_evidences"] = {
+        "base": len(base_rules),
+        "target": len(target_rules),
+        "added": len(target_rules - base_rules),
+        "removed": len(base_rules - target_rules),
+        "unchanged": len(base_rules & target_rules),
+    }
+
+    return {
+        "base_package": {
+            "id": base_pkg.id,
+            "name": base_pkg.name,
+            "regulator": base_pkg.regulator,
+            "spec_version": base_pkg.spec_version,
+            "created_at": base_pkg.created_at.isoformat() if base_pkg.created_at else None,
+        },
+        "target_package": {
+            "id": target_pkg.id,
+            "name": target_pkg.name,
+            "regulator": target_pkg.regulator,
+            "spec_version": target_pkg.spec_version,
+            "created_at": target_pkg.created_at.isoformat() if target_pkg.created_at else None,
         },
         "summary": summary,
         "affected_table_ids": affected_table_ids,

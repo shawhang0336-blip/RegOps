@@ -64,6 +64,7 @@ from app.infra.db_tables import (
     MetadataRevisionModel,
     MetadataValidationModel,
     RawBlockModel,
+    SourceDocumentModel,
     TableMetadataModel,
 )
 from app.infra.config import Settings
@@ -146,11 +147,18 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
 
     safe_code = (draft.table_code or "").strip()[:96]
     safe_name = (draft.table_name or "").strip()[:255]
+    doc_pkg_id = (
+        session.query(SourceDocumentModel.package_id)
+        .filter(SourceDocumentModel.id == block.document_id)
+        .scalar()
+    )
     if existing and not preserve_existing:
         for field in session.query(FieldMetadataModel).filter(FieldMetadataModel.table_id == existing.id).all():
             session.delete(field)
         session.flush()
         table = existing
+        if table.package_id is None and doc_pkg_id:
+            table.package_id = doc_pkg_id
         table.table_code = safe_code
         table.table_name = safe_name
         table.table_definition = draft.table_definition
@@ -159,6 +167,7 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
         next_ver = (existing.current_version + 1) if existing else 1
         table = TableMetadataModel(
             id=str(uuid.uuid4()),
+            package_id=doc_pkg_id,
             document_id=block.document_id,
             block_id=block.id,
             table_code=safe_code,
@@ -222,12 +231,14 @@ def _persist_draft(session: Session, block: RawBlockModel, draft: MetadataTableD
 
 _TABULAR_COL_ALIASES = {
     "field_cn": ("字段中文名", "中文名", "数据项名称", "数据项中文名", "字段名称", "指标名称", "中文名称", "内容"),
-    "field_en": ("字段英文名", "英文名", "字段名", "字段代码", "数据项代码", "英文代码", "field_en", "name"),
-    "data_type": ("数据类型", "类型（长度）", "类型(长度)", "字段类型", "类型", "格式", "data_type"),
-    "length": ("数据长度", "字段长度", "长度", "length"),
-    "decimal_places": ("小数位", "小数位数", "精度", "decimal_places"),
-    "required": ("是否必填", "必填", "是否可空", "可空", "required"),
-    "check_text": ("字段校验", "校验要求", "校验规则", "校验", "业务口径", "说明", "填报说明", "备注", "check_text"),
+    "field_en": ("字段英文名", "英文名", "字段名", "字段代码", "数据项代码", "物理字段名", "英文标识", "英文代码", "field_en", "name"),
+    "data_type": ("数据类型", "类型（长度）", "类型(长度)", "字段类型", "数据格式", "类型", "格式", "data_type"),
+    "length": ("数据长度", "字段长度", "长度_总长", "总长", "长度", "length"),
+    "decimal_places": ("小数位", "小数位数", "长度_小数位", "精度", "decimal_places"),
+    "required": ("是否必填", "必填", "是否可空", "可空", "必选", "必填性", "m/o", "是否非空", "required"),
+    "code_reference": ("代码项", "引用代码表", "码表引用", "关联代码表", "代码表", "枚举引用", "code_reference"),
+    "field_definition": ("业务定义", "业务含义", "指标解释", "口径说明", "数据项定义", "定义", "解释", "field_definition"),
+    "check_text": ("字段校验", "校验要求", "校验规则", "取数逻辑", "填报说明", "校验", "业务口径", "说明", "备注", "check_text"),
 }
 
 
@@ -263,6 +274,8 @@ def _map_tabular_row(row: List[str], headers: List[str]) -> Dict[str, str]:
             "length_raw": "",
             "dec_raw": "",
             "required_raw": "",
+            "code_ref_raw": "",
+            "definition_raw": "",
             "check_text": row[2] if len(row) > 2 else "",
         }
     return {
@@ -272,6 +285,8 @@ def _map_tabular_row(row: List[str], headers: List[str]) -> Dict[str, str]:
         "length_raw": _get("length"),
         "dec_raw": _get("decimal_places"),
         "required_raw": _get("required"),
+        "code_ref_raw": _get("code_reference"),
+        "definition_raw": _get("field_definition"),
         "check_text": _get("check_text"),
     }
 
@@ -283,25 +298,29 @@ def _parse_tabular_type(
     check_text: str,
     field_cn: str,
 ):
-    """兼容 SQL/EAST 类型（VARCHAR(40)/DECIMAL(20,2)/C..30/DATE）与外管局中文类型。"""
+    """兼容 SQL/EAST/一表通/人行类型（VARCHAR(40)/DECIMAL(20,2)/STRING(32)/C..30/AN..18/N..12,2/DATE）与外管局中文类型。"""
     source = (type_raw or "").strip()
     if source:
         upper = source.upper()
-        m_sql = re.match(r"^(VARCHAR2?|CHAR|NUMBER|DECIMAL|NUMERIC|INT|INTEGER)\s*(?:[(（]\s*(\d+)(?:\s*[,，.]\s*(\d+))?\s*[)）])?$", upper)
+        m_sql = re.match(
+            r"^(VARCHAR2?|CHAR|STRING|TEXT|NUMBER|DECIMAL|NUMERIC|INT|INTEGER|BIGINT|FLOAT|DOUBLE)\s*(?:[(（]\s*(\d+)(?:\s*[,，.]\s*(\d+))?\s*[)）])?$",
+            upper,
+        )
         if m_sql:
             kind, g_len, g_dec = m_sql.group(1), m_sql.group(2), m_sql.group(3)
-            is_num = kind in {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER"}
+            is_num = kind in {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT", "FLOAT", "DOUBLE"}
             data_type = "NUMBER" if is_num else "VARCHAR"
-            length = int(g_len or length_raw or (10 if "INT" in kind else (22 if is_num else 128)))
-            dec = int(g_dec or dec_raw or 0) if is_num else 0
+            default_len = 19 if kind == "BIGINT" else (10 if "INT" in kind else (22 if is_num else 128))
+            length = int(g_len or length_raw or default_len)
+            dec = int(g_dec or dec_raw or (2 if kind in {"FLOAT", "DOUBLE"} else 0)) if is_num else 0
             return data_type, max(1, length), max(0, dec), []
-        m_c = re.fullmatch(r"C\.{0,2}(\d+)", upper)
+        m_c = re.fullmatch(r"(?:AN?|C)\.{0,2}(\d+)", upper)
         if m_c:
             return "VARCHAR", int(m_c.group(1)), 0, []
         m_n = re.fullmatch(r"N\.{0,2}(\d+)(?:[.,](\d+))?", upper)
         if m_n:
             return "NUMBER", int(m_n.group(1)), int(m_n.group(2) or 0), []
-        if upper in {"DATE", "TIMESTAMP"}:
+        if upper in {"DATE", "DATETIME", "TIMESTAMP"}:
             return "VARCHAR", 8 if upper == "DATE" else 19, 0, []
     combined = f"{source}{('，' + length_raw) if length_raw else ''}{('.' + dec_raw) if dec_raw else ''} {check_text}".strip()
     _, data_type, length, parsed_dec, _, type_warnings = _parse_type_from_entry(combined, field_cn)
@@ -374,9 +393,15 @@ def _deterministic_field_draft(
             else f"FIELD_{hashlib.sha1(field_cn.encode('utf-8')).hexdigest()[:8].upper()}"
         )
         check_text = mapped["check_text"]
-        req_text = mapped["required_raw"]
+        req_text = mapped["required_raw"].strip()
         if req_text:
-            required_col_hint = req_text in {"是", "必填", "Y", "YES", "TRUE", "1", "非空", "否(不可空)"}
+            req_upper = req_text.upper()
+            if req_upper in {"C", "CONDITIONAL"} or "条件必填" in req_text:
+                required_col_hint = False
+                if "必填" not in check_text:
+                    check_text = f"条件必填；{check_text}".strip("；")
+            else:
+                required_col_hint = req_upper in {"是", "必填", "M", "MANDATORY", "Y", "YES", "TRUE", "1", "非空", "PK", "NOT NULL", "否(不可空)"}
         data_type, length, dec, type_warnings = _parse_tabular_type(
             mapped["data_type_raw"],
             mapped["length_raw"],
@@ -389,17 +414,25 @@ def _deterministic_field_draft(
         raise ValueError("Cannot deterministically map unstructured raw_field without name or row")
 
     # Find term definition in terms_text if available (strictly scoped to this field)
-    field_def = field_cn
+    mapped_def = mapped.get("definition_raw", "") if "row" in raw_field else ""
+    mapped_code_ref = mapped.get("code_ref_raw", "") if "row" in raw_field else ""
+    field_def = mapped_def[:500] if mapped_def else field_cn
     term_definition = lookup_term_definition(terms_text, field_cn)
-    if term_definition:
+    if term_definition and not mapped_def:
         field_def = term_definition[:500]
+    elif term_definition and mapped_def and term_definition not in mapped_def:
+        field_def = f"{mapped_def}；{term_definition}"[:500]
 
     required = (
         required_col_hint
         or bool(raw_field.get("required_basis"))
-        or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text)
+        or ("必填" in check_text and "非必填" not in check_text and "选填" not in check_text and "条件必填" not in check_text)
     )
-    code_ref = extract_code_reference_from_text(check_text) or extract_code_reference_from_text(term_definition)
+    code_ref = (
+        mapped_code_ref
+        or extract_code_reference_from_text(check_text)
+        or extract_code_reference_from_text(term_definition)
+    )
     if not code_ref:
         inline_enums = extract_inline_enum_values(check_text)
         if inline_enums:
@@ -482,14 +515,28 @@ def compute_metadata_for_block_snapshot(
     content_json = dict(block_snap.get("content_json") or {})
 
     source_spec = content_json.get("spec") or content_json.get("parent_spec") or {}
-    terms_text = source_spec.get("terms_text", "")
+    extra_ctx = "\n".join(
+        p
+        for p in (
+            content_json.get("context_before"),
+            content_json.get("sheet_notes"),
+            content_json.get("context_after"),
+        )
+        if p
+    )
+    terms_text = source_spec.get("terms_text") or extra_ctx
     raw_fields = source_spec.get("fields")
     if raw_fields is None:
         rows = content_json.get("rows", [])
         raw_fields = [{"row": row, "headers": content_json.get("headers", [])} for row in rows[1:] if any(row)]
     if not raw_fields:
         raw_fields = [{"raw_text": raw_content}]
-    fallback_code = source_spec.get("table_code") or content_json.get("table_code") or f"TABLE_{block_id.replace('-', '')[:12].upper()}"
+    fallback_code = (
+        source_spec.get("table_code")
+        or content_json.get("table_code")
+        or source_locator.get("table_code")
+        or f"TABLE_{block_id.replace('-', '')[:12].upper()}"
+    )
     fallback_name = source_spec.get("table_name") or content_json.get("table_name") or source_locator.get("sheet") or f"原始表格 {ordinal + 1}"
 
     active_llm = llm

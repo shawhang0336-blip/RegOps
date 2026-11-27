@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.catalog.documents_service import ingest_uploaded_file
+from app.catalog.code_sets.linking import package_code_set_ids
 from app.catalog.code_sets.readiness import evaluate_code_set, is_reference_placeholder
 from app.catalog.code_sets.service import (
     auto_link_all_references,
@@ -83,11 +84,17 @@ def list_code_sets_view(
     session: Session,
     *,
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     include_placeholders: bool = False,
 ) -> List[Dict[str, Any]]:
     query = session.query(CodeSetModel)
     local_ordinals: Dict[str, int] = {}
-    if document_id:
+    if package_id:
+        ids = package_code_set_ids(session, package_id)
+        if not ids:
+            return []
+        query = query.filter(CodeSetModel.id.in_(ids))
+    elif document_id:
         ids = document_code_set_ids(session, document_id)
         query = query.filter(CodeSetModel.id.in_(ids))
         local_ordinals = document_code_set_ordinals(session, document_id, ids)
@@ -208,6 +215,7 @@ def list_unresolved_code_references(
     session: Session,
     *,
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     query = (
         session.query(FieldCodeReferenceModel, FieldMetadataModel, TableMetadataModel)
@@ -220,7 +228,9 @@ def list_unresolved_code_references(
             or_(SourceDocumentModel.id.is_(None), SourceDocumentModel.status != "DELETED"),
         )
     )
-    if document_id:
+    if package_id:
+        query = query.filter(TableMetadataModel.package_id == package_id)
+    elif document_id:
         query = query.filter(TableMetadataModel.document_id == document_id)
     rows = query.all()
     return [
@@ -256,6 +266,7 @@ def publish_code_sets_batch(
     session: Session,
     *,
     document_id: Optional[str],
+    package_id: Optional[str] = None,
     code_set_ids: Optional[List[str]],
     referenced_only: bool,
     dry_run: bool,
@@ -265,6 +276,9 @@ def publish_code_sets_batch(
     query = session.query(CodeSetModel)
     if code_set_ids:
         query = query.filter(CodeSetModel.id.in_(code_set_ids))
+    elif package_id:
+        ids = package_code_set_ids(session, package_id)
+        query = query.filter(CodeSetModel.id.in_(ids)) if ids else query.filter(CodeSetModel.id == "__none__")
     elif document_id:
         ids = document_code_set_ids(session, document_id)
         query = query.filter(CodeSetModel.id.in_(ids))

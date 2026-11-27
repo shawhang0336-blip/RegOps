@@ -1720,6 +1720,8 @@ def test_api_clean_structure_and_router_isolation():
             "documents_service.py",
             "metadata.py",
             "metadata_service.py",
+            "packages.py",
+            "packages_service.py",
         },
         "generation": {
             "__init__.py",
