@@ -62,7 +62,10 @@ RULE_HEADER_HINTS = {
 CATALOG_HEADER_CODE_HINTS = {"表号", "物理表名", "英文表名", "表英文名", "报表编号", "table_code"}
 CATALOG_HEADER_NAME_HINTS = {"表名", "中文表名", "表中文名", "报表名称", "table_name"}
 IGNORE_TABLE_HINTS = {"修订人", "修订日期", "修改记录", "版本历史", "修订版本号", "页码"}
-MATRIX_DIMENSION_HINTS = ("本外币", "人民币", "外币", "期末", "期初", "年初", "本月", "本年", "累计", "平均", "上年")
+MATRIX_DIMENSION_HINTS = (
+    "本外币", "人民币", "外币", "期末", "期初", "年初", "本月", "本年", "累计", "平均", "上年",
+    "当月", "余额", "监测数据", "正常类", "关注类", "不良贷款", "各项贷款", "合计", "境内", "境外",
+)
 MATRIX_ROW_HINTS = ("行次", "指标代码", "指标编号", "项目", "指标名称")
 
 _NOISE_CODE_TOKENS = {
@@ -139,19 +142,29 @@ def convert_legacy_office_bytes(filename: str, content: bytes) -> Tuple[str, byt
     stem = Path(clean_name).stem or "document"
     if ext == "doc":
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        if not soffice:
-            raise ValueError("检测到旧版 .doc 文件，当前环境未安装 LibreOffice，请先另存为 .docx 后上传")
+        textutil = shutil.which("textutil")
+        if not soffice and not textutil:
+            raise ValueError("检测到旧版 .doc 文件，当前环境未安装 LibreOffice 或 textutil，请先另存为 .docx 后上传")
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / clean_name
             src.write_bytes(content)
-            proc = subprocess.run(
-                [soffice, "--headless", "--convert-to", "docx", "--outdir", tmpdir, str(src)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
             out_path = Path(tmpdir) / f"{stem}.docx"
+            if soffice:
+                proc = subprocess.run(
+                    [soffice, "--headless", "--convert-to", "docx", "--outdir", tmpdir, str(src)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            else:
+                proc = subprocess.run(
+                    [textutil, "-convert", "docx", str(src), "-output", str(out_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
             if proc.returncode != 0 or not out_path.exists():
                 raise ValueError(f"旧版 .doc 转换失败：{proc.stderr.strip() or proc.stdout.strip() or '未知错误'}")
             return f"{stem}.docx", out_path.read_bytes()
@@ -242,6 +255,58 @@ def _sniff_tabular_code_set(title: str, headers: List[str], rows: List[List[str]
         None,
     )
     if val_idx is None or label_idx is None:
+        # 兜底：无显式表头的国家标准层级码表（如 GB/T 4754 国民经济行业分类注释：前两列放门类/大中小学代码，后续列放类别中文名）
+        title_and_head = f"{title} {' '.join(headers)}"
+        if any(k in title_and_head for k in ("行业分类", "分类注释", "分类标准", "分类及编码", "代码表", "码表")):
+            hier_values: List[Dict[str, Any]] = []
+            seen_hier = set()
+            for r_i, row in enumerate(rows):
+                cells = [_norm_cell(c) for c in row]
+                code_val = ""
+                code_col = -1
+                for ci in range(min(3, len(cells))):
+                    cand = cells[ci]
+                    if re.fullmatch(r"[A-Z]|\d{2,6}|[A-Z]\d{2,5}", cand):
+                        code_val = cand
+                        code_col = ci
+                        break
+                if not code_val or code_val in seen_hier:
+                    continue
+                label_val = ""
+                for ci in range(code_col + 1, min(6, len(cells))):
+                    cand_lbl = cells[ci]
+                    if cand_lbl and len(cand_lbl) <= 60 and not cand_lbl.startswith(("◇", "—", "包括", "不包括", "指")):
+                        label_val = cand_lbl
+                        break
+                if not label_val:
+                    continue
+                # 尝试提取紧随其后的首行解释作为 definition
+                desc = ""
+                if r_i + 1 < len(rows):
+                    nxt_cells = [_norm_cell(c) for c in rows[r_i + 1]]
+                    if not any(re.fullmatch(r"[A-Z]|\d{2,6}|[A-Z]\d{2,5}", c) for c in nxt_cells[:3]):
+                        desc = " ".join(c for c in nxt_cells if c and c not in {"◇", "—"})[:240]
+                seen_hier.add(code_val)
+                hier_values.append(
+                    {
+                        "value": code_val,
+                        "label_cn": label_val,
+                        "label_en": "",
+                        "definition": desc,
+                    }
+                )
+            if len(hier_values) >= 10:
+                clean_code = re.sub(r"[^A-Z0-9_]", "_", title.upper()).strip("_")
+                if not clean_code or not re.match(r"^[A-Z]", clean_code):
+                    clean_code = f"CS_{hashlib.sha1(title.encode('utf-8')).hexdigest()[:8].upper()}"
+                return {
+                    "code": clean_code[:90],
+                    "name": title,
+                    "definition": f"从国家/行业层级分类表 {title} 结构化提取的码值字典（{len(hier_values)} 项）",
+                    "source_type": "DOCUMENT_TABLE",
+                    "values": hier_values,
+                    "eligible": True,
+                }
         return None
     en_idx = next((i for i, h in enumerate(norm_headers) if i not in {val_idx, label_idx} and ("英文" in h or "label_en" in h)), None)
     def_idx = next(
@@ -420,6 +485,7 @@ def _sniff_matrix_report(
     headers: List[str],
     data_rows: List[List[str]],
     formula_hints: Optional[List[Dict[str, Any]]] = None,
+    notes: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     norm_headers = [_norm_header(h) for h in headers]
     joined_headers = "".join(norm_headers)
@@ -428,14 +494,33 @@ def _sniff_matrix_report(
         return None
     has_row_col = any(any(k in h for k in MATRIX_ROW_HINTS) for h in norm_headers)
     has_dim_col = sum(1 for h in norm_headers if any(d in h for d in MATRIX_DIMENSION_HINTS)) >= 1
-    is_g_or_s_sheet = bool(re.match(r"^[GS]\d{2}(?:[_\-\s]|$)", title.strip(), re.IGNORECASE))
-    if not ((has_row_col and (has_dim_col or is_g_or_s_sheet)) or (is_g_or_s_sheet and data_rows)):
+    is_g_s_t_sheet = bool(re.match(r"^(?:[GS]\d{2}|T\d{1,3}(?:v\d+)?)(?:[_\-\s]|$)", title.strip(), re.IGNORECASE))
+
+    # 兼容银行业非现场/派出机构二维监测报表（表头含「填报机构」「报表日期」「单位：」，列标含 A/B/C，行首为编号指标如 1. / 1.1）
+    top_text = " ".join([title, *(notes or []), *headers, *(" ".join(r[:6]) for r in data_rows[:8])])
+    has_stat_form_meta = ("填报机构" in top_text and ("报表日期" in top_text or "填报日期" in top_text or "单位：" in top_text))
+    has_alpha_col_strip = any(
+        sum(1 for c in r[:10] if re.fullmatch(r"[A-Z]", _norm_cell(c))) >= 3
+        for r in [headers, *data_rows[:6]]
+    )
+    numbered_indicator_rows = sum(
+        1
+        for r in data_rows[:40]
+        if any(re.match(r"^\d+(?:\.\d+)*[.、\s]*[\u4e00-\u9fff]", _norm_cell(c)) for c in r[:2])
+    )
+    is_banking_stat_matrix = (has_stat_form_meta and (numbered_indicator_rows >= 3 or has_alpha_col_strip)) or (
+        is_g_s_t_sheet and (numbered_indicator_rows >= 2 or has_alpha_col_strip or has_dim_col)
+    )
+
+    if not ((has_row_col and (has_dim_col or is_g_s_t_sheet)) or (is_g_s_t_sheet and data_rows) or is_banking_stat_matrix):
         return None
     item_idx = next((i for i, h in enumerate(norm_headers) if "项目" in h or "指标名称" in h), 0)
-    code_idx = next((i for i, h in enumerate(norm_headers) if "指标代码" in h or "行次" in h or "编号" in h), None)
+    code_idx = next((i for i, h in enumerate(norm_headers) if "指标代码" in h or "行次" in h or "编号" in h or "序号" in h), None)
     sample_indicators = []
-    for row in data_rows[:20]:
+    for row in data_rows[:25]:
         label = _norm_cell(row[item_idx]) if item_idx < len(row) else ""
+        if not label and len(row) > 1:
+            label = _norm_cell(row[1])
         code = _norm_cell(row[code_idx]) if code_idx is not None and code_idx < len(row) else ""
         if label:
             sample_indicators.append({"code": code, "name": label})
@@ -582,6 +667,7 @@ def _classify_tabular_region(
     table_index_map: Optional[Dict[str, Dict[str, str]]] = None,
     locator: Optional[Dict[str, Any]] = None,
     default_table_code: str = "",
+    notes: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     norm_headers = [_norm_header(h) for h in headers]
     if any(h in {x.lower() for x in IGNORE_TABLE_HINTS} for h in norm_headers) and not any(
@@ -598,7 +684,7 @@ def _classify_tabular_region(
             "reason": f"目录/表清单索引（共登记 {len(cat_map) // 2 or len(cat_map)} 张表，不单独建表）",
         }
 
-    matrix = _sniff_matrix_report(title, headers, data_rows, formula_hints)
+    matrix = _sniff_matrix_report(title, headers, data_rows, formula_hints, notes=notes)
     if matrix:
         return "MATRIX_REPORT", {
             "candidate_role": "MATRIX_REPORT",
@@ -1170,8 +1256,20 @@ def extract_xlsx(
                 sheet_notes = "\n".join(notes)[:2500]
                 region_title = (
                     notes[0][:80]
-                    if (notes and len(notes[0]) <= 80 and (len(regions) > 1 or _extract_table_code_hint(notes[0], table_index_map)))
-                    else (ws_val.title if len(regions) == 1 else f"{ws_val.title}_{reg_idx + 1}")
+                    if (
+                        notes
+                        and len(notes[0]) <= 80
+                        and (
+                            len(regions) > 1
+                            or ws_val.title.lower().startswith("sheet")
+                            or _extract_table_code_hint(notes[0], table_index_map)
+                        )
+                    )
+                    else (
+                        headers[0][:80]
+                        if (ws_val.title.lower().startswith("sheet") and len([h for h in headers if h]) == 1 and headers[0])
+                        else (ws_val.title if len(regions) == 1 else f"{ws_val.title}_{reg_idx + 1}")
+                    )
                 )
                 region_formulas = [
                     hint
@@ -1202,6 +1300,7 @@ def extract_xlsx(
                     table_index_map=table_index_map,
                     locator=locator,
                     default_table_code=tcode,
+                    notes=notes,
                 )
                 if role == "IGNORE":
                     continue
@@ -1247,14 +1346,14 @@ def infer_document_role(file_name: str, blocks: List[Dict[str, Any]]) -> str:
         roles.append(role)
 
     fname = (file_name or "").lower()
-    if any(k in fname for k in ("修订", "对照", "revision")):
+    is_code_file = any(k in fname for k in ("代码表", "码表", "交易代码", "字典代码", "编码表", "行业分类", "分类注释", "code_set", "code_table"))
+    if is_code_file and not any(r in {"TABLE_METADATA", "MATRIX_REPORT"} for r in roles):
+        return "CODE_SET_APPENDIX"
+    if any(k in fname for k in ("修订说明", "修订对照", "修改对照", "变更对照", "revision")):
         return "REVISION_NOTE"
     if any(k in fname for k in ("核查规则", "检核规则", "校验规则", "校验关系", "勾稽")):
         if not any(r == "TABLE_METADATA" for r in roles):
             return "RULE_SUPPLEMENT"
-    if any(k in fname for k in ("代码表", "码表", "交易代码", "字典代码", "编码表", "code_set", "code_table")):
-        if not any(r == "TABLE_METADATA" for r in roles):
-            return "CODE_SET_APPENDIX"
 
     meta_cnt = sum(1 for r in roles if r == "TABLE_METADATA")
     code_cnt = sum(1 for r in roles if r == "CODE_SET")

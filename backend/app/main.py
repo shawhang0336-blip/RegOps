@@ -6,10 +6,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import register_routers
+from app.api.catalog.packages_service import adopt_legacy_documents
 from app.catalog.pipeline_run import recover_interrupted_ingestion_runs
 from app.delivery.workflow import recover_interrupted_generic_runs
 from app.infra.config import get_settings
-from app.infra.db import init_db
+from app.infra.db import SessionLocal, init_db
 from app.infra.llm import close_http_client
 from app.infra.task_runner import task_runner
 
@@ -23,6 +24,8 @@ def _mark_interrupted_runs() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    with SessionLocal() as session:
+        adopt_legacy_documents(session)
     _mark_interrupted_runs()
     try:
         yield

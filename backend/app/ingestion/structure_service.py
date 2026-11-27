@@ -76,12 +76,22 @@ def _candidate(block: RawBlockModel) -> Dict[str, Any]:
     }
 
 
+_DETERMINISTIC_NON_META_TYPES = frozenset(
+    {"MATRIX_REPORT", "CATALOG_INDEX", "RULE_EVIDENCE", "REVISION_DIFF", "NARRATIVE"}
+)
+
+
 def _is_structured(block: RawBlockModel) -> bool:
     content = block.content_json or {}
+    crole = str(content.get("candidate_role") or "")
     return bool(
         (content.get("eligible") and (content.get("spec") or content.get("code_set_spec")))
-        or (content.get("candidate_role") == "CODE_SET" and content.get("code_set_spec"))
+        or (crole == "CODE_SET" and content.get("code_set_spec"))
         or content.get("parent_spec")
+        or block.block_type in _DETERMINISTIC_NON_META_TYPES
+        or crole in _DETERMINISTIC_NON_META_TYPES
+        or bool(content.get("rule_rows"))
+        or bool(content.get("matrix_profile"))
     )
 
 
@@ -95,6 +105,7 @@ def _validate_structured_guard(args: Dict[str, Any], blocks: List[RawBlockModel]
     structured = {block.id for block in blocks if _is_structured(block)}
     if not structured:
         return
+    allowed_structured_roles = {"TABLE_METADATA", "CODE_SET"} | _DETERMINISTIC_NON_META_TYPES
     for item in args.get("blocks", []):
         ids = set(item.get("source_block_ids", []))
         hits = ids & structured
@@ -104,7 +115,7 @@ def _validate_structured_guard(args: Dict[str, Any], blocks: List[RawBlockModel]
             raise ValueError("AI 计划试图合并多个已解析结构的块，会丢失字段结构")
         if item.get("split_markers"):
             raise ValueError("AI 计划试图切分已解析结构的块")
-        if item.get("role") not in {"TABLE_METADATA", "CODE_SET"}:
+        if item.get("role") not in allowed_structured_roles:
             raise ValueError(f"AI 计划把已解析结构的块标成了 {item.get('role')}")
 
 
@@ -155,14 +166,50 @@ def _default_plan(block: RawBlockModel) -> Dict[str, Any]:
             "warnings": [],
             "split_markers": [],
         }
-    if block.block_type in {"RULE_EVIDENCE", "REVISION_DIFF"}:
+    crole = str(block.content_json.get("candidate_role") or "")
+    if block.block_type == "MATRIX_REPORT" or crole == "MATRIX_REPORT" or block.content_json.get("matrix_profile"):
         return {
             "source_block_ids": [block.id],
-            "role": block.block_type,
+            "role": "MATRIX_REPORT",
+            "title": block.content_json.get("table_name") or block.source_locator.get("sheet", "二维指标矩阵报表"),
+            "column_mapping": {},
+            "human_required": False,
+            "warnings": [],
+            "split_markers": [],
+        }
+    if block.block_type == "CATALOG_INDEX" or crole == "CATALOG_INDEX":
+        return {
+            "source_block_ids": [block.id],
+            "role": "CATALOG_INDEX",
+            "title": block.content_json.get("table_name") or block.source_locator.get("sheet", "报表目录索引"),
+            "column_mapping": {},
+            "human_required": False,
+            "warnings": [],
+            "split_markers": [],
+        }
+    if block.block_type in {"RULE_EVIDENCE", "REVISION_DIFF"} or crole in {"RULE_EVIDENCE", "REVISION_DIFF"} or block.content_json.get("rule_rows"):
+        resolved_role = (
+            block.block_type
+            if block.block_type in {"RULE_EVIDENCE", "REVISION_DIFF"}
+            else (crole if crole in {"RULE_EVIDENCE", "REVISION_DIFF"} else "RULE_EVIDENCE")
+        )
+        return {
+            "source_block_ids": [block.id],
+            "role": resolved_role,
             "title": block.content_json.get("table_name") or block.source_locator.get("section", "规则证据"),
             "column_mapping": {},
             "human_required": False,
             "warnings": ["该块仅作为规则或版本差异证据，不得单独生成完整建表 DDL"],
+            "split_markers": [],
+        }
+    if block.block_type == "NARRATIVE" or crole == "NARRATIVE":
+        return {
+            "source_block_ids": [block.id],
+            "role": "NARRATIVE",
+            "title": block.content_json.get("table_name") or block.source_locator.get("section", "说明正文"),
+            "column_mapping": {},
+            "human_required": False,
+            "warnings": [],
             "split_markers": [],
         }
     return {

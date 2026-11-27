@@ -90,6 +90,50 @@ def extract_rule_evidences_from_block_snapshot(block_snap: Dict[str, Any]) -> Li
             )
         return out
 
+    # EAST 检核规则 OCR PDF 行级解析（如：52 缺失类-为空校验 机构关系表 JGGXB 采集日期 CJRQ 采集日期不允许为空 是）
+    east_rule_re = re.compile(
+        r"(?:^|\s)(\d{1,4})?\s*"
+        r"([^\s]{2,18}(?:校验|校脸|校检|类-[^\s]{2,12}))\s+"
+        r"([\u4e00-\u9fff（）()]{2,24}表)\s+"
+        r"([A-Z][A-Z0-9_]{2,24})\s+"
+        r"([\u4e00-\u9fffA-Za-z0-9（）()/]{1,24})\s+"
+        r"([A-Z][A-Z0-9_]{1,24})\s+"
+        r"(.{4,260}?)\s+(是|否)(?=\s|$)"
+    )
+    east_matches = list(east_rule_re.finditer(re.sub(r"\s+", " ", raw)))
+    if len(east_matches) >= 2:
+        east_items: List[Dict[str, Any]] = []
+        seen_east = set()
+        for idx, m in enumerate(east_matches[:120], start=1):
+            seq, kind, tname, tcode, fld_cn, fld_en, desc, strong = m.groups()
+            tcode_u = tcode.strip().upper()[:90]
+            fld_u = fld_en.strip().upper()
+            rcode = f"EAST_{seq}" if seq else f"EAST_P{locator.get('page', '1')}_{idx}"
+            rtext = f"[{kind}] {fld_cn}({fld_u})：{desc.strip()}"
+            rhash = hashlib.sha256(
+                canonical_json({"table_code": tcode_u, "rule_code": rcode, "rule_text": rtext}).encode("utf-8")
+            ).hexdigest()
+            if rhash in seen_east:
+                continue
+            seen_east.add(rhash)
+            east_items.append(
+                {
+                    "table_code": tcode_u,
+                    "table_name": tname.strip()[:250],
+                    "rule_code": rcode[:90],
+                    "rule_name": f"{kind}-{fld_cn}"[:250],
+                    "severity": "HARD" if strong == "是" else "SOFT",
+                    "scope": "CROSS_TABLE" if any(k in f"{kind}{desc}" for k in ("跨表", "表间", "一致")) else "SINGLE_TABLE",
+                    "target_fields": [fld_u],
+                    "rule_text": rtext[:4000],
+                    "reference_sql": "",
+                    "source_locator": {**locator, "block_id": block_id},
+                    "rule_hash": rhash,
+                }
+            )
+        if east_items:
+            return east_items
+
     # 纯文本 / SAFE 核查规则 PDF 块（例如《对外金融资产负债及交易统计核查规则_2024年版.pdf》）：按规则条目切分
     default_tcode = str(content.get("table_code") or locator.get("table_code") or "").strip().upper()
     default_tname = str(content.get("table_name") or locator.get("section") or "").strip()

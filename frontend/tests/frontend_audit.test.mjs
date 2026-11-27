@@ -7,7 +7,13 @@ import { fileURLToPath } from 'node:url'
 import { ApiError, api, downloadFile, formatApiErrorDetail } from '../src/api/client.js'
 import { formatTime, parseBackendDate } from '../src/utils/dateTime.js'
 import { BUDGET_META, validateBudgetInput } from '../src/utils/budget.js'
-import { REGULATOR_PROJECTS, regulatorMeta } from '../src/utils/activeDocument.js'
+import {
+  REGULATOR_PROJECTS,
+  REGULATORY_AGENCIES,
+  agencyCodeForReport,
+  normalizeReportCode,
+  regulatorMeta,
+} from '../src/utils/activeDocument.js'
 import { fileSha256, updateImportProgress } from '../src/features/catalog/documents/documentHelpers.js'
 import { tableGate, typeBasisMeta } from '../src/features/catalog/metadata/metadataHelpers.js'
 import { formatParams, groupStatusMeta, runLabel, sortRules } from '../src/features/generation/artifactHelpers.js'
@@ -212,9 +218,23 @@ test('helper contracts remain deterministic across document/metadata/artifact he
   ])
   assert.deepEqual(sorted.map((r) => `${r.operator}:${r.field}`), ['REQUIRED:A', 'REQUIRED:Z', 'REGEXP:B'])
 
-  assert.ok(REGULATOR_PROJECTS.some((p) => p.code === '1104' && p.paradigm === 'MATRIX'))
-  assert.equal(regulatorMeta('safe').label, 'SAFE 外汇局')
+  assert.deepEqual(
+    REGULATORY_AGENCIES.map((a) => a.code),
+    ['NFRA', 'PBOC', 'SAFE', 'OTHER'],
+  )
+  assert.ok(REGULATOR_PROJECTS.some((p) => p.code === '1104' && p.agency === 'NFRA' && p.paradigm === 'MATRIX'))
+  assert.ok(REGULATOR_PROJECTS.some((p) => p.code === 'YBT' && p.agency === 'NFRA'))
+  assert.ok(REGULATOR_PROJECTS.some((p) => p.code === 'PBOC_AML' && p.agency === 'PBOC'))
+  assert.ok(REGULATOR_PROJECTS.some((p) => p.code === 'SAFE_FAL' && p.agency === 'SAFE'))
+  assert.equal(agencyCodeForReport('EAST'), 'NFRA')
+  assert.equal(agencyCodeForReport('SAFE_FAL'), 'SAFE')
+  assert.equal(agencyCodeForReport('safe'), 'SAFE')
+  assert.equal(normalizeReportCode('safe'), 'SAFE_BIZ')
+  assert.equal(regulatorMeta('safe').agencyShortLabel, '外汇局')
+  assert.equal(regulatorMeta('safe').label, '外汇业务数据采集')
+  assert.equal(regulatorMeta('SAFE_FAL').label, '对外金融资产负债及交易（FAL）')
   assert.equal(regulatorMeta('上海自贸区').label, '上海自贸区')
+  assert.equal(regulatorMeta('上海自贸区').agency, 'OTHER')
 })
 
 test('architecture guard: clean src/ layout aligned 1:1 with backend 4 domains', () => {

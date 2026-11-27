@@ -8,7 +8,7 @@ import { StatusBadge } from '../../components/StatusBadge.jsx'
 import StatusMessage from '../../components/StatusMessage.jsx'
 import { useWorkspace } from '../../context/WorkspaceContext.jsx'
 import { useEventStream } from '../../hooks/useEventStream.js'
-import { getSavedDocumentId, regulatorMeta, setSavedDocumentId } from '../../utils/activeDocument.js'
+import { setSavedDocumentId } from '../../utils/activeDocument.js'
 import { formatTime } from '../../utils/dateTime.js'
 import { ArtifactDetail, ProductStatusBar } from './ArtifactDetail.jsx'
 import { AllRulesView, RulesView } from './RulesViews.jsx'
@@ -51,7 +51,7 @@ export default function ArtifactsPage() {
   const [reauditBusy, setReauditBusy] = useState(false)
   const [statusFilter, setStatusFilter] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
-  const [docFilter, setDocFilter] = useState(() => urlDocParam || (effectivePackageId ? 'all' : getSavedDocumentId() || 'all'))
+  const [docFilter, setDocFilter] = useState(() => urlDocParam || 'all')
   const [search, setSearch] = useState('')
   const requestRef = useRef(0)
   const tableWrapRef = useRef(null)
@@ -100,26 +100,13 @@ export default function ArtifactsPage() {
     setReadinessById(map)
 
     const availableDocIds = Array.from(new Set(allTables.map((item) => item.document_id).filter(Boolean)))
-    const linkedDocId = linkedTableId ? allTables.find((item) => item.id === linkedTableId)?.document_id : ''
     let resolvedDoc = docFilter
-    if (activeScopePkgId) {
-      // 规范包模式下默认展示整个规范包内的全部融合报表（允许再按单文件子筛）
-      if (urlDocParam && availableDocIds.includes(urlDocParam)) resolvedDoc = urlDocParam
-      else if (resolvedDoc !== 'all' && !availableDocIds.includes(resolvedDoc)) resolvedDoc = 'all'
-    } else if (urlDocParam === 'all') {
-      resolvedDoc = 'all'
-    } else if (urlDocParam && availableDocIds.includes(urlDocParam)) {
+    if (urlDocParam && urlDocParam !== 'all' && availableDocIds.includes(urlDocParam)) {
       resolvedDoc = urlDocParam
-    } else if (linkedDocId && availableDocIds.includes(linkedDocId)) {
-      resolvedDoc = linkedDocId
     } else if (resolvedDoc !== 'all' && !availableDocIds.includes(resolvedDoc)) {
-      resolvedDoc = availableDocIds[0] || 'all'
-    } else if (resolvedDoc === 'all' && !urlDocParam && availableDocIds.length > 0) {
-      const saved = getSavedDocumentId()
-      resolvedDoc = (saved && availableDocIds.includes(saved)) ? saved : availableDocIds[0]
+      resolvedDoc = 'all'
     }
     if (resolvedDoc !== docFilter) setDocFilter(resolvedDoc)
-    if (!activeScopePkgId && resolvedDoc && resolvedDoc !== 'all') setSavedDocumentId(resolvedDoc)
 
     const scopedList = resolvedDoc === 'all'
       ? allTables

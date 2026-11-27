@@ -1,10 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  diffDocuments,
   diffPackages,
   getMetadataTable,
-  listDocuments,
   listMetadataTables,
 } from '../../../api/catalog.js'
 import { diffRuns, listRuns } from '../../../api/delivery.js'
@@ -47,13 +45,9 @@ export default function VersionsPage() {
   const { packages, activePackageId, activePackage, packagesInActiveRegulator, activeRegulator } = useWorkspace()
   const [activeTab, setActiveTab] = useState('doc-diff')
 
-  // Tab 1: 规范包/制度文档跨版本 Diff
-  const [diffMode, setDiffMode] = useState(() => (packages.length > 0 ? 'package' : 'document'))
+  // Tab 1: 规范包跨版本 Diff
   const [basePkgId, setBasePkgId] = useState('')
   const [targetPkgId, setTargetPkgId] = useState('')
-  const [documents, setDocuments] = useState([])
-  const [baseDocId, setBaseDocId] = useState('')
-  const [targetDocId, setTargetDocId] = useState('')
   const [docDiff, setDocDiff] = useState(null)
   const [docDiffFilter, setDocDiffFilter] = useState('CHANGED')
   const [diffBusy, setDiffBusy] = useState(false)
@@ -63,7 +57,6 @@ export default function VersionsPage() {
 
   useEffect(() => {
     if (!packages.length) return
-    setDiffMode((prev) => (prev === 'document' && !baseDocId ? 'package' : prev))
     const pool = selectablePackages
     const targetDefault = (activePackageId && pool.some((p) => p.id === activePackageId)) ? activePackageId : (pool[0]?.id || '')
     const baseDefault = activePackage?.parent_package_id || pool.find((p) => p.id !== targetDefault)?.id || targetDefault
@@ -108,22 +101,13 @@ export default function VersionsPage() {
     let cancelled = false
     setLoading(true)
     Promise.all([
-      listMetadataTables().catch(() => []),
-      listDocuments().catch(() => []),
-      listRuns().catch(() => []),
+      listMetadataTables(activePackageId ? { packageId: activePackageId } : {}).catch(() => []),
+      listRuns(activePackageId ? { packageId: activePackageId } : {}).catch(() => []),
     ])
-      .then(async ([tableList, docList, runList]) => {
+      .then(async ([tableList, runList]) => {
         if (cancelled) return
         setTables(tableList)
-        setDocuments(docList)
         setRuns(runList)
-        if (docList.length >= 2) {
-          setBaseDocId(docList[1].id)
-          setTargetDocId(docList[0].id)
-        } else if (docList.length === 1) {
-          setBaseDocId(docList[0].id)
-          setTargetDocId(docList[0].id)
-        }
         if (runList.length >= 2) {
           setBaseRunId(runList[1].id)
           setTargetRunId(runList[0].id)
@@ -144,28 +128,14 @@ export default function VersionsPage() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [activePackageId])
 
   async function compareDocuments() {
-    if (diffMode === 'package') {
-      if (!basePkgId || !targetPkgId) return
-      setDiffBusy(true)
-      setError('')
-      try {
-        const data = await diffPackages(basePkgId, targetPkgId)
-        setDocDiff(data)
-      } catch (err) {
-        setError(err.message)
-      } finally {
-        setDiffBusy(false)
-      }
-      return
-    }
-    if (!baseDocId || !targetDocId) return
+    if (!basePkgId || !targetPkgId) return
     setDiffBusy(true)
     setError('')
     try {
-      const data = await diffDocuments(baseDocId, targetDocId)
+      const data = await diffPackages(basePkgId, targetPkgId)
       setDocDiff(data)
     } catch (err) {
       setError(err.message)
@@ -264,26 +234,14 @@ export default function VersionsPage() {
         <section className="panel">
           <div className="panel-heading">
             <div>
-              <h2>跨版本监管规范对比</h2>
-              <p>支持按同一监管项目对比新旧「规范包」（含多文件融合表与补充核查规则差异），或按单份文档粒度比对。</p>
+              <h2>跨版本规范包对比</h2>
+              <p>选择同一监管项目的新旧版本规范包，自动比对每张融合报表的增删改、字段类型/长度/必填/校验变更及补充核查规则差异。</p>
             </div>
             <div className="actions">
-              {packages.length > 0 && (
-                <button
-                  type="button"
-                  className="button secondary sm"
-                  onClick={() => {
-                    setDiffMode((m) => (m === 'package' ? 'document' : 'package'))
-                    setDocDiff(null)
-                  }}
-                >
-                  {diffMode === 'package' ? '切换为单文档对比' : '切换为规范包对比'}
-                </button>
-              )}
               <button
                 type="button"
                 className="button primary"
-                disabled={diffBusy || (diffMode === 'package' ? (!basePkgId || !targetPkgId) : (!baseDocId || !targetDocId))}
+                disabled={diffBusy || !basePkgId || !targetPkgId}
                 onClick={compareDocuments}
               >
                 {diffBusy ? '正在比对...' : '执行版本对比'}
@@ -291,57 +249,36 @@ export default function VersionsPage() {
             </div>
           </div>
 
-          {diffMode === 'package' && packages.length > 0 ? (
-            <div className="list-filter-bar" style={{ marginBottom: 14 }}>
-              <label style={{ flex: 1 }}>
-                <small className="muted-text">基线规范包（旧版）</small>
-                <select value={basePkgId} onChange={(e) => setBasePkgId(e.target.value)} style={{ width: '100%' }}>
-                  <option value="">请选择基线规范包</option>
-                  {selectablePackages.map((pkg) => (
+          <div className="list-filter-bar" style={{ marginBottom: 14 }}>
+            <label style={{ flex: 1 }}>
+              <small className="muted-text">基线规范包（旧版）</small>
+              <select value={basePkgId} onChange={(e) => setBasePkgId(e.target.value)} style={{ width: '100%' }}>
+                <option value="">请选择基线规范包</option>
+                {selectablePackages.map((pkg) => {
+                  const pm = regulatorMeta(pkg.regulator)
+                  return (
                     <option key={pkg.id} value={pkg.id}>
-                      [{regulatorMeta(pkg.regulator).shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
+                      [{pm.agencyShortLabel} · {pm.shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
                     </option>
-                  ))}
-                </select>
-              </label>
-              <label style={{ flex: 1 }}>
-                <small className="muted-text">目标规范包（新版）</small>
-                <select value={targetPkgId} onChange={(e) => setTargetPkgId(e.target.value)} style={{ width: '100%' }}>
-                  <option value="">请选择新版规范包</option>
-                  {selectablePackages.map((pkg) => (
+                  )
+                })}
+              </select>
+            </label>
+            <label style={{ flex: 1 }}>
+              <small className="muted-text">目标规范包（新版）</small>
+              <select value={targetPkgId} onChange={(e) => setTargetPkgId(e.target.value)} style={{ width: '100%' }}>
+                <option value="">请选择新版规范包</option>
+                {selectablePackages.map((pkg) => {
+                  const pm = regulatorMeta(pkg.regulator)
+                  return (
                     <option key={pkg.id} value={pkg.id}>
-                      [{regulatorMeta(pkg.regulator).shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
+                      [{pm.agencyShortLabel} · {pm.shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
                     </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          ) : (
-            <div className="list-filter-bar" style={{ marginBottom: 14 }}>
-              <label style={{ flex: 1 }}>
-                <small className="muted-text">基线文档（旧版）</small>
-                <select value={baseDocId} onChange={(e) => setBaseDocId(e.target.value)} style={{ width: '100%' }}>
-                  <option value="">请选择基线文档</option>
-                  {documents.map((doc) => (
-                    <option key={doc.id} value={doc.id}>
-                      {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label style={{ flex: 1 }}>
-                <small className="muted-text">目标文档（新版）</small>
-                <select value={targetDocId} onChange={(e) => setTargetDocId(e.target.value)} style={{ width: '100%' }}>
-                  <option value="">请选择新版文档</option>
-                  {documents.map((doc) => (
-                    <option key={doc.id} value={doc.id}>
-                      {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          )}
+                  )
+                })}
+              </select>
+            </label>
+          </div>
 
           {docDiff ? (
             <>

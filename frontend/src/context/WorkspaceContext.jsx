@@ -2,9 +2,14 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import { createPackage, deletePackage, listPackages } from '../api/catalog.js'
 import {
   REGULATOR_PROJECTS,
+  REGULATORY_AGENCIES,
+  agencyCodeForReport,
+  getSavedAgency,
   getSavedPackageId,
   getSavedRegulator,
+  normalizeReportCode,
   regulatorMeta,
+  setSavedAgency,
   setSavedPackageId,
   setSavedRegulator,
 } from '../utils/activeDocument.js'
@@ -12,11 +17,15 @@ import {
 const WorkspaceContext = createContext({
   packages: [],
   loading: true,
+  activeAgency: 'ALL',
   activeRegulator: 'ALL',
   activePackageId: '',
   activePackage: null,
   packagesInActiveRegulator: [],
+  agencyGroups: [],
   regulatorGroups: [],
+  reportsInActiveAgency: [],
+  selectAgency: () => {},
   selectRegulator: () => {},
   selectPackage: () => {},
   refreshPackages: async () => [],
@@ -24,31 +33,68 @@ const WorkspaceContext = createContext({
   deleteProjectPackage: async () => {},
 })
 
-function normalizeRegKey(code) {
-  const clean = String(code || '').trim()
-  if (!clean) return 'CUSTOM'
-  return /^[A-Za-z0-9_-]+$/.test(clean) ? clean.toUpperCase() : clean
+function pkgMatchesScope(pkg, agencyCode, reportCode) {
+  const pkgReport = normalizeReportCode(pkg.regulator)
+  const pkgAgency = agencyCodeForReport(pkgReport)
+  if (reportCode && reportCode !== 'ALL') {
+    return pkgReport === normalizeReportCode(reportCode)
+  }
+  if (agencyCode && agencyCode !== 'ALL') {
+    return pkgAgency === agencyCode
+  }
+  return true
 }
 
 export function WorkspaceProvider({ children }) {
   const [packages, setPackages] = useState([])
   const [loading, setLoading] = useState(true)
-  const [activeRegulator, setActiveRegulatorState] = useState(() => getSavedRegulator() || 'ALL')
+  const [activeRegulator, setActiveRegulatorState] = useState(() => {
+    const saved = getSavedRegulator()
+    if (!saved || saved === 'ALL') return 'ALL'
+    return normalizeReportCode(saved)
+  })
+  const [activeAgency, setActiveAgencyState] = useState(() => {
+    const savedAg = getSavedAgency()
+    if (savedAg) return savedAg
+    const savedRep = getSavedRegulator()
+    if (savedRep && savedRep !== 'ALL') return agencyCodeForReport(savedRep)
+    return ''
+  })
   const [activePackageId, setActivePackageIdState] = useState(() => getSavedPackageId() || '')
 
   const refreshPackages = useCallback(async () => {
     try {
       const list = await listPackages()
-      setPackages(Array.isArray(list) ? list : [])
+      const safeList = Array.isArray(list) ? list : []
+      setPackages(safeList)
+
+      let resolvedPkgId = ''
       setActivePackageIdState((prevId) => {
-        if (prevId && list.some((p) => p.id === prevId)) return prevId
+        if (prevId && safeList.some((p) => p.id === prevId)) {
+          resolvedPkgId = prevId
+          return prevId
+        }
         const savedPkg = getSavedPackageId()
-        if (savedPkg && list.some((p) => p.id === savedPkg)) return savedPkg
-        const firstId = list[0]?.id || ''
+        if (savedPkg && safeList.some((p) => p.id === savedPkg)) {
+          resolvedPkgId = savedPkg
+          return savedPkg
+        }
+        const firstId = safeList[0]?.id || ''
+        resolvedPkgId = firstId
         if (firstId) setSavedPackageId(firstId)
         return firstId
       })
-      return list
+
+      // 首次访问（尚无本地机构偏好）时，默认定位到首个已有版本包的监管机构，直接呈现「机构 -> 报表 -> 版本包」清晰层级
+      setActiveAgencyState((prevAgency) => {
+        if (prevAgency) return prevAgency
+        const firstPkg = safeList.find((p) => p.id === resolvedPkgId) || safeList[0]
+        const initAgency = firstPkg ? agencyCodeForReport(firstPkg.regulator) : 'NFRA'
+        setSavedAgency(initAgency)
+        return initAgency
+      })
+
+      return safeList
     } catch {
       return []
     } finally {
@@ -60,25 +106,29 @@ export function WorkspaceProvider({ children }) {
     refreshPackages()
   }, [refreshPackages])
 
+  const effectiveAgency = activeAgency || 'ALL'
+
   const activePackage = useMemo(
     () => packages.find((pkg) => pkg.id === activePackageId) || null,
     [packages, activePackageId],
   )
 
-  useEffect(() => {
-    if (activePackage && activeRegulator !== 'ALL') {
-      const pkgReg = normalizeRegKey(activePackage.regulator)
-      if (pkgReg !== normalizeRegKey(activeRegulator)) {
-        setActiveRegulatorState(pkgReg)
-        setSavedRegulator(pkgReg)
-      }
+  const agencyGroups = useMemo(() => {
+    const counts = new Map()
+    for (const pkg of packages) {
+      const ag = agencyCodeForReport(pkg.regulator)
+      counts.set(ag, (counts.get(ag) || 0) + 1)
     }
-  }, [activePackage])
+    return REGULATORY_AGENCIES.map((item) => ({
+      ...item,
+      count: counts.get(item.code) || 0,
+    }))
+  }, [packages])
 
   const regulatorGroups = useMemo(() => {
     const counts = new Map()
     for (const pkg of packages) {
-      const key = normalizeRegKey(pkg.regulator)
+      const key = normalizeReportCode(pkg.regulator)
       counts.set(key, (counts.get(key) || 0) + 1)
     }
     const groups = REGULATOR_PROJECTS.map((item) => ({
@@ -95,11 +145,18 @@ export function WorkspaceProvider({ children }) {
     return groups
   }, [packages])
 
-  const packagesInActiveRegulator = useMemo(() => {
-    if (!activeRegulator || activeRegulator === 'ALL') return packages
-    const target = normalizeRegKey(activeRegulator)
-    return packages.filter((pkg) => normalizeRegKey(pkg.regulator) === target)
-  }, [packages, activeRegulator])
+  const reportsInActiveAgency = useMemo(() => {
+    if (effectiveAgency === 'ALL') {
+      // 全部机构视图下仅平铺已有版本包的报表（避免 16+ 项挤占多行），点击具体监管机构则展开该机构全部报表体系
+      return regulatorGroups.filter((item) => item.count > 0 || item.code === activeRegulator)
+    }
+    return regulatorGroups.filter((item) => item.agency === effectiveAgency)
+  }, [regulatorGroups, effectiveAgency, activeRegulator])
+
+  const packagesInActiveRegulator = useMemo(
+    () => packages.filter((pkg) => pkgMatchesScope(pkg, effectiveAgency, activeRegulator)),
+    [packages, effectiveAgency, activeRegulator],
+  )
 
   const selectPackage = useCallback(
     (nextPackageId, { syncRegulator = true } = {}) => {
@@ -108,23 +165,27 @@ export function WorkspaceProvider({ children }) {
       setSavedPackageId(cleanId)
       if (syncRegulator && cleanId) {
         const hit = packages.find((p) => p.id === cleanId)
-        if (hit) {
-          const reg = normalizeRegKey(hit.regulator)
-          setActiveRegulatorState(reg)
-          setSavedRegulator(reg)
+        if (hit && !pkgMatchesScope(hit, effectiveAgency, activeRegulator)) {
+          const rep = normalizeReportCode(hit.regulator)
+          const ag = agencyCodeForReport(rep)
+          setActiveAgencyState(ag)
+          setSavedAgency(ag)
+          setActiveRegulatorState(rep)
+          setSavedRegulator(rep)
         }
       }
     },
-    [packages],
+    [packages, effectiveAgency, activeRegulator],
   )
 
-  const selectRegulator = useCallback(
-    (nextRegulator) => {
-      const norm = nextRegulator === 'ALL' ? 'ALL' : normalizeRegKey(nextRegulator)
-      setActiveRegulatorState(norm)
-      setSavedRegulator(norm)
-      if (norm === 'ALL') return
-      const matches = packages.filter((pkg) => normalizeRegKey(pkg.regulator) === norm)
+  const selectAgency = useCallback(
+    (nextAgency) => {
+      const normAg = nextAgency === 'ALL' ? 'ALL' : String(nextAgency || 'NFRA').toUpperCase()
+      setActiveAgencyState(normAg)
+      setSavedAgency(normAg)
+      setActiveRegulatorState('ALL')
+      setSavedRegulator('ALL')
+      const matches = packages.filter((pkg) => pkgMatchesScope(pkg, normAg, 'ALL'))
       if (matches.length > 0) {
         if (!matches.some((p) => p.id === activePackageId)) {
           setActivePackageIdState(matches[0].id)
@@ -138,42 +199,72 @@ export function WorkspaceProvider({ children }) {
     [packages, activePackageId],
   )
 
-  const createProjectPackage = useCallback(
-    async (payload) => {
-      const created = await createPackage(payload)
-      setPackages((prev) => [created, ...prev])
-      const reg = normalizeRegKey(created.regulator)
-      setActiveRegulatorState(reg)
-      setSavedRegulator(reg)
-      setActivePackageIdState(created.id)
-      setSavedPackageId(created.id)
-      return created
+  const selectRegulator = useCallback(
+    (nextReport) => {
+      const normRep = nextReport === 'ALL' ? 'ALL' : normalizeReportCode(nextReport)
+      setActiveRegulatorState(normRep)
+      setSavedRegulator(normRep)
+      let targetAg = effectiveAgency
+      if (normRep !== 'ALL') {
+        targetAg = agencyCodeForReport(normRep)
+        setActiveAgencyState(targetAg)
+        setSavedAgency(targetAg)
+      }
+      const matches = packages.filter((pkg) => pkgMatchesScope(pkg, targetAg, normRep))
+      if (matches.length > 0) {
+        if (!matches.some((p) => p.id === activePackageId)) {
+          setActivePackageIdState(matches[0].id)
+          setSavedPackageId(matches[0].id)
+        }
+      } else {
+        setActivePackageIdState('')
+        setSavedPackageId('')
+      }
     },
-    [],
+    [packages, effectiveAgency, activePackageId],
   )
+
+  const createProjectPackage = useCallback(async (payload) => {
+    const created = await createPackage(payload)
+    setPackages((prev) => [created, ...prev])
+    const rep = normalizeReportCode(created.regulator)
+    const ag = agencyCodeForReport(rep)
+    setActiveAgencyState(ag)
+    setSavedAgency(ag)
+    setActiveRegulatorState(rep)
+    setSavedRegulator(rep)
+    setActivePackageIdState(created.id)
+    setSavedPackageId(created.id)
+    return created
+  }, [])
 
   const deleteProjectPackage = useCallback(
     async (packageId) => {
       await deletePackage(packageId)
       const list = await refreshPackages()
       if (packageId === activePackageId) {
-        const nextId = list[0]?.id || ''
+        const scoped = list.filter((pkg) => pkgMatchesScope(pkg, effectiveAgency, activeRegulator))
+        const nextId = scoped[0]?.id || list[0]?.id || ''
         setActivePackageIdState(nextId)
         setSavedPackageId(nextId)
       }
     },
-    [activePackageId, refreshPackages],
+    [activePackageId, effectiveAgency, activeRegulator, refreshPackages],
   )
 
   const value = useMemo(
     () => ({
       packages,
       loading,
+      activeAgency: effectiveAgency,
       activeRegulator,
       activePackageId,
       activePackage,
       packagesInActiveRegulator,
+      agencyGroups,
       regulatorGroups,
+      reportsInActiveAgency,
+      selectAgency,
       selectRegulator,
       selectPackage,
       refreshPackages,
@@ -183,11 +274,15 @@ export function WorkspaceProvider({ children }) {
     [
       packages,
       loading,
+      effectiveAgency,
       activeRegulator,
       activePackageId,
       activePackage,
       packagesInActiveRegulator,
+      agencyGroups,
       regulatorGroups,
+      reportsInActiveAgency,
+      selectAgency,
       selectRegulator,
       selectPackage,
       refreshPackages,

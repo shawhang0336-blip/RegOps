@@ -58,7 +58,7 @@ def _wal_factory(tmp_path: Path, name: str):
     return engine, factory
 
 
-def test_word_excel_zip_heterogeneous_parsers(tmp_path):
+def test_word_excel_zip_heterogeneous_parsers(tmp_path, monkeypatch):
     """验证 Word 合并表头/表后口径、Excel 双模式公式/单 Sheet 多表、ZIP 防穿越与 1104 矩阵识别。"""
     # 1) SAFE Word：修订表被忽略、BOP_A 横跨 banner + 两级表头 + 表后校验口径被完整绑定
     safe_docx = tmp_path / "SAFE_涉外收入接口规范.docx"
@@ -109,11 +109,15 @@ def test_word_excel_zip_heterogeneous_parsers(tmp_path):
     with pytest.raises(ValueError, match="Zip Slip"):
         unpack_zip_archive(bad_zip.getvalue())
 
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
     with pytest.raises(ValueError, match="LibreOffice"):
         convert_legacy_office_bytes("old.doc", b"dummy")
+    monkeypatch.undo()
 
-    # 5) 真实银行填报表单 Excel 回归：横向合并横幅去重、非字典表单降级为 NARRATIVE（不误建表报错）、交易代码文件角色识别
+    # 5) 真实银行填报表单与国家标准层级码表/EAST OCR 规则回归
     from openpyxl import Workbook as _Wb
+    from app.catalog.extraction import extract_rule_evidences_from_block_snapshot
     from app.ingestion.parsers import infer_document_role
 
     wb_form = _Wb()
@@ -131,6 +135,24 @@ def test_word_excel_zip_heterogeneous_parsers(tmp_path):
     assert form_blocks[0]["content_json"]["eligible"] is False
     assert form_blocks[0]["content_json"]["sheet_notes"].count("电子商业汇票系统用户建立申请表格") == 1
     assert infer_document_role("SAFE_涉外收支交易代码_支出.pdf", []) == "CODE_SET_APPENDIX"
+    assert infer_document_role("2017国民经济行业分类注释（按第1号修改单修订）.xlsx", []) == "CODE_SET_APPENDIX"
+    assert infer_document_role("汇发2025_22号_附件2_修订对照表.pdf", []) == "REVISION_NOTE"
+
+    # EAST 检核规则 OCR 文本行级提取回归
+    east_rules = extract_rule_evidences_from_block_snapshot(
+        {
+            "id": "blk-east",
+            "raw_content": (
+                "52 缺失类-为空校验 机构关系表 JGGXB 采集日期 CJRQ 采集日期不允许为空 是 "
+                "53 缺失类-为空校验 对公客户信息表 DGKHXXB 信用评级 XYPJ 授信客户信用评级不允许为空 否"
+            ),
+            "content_json": {},
+            "source_locator": {"page": "2"},
+        }
+    )
+    assert len(east_rules) == 2
+    assert east_rules[0]["table_code"] == "JGGXB" and east_rules[0]["target_fields"] == ["CJRQ"] and east_rules[0]["severity"] == "HARD"
+    assert east_rules[1]["table_code"] == "DGKHXXB" and east_rules[1]["target_fields"] == ["XYPJ"] and east_rules[1]["severity"] == "SOFT"
 
 
 def test_real_safe_pdfs_parse_when_present():

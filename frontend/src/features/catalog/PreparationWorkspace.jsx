@@ -4,42 +4,47 @@ import {
   extractPackage,
   getMetadataReadiness,
   getPackage,
-  listDocuments,
   removePackageFile,
   replacePackageFile,
   updatePackageFileRole,
   uploadPackageFiles,
 } from '../../api/catalog.js'
 import PageHeader from '../../components/PageHeader.jsx'
+import SelectDropdown from '../../components/SelectDropdown.jsx'
 import { StatusBadge } from '../../components/StatusBadge.jsx'
 import StatusMessage from '../../components/StatusMessage.jsx'
 import { useFeedback } from '../../context/FeedbackContext.jsx'
 import { useWorkspace } from '../../context/WorkspaceContext.jsx'
-import { getSavedDocumentId, regulatorMeta, setSavedDocumentId } from '../../utils/activeDocument.js'
+import { REGULATOR_PROJECTS, agencyMeta, regulatorMeta } from '../../utils/activeDocument.js'
 import CodeSetsPage from './codeSets/CodeSetsPage.jsx'
-import DocumentsPage from './documents/DocumentsPage.jsx'
 import MetadataPage from './metadata/MetadataPage.jsx'
 
 const DOC_ROLE_OPTIONS = [
-  { value: 'AUTO', label: '自动识别' },
-  { value: 'MAIN_SPEC', label: '主规范文档' },
-  { value: 'SCHEMA_APPENDIX', label: '字段结构附表' },
-  { value: 'CODE_SET_APPENDIX', label: '公共代码表' },
-  { value: 'RULE_SUPPLEMENT', label: '独立核查规则' },
-  { value: 'REVISION_NOTE', label: '修订说明对照' },
+  { value: 'AUTO', label: '自动识别', description: '按文档结构与内容自动判定角色' },
+  { value: 'MAIN_SPEC', label: '主规范文档', description: '监管制度正文与基础口径说明' },
+  { value: 'SCHEMA_APPENDIX', label: '字段结构附表', description: '报表清单、字段类型与长度字典' },
+  { value: 'CODE_SET_APPENDIX', label: '公共代码表', description: '全局代码集与枚举值附表' },
+  { value: 'RULE_SUPPLEMENT', label: '独立核查规则', description: '表内/表间检核公式与规则清单' },
+  { value: 'REVISION_NOTE', label: '修订说明对照', description: '新旧版本变更说明与差异对照' },
 ]
 
 export default function PreparationWorkspace() {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const { confirm } = useFeedback()
-  const { activePackageId, activePackage, activeRegulator, selectPackage, refreshPackages } = useWorkspace()
+  const {
+    activeAgency,
+    activePackageId,
+    activePackage,
+    activeRegulator,
+    selectPackage,
+    refreshPackages,
+    createProjectPackage,
+  } = useWorkspace()
 
   const view = ['fields', 'codes'].includes(params.get('view')) ? params.get('view') : 'fields'
-  const urlDocumentId = params.get('document_id') || ''
   const urlPackageId = params.get('package_id') || ''
-  const packageId = urlPackageId || (!urlDocumentId ? activePackageId : '')
-  const documentId = packageId ? '' : urlDocumentId
+  const packageId = urlPackageId || activePackageId || ''
 
   const [readiness, setReadiness] = useState(null)
   const [codeSummary, setCodeSummary] = useState(null)
@@ -51,7 +56,20 @@ export default function PreparationWorkspace() {
   const [pkgMsg, setPkgMsg] = useState('')
   const [pkgErr, setPkgErr] = useState('')
 
-  // 同步 URL 与全局 Workspace 选中规范包
+  const [quickReport, setQuickReport] = useState('')
+  const [quickName, setQuickName] = useState('')
+  const [quickVersion, setQuickVersion] = useState('1.0')
+
+  const quickAgencyReports = REGULATOR_PROJECTS.filter(
+    (item) => activeAgency === 'ALL' || item.agency === activeAgency,
+  )
+  const resolvedQuickReport =
+    activeRegulator && activeRegulator !== 'ALL'
+      ? activeRegulator
+      : quickReport && quickAgencyReports.some((r) => r.code === quickReport)
+        ? quickReport
+        : quickAgencyReports[0]?.code || 'YBT'
+
   useEffect(() => {
     if (urlPackageId && urlPackageId !== activePackageId) {
       selectPackage(urlPackageId)
@@ -75,30 +93,14 @@ export default function PreparationWorkspace() {
   }, [packageId])
 
   useEffect(() => {
-    let cancelled = false
-    listDocuments()
-      .then((list) => {
-        if (cancelled || documentId || packageId) return
-        const saved = getSavedDocumentId()
-        const preferred = (saved && list.find((doc) => doc.id === saved)?.id) || list[0]?.id
-        if (preferred) changeDocument(preferred)
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [documentId, packageId])
-
-  useEffect(() => {
-    if (documentId) setSavedDocumentId(documentId)
     setReadiness(null)
     setCodeSummary(null)
-  }, [documentId, packageId])
+  }, [packageId])
 
   useEffect(() => {
-    if ((!documentId && !packageId) || view !== 'codes' || readiness) return undefined
+    if (!packageId || view !== 'codes' || readiness) return undefined
     let cancelled = false
-    getMetadataReadiness(packageId ? { packageId } : { documentId })
+    getMetadataReadiness({ packageId })
       .then((payload) => {
         if (!cancelled) setReadiness(payload)
       })
@@ -106,22 +108,12 @@ export default function PreparationWorkspace() {
     return () => {
       cancelled = true
     }
-  }, [documentId, packageId, view, readiness])
-
-  function changeDocument(nextDocumentId) {
-    setSavedDocumentId(nextDocumentId || '')
-    const next = new URLSearchParams(params)
-    next.delete('package_id')
-    if (nextDocumentId) next.set('document_id', nextDocumentId)
-    else next.delete('document_id')
-    next.delete('table')
-    next.delete('set')
-    setParams(next)
-  }
+  }, [packageId, view, readiness])
 
   function changeView(nextView, assetId = '') {
     const next = new URLSearchParams(params)
     next.set('view', nextView)
+    if (packageId) next.set('package_id', packageId)
     if (nextView === 'fields') {
       if (assetId) next.set('table', assetId)
       next.delete('set')
@@ -140,6 +132,32 @@ export default function PreparationWorkspace() {
   function openCodes(filter = 'all') {
     setCodeFilter(filter)
     changeView('codes')
+  }
+
+  async function handleQuickCreatePackage(event) {
+    event.preventDefault()
+    if (!quickName.trim()) return
+    const targetReg = resolvedQuickReport
+    setPkgBusy(true)
+    setPkgErr('')
+    setPkgMsg('')
+    try {
+      const created = await createProjectPackage({
+        name: quickName.trim(),
+        regulator: targetReg,
+        spec_version: quickVersion.trim() || '1.0',
+      })
+      setQuickName('')
+      const next = new URLSearchParams(params)
+      next.set('package_id', created.id)
+      next.delete('document_id')
+      setParams(next, { replace: true })
+      setPkgMsg(`已创建版本包「${created.name}」，现在可批量上传该监管项目的 Word / Excel / PDF / ZIP 文件。`)
+    } catch (err) {
+      setPkgErr(err.message || '创建版本包失败')
+    } finally {
+      setPkgBusy(false)
+    }
   }
 
   async function handleUploadPackageFiles(event) {
@@ -251,20 +269,17 @@ export default function PreparationWorkspace() {
   const codeBlockedCount = codeSummary?.blocked ?? tableCodeDefects
 
   const activePkgMeta = pkgDetail || activePackage
-  const regInfo = regulatorMeta(activePkgMeta?.regulator || activeRegulator)
+  const regInfo = regulatorMeta(activePkgMeta?.regulator || (activeRegulator !== 'ALL' ? activeRegulator : resolvedQuickReport))
+  const emptyAgencyInfo = agencyMeta(activeAgency)
 
-  const step2Url = packageId
-    ? `/generation?package_id=${encodeURIComponent(packageId)}`
-    : documentId
-      ? `/generation?document_id=${encodeURIComponent(documentId)}`
-      : '/generation'
+  const step2Url = packageId ? `/generation?package_id=${encodeURIComponent(packageId)}` : '/generation'
 
   return (
     <>
       <PageHeader
         eyebrow="第 1 步 · 共 3 步"
         title="规范解析与核对"
-        description="一个监管报表体系即一个独立项目，每个版本包支持多份 Word / Excel / PDF / ZIP 混装上传、局部单文件替换更新与跨文件融合。"
+        description="按监管项目与版本包管理规范文档，支持多份 Word / Excel / PDF / ZIP 混装上传、单文件原地替换更新与跨文件融合。"
       />
 
       {packageId ? (
@@ -273,7 +288,7 @@ export default function PreparationWorkspace() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
               <div>
                 <span className="current-file-eyebrow">
-                  {regInfo.label} · {activePkgMeta?.spec_version && activePkgMeta.spec_version !== 'UNKNOWN' ? `版本 v${activePkgMeta.spec_version}` : '当前版本包'}
+                  {regInfo.agencyShortLabel} · {regInfo.label} · {activePkgMeta?.spec_version && activePkgMeta.spec_version !== 'UNKNOWN' ? `版本 v${activePkgMeta.spec_version}` : '当前版本包'}
                 </span>
                 <div className="current-file-heading" style={{ marginTop: 4 }}>
                   <strong>{activePkgMeta?.name || '当前规范包'}</strong>
@@ -321,16 +336,16 @@ export default function PreparationWorkspace() {
                       </span>
                     </div>
                     <div className="package-doc-actions">
-                      <select
-                        aria-label={`文件角色-${doc.file_name}`}
+                      <SelectDropdown
+                        ariaLabel={`文件角色-${doc.file_name}`}
+                        size="sm"
+                        minWidth={146}
+                        align="right"
                         value={doc.doc_role || 'AUTO'}
+                        options={DOC_ROLE_OPTIONS}
                         disabled={pkgBusy}
-                        onChange={(e) => handleRoleChange(doc.id, e.target.value)}
-                      >
-                        {DOC_ROLE_OPTIONS.map((r) => (
-                          <option key={r.value} value={r.value}>{r.label}</option>
-                        ))}
-                      </select>
+                        onChange={(role) => handleRoleChange(doc.id, role)}
+                      />
                       <label className="button secondary sm" style={{ cursor: 'pointer' }} title="仅替换这一份文件并沿用当前角色">
                         替换更新
                         <input
@@ -343,7 +358,7 @@ export default function PreparationWorkspace() {
                       </label>
                       <button
                         type="button"
-                        className="button subtle sm"
+                        className="button subtle danger-hover sm"
                         disabled={pkgBusy}
                         onClick={() => handleRemoveFile(doc)}
                       >
@@ -355,89 +370,129 @@ export default function PreparationWorkspace() {
               </div>
             ) : (
               <p className="muted-text" style={{ marginTop: 8 }}>
-                当前版本包尚无文档，请点击右上角「+ 追加文件 / ZIP」一次上传该监管报表的规范正文、数据字典、代码表或核查规则附件。
+                当前版本包尚无文档，请点击右上角「+ 追加文件 / ZIP」一次上传该监管项目的规范正文、数据字典、代码表或核查规则附件。
               </p>
             )}
             <StatusMessage error={pkgErr} notice={pkgMsg} onClose={() => { setPkgErr(''); setPkgMsg('') }} />
           </div>
         </section>
       ) : (
-        <DocumentsPage
-          embedded
-          importOnly
-          autoParse
-          selectedDocumentId={documentId}
-          onShowAssets={changeView}
-          onSelectDocument={changeDocument}
-        />
-      )}
-
-      {(documentId || packageId) && (
-        <section className="preparation-overview" aria-label="第一步核对进度">
-          <div className="preparation-metrics">
-            <button type="button" className={reportFilter === 'all' && view === 'fields' ? 'active' : ''} onClick={() => openReports('all')}>
-              <span>报表总数</span><strong>{summary ? tableCount : '—'}</strong>
-            </button>
-            <button type="button" className={reportFilter === 'ready' && view === 'fields' ? 'active' : ''} onClick={() => openReports('ready')}>
-              <span>可生成</span><strong className="success-text">{summary ? readyCount : '—'}</strong>
-            </button>
-            <button type="button" className={reportFilter === 'blocked' && view === 'fields' ? 'active' : ''} onClick={() => openReports('blocked')}>
-              <span>需处理</span><strong className={blockedCount ? 'danger-text' : 'success-text'}>{summary ? blockedCount : '—'}</strong>
-            </button>
-            <button type="button" className={codeFilter === 'blocked' && view === 'codes' ? 'active' : ''} onClick={() => openCodes('blocked')}>
-              <span>码表需补</span><strong className={codeBlockedCount ? 'danger-text' : 'success-text'}>{summary || codeSummary ? codeBlockedCount : '—'}</strong>
-            </button>
+        <section className="panel" aria-label="创建监管报表首个版本包">
+          <div className="panel-heading">
+            <div>
+              <h2>
+                为「{activeRegulator !== 'ALL' ? `${regInfo.agencyShortLabel} · ${regInfo.label}` : emptyAgencyInfo.label}」创建版本规范包
+              </h2>
+              <p>{activeRegulator !== 'ALL' ? regInfo.hint : emptyAgencyInfo.hint}。创建版本包后即可一次导入 Word / Excel / PDF / ZIP 多份资料，后续随时替换更新单个文件或升级新版本。</p>
+            </div>
           </div>
-          <div className="preparation-overview-footer">
-            <p>
-              {summary
-                ? blockedCount > 0
-                  ? `还有 ${blockedCount} 张报表暂不可生成，但可以继续使用已就绪的 ${readyCount} 张。`
-                  : `全部 ${readyCount} 张报表都已就绪，可以进入第二步选表生成。`
-                : '正在评估报表和码表，请稍候；也可以先查看已识别的内容。'}
-            </p>
-            <button
-              type="button"
-              className="button primary preparation-next"
-              onClick={() => navigate(step2Url)}
-            >
-              进入第二步
+          <form className="package-create-inline onboarding-create-form" onSubmit={handleQuickCreatePackage}>
+            {activeRegulator === 'ALL' && (
+              <SelectDropdown
+                ariaLabel="选择监管报表体系"
+                minWidth={220}
+                value={resolvedQuickReport}
+                options={quickAgencyReports.map((item) => ({
+                  value: item.code,
+                  badge: activeAgency === 'ALL' ? agencyMeta(item.agency).shortLabel : '',
+                  label: item.label,
+                  tag: item.paradigm === 'MATRIX' ? '矩阵' : '',
+                  description: item.hint,
+                }))}
+                disabled={pkgBusy}
+                onChange={setQuickReport}
+              />
+            )}
+            <input
+              type="text"
+              placeholder={`版本包名称（如 ${regInfo.shortLabel} 2025版）`}
+              value={quickName}
+              onChange={(e) => setQuickName(e.target.value)}
+              required
+              style={{ minWidth: 260 }}
+            />
+            <input
+              type="text"
+              placeholder="版本号（如 2.0 / 2025）"
+              value={quickVersion}
+              onChange={(e) => setQuickVersion(e.target.value)}
+              style={{ width: 130 }}
+            />
+            <button type="submit" className="button primary" disabled={pkgBusy}>
+              {pkgBusy ? '创建中...' : '创建版本包并开始上传'}
             </button>
-          </div>
+          </form>
+          <StatusMessage error={pkgErr} notice={pkgMsg} onClose={() => { setPkgErr(''); setPkgMsg('') }} />
         </section>
       )}
 
-      <nav className="asset-workspace-tabs" aria-label="导入与核对视图">
-        <button type="button" className={view === 'fields' ? 'active' : ''} onClick={() => openReports(reportFilter)}>
-          报表与字段 {summary && <span>{tableCount}</span>}
-        </button>
-        <button type="button" className={view === 'codes' ? 'active' : ''} onClick={() => openCodes(codeFilter)}>
-          码值表 {codeSummary && <span>{codeSummary.total}</span>}
-          {!codeSummary && codeBlockedCount > 0 && <span>{codeBlockedCount} 需补</span>}
-        </button>
-      </nav>
-      <div className="tab-panel-stage" key={`${view}-${packageId || documentId}`}>
-        {view === 'fields' && (
-          <MetadataPage
-            embedded
-            packageId={packageId}
-            onOpenCodeSets={() => openCodes('blocked')}
-            onReadinessChange={setReadiness}
-            reportFilter={reportFilter}
-            onReportFilterChange={setReportFilter}
-          />
-        )}
-        {view === 'codes' && (
-          <CodeSetsPage
-            embedded
-            packageId={packageId}
-            onDocumentChange={changeDocument}
-            onSummaryChange={setCodeSummary}
-            statusFilter={codeFilter}
-            onStatusFilterChange={setCodeFilter}
-          />
-        )}
-      </div>
+      {packageId && (
+        <>
+          <section className="preparation-overview" aria-label="第一步核对进度">
+            <div className="preparation-metrics">
+              <button type="button" className={reportFilter === 'all' && view === 'fields' ? 'active' : ''} onClick={() => openReports('all')}>
+                <span>报表总数</span><strong>{summary ? tableCount : '—'}</strong>
+              </button>
+              <button type="button" className={reportFilter === 'ready' && view === 'fields' ? 'active' : ''} onClick={() => openReports('ready')}>
+                <span>可生成</span><strong className="success-text">{summary ? readyCount : '—'}</strong>
+              </button>
+              <button type="button" className={reportFilter === 'blocked' && view === 'fields' ? 'active' : ''} onClick={() => openReports('blocked')}>
+                <span>需处理</span><strong className={blockedCount ? 'danger-text' : 'success-text'}>{summary ? blockedCount : '—'}</strong>
+              </button>
+              <button type="button" className={codeFilter === 'blocked' && view === 'codes' ? 'active' : ''} onClick={() => openCodes('blocked')}>
+                <span>码表需补</span><strong className={codeBlockedCount ? 'danger-text' : 'success-text'}>{summary || codeSummary ? codeBlockedCount : '—'}</strong>
+              </button>
+            </div>
+            <div className="preparation-overview-footer">
+              <p>
+                {summary
+                  ? blockedCount > 0
+                    ? `还有 ${blockedCount} 张报表暂不可生成，但可以继续使用已就绪的 ${readyCount} 张。`
+                    : `全部 ${readyCount} 张报表都已就绪，可以进入第二步选表生成。`
+                  : '正在评估报表和码表，请稍候；也可以先查看已识别的内容。'}
+              </p>
+              <button
+                type="button"
+                className="button primary preparation-next"
+                onClick={() => navigate(step2Url)}
+              >
+                进入第二步
+              </button>
+            </div>
+          </section>
+
+          <nav className="asset-workspace-tabs" aria-label="导入与核对视图">
+            <button type="button" className={view === 'fields' ? 'active' : ''} onClick={() => openReports(reportFilter)}>
+              报表与字段 {summary && <span>{tableCount}</span>}
+            </button>
+            <button type="button" className={view === 'codes' ? 'active' : ''} onClick={() => openCodes(codeFilter)}>
+              码值表 {codeSummary && <span>{codeSummary.total}</span>}
+              {!codeSummary && codeBlockedCount > 0 && <span>{codeBlockedCount} 需补</span>}
+            </button>
+          </nav>
+          <div className="tab-panel-stage" key={`${view}-${packageId}`}>
+            {view === 'fields' && (
+              <MetadataPage
+                embedded
+                packageId={packageId}
+                onOpenCodeSets={() => openCodes('blocked')}
+                onReadinessChange={setReadiness}
+                reportFilter={reportFilter}
+                onReportFilterChange={setReportFilter}
+              />
+            )}
+            {view === 'codes' && (
+              <CodeSetsPage
+                embedded
+                packageId={packageId}
+                onSummaryChange={setCodeSummary}
+                statusFilter={codeFilter}
+                onStatusFilterChange={setCodeFilter}
+              />
+            )}
+          </div>
+        </>
+      )}
     </>
   )
 }

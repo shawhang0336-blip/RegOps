@@ -44,6 +44,10 @@ _DATA_ROW_TYPE_RE = re.compile(
 )
 _CODE_SET_TITLE_HINTS = ("代码表", "码值表", "码表", "代码字典", "编码表", "分类代码", "行业分类", "币种", "国别", "行政区划")
 _RULE_TITLE_HINTS = ("核查规则", "校验规则", "勾稽关系", "检核规则", "修订对照", "修订说明")
+_RULE_BODY_SIGNATURES = (
+    "检核规则", "核查规则", "校验规则", "是否强校验", "检核类型", "检核表名",
+    "缺失类-为空校验", "缺失类为空校", "表间校验", "跨表校验", "勾稽关系",
+)
 _IGNORE_TITLE_HINTS = ("目录", "目 录", "修订记录", "修订历史", "封面", "前言", "编写说明", "版本说明")
 
 _TYPE_SPEC_PATTERN = (
@@ -145,13 +149,23 @@ def _is_toc_page(page_text: str) -> bool:
     return dot_lines >= 4 and dot_lines / max(1, len(lines)) >= 0.35
 
 
-def _infer_section_role(title: str, body: str) -> str:
+def _infer_section_role(title: str, body: str, file_name: str = "") -> str:
     compact_title = re.sub(r"\s+", "", title)
     if any(hint in compact_title for hint in _IGNORE_TITLE_HINTS):
         return "IGNORE"
     if any(hint in title for hint in _CODE_SET_TITLE_HINTS):
         return "CODE_SET"
     if any(hint in title for hint in _RULE_TITLE_HINTS):
+        return "RULE_EVIDENCE"
+    # 若文件名或正文头部显著命中检核/核查规则表格特征（如 EAST 检核规则 PDF），优先判定为 RULE_EVIDENCE，避免误当成字段字典建假表
+    head_body = body[:800]
+    has_schema_types = bool(
+        re.search(r"(?:VARCHAR2?|DECIMAL|NUMBER|数据类型|类型（长度）|数据长度|定长字符型|变长字符型)", head_body, re.I)
+    )
+    if not has_schema_types and (
+        any(h in (file_name or "") for h in ("检核规则", "核查规则", "校验规则", "校验关系"))
+        or sum(1 for sig in _RULE_BODY_SIGNATURES if sig in head_body) >= 1
+    ):
         return "RULE_EVIDENCE"
     if any(kw in body for kw in ("字段名", "数据类型", "字符型", "数值型", "VARCHAR", "DECIMAL", "NUMBER", "校验")):
         return "TABLE_METADATA"
@@ -467,7 +481,7 @@ def extract_pdf_generic_sections(
             continue
 
         title = item["text"]
-        role = role_by_heading_idx.get(idx) or _infer_section_role(title, body_only)
+        role = role_by_heading_idx.get(idx) or _infer_section_role(title, body_only, path.name)
         if role == "IGNORE":
             continue
 
@@ -511,7 +525,7 @@ def extract_pdf_page_windows(
         combined = "\n\n".join(buf_texts).strip()
         if combined:
             title = f"第 {buf_start_page}-{buf_end_page} 页" if buf_start_page != buf_end_page else f"第 {buf_start_page} 页"
-            role = _infer_section_role(title, combined)
+            role = _infer_section_role(title, combined, path.name)
             if role == "IGNORE":
                 role = "NARRATIVE"
             blocks.append(

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.api.common import run_tables_from_content, run_view
+from app.api.common import matches_regulator_filter, run_tables_from_content, run_view
 from app.delivery.workflow import _regops_delete_pre_hook
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
@@ -106,8 +106,7 @@ def list_generation_runs(
 
         if target_pkg and target_pkg not in pkg_ids and pkg_id != target_pkg:
             continue
-        norm_reg = reg.upper() if isinstance(reg, str) and reg.isascii() else (reg or "")
-        if target_reg and target_reg != "ALL" and norm_reg != target_reg:
+        if target_reg and not matches_regulator_filter(reg, target_reg):
             continue
 
         results.append(

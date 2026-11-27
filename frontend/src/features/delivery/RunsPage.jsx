@@ -11,7 +11,7 @@ import StatusMessage from '../../components/StatusMessage.jsx'
 import { useFeedback } from '../../context/FeedbackContext.jsx'
 import { useWorkspace } from '../../context/WorkspaceContext.jsx'
 import { useEventStream } from '../../hooks/useEventStream.js'
-import { regulatorMeta } from '../../utils/activeDocument.js'
+import { agencyMeta, regulatorMeta } from '../../utils/activeDocument.js'
 import { formatTime } from '../../utils/dateTime.js'
 import HistoryCleanupModal from './HistoryCleanupModal.jsx'
 import RunTraceTimeline from './RunTraceTimeline.jsx'
@@ -48,7 +48,8 @@ export default function RunsPage() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
   const { confirm } = useFeedback()
-  const { activePackageId, activeRegulator, activePackage } = useWorkspace()
+  const { activeAgency, activePackageId, activeRegulator, activePackage } = useWorkspace()
+  const activeScopeRegulator = activeRegulator !== 'ALL' ? activeRegulator : (activeAgency !== 'ALL' ? activeAgency : '')
   const [scopeByProject, setScopeByProject] = useState(true)
   const [runs, setRuns] = useState([])
   const [selectedRunId, setSelectedRunId] = useState(null)
@@ -108,8 +109,8 @@ export default function RunsPage() {
   }, [])
 
   const load = useCallback(async (preferredId, options = {}) => {
-    const queryArgs = scopeByProject && (activePackageId || (activeRegulator && activeRegulator !== 'ALL'))
-      ? { packageId: activePackageId || '', regulator: activeRegulator || '' }
+    const queryArgs = scopeByProject && (activePackageId || activeScopeRegulator)
+      ? { packageId: activePackageId || '', regulator: activeScopeRegulator || '' }
       : {}
     const list = await deliveryApi.listRuns(queryArgs)
     setRuns(list)
@@ -124,7 +125,7 @@ export default function RunsPage() {
       setBusEvents([])
       setReplay(null)
     }
-  }, [active?.id, activePackageId, activeRegulator, params, scopeByProject, select])
+  }, [active?.id, activePackageId, activeScopeRegulator, params, scopeByProject, select])
 
   const runQueryParam = params.get('run')
 
@@ -138,7 +139,7 @@ export default function RunsPage() {
     ).then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
-  }, [activePackageId, activeRegulator, scopeByProject])
+  }, [activePackageId, activeScopeRegulator, scopeByProject])
 
   useEffect(() => {
     if (runQueryParam && active?.id && runQueryParam !== active.id) {
@@ -493,19 +494,25 @@ export default function RunsPage() {
             <div>
               <h2>验证批次</h2>
               <p>
-                {scopeByProject && (activePackageId || (activeRegulator && activeRegulator !== 'ALL'))
-                  ? `当前范围：${activePackage ? `${regulatorMeta(activePackage.regulator).shortLabel} · ${activePackage.name}` : regulatorMeta(activeRegulator).label}（共 ${runs.length} 个批次）`
+                {scopeByProject && (activePackageId || activeScopeRegulator)
+                  ? `当前范围：${
+                    activePackage
+                      ? `${regulatorMeta(activePackage.regulator).agencyShortLabel} · ${regulatorMeta(activePackage.regulator).shortLabel} · ${activePackage.name}`
+                      : activeRegulator !== 'ALL'
+                        ? `${regulatorMeta(activeRegulator).agencyShortLabel} · ${regulatorMeta(activeRegulator).label}`
+                        : agencyMeta(activeAgency).label
+                  }（共 ${runs.length} 个批次）`
                   : `共 ${runs.length} 个批次，按报表和生成时间标识`}
               </p>
             </div>
             <div className="actions">
-              {(activePackageId || (activeRegulator && activeRegulator !== 'ALL')) && (
+              {(activePackageId || activeScopeRegulator) && (
                 <button
                   type="button"
                   className="button subtle sm"
                   onClick={() => setScopeByProject((v) => !v)}
                 >
-                  {scopeByProject ? '显示全部项目' : '仅看当前项目'}
+                  {scopeByProject ? '显示全部机构' : '仅看当前报表'}
                 </button>
               )}
               <StatusBadge tone="neutral">{runs.length}</StatusBadge>
@@ -562,7 +569,7 @@ export default function RunsPage() {
                 </div>
                 {(run.regulator || run.package_name) && (
                   <span className="muted-text" style={{ fontSize: 11.5 }}>
-                    [{regulatorMeta(run.regulator).shortLabel}] {run.package_name || ''}
+                    [{regulatorMeta(run.regulator).agencyShortLabel} · {regulatorMeta(run.regulator).shortLabel}] {run.package_name || ''}
                   </span>
                 )}
                 <span>{formatTime(run.created_at)}{batchTables(run) ? ` · ${batchTables(run)}` : ''}</span>
