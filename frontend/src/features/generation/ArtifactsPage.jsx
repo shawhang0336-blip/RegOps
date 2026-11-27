@@ -6,8 +6,9 @@ import * as generationApi from '../../api/generation.js'
 import PageHeader from '../../components/PageHeader.jsx'
 import { StatusBadge } from '../../components/StatusBadge.jsx'
 import StatusMessage from '../../components/StatusMessage.jsx'
+import { useWorkspace } from '../../context/WorkspaceContext.jsx'
 import { useEventStream } from '../../hooks/useEventStream.js'
-import { getSavedDocumentId, setSavedDocumentId } from '../../utils/activeDocument.js'
+import { getSavedDocumentId, regulatorMeta, setSavedDocumentId } from '../../utils/activeDocument.js'
 import { formatTime } from '../../utils/dateTime.js'
 import { ArtifactDetail, ProductStatusBar } from './ArtifactDetail.jsx'
 import { AllRulesView, RulesView } from './RulesViews.jsx'
@@ -23,8 +24,12 @@ import {
 export default function ArtifactsPage() {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
+  const { activePackageId, activePackage, selectPackage } = useWorkspace()
   const linkedTableId = params.get('table')
   const urlDocParam = params.get('document_id') || ''
+  const urlPkgParam = params.get('package_id') || ''
+  const effectivePackageId = urlPkgParam || activePackageId || ''
+  const [scopeMode, setScopeMode] = useState(() => (urlPkgParam || activePackageId ? 'package' : 'all'))
 
   const [tables, setTables] = useState([])
   const [readinessById, setReadinessById] = useState({})
@@ -46,11 +51,26 @@ export default function ArtifactsPage() {
   const [reauditBusy, setReauditBusy] = useState(false)
   const [statusFilter, setStatusFilter] = useState('all')
   const [readinessFilter, setReadinessFilter] = useState('all')
-  const [docFilter, setDocFilter] = useState(() => urlDocParam || getSavedDocumentId() || 'all')
+  const [docFilter, setDocFilter] = useState(() => urlDocParam || (effectivePackageId ? 'all' : getSavedDocumentId() || 'all'))
   const [search, setSearch] = useState('')
   const requestRef = useRef(0)
   const tableWrapRef = useRef(null)
   const listScrollRef = useRef(0)
+
+  useEffect(() => {
+    if (urlPkgParam && urlPkgParam !== activePackageId) {
+      selectPackage(urlPkgParam)
+      setScopeMode('package')
+    }
+  }, [urlPkgParam, activePackageId, selectPackage])
+
+  useEffect(() => {
+    if (effectivePackageId && scopeMode !== 'package' && !urlDocParam) {
+      setScopeMode('package')
+    }
+  }, [effectivePackageId])
+
+  const activeScopePkgId = scopeMode === 'package' ? effectivePackageId : ''
 
   function handleDocFilterChange(nextDocId) {
     setDocFilter(nextDocId)
@@ -65,10 +85,11 @@ export default function ArtifactsPage() {
   }
 
   async function load(preferredId) {
+    const queryScope = activeScopePkgId ? { packageId: activeScopePkgId } : {}
     const [data, readinessPayload, rulesOverview] = await Promise.all([
-      generationApi.listArtifactsStatus(),
-      getMetadataReadiness().catch(() => null),
-      generationApi.listAllTableRules().catch(() => null),
+      generationApi.listArtifactsStatus(queryScope),
+      getMetadataReadiness(queryScope).catch(() => null),
+      generationApi.listAllTableRules(queryScope).catch(() => null),
     ])
     const allTables = data.tables || []
     setTables(allTables)
@@ -78,11 +99,14 @@ export default function ArtifactsPage() {
     )
     setReadinessById(map)
 
-    // 与第一步当前选中文档打通：优先 URL document_id → 指定 table 所属文档 → 第一步记住的文档 → 第一份有效文档
     const availableDocIds = Array.from(new Set(allTables.map((item) => item.document_id).filter(Boolean)))
     const linkedDocId = linkedTableId ? allTables.find((item) => item.id === linkedTableId)?.document_id : ''
     let resolvedDoc = docFilter
-    if (urlDocParam === 'all') {
+    if (activeScopePkgId) {
+      // 规范包模式下默认展示整个规范包内的全部融合报表（允许再按单文件子筛）
+      if (urlDocParam && availableDocIds.includes(urlDocParam)) resolvedDoc = urlDocParam
+      else if (resolvedDoc !== 'all' && !availableDocIds.includes(resolvedDoc)) resolvedDoc = 'all'
+    } else if (urlDocParam === 'all') {
       resolvedDoc = 'all'
     } else if (urlDocParam && availableDocIds.includes(urlDocParam)) {
       resolvedDoc = urlDocParam
@@ -95,13 +119,14 @@ export default function ArtifactsPage() {
       resolvedDoc = (saved && availableDocIds.includes(saved)) ? saved : availableDocIds[0]
     }
     if (resolvedDoc !== docFilter) setDocFilter(resolvedDoc)
-    if (resolvedDoc && resolvedDoc !== 'all') setSavedDocumentId(resolvedDoc)
+    if (!activeScopePkgId && resolvedDoc && resolvedDoc !== 'all') setSavedDocumentId(resolvedDoc)
 
-    const scopedTables = resolvedDoc === 'all'
+    const scopedList = resolvedDoc === 'all'
       ? allTables
       : allTables.filter((item) => item.document_id === resolvedDoc)
-    const target = preferredId || linkedTableId || currentId || scopedTables.find((item) => item.generated && item.rule_count > 0)?.id
+    const target = preferredId || linkedTableId || (scopedList.some((item) => item.id === currentId) ? currentId : '') || scopedList.find((item) => item.generated && item.rule_count > 0)?.id || scopedList[0]?.id || ''
     if (target) await select(target)
+    else setDetail(null)
   }
 
   async function select(id, options = {}) {
@@ -125,7 +150,8 @@ export default function ArtifactsPage() {
   }
 
   async function refreshSummary() {
-    const data = await generationApi.listArtifactsStatus().catch(() => null)
+    const queryScope = activeScopePkgId ? { packageId: activeScopePkgId } : {}
+    const data = await generationApi.listArtifactsStatus(queryScope).catch(() => null)
     if (data) {
       const nextTables = data.tables || []
       setTables(nextTables)
@@ -135,14 +161,18 @@ export default function ArtifactsPage() {
   }
 
   function openMetadataTable(tableId, documentId = '') {
-    const resolvedDocId = documentId || tables.find((row) => row.id === tableId)?.document_id || ''
+    const row = tables.find((item) => item.id === tableId)
+    const resolvedPkgId = activeScopePkgId || row?.package_id || ''
+    const resolvedDocId = documentId || row?.document_id || ''
     const qs = new URLSearchParams({ view: 'fields', table: tableId })
-    if (resolvedDocId) qs.set('document_id', resolvedDocId)
+    if (resolvedPkgId) qs.set('package_id', resolvedPkgId)
+    else if (resolvedDocId) qs.set('document_id', resolvedDocId)
     navigate(`/documents?${qs.toString()}`)
   }
 
   async function refreshOverview() {
-    const data = await generationApi.listAllTableRules().catch(() => null)
+    const queryScope = activeScopePkgId ? { packageId: activeScopePkgId } : {}
+    const data = await generationApi.listAllTableRules(queryScope).catch(() => null)
     if (data) {
       setOverview(data)
       setRefreshedAt(new Date())
@@ -163,8 +193,10 @@ export default function ArtifactsPage() {
   }
 
   useEffect(() => {
+    setSelected([])
+    setLoading(true)
     load().catch((err) => setError(err.message)).finally(() => setLoading(false))
-  }, [])
+  }, [activeScopePkgId])
 
   useEffect(() => {
     if (!urlDocParam || !tables.length) return
@@ -438,6 +470,18 @@ export default function ArtifactsPage() {
           </div>
 
           <div className="list-filter-bar report-filter-bar">
+            {effectivePackageId && (
+              <button
+                type="button"
+                className="button secondary sm"
+                onClick={() => setScopeMode((m) => (m === 'package' ? 'all' : 'package'))}
+                title="切换仅查看当前规范包或查看全部报表"
+              >
+                {scopeMode === 'package'
+                  ? `当前规范包：${activePackage?.name || '已锁定'}（点此看全部）`
+                  : '范围：全部规范包（点此切回当前包）'}
+              </button>
+            )}
             <input
               type="search"
               placeholder="检索报表名称或表代码..."
@@ -452,8 +496,12 @@ export default function ArtifactsPage() {
             </select>
             {documents.length > 0 && (
               <select aria-label="来源文件" value={docFilter} onChange={(e) => handleDocFilterChange(e.target.value)}>
+                {documents.length > 1 && (
+                  <option value="all">
+                    {activeScopePkgId ? `当前规范包全部分件（${tables.length} 张）` : `全部有效文件（${tables.length} 张）`}
+                  </option>
+                )}
                 {documents.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-                {documents.length > 1 && <option value="all">全部有效文件（{tables.length} 张）</option>}
               </select>
             )}
           </div>

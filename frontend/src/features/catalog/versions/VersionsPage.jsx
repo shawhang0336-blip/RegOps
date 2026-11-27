@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { diffDocuments, getMetadataTable, listDocuments, listMetadataTables } from '../../../api/catalog.js'
+import {
+  diffDocuments,
+  diffPackages,
+  getMetadataTable,
+  listDocuments,
+  listMetadataTables,
+} from '../../../api/catalog.js'
 import { diffRuns, listRuns } from '../../../api/delivery.js'
 import { createGenerationRun } from '../../../api/generation.js'
 import PageHeader from '../../../components/PageHeader.jsx'
@@ -8,6 +14,8 @@ import { RevisionDiffView } from '../../../components/RevisionDiffView.jsx'
 import { DetailSkeleton, ListSkeleton } from '../../../components/Skeleton.jsx'
 import { StatusBadge } from '../../../components/StatusBadge.jsx'
 import StatusMessage from '../../../components/StatusMessage.jsx'
+import { useWorkspace } from '../../../context/WorkspaceContext.jsx'
+import { regulatorMeta } from '../../../utils/activeDocument.js'
 import { formatTime } from '../../../utils/dateTime.js'
 
 const IMPACT_META = {
@@ -36,9 +44,13 @@ const ATTR_LABELS = {
 
 export default function VersionsPage() {
   const navigate = useNavigate()
+  const { packages, activePackageId, activePackage, packagesInActiveRegulator, activeRegulator } = useWorkspace()
   const [activeTab, setActiveTab] = useState('doc-diff')
 
-  // Tab 1: 跨版本制度文档 Diff
+  // Tab 1: 规范包/制度文档跨版本 Diff
+  const [diffMode, setDiffMode] = useState(() => (packages.length > 0 ? 'package' : 'document'))
+  const [basePkgId, setBasePkgId] = useState('')
+  const [targetPkgId, setTargetPkgId] = useState('')
   const [documents, setDocuments] = useState([])
   const [baseDocId, setBaseDocId] = useState('')
   const [targetDocId, setTargetDocId] = useState('')
@@ -46,6 +58,18 @@ export default function VersionsPage() {
   const [docDiffFilter, setDocDiffFilter] = useState('CHANGED')
   const [diffBusy, setDiffBusy] = useState(false)
   const [genBusy, setGenBusy] = useState(false)
+
+  const selectablePackages = packagesInActiveRegulator.length >= 2 ? packagesInActiveRegulator : packages
+
+  useEffect(() => {
+    if (!packages.length) return
+    setDiffMode((prev) => (prev === 'document' && !baseDocId ? 'package' : prev))
+    const pool = selectablePackages
+    const targetDefault = (activePackageId && pool.some((p) => p.id === activePackageId)) ? activePackageId : (pool[0]?.id || '')
+    const baseDefault = activePackage?.parent_package_id || pool.find((p) => p.id !== targetDefault)?.id || targetDefault
+    if (!targetPkgId || !pool.some((p) => p.id === targetPkgId)) setTargetPkgId(targetDefault)
+    if (!basePkgId || !pool.some((p) => p.id === basePkgId)) setBasePkgId(baseDefault)
+  }, [packages, activePackageId, activePackage, activeRegulator])
 
   // Tab 2: 跨验证批次规则与 SQL Diff
   const [runs, setRuns] = useState([])
@@ -123,6 +147,20 @@ export default function VersionsPage() {
   }, [])
 
   async function compareDocuments() {
+    if (diffMode === 'package') {
+      if (!basePkgId || !targetPkgId) return
+      setDiffBusy(true)
+      setError('')
+      try {
+        const data = await diffPackages(basePkgId, targetPkgId)
+        setDocDiff(data)
+      } catch (err) {
+        setError(err.message)
+      } finally {
+        setDiffBusy(false)
+      }
+      return
+    }
     if (!baseDocId || !targetDocId) return
     setDiffBusy(true)
     setError('')
@@ -226,14 +264,26 @@ export default function VersionsPage() {
         <section className="panel">
           <div className="panel-heading">
             <div>
-              <h2>跨版本监管制度对比</h2>
-              <p>选择基线版本与新版本文档，自动比对每张表的增删改、字段类型/长度/必填/校验变更，并分级标注影响面。</p>
+              <h2>跨版本监管规范对比</h2>
+              <p>支持按同一监管项目对比新旧「规范包」（含多文件融合表与补充核查规则差异），或按单份文档粒度比对。</p>
             </div>
             <div className="actions">
+              {packages.length > 0 && (
+                <button
+                  type="button"
+                  className="button secondary sm"
+                  onClick={() => {
+                    setDiffMode((m) => (m === 'package' ? 'document' : 'package'))
+                    setDocDiff(null)
+                  }}
+                >
+                  {diffMode === 'package' ? '切换为单文档对比' : '切换为规范包对比'}
+                </button>
+              )}
               <button
                 type="button"
                 className="button primary"
-                disabled={diffBusy || !baseDocId || !targetDocId}
+                disabled={diffBusy || (diffMode === 'package' ? (!basePkgId || !targetPkgId) : (!baseDocId || !targetDocId))}
                 onClick={compareDocuments}
               >
                 {diffBusy ? '正在比对...' : '执行版本对比'}
@@ -241,30 +291,57 @@ export default function VersionsPage() {
             </div>
           </div>
 
-          <div className="list-filter-bar" style={{ marginBottom: 14 }}>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">基线文档（旧版）</small>
-              <select value={baseDocId} onChange={(e) => setBaseDocId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择基线文档</option>
-                {documents.map((doc) => (
-                  <option key={doc.id} value={doc.id}>
-                    {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label style={{ flex: 1 }}>
-              <small className="muted-text">目标文档（新版）</small>
-              <select value={targetDocId} onChange={(e) => setTargetDocId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">请选择新版文档</option>
-                {documents.map((doc) => (
-                  <option key={doc.id} value={doc.id}>
-                    {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
+          {diffMode === 'package' && packages.length > 0 ? (
+            <div className="list-filter-bar" style={{ marginBottom: 14 }}>
+              <label style={{ flex: 1 }}>
+                <small className="muted-text">基线规范包（旧版）</small>
+                <select value={basePkgId} onChange={(e) => setBasePkgId(e.target.value)} style={{ width: '100%' }}>
+                  <option value="">请选择基线规范包</option>
+                  {selectablePackages.map((pkg) => (
+                    <option key={pkg.id} value={pkg.id}>
+                      [{regulatorMeta(pkg.regulator).shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ flex: 1 }}>
+                <small className="muted-text">目标规范包（新版）</small>
+                <select value={targetPkgId} onChange={(e) => setTargetPkgId(e.target.value)} style={{ width: '100%' }}>
+                  <option value="">请选择新版规范包</option>
+                  {selectablePackages.map((pkg) => (
+                    <option key={pkg.id} value={pkg.id}>
+                      [{regulatorMeta(pkg.regulator).shortLabel}] {pkg.name} · v{pkg.spec_version}（{pkg.table_count} 表 / {pkg.rule_evidence_count} 规则）
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          ) : (
+            <div className="list-filter-bar" style={{ marginBottom: 14 }}>
+              <label style={{ flex: 1 }}>
+                <small className="muted-text">基线文档（旧版）</small>
+                <select value={baseDocId} onChange={(e) => setBaseDocId(e.target.value)} style={{ width: '100%' }}>
+                  <option value="">请选择基线文档</option>
+                  {documents.map((doc) => (
+                    <option key={doc.id} value={doc.id}>
+                      {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ flex: 1 }}>
+                <small className="muted-text">目标文档（新版）</small>
+                <select value={targetDocId} onChange={(e) => setTargetDocId(e.target.value)} style={{ width: '100%' }}>
+                  <option value="">请选择新版文档</option>
+                  {documents.map((doc) => (
+                    <option key={doc.id} value={doc.id}>
+                      {doc.file_name}（{doc.spec_version || 'UNKNOWN'} · {doc.block_count} 块）
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
 
           {docDiff ? (
             <>
@@ -272,7 +349,15 @@ export default function VersionsPage() {
                 <div><span>新增 / 下线报表</span><strong>+{docDiff.summary.added_tables} / -{docDiff.summary.removed_tables}</strong></div>
                 <div><span>变更报表</span><strong>{docDiff.summary.modified_tables} 张</strong><small>无变化 {docDiff.summary.unchanged_tables} 张</small></div>
                 <div><span>破坏性变更</span><strong>{docDiff.summary.breaking_tables} 张</strong><small>规则受影响 {docDiff.summary.rule_impact_tables} 张</small></div>
-                <div><span>建议增量重跑</span><strong>{docDiff.summary.affected_table_count} 张</strong></div>
+                <div>
+                  <span>建议增量重跑</span>
+                  <strong>{docDiff.summary.affected_table_count} 张</strong>
+                  {docDiff.summary.rule_evidences && (
+                    <small>
+                      补充规则 {docDiff.summary.rule_evidences.base} → {docDiff.summary.rule_evidences.target}（+{docDiff.summary.rule_evidences.added} / -{docDiff.summary.rule_evidences.removed}）
+                    </small>
+                  )}
+                </div>
               </div>
 
               {docDiff.affected_table_ids?.length > 0 && (

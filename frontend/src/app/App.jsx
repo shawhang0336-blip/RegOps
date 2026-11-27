@@ -4,7 +4,9 @@ import ErrorBoundary from '../components/ErrorBoundary.jsx'
 import { DetailSkeleton } from '../components/Skeleton.jsx'
 import { FeedbackProvider } from '../context/FeedbackContext.jsx'
 import { ThemeProvider, useTheme } from '../context/ThemeContext.jsx'
+import { WorkspaceProvider } from '../context/WorkspaceContext.jsx'
 import BackendHealthPill from './BackendHealthPill.jsx'
+import ProjectContextBar from './ProjectContextBar.jsx'
 
 const PreparationWorkspace = lazy(() => import('../features/catalog/PreparationWorkspace.jsx'))
 const VersionsPage = lazy(() => import('../features/catalog/versions/VersionsPage.jsx'))
@@ -110,6 +112,8 @@ function WorkbenchLayout() {
         </button>
       </header>
 
+      <ProjectContextBar />
+
       <main className="main-content">
         <ErrorBoundary resetKey={location.pathname}>
           <div className="page-stage" key={location.pathname}>
@@ -137,9 +141,11 @@ export default function App() {
   return (
     <ThemeProvider>
       <FeedbackProvider>
-        <BrowserRouter>
-          <WorkbenchLayout />
-        </BrowserRouter>
+        <WorkspaceProvider>
+          <BrowserRouter>
+            <WorkbenchLayout />
+          </BrowserRouter>
+        </WorkspaceProvider>
       </FeedbackProvider>
     </ThemeProvider>
   )

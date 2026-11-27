@@ -128,6 +128,23 @@ export function updatePackageFileRole(packageId, documentId, docRole) {
   })
 }
 
+export function replacePackageFile(packageId, documentId, file, { docRole = 'AUTO', prepare = true } = {}) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('doc_role', docRole)
+  form.append('prepare', prepare ? 'true' : 'false')
+  return api(`/api/packages/${packageId}/files/${documentId}`, {
+    method: 'PUT',
+    body: form,
+  })
+}
+
+export function removePackageFile(packageId, documentId) {
+  return api(`/api/packages/${packageId}/files/${documentId}`, {
+    method: 'DELETE',
+  })
+}
+
 export function extractPackage(packageId, payload = {}) {
   return api(`/api/packages/${packageId}/extract`, {
     method: 'POST',

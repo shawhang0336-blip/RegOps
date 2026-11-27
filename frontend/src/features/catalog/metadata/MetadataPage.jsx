@@ -147,8 +147,10 @@ export default function MetadataPage({
     if (!codeSetId) return
     const next = new URLSearchParams()
     next.set('view', 'codes')
+    const activePkgId = packageId || params.get('package_id')
     const documentId = params.get('document_id')
-    if (documentId) next.set('document_id', documentId)
+    if (activePkgId) next.set('package_id', activePkgId)
+    else if (documentId) next.set('document_id', documentId)
     next.set('set', codeSetId)
     navigate(`/documents?${next.toString()}`)
   }

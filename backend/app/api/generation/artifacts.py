@@ -27,17 +27,19 @@ class RuleEditRequest(BaseModel):
 @router.get("/rules")
 def all_table_rules(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
-    return list_all_table_rules(session, document_id=document_id)
+    return list_all_table_rules(session, document_id=document_id, package_id=package_id)
 
 
 @router.get("")
 def artifacts_status(
     document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
     session: Session = Depends(db_session),
 ) -> Dict[str, Any]:
-    return list_artifacts_status(session, document_id=document_id)
+    return list_artifacts_status(session, document_id=document_id, package_id=package_id)
 
 
 @router.patch("/rules/{rule_row_id}")

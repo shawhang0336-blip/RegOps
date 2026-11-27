@@ -22,6 +22,7 @@ from app.infra.db_tables import (
     RuleModel,
     RunModel,
     SourceDocumentModel,
+    SpecPackageModel,
     SpecificationModel,
     TableMetadataModel,
 )
@@ -139,8 +140,13 @@ def _rules_payload(
     return rules
 
 
-def list_all_table_rules(session: Session, *, document_id: Optional[str] = None) -> Dict[str, Any]:
-    tables = latest_table_rows(session, document_id=document_id)
+def list_all_table_rules(
+    session: Session,
+    *,
+    document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     latest = _latest_run_ids_by_table(session)
     table_codes_with_runs = {table.table_code for table in tables if table.table_code in latest}
     run_ids = {latest[code] for code in table_codes_with_runs}
@@ -164,6 +170,13 @@ def list_all_table_rules(session: Session, *, document_id: Optional[str] = None)
     for rule_row in all_rule_rows:
         rules_by_pair.setdefault((rule_row.run_id, rule_row.table_code), []).append(rule_row)
 
+    pkg_ids = {table.package_id for table in tables if table.package_id}
+    pkgs_by_id = (
+        {row.id: row for row in session.query(SpecPackageModel).filter(SpecPackageModel.id.in_(pkg_ids)).all()}
+        if pkg_ids
+        else {}
+    )
+
     items: List[Dict[str, Any]] = []
     for table in tables:
         run_id = latest.get(table.table_code)
@@ -180,11 +193,15 @@ def list_all_table_rules(session: Session, *, document_id: Optional[str] = None)
             spec_model=specs_by_id.get(run.spec_id),
         )
         result = state.result_json or {}
+        pkg = pkgs_by_id.get(table.package_id) if table.package_id else None
         items.append(
             {
                 "table": {
                     "id": table.id,
                     "document_id": table.document_id,
+                    "package_id": table.package_id,
+                    "package_name": pkg.name if pkg else None,
+                    "regulator": pkg.regulator if pkg else None,
                     "table_code": table.table_code,
                     "table_name": table.table_name,
                     "status": table.status,
@@ -205,7 +222,12 @@ def list_all_table_rules(session: Session, *, document_id: Optional[str] = None)
     return {"tables": items}
 
 
-def list_artifacts_status(session: Session, *, document_id: Optional[str] = None) -> Dict[str, Any]:
+def list_artifacts_status(
+    session: Session,
+    *,
+    document_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+) -> Dict[str, Any]:
     latest = _latest_run_ids_by_table(session)
     count_rows = (
         session.query(RuleModel.run_id, RuleModel.table_code, func.count())
@@ -216,7 +238,7 @@ def list_artifacts_status(session: Session, *, document_id: Optional[str] = None
     rule_counts: Dict[str, Dict[str, int]] = {}
     for run_id, table_code, count in count_rows:
         rule_counts.setdefault(run_id, {})[table_code] = count
-    tables = latest_table_rows(session, document_id=document_id)
+    tables = latest_table_rows(session, document_id=document_id, package_id=package_id)
     run_ids = {latest[table.table_code] for table in tables if table.table_code in latest}
     runs = {row.id: row for row in session.query(RunModel).filter(RunModel.id.in_(run_ids)).all()} if run_ids else {}
     run_states = project_many(session, runs.values()) if runs else {}
@@ -229,6 +251,12 @@ def list_artifacts_status(session: Session, *, document_id: Optional[str] = None
         if doc_ids
         else {}
     )
+    pkg_ids = {table.package_id for table in tables if table.package_id}
+    pkgs_by_id = (
+        {row.id: row for row in session.query(SpecPackageModel).filter(SpecPackageModel.id.in_(pkg_ids)).all()}
+        if pkg_ids
+        else {}
+    )
     result = []
     for table in tables:
         run_id = latest.get(table.table_code)
@@ -236,6 +264,7 @@ def list_artifacts_status(session: Session, *, document_id: Optional[str] = None
         run_state = run_states.get(run.id) if run else None
         run_result = (run_state.result_json or {}) if run_state else {}
         summary = run_result.get("audit_summary") or {}
+        pkg = pkgs_by_id.get(table.package_id) if table.package_id else None
         result.append(
             {
                 "id": table.id,
@@ -244,6 +273,9 @@ def list_artifacts_status(session: Session, *, document_id: Optional[str] = None
                 "table_name": table.table_name,
                 "document_id": table.document_id,
                 "document_name": doc_names.get(table.document_id, ""),
+                "package_id": table.package_id,
+                "package_name": pkg.name if pkg else None,
+                "regulator": pkg.regulator if pkg else None,
                 "status": table.status,
                 "generated": run_id is not None,
                 "run_id": run_id,

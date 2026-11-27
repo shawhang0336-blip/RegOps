@@ -1,8 +1,12 @@
 /** 运行批次控制、审批与审计交付 API（对应后端 `api/delivery/`）。 */
 import { api } from './client.js'
 
-export function listRuns() {
-  return api('/api/runs')
+export function listRuns({ packageId, regulator } = {}) {
+  const params = new URLSearchParams()
+  if (packageId) params.set('package_id', packageId)
+  if (regulator && regulator !== 'ALL') params.set('regulator', regulator)
+  const qs = params.toString()
+  return api(`/api/runs${qs ? `?${qs}` : ''}`)
 }
 
 export function getRun(runId) {

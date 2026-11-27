@@ -14,7 +14,7 @@ from app.catalog.tables.service import metadata_to_spec, publish_table
 from app.delivery.workflow import _create_run
 from app.infra.config import get_budget
 from app.infra.contracts import canonical_json
-from app.infra.db_tables import RunModel, SpecificationModel, TableMetadataModel
+from app.infra.db_tables import RunModel, SpecPackageModel, SpecificationModel, TableMetadataModel
 
 
 def prepare_generation_run(
@@ -129,6 +129,8 @@ def prepare_generation_run(
             },
         )
 
+    pkg_ids = list(dict.fromkeys(table.package_id for table in tables if table.package_id))
+    primary_pkg = session.get(SpecPackageModel, pkg_ids[0]) if pkg_ids else None
     snapshot_material = [
         {"table_id": table.id, "version": table.published_version, "spec_sha256": spec.source_sha256}
         for table, spec in zip(tables, specs)
@@ -142,6 +144,10 @@ def prepare_generation_run(
         source_sha256=digest,
         content_json={
             "selection_confirmed": True,
+            "package_id": pkg_ids[0] if len(pkg_ids) == 1 else (pkg_ids[0] if pkg_ids else None),
+            "package_ids": pkg_ids,
+            "package_name": primary_pkg.name if primary_pkg else None,
+            "regulator": primary_pkg.regulator if primary_pkg else None,
             "table_name": f"已发布元数据 · {len(specs)} 张表",
             "confirmation": {"approver": approver, "tables": snapshot_material},
             "tables": [spec.model_dump() for spec in specs],

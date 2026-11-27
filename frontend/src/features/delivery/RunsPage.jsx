@@ -9,7 +9,9 @@ import { DetailSkeleton, ListSkeleton } from '../../components/Skeleton.jsx'
 import { StatusBadge } from '../../components/StatusBadge.jsx'
 import StatusMessage from '../../components/StatusMessage.jsx'
 import { useFeedback } from '../../context/FeedbackContext.jsx'
+import { useWorkspace } from '../../context/WorkspaceContext.jsx'
 import { useEventStream } from '../../hooks/useEventStream.js'
+import { regulatorMeta } from '../../utils/activeDocument.js'
 import { formatTime } from '../../utils/dateTime.js'
 import HistoryCleanupModal from './HistoryCleanupModal.jsx'
 import RunTraceTimeline from './RunTraceTimeline.jsx'
@@ -46,6 +48,8 @@ export default function RunsPage() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
   const { confirm } = useFeedback()
+  const { activePackageId, activeRegulator, activePackage } = useWorkspace()
+  const [scopeByProject, setScopeByProject] = useState(true)
   const [runs, setRuns] = useState([])
   const [selectedRunId, setSelectedRunId] = useState(null)
   const [active, setActive] = useState(null)
@@ -104,19 +108,23 @@ export default function RunsPage() {
   }, [])
 
   const load = useCallback(async (preferredId, options = {}) => {
-    const list = await deliveryApi.listRuns()
+    const queryArgs = scopeByProject && (activePackageId || (activeRegulator && activeRegulator !== 'ALL'))
+      ? { packageId: activePackageId || '', regulator: activeRegulator || '' }
+      : {}
+    const list = await deliveryApi.listRuns(queryArgs)
     setRuns(list)
-    const target = preferredId || active?.id || params.get('run') || list[0]?.id
+    const target = preferredId || (list.some((r) => r.id === active?.id) ? active?.id : '') || params.get('run') || list[0]?.id
     if (target) {
       await select(target, options)
     } else {
+      setSelectedRunId(null)
       setActive(null)
       setValidation(null)
       setPlans([])
       setBusEvents([])
       setReplay(null)
     }
-  }, [active?.id, params, select])
+  }, [active?.id, activePackageId, activeRegulator, params, scopeByProject, select])
 
   const runQueryParam = params.get('run')
 
@@ -125,10 +133,12 @@ export default function RunsPage() {
     load(runQueryParam)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-    generationApi.listArtifactsStatus().then((payload) => {
+    generationApi.listArtifactsStatus(
+      scopeByProject && activePackageId ? { packageId: activePackageId } : {},
+    ).then((payload) => {
       setTableIdByCode(Object.fromEntries((payload.tables || []).map((table) => [table.table_code, table.id])))
     }).catch(() => {})
-  }, [])
+  }, [activePackageId, activeRegulator, scopeByProject])
 
   useEffect(() => {
     if (runQueryParam && active?.id && runQueryParam !== active.id) {
@@ -480,8 +490,26 @@ export default function RunsPage() {
       <section className="workspace-grid runs-layout">
         <div className="panel list-panel">
           <div className="panel-heading">
-            <div><h2>验证批次</h2><p>共 {runs.length} 个批次，按报表和生成时间标识</p></div>
-            <StatusBadge tone="neutral">{runs.length}</StatusBadge>
+            <div>
+              <h2>验证批次</h2>
+              <p>
+                {scopeByProject && (activePackageId || (activeRegulator && activeRegulator !== 'ALL'))
+                  ? `当前范围：${activePackage ? `${regulatorMeta(activePackage.regulator).shortLabel} · ${activePackage.name}` : regulatorMeta(activeRegulator).label}（共 ${runs.length} 个批次）`
+                  : `共 ${runs.length} 个批次，按报表和生成时间标识`}
+              </p>
+            </div>
+            <div className="actions">
+              {(activePackageId || (activeRegulator && activeRegulator !== 'ALL')) && (
+                <button
+                  type="button"
+                  className="button subtle sm"
+                  onClick={() => setScopeByProject((v) => !v)}
+                >
+                  {scopeByProject ? '显示全部项目' : '仅看当前项目'}
+                </button>
+              )}
+              <StatusBadge tone="neutral">{runs.length}</StatusBadge>
+            </div>
           </div>
           <div className="list-filters" style={{ marginBottom: 10 }}>
             <input
@@ -528,7 +556,15 @@ export default function RunsPage() {
                 >
                   ×
                 </button>
-                <div className="list-row-top"><strong title={batchTitle(run)}>{batchTitle(run)}</strong><StatusBadge status={run.status} /></div>
+                <div className="list-row-top">
+                  <strong title={batchTitle(run)}>{batchTitle(run)}</strong>
+                  <StatusBadge status={run.status} />
+                </div>
+                {(run.regulator || run.package_name) && (
+                  <span className="muted-text" style={{ fontSize: 11.5 }}>
+                    [{regulatorMeta(run.regulator).shortLabel}] {run.package_name || ''}
+                  </span>
+                )}
                 <span>{formatTime(run.created_at)}{batchTables(run) ? ` · ${batchTables(run)}` : ''}</span>
                 <em>{run.rules?.length || 0} 条规则 · 第 {run.attempt} 次生成</em>
               </div>

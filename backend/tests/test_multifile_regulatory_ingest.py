@@ -335,6 +335,53 @@ def test_multifile_ybt_package_reconcile_isolation_and_step2_bridge(tmp_path, mo
         assert r_diff.status_code == 200
         assert r_diff.json()["summary"]["rule_evidences"]["base"] >= 3
         assert r_diff.json()["summary"]["rule_evidences"]["target"] >= 1
+
+        # 6) 验证自定义监管项目、包内单文件替换(PUT)/移除(DELETE)、以及 Step 2 /artifacts?package_id= 筛选
+        r_cust = client.post("/api/packages", json={"name": "上海自贸区监测_2025", "regulator": "上海自贸区", "spec_version": "2025"})
+        assert r_cust.status_code == 201
+        assert r_cust.json()["regulator"] == "上海自贸区"
+        cust_pkg_id = r_cust.json()["id"]
+
+        r_up_one = client.post(
+            f"/api/packages/{cust_pkg_id}/files",
+            files={"files": ("ftz_v1.xlsx", build_ybt_rules_xlsx(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"doc_role": "RULE_SUPPLEMENT", "prepare": "false"},
+        )
+        assert r_up_one.status_code == 201
+        old_doc_id = r_up_one.json()["uploaded"][0]["id"]
+
+        r_rep = client.put(
+            f"/api/packages/{cust_pkg_id}/files/{old_doc_id}",
+            files={"file": ("ftz_v2.xlsx", build_safe_codeset_xlsx(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"prepare": "false"},
+        )
+        assert r_rep.status_code == 200
+        new_doc_id = r_rep.json()["document"]["id"]
+        assert new_doc_id != old_doc_id
+        assert r_rep.json()["document"]["doc_role"] == "RULE_SUPPLEMENT"  # 继承旧文件角色
+
+        r_del_file = client.delete(f"/api/packages/{cust_pkg_id}/files/{new_doc_id}")
+        assert r_del_file.status_code == 200
+        assert r_del_file.json()["package"]["document_count"] == 0
+
+        # 验证 /api/artifacts 与 /api/artifacts/rules 支持按 package_id 精准隔离
+        r_art_ybt = client.get(f"/api/artifacts?package_id={ybt_pkg_id}")
+        assert r_art_ybt.status_code == 200
+        art_codes = {t["table_code"] for t in r_art_ybt.json()["tables"]}
+        assert art_codes == {"YBT_CUST_BASE", "YBT_LOAN_RECEIPT", "YBT_PROD_INFO"}
+        assert all(t["regulator"] == "YBT" and t["package_id"] == ybt_pkg_id for t in r_art_ybt.json()["tables"])
+
+        r_art_east = client.get(f"/api/artifacts?package_id={east_pkg_id}")
+        assert r_art_east.status_code == 200
+        assert {t["table_code"] for t in r_art_east.json()["tables"]} == {"A_CORP_BASIC", "S_LOAN_JJ"}
+
+        r_rules_ybt = client.get(f"/api/artifacts/rules?package_id={ybt_pkg_id}")
+        assert r_rules_ybt.status_code == 200
+
+        # 验证 /api/runs 支持按 package_id 与 regulator 过滤
+        r_runs_ybt = client.get(f"/api/runs?package_id={ybt_pkg_id}&regulator=YBT")
+        assert r_runs_ybt.status_code == 200
+        assert isinstance(r_runs_ybt.json(), list)
     finally:
         app.dependency_overrides.pop(db_session, None)
         engine.dispose()

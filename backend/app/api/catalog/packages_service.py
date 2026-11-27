@@ -7,7 +7,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.api.catalog.documents_service import document_summary, ingest_uploaded_file_with_flag
+from app.api.catalog.documents_service import (
+    document_has_active_run,
+    document_summary,
+    ingest_uploaded_file_with_flag,
+)
 from app.catalog.code_sets.linking import package_code_set_ids
 from app.catalog.extraction import extract_parallel_for_blocks, reconcile_package_assets
 from app.catalog.tables.readiness import latest_table_rows
@@ -26,7 +30,14 @@ from app.ingestion.structure_service import analyze_document_structure
 ALLOWED_DOC_ROLES = frozenset(
     {"AUTO", "MAIN_SPEC", "SCHEMA_APPENDIX", "CODE_SET_APPENDIX", "RULE_SUPPLEMENT", "REVISION_NOTE"}
 )
-ALLOWED_REGULATORS = frozenset({"SAFE", "YBT", "EAST", "PBOC", "1104", "CUSTOM"})
+ALLOWED_REGULATORS = frozenset({"SAFE", "YBT", "EAST", "PBOC", "1104", "CSRC", "CUSTOM"})
+
+
+def _normalize_regulator(regulator: Optional[str]) -> str:
+    clean = (regulator or "SAFE").strip()[:32]
+    if not clean:
+        return "SAFE"
+    return clean.upper() if clean.isascii() else clean
 
 
 def package_summary(session: Session, pkg: SpecPackageModel) -> Dict[str, Any]:
@@ -81,9 +92,7 @@ def create_package(
     clean_name = (name or "").strip()
     if not clean_name:
         raise HTTPException(status_code=422, detail="规范包名称不能为空")
-    reg = (regulator or "SAFE").strip().upper()
-    if reg not in ALLOWED_REGULATORS:
-        reg = "CUSTOM"
+    reg = _normalize_regulator(regulator)
     if parent_package_id and not session.get(SpecPackageModel, parent_package_id):
         raise HTTPException(status_code=404, detail="Parent package not found")
     pkg = SpecPackageModel(
@@ -198,6 +207,75 @@ def update_file_role(
     doc.doc_role = role
     session.commit()
     return document_summary(doc)
+
+
+def remove_file_from_package(session: Session, package_id: str, document_id: str) -> Dict[str, Any]:
+    pkg = session.get(SpecPackageModel, package_id)
+    if not pkg or pkg.status == "DELETED":
+        raise HTTPException(status_code=404, detail="Package not found")
+    doc = session.get(SourceDocumentModel, document_id)
+    if not doc or doc.package_id != package_id or doc.status == "DELETED":
+        raise HTTPException(status_code=404, detail="Document not found in package")
+    if document_has_active_run(session, doc):
+        raise HTTPException(status_code=409, detail="该文档当前有后台解析任务正在运行，请先等待或中止后再移除")
+    doc.status = "DELETED"
+    session.commit()
+    session.expire_all()
+    pkg = session.get(SpecPackageModel, package_id)
+    return {"package": package_summary(session, pkg), "removed_document_id": document_id}
+
+
+def replace_file_in_package(
+    session: Session,
+    package_id: str,
+    document_id: str,
+    filename: Optional[str],
+    content: bytes,
+    *,
+    doc_role: str = "AUTO",
+    prepare: bool = True,
+    session_factory: Optional[Callable[[], Any]] = None,
+    get_settings_fn: Optional[Callable[[], Any]] = None,
+    extract_document_fn: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """在规范包内替换更新某一份文档（保留原文档角色，安全软删旧文档并导入新版）。"""
+    pkg = session.get(SpecPackageModel, package_id)
+    if not pkg or pkg.status == "DELETED":
+        raise HTTPException(status_code=404, detail="Package not found")
+    old_doc = session.get(SourceDocumentModel, document_id)
+    if not old_doc or old_doc.package_id != package_id or old_doc.status == "DELETED":
+        raise HTTPException(status_code=404, detail="Document not found in package")
+    if document_has_active_run(session, old_doc):
+        raise HTTPException(status_code=409, detail="旧文档当前有后台解析任务正在运行，请先等待或中止后再替换")
+
+    effective_role = (doc_role or "AUTO").strip().upper() or "AUTO"
+    if effective_role == "AUTO" and old_doc.doc_role and old_doc.doc_role != "AUTO":
+        effective_role = old_doc.doc_role
+
+    import hashlib
+    new_digest = hashlib.sha256(content).hexdigest()
+    if new_digest != old_doc.sha256:
+        old_doc.status = "DELETED"
+        session.commit()
+
+    new_doc, _ = ingest_uploaded_file_with_flag(
+        filename,
+        content,
+        prepare=prepare,
+        package_id=package_id,
+        doc_role=effective_role,
+        session_factory=session_factory or SessionLocal,
+        get_settings_fn=get_settings_fn or get_settings,
+        extract_document_fn=extract_document_fn,
+    )
+    session.expire_all()
+    pkg = session.get(SpecPackageModel, package_id)
+    fresh_doc = session.get(SourceDocumentModel, new_doc.id) or new_doc
+    return {
+        "package": package_summary(session, pkg),
+        "replaced_document_id": document_id,
+        "document": document_summary(fresh_doc),
+    }
 
 
 def extract_and_reconcile_package(

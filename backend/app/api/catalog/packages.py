@@ -89,6 +89,35 @@ def update_package_file_role(
     return svc.update_file_role(session, package_id, document_id, request.doc_role)
 
 
+@router.put("/{package_id}/files/{document_id}")
+async def replace_package_file(
+    package_id: str,
+    document_id: str,
+    file: UploadFile = File(...),
+    doc_role: str = Form(default="AUTO"),
+    prepare: bool = Form(default=True),
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return svc.replace_file_in_package(
+        session,
+        package_id,
+        document_id,
+        file.filename or "",
+        await file.read(),
+        doc_role=doc_role,
+        prepare=prepare,
+    )
+
+
+@router.delete("/{package_id}/files/{document_id}")
+def delete_package_file(
+    package_id: str,
+    document_id: str,
+    session: Session = Depends(db_session),
+) -> Dict[str, Any]:
+    return svc.remove_file_from_package(session, package_id, document_id)
+
+
 @router.post("/{package_id}/extract")
 def extract_package(
     package_id: str,

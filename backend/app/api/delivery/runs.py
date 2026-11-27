@@ -90,8 +90,12 @@ def create_run(request: RunRequest, session: Session = Depends(db_session)) -> D
 
 
 @router.get("/api/runs")
-def list_runs(session: Session = Depends(db_session)) -> List[Dict]:
-    return list_generation_runs(session)
+def list_runs(
+    package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
+    session: Session = Depends(db_session),
+) -> List[Dict]:
+    return list_generation_runs(session, package_id=package_id, regulator=regulator)
 
 
 @router.get("/api/runs/active")

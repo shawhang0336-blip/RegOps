@@ -1,16 +1,20 @@
 /** 规则与产物装配 API（对应后端 `api/generation/`）。 */
 import { api, downloadFile } from './client.js'
 
-function docQuery(documentId) {
-  return documentId ? `?document_id=${encodeURIComponent(documentId)}` : ''
+function scopeQuery({ documentId, packageId } = {}) {
+  const params = new URLSearchParams()
+  if (packageId) params.set('package_id', packageId)
+  else if (documentId) params.set('document_id', documentId)
+  const qs = params.toString()
+  return qs ? `?${qs}` : ''
 }
 
-export function listArtifactsStatus({ documentId } = {}) {
-  return api(`/api/artifacts${docQuery(documentId)}`)
+export function listArtifactsStatus({ documentId, packageId } = {}) {
+  return api(`/api/artifacts${scopeQuery({ documentId, packageId })}`)
 }
 
-export function listAllTableRules({ documentId } = {}) {
-  return api(`/api/artifacts/rules${docQuery(documentId)}`)
+export function listAllTableRules({ documentId, packageId } = {}) {
+  return api(`/api/artifacts/rules${scopeQuery({ documentId, packageId })}`)
 }
 
 export function getTableArtifacts(tableId) {

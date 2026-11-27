@@ -1,7 +1,7 @@
 """运行批次查询与审计明细聚合服务（供 `api/delivery/runs.py` 调用）。"""
 
 import json
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -9,7 +9,14 @@ from app.api.common import run_tables_from_content, run_view
 from app.delivery.workflow import _regops_delete_pre_hook
 from app.infra.blob_store import LocalBlobStore
 from app.infra.config import Settings
-from app.infra.db_tables import EventModel, RuleModel, RunModel, SpecificationModel
+from app.infra.db_tables import (
+    EventModel,
+    RuleModel,
+    RunModel,
+    SpecPackageModel,
+    SpecificationModel,
+    TableMetadataModel,
+)
 from app.policy.regops_channels import resolve_event_tables
 from app.policy.regops_plan import project, project_many
 
@@ -31,13 +38,20 @@ def _latest_event_tables(events: List[EventModel], kind: str, blob_store: LocalB
     return tables
 
 
-def list_generation_runs(session: Session, *, limit: int = 50) -> List[Dict]:
-    """仅列出 Step 2/3 规则验证批次（关联 SpecificationModel），与文档导入 Run 隔离。"""
+def list_generation_runs(
+    session: Session,
+    *,
+    limit: int = 50,
+    package_id: Optional[str] = None,
+    regulator: Optional[str] = None,
+) -> List[Dict]:
+    """仅列出 Step 2/3 规则验证批次（关联 SpecificationModel），支持按规范包与监管体系筛选。"""
+    fetch_limit = max(limit, 200) if (package_id or regulator) else limit
     runs = (
         session.query(RunModel)
         .join(SpecificationModel, RunModel.spec_id == SpecificationModel.id)
         .order_by(RunModel.created_at.desc())
-        .limit(limit)
+        .limit(fetch_limit)
         .all()
     )
     if not runs:
@@ -52,19 +66,69 @@ def list_generation_runs(session: Session, *, limit: int = 50) -> List[Dict]:
         row.id: row
         for row in session.query(SpecificationModel).filter(SpecificationModel.id.in_(spec_ids)).all()
     }
-    return [
-        run_view(
-            session,
-            run,
-            include_events=False,
-            run_state=states[run.id],
-            prefetched_rules=rules_by_run.get(run.id, []),
-            prefetched_tables=run_tables_from_content(
-                (spec_by_id[run.spec_id].content_json or {}) if run.spec_id in spec_by_id else {}
-            ),
+
+    # 为缺少规范包标签的历史批次建立 table_code -> SpecPackage 回溯索引
+    pkgs_by_id = {
+        p.id: p
+        for p in session.query(SpecPackageModel).filter(SpecPackageModel.status != "DELETED").all()
+    }
+    pkg_by_table_code: Dict[str, SpecPackageModel] = {}
+    if pkgs_by_id:
+        for t in (
+            session.query(TableMetadataModel)
+            .filter(TableMetadataModel.package_id.isnot(None), TableMetadataModel.status != "MERGED")
+            .order_by(TableMetadataModel.current_version.desc())
+            .all()
+        ):
+            if t.package_id in pkgs_by_id and t.table_code not in pkg_by_table_code:
+                pkg_by_table_code[t.table_code] = pkgs_by_id[t.package_id]
+
+    target_pkg = (package_id or "").strip()
+    target_reg = (regulator or "").strip()
+    if target_reg.isascii():
+        target_reg = target_reg.upper()
+
+    results: List[Dict] = []
+    for run in runs:
+        content = (spec_by_id[run.spec_id].content_json or {}) if run.spec_id in spec_by_id else {}
+        tables = run_tables_from_content(content)
+        pkg_ids = list(content.get("package_ids") or ([content["package_id"]] if content.get("package_id") else []))
+        pkg_id = content.get("package_id")
+        pkg_name = content.get("package_name")
+        reg = content.get("regulator")
+        if not pkg_id and tables:
+            matched_pkgs = [pkg_by_table_code[t["table_code"]] for t in tables if t.get("table_code") in pkg_by_table_code]
+            if matched_pkgs:
+                pkg_ids = list(dict.fromkeys(p.id for p in matched_pkgs))
+                pkg_id = pkg_ids[0]
+                pkg_name = matched_pkgs[0].name
+                reg = matched_pkgs[0].regulator
+
+        if target_pkg and target_pkg not in pkg_ids and pkg_id != target_pkg:
+            continue
+        norm_reg = reg.upper() if isinstance(reg, str) and reg.isascii() else (reg or "")
+        if target_reg and target_reg != "ALL" and norm_reg != target_reg:
+            continue
+
+        results.append(
+            run_view(
+                session,
+                run,
+                include_events=False,
+                run_state=states[run.id],
+                prefetched_rules=rules_by_run.get(run.id, []),
+                prefetched_tables=tables,
+                prefetched_package={
+                    "package_id": pkg_id,
+                    "package_ids": pkg_ids,
+                    "package_name": pkg_name,
+                    "regulator": reg,
+                },
+            )
         )
-        for run in runs
-    ]
+        if len(results) >= limit:
+            break
+    return results
 
 
 def build_validation_detail(session: Session, run: RunModel, settings: Settings) -> Dict:
