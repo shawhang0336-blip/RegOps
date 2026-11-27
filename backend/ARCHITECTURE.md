@@ -13,7 +13,7 @@ infra (0) ← kernel (1) ← policy (2) ← ingestion (3) ← catalog (4) ← ge
 
 ```text
 backend/app/
-├── main.py                      # 极简 FastAPI 启动入口（lifespan / CORS / 挂载路由）
+├── main.py                      # 极简 FastAPI 启动入口（lifespan / 自动收编历史孤立文档 adopt_legacy_documents / CORS / 挂载路由）
 │
 ├── infra/                       # 层 0：基础设施与跨层共享契约（7 模块 + llm/ 子包，零上层依赖）
 │   ├── blob_store.py            #    SHA-256 内容寻址不可变大对象存储（原子临时文件替换，并发零竞态）
@@ -43,12 +43,12 @@ backend/app/
 │
 ├── ingestion/                   # 层 3（Step 0：原始规范文件拆箱、体检与切块，前端归入「01 规范解析与核对」上半段）
 │   ├── parsers/                 #    纯离线文件拆箱、通用三级 PDF 切块与硬伤体检（零 DB、零 LLM）
-│   │   ├── extractors.py        #      PDF / Word（标题树与 XML 合并单元格展开）/ Excel（双模式公式读值、单 Sheet 多表拆分、1104 MATRIX_REPORT）/ ZIP 拆包统一抽块入口、doc_role 识别与全文摘要 survey
+│   │   ├── extractors.py        #      PDF / Word（标题树与 XML 合并单元格）/ Excel（双模式公式、单 Sheet 多表、1104 与地方监测 MATRIX_REPORT、无表头国标层级码表）/ ZIP 安全拆包 / 旧版 .doc（soffice/textutil）与 .xls（xlrd）转码统一入口
 │   │   ├── pdf_catalog.py       #      外管局已知规范高精插件（目录与附录公共码表扫描）
-│   │   ├── pdf_generic.py       #      通用监管 PDF 二级章节切块（HEADING_SECTIONS）与三级分页兜底（PAGE_WINDOWS）
+│   │   ├── pdf_generic.py       #      通用监管 PDF 二级章节切块（HEADING_SECTIONS）、三级分页兜底（PAGE_WINDOWS）与检核规则 PDF 自动识别
 │   │   ├── pdf_parser.py        #      PDF pdftotext 提取、表格折行重排与字段精拆
 │   │   └── quality.py           #      切块后零 AI 确定性硬伤体检
-│   ├── structure_service.py     #    AI 辅助文档体检、跨页合并/切块与单块内语义细分
+│   ├── structure_service.py     #    AI 辅助文档体检与跨页切块（白名单保护 MATRIX_REPORT / CATALOG_INDEX / RULE_EVIDENCE / REVISION_DIFF / NARRATIVE 免被 AI 改写）
 │   └── import_progress.py       #    文档解析实时进度与 document.progress 总线广播
 │
 ├── catalog/                     # 层 4（Step 1：监管数据目录，前端「01 规范解析与核对」下半段 +「变更记录」，100% 脱离 SQL 方言）
@@ -64,7 +64,7 @@ backend/app/
 │   │   ├── service.py           #      码表抽取、AI 复核防幻觉护栏与摘要/删除服务
 │   │   ├── readiness.py         #      码表就绪度评估与自动发布
 │   │   └── bindings.py          #      数据库无关的已发布码表加载、值域绑定与规则/造数用量校验
-│   ├── extraction.py            #    跨子域协同：三轨（metadata/code_sets/rule_evidence）execute_wave Worker 纯计算、主协调单写落库及 reconcile_package_assets 跨文件融合与冲突检测
+│   ├── extraction.py            #    跨子域协同：三轨（metadata/code_sets/rule_evidence，含 EAST OCR 行级与 SAFE 核查规则提取）execute_wave Worker 纯计算、主协调单写落库及 reconcile_package_assets 跨文件融合与冲突检测
 │   ├── pipeline_run.py          #    Step 0 + Step 1 文档导入/解析统一 Run 控制面（基于 Scheduler + INGESTION_CHANNELS 三轨块级断点续跑）
 │   └── version_diff.py          #    跨版本监管制度文档（diff_documents）与规范包（diff_packages）差异对比与影响面分级（返回增量受影响表清单）
 │
@@ -101,13 +101,13 @@ backend/app/
 │
 └── api/                         # 层 7：HTTP 接口层（按 4 个业务域分组 + 薄路由/服务分离，统一由 register_routers 挂载 /api/*）
     ├── __init__.py              #    唯一路由装配入口 register_routers(app)
-    ├── common.py                #    跨域公共依赖（db_session）、spawn_run_driver 与通用 Run 视图序列化
+    ├── common.py                #    跨域公共依赖（db_session）、商业银行监管机构→报表筛选映射（matches_regulator_filter）、spawn_run_driver 与通用 Run 视图序列化
     ├── platform/                #    域 1：平台底座与配置
     │   ├── system.py            #      /api/health、/api/events/stream（SSE）、/api/blobs/*、/api/business/preview
     │   └── settings.py          #      /api/settings/*（连接探活与执行预算校验/持久化）
     ├── catalog/                 #    域 2：监管资产目录（多文件规范包 / 文档 / 表字段元数据 / 码表）
-    │   ├── packages.py          #      /api/packages/* 薄路由（多文件/ZIP 批量上传、doc_role 修正、整包三轨提取与跨文件融合、包级对比）
-    │   ├── packages_service.py  #      规范包生命周期、ZIP 安全拆包、角色推断与整包重提取协调服务
+    │   ├── packages.py          #      /api/packages/* 薄路由（多文件/ZIP 批量上传、doc_role 修正、PUT 单文件原地替换、DELETE 移除文件、整包三轨提取融合与跨版本对比）
+    │   ├── packages_service.py  #      规范包生命周期、ZIP 安全拆包、历史文档自动收编、REVISION_NOTE 规则隔离、MySQL REPEATABLE READ 快照刷新与整包重提取协调服务
     │   ├── documents.py         #      /api/documents/* 薄路由（上传、切块、提取、进度、版本对比）
     │   ├── documents_service.py #      文档接入、原子落盘、初始切块与状态校验服务
     │   ├── metadata.py          #      /api/metadata/* 薄路由（报表字段、就绪度、类型修正与发布）
@@ -120,8 +120,8 @@ backend/app/
     │   ├── artifacts.py         #      /api/artifacts/* 薄路由（产物状态、规则总览与手工改参）
     │   └── artifacts_service.py #      产物批量聚合（防 N+1）、规则改参校验与 EventLog 留痕服务
     └── delivery/                #    域 4：运行批次控制与审计交付
-        ├── runs.py              #      /api/runs/* 薄路由（生命周期、审批、测试确认、重试、回放、trace、bus-events）
-        └── runs_service.py      #      批次列表批量折叠、多轮 Oracle 沙箱表清理与校验明细拼装服务
+        ├── runs.py              #      /api/runs/* 薄路由（支持按 package_id 与监管机构/报表 regulator 过滤，覆盖审批、测试确认、断点重试、回放、trace、bus-events）
+        └── runs_service.py      #      批次列表批量折叠（机构级过滤）、多轮 Oracle 沙箱表清理与校验明细拼装服务
 ```
 
 ---

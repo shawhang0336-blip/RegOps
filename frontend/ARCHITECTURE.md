@@ -16,17 +16,19 @@ frontend/src/
 ├── main.jsx                         # 入口：挂载 <App /> 与统一加载 styles/index.css
 │
 ├── app/                             # 应用外壳与路由装配（唯一顶层路由表）
-│   ├── App.jsx                      #   Provider / WorkbenchLayout / React.lazy 路由懒加载
+│   ├── App.jsx                      #   Provider（含 WorkspaceProvider）/ WorkbenchLayout / React.lazy 路由懒加载
+│   ├── ProjectContextBar.jsx        #   全局三层监管切换栏（一级监管机构 → 二级监管报表 → 三级版本规范包 + 快捷新建包）
 │   └── BackendHealthPill.jsx        #   顶栏后端健康探测胶囊
 │
 ├── api/                             # 统一后端 API 客户端层（全站唯一允许出现 /api/* 路径的目录）
 │   ├── client.js                    #   底层 HTTP 封装（api / ApiError / downloadFile / 422 格式化）
 │   ├── platform.js                  #   /api/health、/api/blobs/*、/api/settings/*、SSE URL 构造
-│   ├── catalog.js                   #   /api/documents/*、/api/metadata/*、/api/code-sets/*
-│   ├── generation.js                #   /api/generation/*、/api/artifacts/*
-│   └── delivery.js                  #   /api/runs/*（生命周期、审批、重审、清理、diff、预览）
+│   ├── catalog.js                   #   /api/packages/*（含 PUT 单文件替换/DELETE 移除/extract/diff）、/api/documents/*、/api/metadata/*、/api/code-sets/*
+│   ├── generation.js                #   /api/generation/*、/api/artifacts/*（支持 package_id 过滤）
+│   └── delivery.js                  #   /api/runs/*（支持 package_id & 机构级 regulator 过滤、审批、重审、清理、diff、预览）
 │
 ├── components/                      # 全站通用 UI 组件（零业务路由状态，严禁依赖 features/）
+│   ├── SelectDropdown.jsx           #   自研键盘无障碍现代下拉组件（徽章、版本标签、统计副标题与明暗主题浮层）
 │   ├── PageHeader.jsx               #   页头标题与操作栏
 │   ├── StatusMessage.jsx            #   错误横幅 + Toast 同步通知
 │   ├── StatusBadge.jsx              #   统一状态徽章
@@ -38,6 +40,7 @@ frontend/src/
 │   └── Skeleton.jsx                 #   列表与详情骨架屏
 │
 ├── context/                         # 全局 Context
+│   ├── WorkspaceContext.jsx         #   全局三层「监管机构 → 监管报表 → 版本规范包」状态同步与 URL/本地持久化
 │   ├── FeedbackContext.jsx          #   全局 Toast 与异步确认弹窗（confirm）
 │   └── ThemeContext.jsx             #   浅色 / 深色主题切换
 │
@@ -45,30 +48,30 @@ frontend/src/
 │   └── useEventStream.js            #   Bus SSE 实时事件流订阅、轮询兜底与文档进度监听
 │
 ├── utils/                           # 纯工具函数与领域词典（零 React/DOM 强耦合）
-│   ├── activeDocument.js            #   跨工作台记住当前选中的文档 ID
+│   ├── activeDocument.js            #   商业银行监管机构/报表两级字典（REGULATORY_AGENCIES / REGULATOR_PROJECTS）、历史别名归一与上下文持久化
 │   ├── budget.js                    #   执行预算字段元信息与边界校验
 │   ├── dateTime.js                  #   后端 UTC 时间解析与本地化显示
 │   └── labels.js                    #   状态/字段/修订/问题码文案词典与友好错误转换
 │
 ├── styles/                          # 全局样式收口目录
 │   ├── index.css                    #   显式固定层叠顺序（base → pages → styles → ux）
-│   ├── base.css / pages.css / styles.css / ux.css
+│   └── base.css / pages.css / styles.css / ux.css  # 含统一 8px 现代按钮/原生 select SVG 箭头、SelectDropdown 与三层切换栏样式
 │
 └── features/                        # 按 4 大业务域组织的页面模块（与后端 api/ 1:1 对齐）
     ├── catalog/                     #   域 1：监管资产目录
-    │   ├── PreparationWorkspace.jsx #     文档接入 + 报表/码表核对主工作台
+    │   ├── PreparationWorkspace.jsx #     规范包文档清单（多文件/ZIP 上传、doc_role 切换、原地替换更新、整包融合）+ 报表/码表核对主工作台
     │   ├── documents/               #     DocumentsPage / CurrentFilePicker / ImportProgressPanel / documentHelpers
     │   ├── metadata/                #     MetadataPage / FieldEditorDrawer / MetadataPanels / metadataHelpers
-    │   ├── codeSets/                #     CodeSetsPage
-    │   └── versions/                #     VersionsPage（制度文档 Diff / 批次 SQL Diff / 修订历史）
+    │   ├── codeSets/                #     CodeSetsPage（支持 packageId 隔离查询）
+    │   └── versions/                #     VersionsPage（跨版本规范包 Diff / 批次 SQL Diff / 单表修订历史）
     ├── generation/                  #   域 2：规则与产物装配
-    │   ├── ArtifactsPage.jsx        #     规则工作台主页面
+    │   ├── ArtifactsPage.jsx        #     规则工作台主页面（按当前规范包自动限定报表与规则范围）
     │   ├── ArtifactDetail.jsx       #     表结构 / 码表 / 产物明细
     │   ├── RulesViews.jsx           #     单表与跨表规则审批视图
     │   ├── RuleDrawer.jsx           #     规则参数抽屉与手工改参
     │   └── artifactHelpers.js
     ├── delivery/                    #   域 3：运行批次控制与测试下载
-    │   ├── RunsPage.jsx             #     批次列表、验证明细、沙箱预览与生产 ZIP 下载
+    │   ├── RunsPage.jsx             #     按监管机构/报表/版本包筛选批次、验证明细、沙箱预览与生产 ZIP 下载
     │   ├── HistoryCleanupModal.jsx  #     历史冗余批次清理弹窗
     │   └── RunTraceTimeline.jsx     #     EventLog / Bus 耗时瀑布与链路回放
     └── platform/                    #   域 4：系统设置
@@ -89,6 +92,6 @@ frontend/src/
 
 ## 三、看代码推荐阅读顺序
 
-1. **看启动与顶层路由**：[`src/main.jsx`](src/main.jsx) → [`src/app/App.jsx`](src/app/App.jsx)
+1. **看启动、全局上下文与三层切换栏**：[`src/main.jsx`](src/main.jsx) → [`src/app/App.jsx`](src/app/App.jsx) → [`src/context/WorkspaceContext.jsx`](src/context/WorkspaceContext.jsx) → [`src/app/ProjectContextBar.jsx`](src/app/ProjectContextBar.jsx)
 2. **看前后端接口契约**：[`src/api/client.js`](src/api/client.js) → [`src/api/catalog.js`](src/api/catalog.js) / [`generation.js`](src/api/generation.js) / [`delivery.js`](src/api/delivery.js) / [`platform.js`](src/api/platform.js)
 3. **看三大核心业务工作台**：[`features/catalog/PreparationWorkspace.jsx`](src/features/catalog/PreparationWorkspace.jsx) → [`features/generation/ArtifactsPage.jsx`](src/features/generation/ArtifactsPage.jsx) → [`features/delivery/RunsPage.jsx`](src/features/delivery/RunsPage.jsx)

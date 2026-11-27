@@ -8,11 +8,12 @@
 
 ## 核心特性与工作台界面
 
-- **顶部横向三步工作台与辅助治理入口**
-  1. **01 规范解析与核对（`/documents`）**：支持基于规范包（`SpecPackage`）的多文件与压缩包异构接入（PDF / DOCX / XLSX / ZIP，自动识别文档角色 `doc_role`、Word 合并单元格与章节树、Excel 多表拆分与 1104 二维表样隔离、三轨并行提取表字段/码表/检核规则补充证据、跨文件同表融合与冲突标红），以及人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
-  2. **02 生成表结构、码表和规则（`/generation`）**：确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
-  3. **03 测试与下载（`/runs`）**：AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、测试确认门禁、生产 DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载。
-  - 辅助入口：**变更记录（`/versions`）** 支持跨版本制度文档 Diff 与跨批次 SQL Diff；**系统设置（`/settings`）** 配置数据源与模型/预算参数，右上角实时显示后端在线状态与浅色/深色外观切换。
+- **商业银行三层监管导航与顶部横向三步工作台**
+  - **全局三层监管切换栏（`ProjectContextBar` + `WorkspaceContext`）**：按 2023 金融监管机构改革后口径分层管理 **一级监管机构**（国家金融监督管理总局 `NFRA` / 中国人民银行 `PBOC` / 国家外汇管理局 `SAFE` / 财政部·登记托管·其他 `OTHER`）→ **二级监管报表体系**（一表通 `YBT`、EAST、1104 非现场、客户风险统计、人行金数/大集中/反洗钱/二代征信/跨境人民币、外汇业务采集 `SAFE_BIZ`、对外金融资产负债 `SAFE_FAL`、国际收支 `SAFE_BOP` 及自定义地方银行报表）→ **三级版本规范包（`SpecPackage`）**，配套自研无障碍现代下拉组件（`SelectDropdown`）并已彻底收口单文件兼容态（启动时自动收编历史孤立文档）。
+  1. **01 规范解析与核对（`/documents`）**：支持基于规范包的多文件与压缩包异构接入（PDF / DOCX / XLSX / ZIP 以及旧版 `.doc`（LibreOffice / macOS `textutil`）与 `.xls`（`xlrd`）自动转码），自动识别文档角色（`MAIN_SPEC` / `SCHEMA_APPENDIX` / `CODE_SET_APPENDIX` / `RULE_SUPPLEMENT` / `REVISION_NOTE`）、Word 合并单元格与章节树、Excel 多表拆分、1104/地方银行业二维矩阵表样（`MATRIX_REPORT`）隔离、EAST OCR 检核规则 PDF 行级解析、国标层级码表（如 GB/T 4754-2017）零 LLM 结构化抽取、三轨并行提取与跨文件同表融合/冲突标红、单文件原地替换更新（`PUT`），以及人工抽屉修订、CSV/XLSX 批量修正与就绪度检查。
+  2. **02 生成表结构、码表和规则（`/generation`）**：按当前规范包自动筛选报表清单，将包内独立核查规则（`TableRuleEvidence`）桥接注入 Step 2，完成确定性预算规划与 DDL 编译、13 类监管算子规则生成、Oracle 沙箱空跑预检、规则手工改参与人工审批确权。
+  3. **03 测试与下载（`/runs`）**：支持按监管机构 / 监管报表 / 版本包过滤历史批次，执行 AI 黄金正例造数 + 确定性反例变异、Oracle AB 沙箱真跑与三路自愈、断点续跑（`RUN_RESUMED`）、测试确认门禁、生产 Oracle + MySQL DDL / 只读校验 SQL 部署 ZIP 包防篡改打包下载。
+  - 辅助入口：**变更记录（`/versions`）** 支持跨版本规范包字段与补充规则 Diff（`diffPackages`）、影响面分级及跨批次 SQL Diff；**系统设置（`/settings`）** 配置数据源与模型/预算参数，右上角实时显示后端在线状态与浅色/深色外观切换。
 - **后端架构（ProdAgent「机制在内，策略在外」+ 严格单向八层 DAG）**
   - 六大微内核（`Plan` / `Bus` / `EventLog` / `Interrupt` / `Run` / `Scheduler` 真 BSP `Send` 波次引擎）与业务策略彻底隔离；
   - 全链路以只追加哈希链事件账本（`EventLog`）与内容寻址大对象存储（`BlobStore`）为唯一事实源，支持门禁拦截、一等人工中断挂起、横切成本熔断（`BudgetGuard`）、运行中取消、断点续跑与 SSE 实时事件推送；
@@ -56,16 +57,16 @@ data-rule-studio/
 │   ├── ARCHITECTURE.md               # 前端目录分层与依赖守卫说明
 │   ├── src/
 │   │   ├── main.jsx                  # 唯一挂载入口
-│   │   ├── app/                      # 应用外壳、顶栏导航、路由表与健康探测
+│   │   ├── app/                      # 应用外壳、顶栏导航、三层监管项目切换栏（ProjectContextBar）、路由表与健康探测
 │   │   ├── api/                      # 全站统一接口客户端（client / platform / catalog / generation / delivery）
-│   │   ├── components/               # 通用 UI 组件（PageHeader / StatusMessage / StatusBadge / Modal 等）
-│   │   ├── context/                  # ThemeContext / FeedbackContext
+│   │   ├── components/               # 通用 UI 组件（SelectDropdown / PageHeader / StatusMessage / StatusBadge / Modal 等）
+│   │   ├── context/                  # WorkspaceContext（三层机构/报表/版本包）/ ThemeContext / FeedbackContext
 │   │   ├── hooks/                    # Bus SSE 订阅与进度监听（useEventStream）
-│   │   ├── utils/                    # 纯工具函数与文案词典（dateTime / budget / activeDocument / labels）
-│   │   ├── styles/                   # 全局样式收口（index.css 固定层叠顺序）
+│   │   ├── utils/                    # 纯工具函数与银行监管机构/报表字典（activeDocument / dateTime / budget / labels）
+│   │   ├── styles/                   # 全局样式收口（index.css 固定层叠顺序，统一现代按钮/下拉质感）
 │   │   └── features/                 # 按 4 大业务域组织的页面模块（catalog / generation / delivery / platform）
 │   └── tests/                        # 前端单测与架构边界自动化守卫（node --test）
-├── data/                             # 统一监管规范资料库与测试样本（二进制原件 .gitignore 忽略，目录说明与清单索引入库）
+├── data/                             # 商业银行监管规范资料库与多文件混装测试样本（二进制原件 .gitignore 忽略，仅说明与清单索引入库）
 ├── .env.example                      # 环境变量模板
 └── README.md
 ```
@@ -107,7 +108,7 @@ data-rule-studio/
 
 ```mermaid
 flowchart TD
-    A["上传规范 PDF / DOCX / XLSX"] --> B["离线体检 survey + AI 文档结构导航（inspect_document_structure）"]
+    A["上传规范包（PDF / DOCX / XLSX / ZIP / 旧版 DOC·XLS）"] --> B["离线体检 survey + 确定性结构分流（MATRIX_REPORT / RULE_EVIDENCE / CODE_SET 零 Token 保真）"]
     B --> C["程序按策略切块"]
     C --> D{"是否存在跨页断裂/混装/告警？（adaptive 门控）"}
     D -- "否（0 Token）" --> F["确定性字段与码表提取"]
@@ -220,12 +221,14 @@ npm run dev
 ## 测试与架构守卫
 
 ```bash
-# 后端全量测试（340 passed, 1 skipped：含八层 DAG、内核纯净度、多文件异构规范解析与跨文件融合、Step 0/1 断点续跑与 RPM 限流等守卫）
+# 后端全量测试（340 passed, 1 skipped：含八层 DAG、内核纯净度、多文件异构规范解析与跨文件融合、旧版 .doc/.xls 与 EAST OCR 规则回归、Step 0/1 断点续跑与 RPM 限流等守卫）
 cd backend && pytest -q
 
-# 前端单测与架构边界守卫（10 项：目录结构、/api/* 统一收口与单向依赖校验）
+# 前端单测与架构边界守卫（10 项：目录结构、银行监管机构/报表字典、/api/* 统一收口与单向依赖校验）
 cd frontend && npm test
 
 # 前端生产构建验证
 cd frontend && npm run build
 ```
+
+> **多文件多格式真机 E2E 实测覆盖**：已基于真实 `MySQL 8 + Oracle 23 + DeepSeek` 端到端验证 5 类银行典型混装案例（一表通 `DOCX + 2×XLSX` 跨文件融合与冲突检出、EAST `ZIP + 39 页 OCR 检核规则 PDF` 析出 1,221 条规则、1104 `G01` 二维矩阵隔离、外汇局汇发〔2025〕22 号 4 份官方 PDF 315 条核查规则、上海自贸区旧版 `.xls + .doc + GB/T 4754-2017` 1,616 条国标行业码值），并在一表通 `YBT_PROD_INFO`、EAST `S_LOAN_JJ`、外汇局 `FAL_2025_Z02` 三张代表报表上跑通 Oracle 23 沙箱 100% 覆盖率、单文件原地替换与跨版本 Diff 及 SHA-256 生产部署 ZIP 交付。
