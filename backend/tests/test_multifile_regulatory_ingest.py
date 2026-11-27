@@ -399,7 +399,7 @@ def test_alembic_0007_migration_runs_cleanly(tmp_path):
     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_file}")
 
     command.upgrade(cfg, "0006_mysql_column_widths")
-    command.upgrade(cfg, "0007_spec_packages_and_rule_evidence")
+    command.upgrade(cfg, "0007_spec_packages")
 
     engine = create_engine(f"sqlite:///{db_file}")
     try:

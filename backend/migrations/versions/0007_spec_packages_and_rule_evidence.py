@@ -1,6 +1,6 @@
 """Add SpecPackage multi-file container, document roles, and structured rule evidences.
 
-Revision ID: 0007_spec_packages_and_rule_evidence
+Revision ID: 0007_spec_packages
 Revises: 0006_mysql_column_widths
 """
 
@@ -8,7 +8,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import LONGTEXT
 
-revision = "0007_spec_packages_and_rule_evidence"
+revision = "0007_spec_packages"
 down_revision = "0006_mysql_column_widths"
 branch_labels = None
 depends_on = None
@@ -43,7 +43,7 @@ def upgrade() -> None:
             sa.Column("spec_version", sa.String(64), nullable=False, server_default="UNKNOWN"),
             sa.Column("parent_package_id", sa.String(36), sa.ForeignKey("spec_packages.id"), nullable=True),
             sa.Column("status", sa.String(32), nullable=False, server_default="ACTIVE"),
-            sa.Column("description", sa.Text(), nullable=False, server_default=""),
+            sa.Column("description", sa.Text(), nullable=False),
             sa.Column("created_at", sa.DateTime(), nullable=False),
             sa.Column("updated_at", sa.DateTime(), nullable=False),
         )
@@ -127,7 +127,7 @@ def upgrade() -> None:
             sa.Column("scope", sa.String(24), nullable=False, server_default="SINGLE_TABLE"),
             sa.Column("target_fields_json", sa.JSON(), nullable=False),
             sa.Column("rule_text", _LONG_TEXT, nullable=False),
-            sa.Column("reference_sql", _LONG_TEXT, nullable=False, server_default=""),
+            sa.Column("reference_sql", _LONG_TEXT, nullable=False),
             sa.Column("source_locator", sa.JSON(), nullable=False),
             sa.Column("rule_hash", sa.String(64), nullable=False),
             sa.Column("created_at", sa.DateTime(), nullable=False),
